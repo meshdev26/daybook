@@ -74,6 +74,91 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Base32 (RFC 4648) encode, no spaces, with `=` padding.
+pub fn base32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let mut buffer: u64 = 0;
+    let mut bits_left: usize = 0;
+    for &byte in input {
+        buffer = (buffer << 8) | byte as u64;
+        bits_left += 8;
+        while bits_left >= 5 {
+            bits_left -= 5;
+            let idx = ((buffer >> bits_left) & 0x1f) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+    }
+    if bits_left > 0 {
+        buffer <<= 5 - bits_left;
+        let idx = (buffer & 0x1f) as usize;
+        out.push(ALPHABET[idx] as char);
+    }
+    while !out.is_empty() && !out.len().is_multiple_of(8) {
+        out.push('=');
+    }
+    out
+}
+
+/// Base32 (RFC 4648) decode. Case-insensitive; ignores whitespace and padding.
+pub fn base32_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut bits: u64 = 0;
+    let mut bits_left: usize = 0;
+    let mut out: Vec<u8> = Vec::new();
+    for c in input.chars() {
+        if c == '=' || c.is_whitespace() {
+            continue;
+        }
+        let val = match c.to_ascii_uppercase() {
+            'A'..='Z' => c.to_ascii_uppercase() as u8 - b'A',
+            '2'..='7' => c.to_ascii_uppercase() as u8 - b'2' + 26,
+            _ => return Err(format!("invalid base32 character: {}", c)),
+        };
+        bits = (bits << 5) | val as u64;
+        bits_left += 5;
+        if bits_left >= 8 {
+            bits_left -= 8;
+            out.push(((bits >> bits_left) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// TOTP code generation using HMAC-SHA256 (RFC 6238 / RFC 4226 truncation).
+pub fn totp_generate<Ts, Td, Tstep>(
+    secret_base32: &str,
+    timestamp: Ts,
+    digits: Td,
+    step: Tstep,
+) -> String
+where
+    Ts: TryInto<u64>,
+    Ts::Error: std::fmt::Debug,
+    Td: TryInto<usize>,
+    Td::Error: std::fmt::Debug,
+    Tstep: TryInto<u64>,
+    Tstep::Error: std::fmt::Debug,
+{
+    let ts: u64 = timestamp.try_into().unwrap_or(0);
+    let digits: usize = digits.try_into().unwrap_or(6);
+    let step: u64 = step.try_into().unwrap_or(30);
+    let key = base32_decode(secret_base32).unwrap_or_default();
+    let counter = ts.checked_div(step).unwrap_or(0);
+    let mut msg = [0u8; 8];
+    for i in 0..8usize {
+        msg[7 - i] = ((counter >> (i * 8)) & 0xff) as u8;
+    }
+    let mac = hmac_sha256(&key, &msg);
+    let offset = (mac[mac.len() - 1] & 0x0f) as usize;
+    let mut code = ((mac[offset] as u32 & 0x7f) << 24)
+        | ((mac[offset + 1] as u32) << 16)
+        | ((mac[offset + 2] as u32) << 8)
+        | (mac[offset + 3] as u32);
+    let modulus = 10u32.pow(digits as u32);
+    code %= modulus;
+    format!("{:0width$}", code, width = digits)
+}
+
 #[cfg(test)]
 mod prop_tests {
     use super::*;

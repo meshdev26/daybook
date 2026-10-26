@@ -7,17 +7,27 @@ use super::provider::{GenerateRequest, GenerateResponse, TokenUsage};
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
+    base_url: String,
     api_key: String,
     client: reqwest::Client,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(base_url: String, api_key: String) -> Result<Self, AiError> {
+        let base_url = if base_url.trim().is_empty() {
+            "https://api.anthropic.com/v1".to_string()
+        } else {
+            base_url
+        };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap();
-        Self { api_key, client }
+            .map_err(|e| AiError::Provider(format!("failed to build HTTP client: {}", e)))?;
+        Ok(Self {
+            base_url,
+            api_key,
+            client,
+        })
     }
 }
 
@@ -74,9 +84,10 @@ impl super::provider::AiProvider for AnthropicProvider {
             messages: msgs,
             system,
         };
+        let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&body)

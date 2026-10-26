@@ -12,6 +12,7 @@ pub struct Config {
     pub crypto_token: Option<String>,
     pub ai_enabled: bool,
     pub ai_provider: String,
+    pub ai_api_style: String,
     pub ai_base_url: String,
     pub ai_api_key: Option<String>,
     pub ai_model: String,
@@ -113,7 +114,7 @@ pub fn load_dotenv() {
 /// these. Every other line in an existing `.env` (WEB_BIND, WEB_URL,
 /// WEB_BASE_PATH, OPEN_BROWSER, ...) is preserved verbatim so a re-run never
 /// drops deployment settings it knows nothing about.
-pub const SETUP_ENV_KEYS: [&str; 9] = [
+pub const SETUP_ENV_KEYS: [&str; 16] = [
     "TELEGRAM_BOT_TOKEN",
     "OWNER_ID",
     "DATABASE_URL",
@@ -123,6 +124,13 @@ pub const SETUP_ENV_KEYS: [&str; 9] = [
     "WEB_PASSWORD",
     "WEB_PORT",
     "RUST_LOG",
+    "AI_ENABLED",
+    "AI_PROVIDER",
+    "AI_API_STYLE",
+    "AI_BASE_URL",
+    "AI_API_KEY",
+    "AI_MODEL",
+    "AI_DAILY_TOKEN_BUDGET",
 ];
 
 /// Pure path resolution for the `.env` writer, testable without touching the
@@ -188,13 +196,56 @@ fn write_env_file_at(path: &Path, updates: &[(String, String)]) -> Result<PathBu
         content.push_str(&preserved.join("\n"));
         content.push('\n');
     }
-    fs::write(path, content)
-        .map_err(|e| io::Error::new(e.kind(), format!("cannot write {}: {e}", path.display())))?;
-    // best-effort permissions 0600
+    // Atomic replace: stage the content in a sibling temp file, set 0600 on
+    // the temp BEFORE the rename (the target must never be briefly
+    // world-readable or half-written), then rename over the target —
+    // rename(2) within one directory is atomic. For the usual target `.env`
+    // this is the sibling `.env.tmp`. The temp is CREATED with mode 0600 via
+    // open(2), so there is no window where the file exists under umask-wide
+    // permissions before the chmod; the best-effort chmod below stays as
+    // belt-and-braces for a stale temp left by an earlier run (open(2) mode
+    // only applies at creation, never to an existing file).
+    let tmp_path = path.with_extension("tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut tmp = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot write {}: {e}", tmp_path.display()),
+                )
+            })?;
+        tmp.write_all(content.as_bytes())?;
+        tmp.flush()?;
+    }
+    #[cfg(not(unix))]
+    fs::write(&tmp_path, &content).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot write {}: {e}", tmp_path.display()),
+        )
+    })?;
+    // best-effort permissions 0600 (applied to the temp file, pre-rename; on
+    // unix this only matters for a pre-existing temp file whose mode open(2)
+    // would not have changed)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("cannot write {}: {e}", path.display()),
+        ));
     }
     Ok(path.to_path_buf())
 }
@@ -299,6 +350,13 @@ impl Config {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let ai_provider = env::var("AI_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+        let ai_api_style = env::var("AI_API_STYLE").unwrap_or_else(|_| {
+            if ai_provider == "anthropic" {
+                "anthropic".to_string()
+            } else {
+                "openai".to_string()
+            }
+        });
         let ai_base_url =
             env::var("AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         let ai_api_key = env::var("AI_API_KEY").ok().filter(|s| !s.is_empty());
@@ -315,6 +373,7 @@ impl Config {
             crypto_token,
             ai_enabled,
             ai_provider,
+            ai_api_style,
             ai_base_url,
             ai_api_key,
             ai_model,

@@ -125,6 +125,7 @@ impl AgentAppBuilder {
             cfg,
             bot,
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
+            ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
             base_path: base,
         };
         Ok(AgentApp { state, registry })

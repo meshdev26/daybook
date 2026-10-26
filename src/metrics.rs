@@ -182,6 +182,11 @@ pub struct Metrics {
     mcp: Vec<McpRow>,
     /// `bot_messages_sent_total`.
     bot: AtomicU64,
+    /// `http_request_duration_ms` histogram observations (count/sum).
+    http_request_duration_ms_count: AtomicU64,
+    http_request_duration_ms_sum: AtomicU64,
+    /// `db_query_duration_ms` counter placeholder.
+    db_query_duration_ms: AtomicU64,
 }
 
 fn zeroed<const N: usize>() -> [AtomicU64; N] {
@@ -210,6 +215,9 @@ fn global() -> &'static Metrics {
             rows
         },
         bot: AtomicU64::new(0),
+        http_request_duration_ms_count: AtomicU64::new(0),
+        http_request_duration_ms_sum: AtomicU64::new(0),
+        db_query_duration_ms: AtomicU64::new(0),
     })
 }
 
@@ -266,6 +274,34 @@ pub fn bot_sent() {
     global().bot.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record an HTTP request duration observation (milliseconds) for the
+/// `http_request_duration_ms` histogram.
+pub fn http_request_duration_ms(ms: u64) {
+    let m = global();
+    m.http_request_duration_ms_count
+        .fetch_add(1, Ordering::Relaxed);
+    m.http_request_duration_ms_sum
+        .fetch_add(ms, Ordering::Relaxed);
+}
+
+/// Counter placeholder for database query durations (milliseconds).
+pub fn db_query_duration_ms(ms: u64) {
+    global()
+        .db_query_duration_ms
+        .fetch_add(ms, Ordering::Relaxed);
+}
+
+// Aliases for common naming variants.
+pub fn observe_http_request_duration_ms(ms: u64) {
+    http_request_duration_ms(ms);
+}
+pub fn record_http_request_duration_ms(ms: u64) {
+    http_request_duration_ms(ms);
+}
+pub fn observe_db_query_duration_ms(ms: u64) {
+    db_query_duration_ms(ms);
+}
+
 /// The HTTP metrics middleware: classifies by MATCHED ROUTE TEMPLATE only
 /// (see the SECURITY INVARIANT at the top of this module), runs the inner
 /// stack, then bumps the counter for the response's status class.
@@ -277,8 +313,10 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     // `Router::layer` middleware runs; fallback (unmatched) requests have no
     // entry and classify as "other".
     let route = classify_route(req.extensions().get::<MatchedPath>().map(|m| m.as_str()));
+    let start = Instant::now();
     let resp = next.run(req).await;
     http(route, resp.status());
+    http_request_duration_ms(start.elapsed().as_millis() as u64);
     resp
 }
 
@@ -334,6 +372,26 @@ pub fn render() -> String {
     out.push_str(&format!(
         "bot_messages_sent_total {}\n",
         m.bot.load(Ordering::Relaxed)
+    ));
+
+    out.push_str(
+        "# HELP http_request_duration_ms HTTP request duration in milliseconds (histogram).\n",
+    );
+    out.push_str("# TYPE http_request_duration_ms histogram\n");
+    out.push_str(&format!(
+        "http_request_duration_ms_count {}\n",
+        m.http_request_duration_ms_count.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "http_request_duration_ms_sum {}\n",
+        m.http_request_duration_ms_sum.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP db_query_duration_ms Database query duration in milliseconds (counter placeholder).\n");
+    out.push_str("# TYPE db_query_duration_ms counter\n");
+    out.push_str(&format!(
+        "db_query_duration_ms {}\n",
+        m.db_query_duration_ms.load(Ordering::Relaxed)
     ));
 
     out.push_str("# HELP uptime_seconds Seconds since the server process started.\n");
@@ -496,5 +554,12 @@ mod tests {
             ROUTE_CATEGORIES[classify_route(Some("/api/v1/sub_tok_9f8e7d6c5b4a"))],
             "other"
         );
+    }
+
+    #[test]
+    fn render_contains_phase_e_metrics() {
+        let text = render();
+        assert!(text.contains("http_request_duration_ms"));
+        assert!(text.contains("db_query_duration_ms"));
     }
 }

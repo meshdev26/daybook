@@ -14,6 +14,7 @@ pub mod embed;
 pub mod handlers;
 pub mod mcp;
 pub mod metrics;
+pub mod qr;
 pub mod roles;
 pub mod services;
 pub mod util;
@@ -24,9 +25,13 @@ use teloxide::prelude::*;
 /// Revoke every expired subscription: kick the member out of the channel
 /// (ban + unban) and mark the row expired. Shared by the `/expirecheck`
 /// command and the periodic expiry sweeper so the behavior stays
-/// single-sourced. Returns the number of subscriptions processed.
-pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> usize {
-    let mut n = 0;
+/// single-sourced. Returns one entry per expired subscription —
+/// (subscription id, buyer user_id, channel) — so callers can DM the buyer
+/// the revocation notice; the fields come straight from
+/// `expired_subscriptions()` (subscriptions.id / user_id / channel_id), no
+/// extra joins.
+pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> Vec<(i64, i64, String)> {
+    let mut expired = Vec::new();
     for (id, _seller, uid, ch) in db.expired_subscriptions() {
         let cid = util::to_chat_id(&ch);
         let _ = bot
@@ -36,9 +41,9 @@ pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> usize {
             .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
             .await;
         db.mark_subscription_expired(id);
-        n += 1;
+        expired.push((id, uid, ch));
     }
-    n
+    expired
 }
 
 /// Send `text` to every user id in `users`, counting deliveries. Shared by
@@ -53,6 +58,7 @@ pub async fn broadcast_to_users(bot: &Bot, users: &[i64], text: &str) -> usize {
             .await
             .is_ok()
         {
+            metrics::bot_sent();
             sent += 1;
         }
     }

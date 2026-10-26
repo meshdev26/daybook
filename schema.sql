@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS activation_codes (
     max_uses    INTEGER NOT NULL DEFAULT 1,
     uses        INTEGER NOT NULL DEFAULT 0,
     expires_at  TEXT,
+    revoked     INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );
 
@@ -168,7 +169,27 @@ CREATE TABLE IF NOT EXISTS web_accounts (
     salt          TEXT NOT NULL,
     role          TEXT NOT NULL,
     seller_id     INTEGER,
+    totp_secret   TEXT,
+    totp_enabled  INTEGER NOT NULL DEFAULT 0,
+    totp_last_used INTEGER,
     created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS web_pending_mfa (
+    token_hash  TEXT PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    purpose     TEXT NOT NULL,
+    totp_secret TEXT,
+    expires_at  TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS web_recovery_codes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    code_hash  TEXT NOT NULL,
+    used       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
 );
 
 -- Web dashboard sessions
@@ -303,6 +324,82 @@ CREATE TABLE IF NOT EXISTS mcp_audit (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at);
+
+-- Per-seller MCP tokens (v2): bearer tokens scoped to a seller account.
+-- Not yet wired into auth (MCP_OWNER_TOKEN remains the only live credential);
+-- reserved for the v2 per-seller MCP token flow.
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    token_prefix TEXT,
+    name         TEXT,
+    revoked      INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_seller ON mcp_tokens(seller_id);
+
+-- AI-assisted post drafts
+CREATE TABLE IF NOT EXISTS ai_post_drafts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id           INTEGER NOT NULL,
+    channel             TEXT NOT NULL,
+    template            TEXT,
+    content             TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'draft',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    published_message_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ai_post_drafts_seller ON ai_post_drafts(seller_id);
+
+-- Bookings (v2): services, slots, bookings. Reuses invoice pipeline optionally.
+CREATE TABLE IF NOT EXISTS services (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id       INTEGER NOT NULL,
+    name            TEXT NOT NULL,
+    price           TEXT NOT NULL,
+    asset           TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL DEFAULT 60,
+    channel_id      TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL,
+    UNIQUE(seller_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_services_seller ON services(seller_id);
+
+CREATE TABLE IF NOT EXISTS slots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id  INTEGER NOT NULL,
+    seller_id   INTEGER NOT NULL,
+    starts_at   TEXT NOT NULL,
+    ends_at     TEXT,
+    capacity    INTEGER NOT NULL DEFAULT 1,
+    booked      INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'available',
+    held_until  TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slots_service ON slots(service_id);
+CREATE INDEX IF NOT EXISTS idx_slots_status ON slots(status);
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    booking_id  TEXT NOT NULL UNIQUE,
+    seller_id   INTEGER NOT NULL,
+    service_id  INTEGER NOT NULL,
+    slot_id     INTEGER,
+    user_id     INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'held',
+    invoice_id  TEXT,
+    expires_at  TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_seller ON bookings(seller_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);

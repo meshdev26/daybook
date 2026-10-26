@@ -13,16 +13,16 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String, api_key: String) -> Result<Self, AiError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap();
-        Self {
+            .map_err(|e| AiError::Provider(format!("failed to build HTTP client: {}", e)))?;
+        Ok(Self {
             base_url,
             api_key,
             client,
-        }
+        })
     }
 }
 

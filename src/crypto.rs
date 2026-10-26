@@ -15,8 +15,11 @@ impl CryptoPay {
     /// Like [`CryptoPay::new`], but targets a custom API base; used by tests
     /// to point the client at a local mock server. `new()` stays canonical.
     pub fn with_base_url(token: String, base: &str) -> Self {
+        // 15s, deliberately below the web request-timeout middleware (30s):
+        // a transfer call must always time out on the client side before the
+        // HTTP middleware can kill the request mid-flight.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(15))
             .build()
             .unwrap();
         Self {

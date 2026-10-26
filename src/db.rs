@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
@@ -27,6 +28,14 @@ type InvoiceRow = (
 // them (the /buy resolver in handlers::commands returns these verbatim).
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
+
+/// How long an invoice may sit in 'granting' before pending_invoices()
+/// treats the claim as wedged (claimer crashed between
+/// claim_invoice_for_grant and finalize_invoice_paid) and re-queues it for
+/// re-verification. Generous enough that a live granter — verify + grant +
+/// finalize takes seconds — is never raced, and the claim stamps updated_at
+/// so the clock starts at claim acquisition.
+const WEDGED_GRANT_STALE_MINUTES: i64 = 5;
 // Named-field row (not a tuple alias) — a new public surface consumed by the
 // web channels manager; seller_id 0 = global namespace, is_default flags the
 // single global default.
@@ -50,8 +59,9 @@ pub type ProductRow = (
     i64,
 );
 type CodeRow = (i64, i64, Option<i64>, Option<i64>, i64, i64, Option<String>);
-type CodeListRow = (String, Option<i64>, Option<i64>, i64, i64, i64);
+type CodeListRow = (String, Option<i64>, Option<i64>, i64, i64, i64, bool);
 type SellerAiSettings = (Option<String>, Option<String>, Option<i64>, Option<i64>);
+type CodeRedemptionRow = (i64, i64, String);
 type AiTemplateRow = (
     String,
     Option<String>,
@@ -174,6 +184,10 @@ impl Db {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE activation_codes ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE invoices ADD COLUMN seller_id INTEGER NOT NULL DEFAULT 0",
             [],
         );
@@ -293,6 +307,16 @@ impl Db {
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, role TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL)", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at)",
+            [],
+        );
+        // v2 per-seller MCP tokens (not yet wired into auth). Additive.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, token_prefix TEXT, name TEXT, revoked INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT, last_used_at TEXT)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_tokens_seller ON mcp_tokens(seller_id)",
             [],
         );
         // v1.3.x channels: managed-channel store (schema.sql declares it for
@@ -476,10 +500,57 @@ impl Db {
                 e
             );
         }
+        // Bookings (v2): services / slots / bookings.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS services (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, name TEXT NOT NULL, price TEXT NOT NULL, asset TEXT NOT NULL, duration_minutes INTEGER NOT NULL DEFAULT 60, channel_id TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, UNIQUE(seller_id, name))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_services_seller ON services(seller_id)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, service_id INTEGER NOT NULL, seller_id INTEGER NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT, capacity INTEGER NOT NULL DEFAULT 1, booked INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'available', held_until TEXT, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_slots_service ON slots(service_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_slots_status ON slots(status)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL UNIQUE, seller_id INTEGER NOT NULL, service_id INTEGER NOT NULL, slot_id INTEGER, user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'held', invoice_id TEXT, expires_at TEXT, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookings_seller ON bookings(seller_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status)",
+            [],
+        );
+        // AI-assisted post drafts.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS ai_post_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, channel TEXT NOT NULL, template TEXT, content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, published_message_id INTEGER)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_post_drafts_seller ON ai_post_drafts(seller_id)",
+            [],
+        );
+
+        // Phase 4 MFA: additive columns + tables.
+        let _ = conn.execute("ALTER TABLE web_accounts ADD COLUMN totp_secret TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE web_accounts ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE web_accounts ADD COLUMN totp_last_used INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS web_pending_mfa (token_hash TEXT PRIMARY KEY, account_id INTEGER NOT NULL, purpose TEXT NOT NULL, totp_secret TEXT, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS web_recovery_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, code_hash TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)",
+            [],
+        );
+
         // One-time credential rotation (tracked via the config table so it
-        // runs exactly once per database): every token issued before the
-        // CSPRNG switch was generated from a predictable LCG, so existing web
-        // sessions and API keys must be considered forgeable. Revoke them.
         let rotated = conn
             .query_row(
                 "SELECT value FROM config WHERE key = 'migration_rotate_tokens_v1'",
@@ -602,6 +673,50 @@ impl Db {
         self.get_seller(seller_id).and_then(|s| s.2)
     }
 
+    /// Whether the seller has a usable delivery channel configured (their
+    /// `sellers.default_channel` exists and is non-empty — mirrors the
+    /// `seller_channel(..).unwrap_or_default().is_empty()` check callers do).
+    /// Lets code-redeem paths validate BEFORE redeem_code burns a use: the
+    /// redeem handler checks this first and refuses the code untouched when
+    /// the seller has no channel to grant into.
+    pub fn seller_has_channel(&self, seller_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT 1 FROM sellers WHERE user_id=?1 AND default_channel IS NOT NULL AND default_channel <> ''",
+            params![seller_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Resolve a seller's user_id from their Telegram username (case-insensitive,
+    /// leading '@' tolerated by the caller). Returns None when no seller row
+    /// matches.
+    pub fn get_seller_by_username(&self, username: &str) -> Option<i64> {
+        let uname = username.trim().trim_start_matches('@');
+        if uname.is_empty() {
+            return None;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT user_id FROM sellers WHERE username = ?1 COLLATE NOCASE",
+            params![uname],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn set_seller_channel(&self, seller_id: i64, channel: &str) {
         self.upsert_seller(seller_id, None, Some(channel));
     }
@@ -702,6 +817,188 @@ impl Db {
             params![content, id],
         )?;
         Ok(())
+    }
+
+    // ---- AI post drafts ----
+    pub fn create_ai_post_draft(&self, seller_id: i64, channel: &str, content: &str) -> i64 {
+        self.create_ai_post_draft_with_template(seller_id, channel, None, content)
+    }
+
+    pub fn create_ai_post_draft_with_template(
+        &self,
+        seller_id: i64,
+        channel: &str,
+        template: Option<&str>,
+        content: &str,
+    ) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO ai_post_drafts(seller_id,channel,template,content,status,created_at,updated_at) VALUES(?1,?2,?3,?4,'draft',?5,?5)",
+            params![seller_id, channel, template, content, now],
+        );
+        conn.last_insert_rowid()
+    }
+
+    // Aliases for create.
+    pub fn create_ai_draft(&self, seller_id: i64, channel: &str, content: &str) -> i64 {
+        self.create_ai_post_draft(seller_id, channel, content)
+    }
+    pub fn create_draft(&self, seller_id: i64, channel: &str, content: &str) -> i64 {
+        self.create_ai_post_draft(seller_id, channel, content)
+    }
+    pub fn add_ai_post_draft(&self, seller_id: i64, channel: &str, content: &str) -> i64 {
+        self.create_ai_post_draft(seller_id, channel, content)
+    }
+
+    pub fn get_ai_post_draft(
+        &self,
+        id: i64,
+    ) -> Option<(
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    )> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,channel,template,content,status,created_at,updated_at,published_message_id FROM ai_post_drafts WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    // Aliases for get.
+    pub fn get_ai_draft(
+        &self,
+        id: i64,
+    ) -> Option<(
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    )> {
+        self.get_ai_post_draft(id)
+    }
+    pub fn get_draft(
+        &self,
+        id: i64,
+    ) -> Option<(
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    )> {
+        self.get_ai_post_draft(id)
+    }
+
+    pub fn update_ai_post_draft(&self, id: i64, content: &str) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE ai_post_drafts SET content=?1, updated_at=?2 WHERE id=?3",
+            params![content, now, id],
+        )?;
+        Ok(())
+    }
+
+    // Aliases for update.
+    pub fn update_ai_post_draft_content(
+        &self,
+        id: i64,
+        content: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.update_ai_post_draft(id, content)
+    }
+    pub fn update_ai_draft(&self, id: i64, content: &str) -> Result<(), rusqlite::Error> {
+        self.update_ai_post_draft(id, content)
+    }
+    pub fn update_draft(&self, id: i64, content: &str) -> Result<(), rusqlite::Error> {
+        self.update_ai_post_draft(id, content)
+    }
+
+    pub fn mark_ai_post_draft_published(
+        &self,
+        id: i64,
+        message_id: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE ai_post_drafts SET status='published', published_message_id=?1, updated_at=?2 WHERE id=?3",
+            params![message_id, now, id],
+        )?;
+        Ok(())
+    }
+
+    // Aliases for mark published.
+    pub fn mark_ai_post_published(&self, id: i64, message_id: i64) -> Result<(), rusqlite::Error> {
+        self.mark_ai_post_draft_published(id, message_id)
+    }
+    pub fn mark_draft_published(&self, id: i64, message_id: i64) -> Result<(), rusqlite::Error> {
+        self.mark_ai_post_draft_published(id, message_id)
+    }
+    pub fn mark_published(&self, id: i64, message_id: i64) -> Result<(), rusqlite::Error> {
+        self.mark_ai_post_draft_published(id, message_id)
+    }
+
+    pub fn delete_ai_post_draft(&self, id: i64) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute("DELETE FROM ai_post_drafts WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    // Aliases for delete.
+    pub fn delete_ai_draft(&self, id: i64) -> Result<(), rusqlite::Error> {
+        self.delete_ai_post_draft(id)
+    }
+    pub fn delete_draft(&self, id: i64) -> Result<(), rusqlite::Error> {
+        self.delete_ai_post_draft(id)
     }
 
     // ---- Scheduled posts ----
@@ -993,15 +1290,41 @@ impl Db {
 
     /// Atomically claim an invoice for granting: flips 'active' -> 'granting'
     /// only if no other granter got there first. Serializes concurrent
-    /// granters at the DB level.
+    /// granters at the DB level. The claim stamps `updated_at` so
+    /// pending_invoices()'s wedged-grant recovery measures staleness from
+    /// claim acquisition: a freshly claimed invoice never looks wedged, and
+    /// one still 'granting' after WEDGED_GRANT_STALE_MINUTES is one whose
+    /// claimer died mid-grant.
     pub fn claim_invoice_for_grant(&self, invoice_id: &str) -> bool {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE invoices SET status='granting' WHERE invoice_id=?1 AND status='active'",
-            params![invoice_id],
+            "UPDATE invoices SET status='granting', updated_at=?2 WHERE invoice_id=?1 AND status='active'",
+            params![invoice_id, now],
+        ) == Ok(1)
+    }
+
+    /// Release a claim that cannot proceed (e.g. no resolvable seller
+    /// channel): flips 'granting' -> 'active' ONLY, never touching rows in
+    /// any other state, so it can never resurrect a 'paid'/'failed' invoice
+    /// or steal another granter's claim except to undo it. Returns whether a
+    /// row was released. This is the ONLY sanctioned way to unwind a claim —
+    /// callers must never write the 'granting' status directly (it is set
+    /// exclusively by claim_invoice_for_grant, which keeps the active ->
+    /// granting handoff atomic and fail-closed).
+    pub fn release_invoice_claim(&self, invoice_id: impl ToString) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let inv = invoice_id.to_string();
+        conn.execute(
+            "UPDATE invoices SET status='active', updated_at=?2 WHERE invoice_id=?1 AND status='granting'",
+            params![inv, now],
         ) == Ok(1)
     }
 
@@ -1037,16 +1360,44 @@ impl Db {
         .is_some()
     }
 
-    /// Invoices still awaiting (or mid-) grant. Includes 'granting' so a crash
-    /// after claim re-queues the stuck grant instead of losing it.
+    /// Invoices still awaiting (or stuck mid-) grant, returned as
+    /// (invoice_id, plan_id, user_id, seller_id). Two disjoint queues:
+    ///
+    /// * every 'active' invoice that carries something grantable — a plan
+    ///   (plan_id) OR a product (product_id); product-only invoices were
+    ///   previously filtered out here and never auto-processed;
+    /// * 'granting' invoices older than WEDGED_GRANT_STALE_MINUTES — crash
+    ///   recovery for a claimer that died between claim_invoice_for_grant and
+    ///   finalize_invoice_paid. Re-verification is safe to re-run because the
+    ///   grant step is idempotent: the product branch is gated by
+    ///   product_grant_exists plus grant_product's atomic
+    ///   exists-check/decrement/insert (UNIQUE(invoice_id) on
+    ///   product_grants), the plan branch by subscription_exists_for_invoice
+    ///   plus the one-subscription-per-invoice unique index, and
+    ///   finalize_invoice_paid is a status set. INVARIANT: a just-claimed
+    ///   invoice is never re-queued, because the claim stamps updated_at and
+    ///   only rows older than the threshold requeue — the live claimer owns
+    ///   the row exclusively until it finalizes, releases, or dies.
     pub fn pending_invoices(&self) -> Vec<(String, Option<String>, Option<i64>, i64)> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut stmt = match conn.prepare("SELECT invoice_id, plan_id, user_id, seller_id FROM invoices WHERE status IN ('active','granting') AND plan_id IS NOT NULL") { Ok(s)=>s, Err(_)=>return vec![] };
+        let cutoff = (Utc::now()
+            - chrono::Duration::try_minutes(WEDGED_GRANT_STALE_MINUTES).unwrap_or_default())
+        .to_rfc3339();
+        let mut stmt = match conn.prepare(
+            "SELECT invoice_id, plan_id, user_id, seller_id FROM invoices \
+             WHERE (status = 'active' OR (status = 'granting' AND updated_at < ?1)) \
+             AND (plan_id IS NOT NULL OR product_id IS NOT NULL)",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_map(params![cutoff], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .ok();
         match rows {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -1777,6 +2128,184 @@ impl Db {
         }
     }
 
+    pub fn list_subscriptions_filtered(
+        &self,
+        seller_scope: Option<i64>,
+        status_opt: Option<&str>,
+        limit: i64,
+    ) -> Vec<(i64, i64, i64, String, String, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = "SELECT id,seller_id,user_id,channel_id,status,expires_at FROM subscriptions"
+            .to_string();
+        let mut conds: Vec<String> = vec![];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        if seller_scope.is_some() {
+            conds.push("seller_id=?1".to_string());
+        }
+        if status_opt.is_some() {
+            if seller_scope.is_some() {
+                conds.push("status=?2".to_string());
+            } else {
+                conds.push("status=?1".to_string());
+            }
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        if let Some(sid) = seller_scope {
+            params_vec.push(Box::new(sid));
+        }
+        if let Some(st) = status_opt {
+            params_vec.push(Box::new(st.to_string()));
+        }
+        let limit_idx = params_vec.len() + 1;
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", limit_idx));
+        params_vec.push(Box::new(limit));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Paged + searchable variant of `list_subscriptions_filtered`. `search`
+    /// matches user_id (as text) or channel_id (substring). `offset` is a row
+    /// offset (0-based) applied after ORDER BY id DESC.
+    pub fn list_subscriptions_filtered_paged(
+        &self,
+        seller_scope: Option<i64>,
+        status_opt: Option<&str>,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<(i64, i64, i64, String, String, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = "SELECT id,seller_id,user_id,channel_id,status,expires_at FROM subscriptions"
+            .to_string();
+        let mut conds: Vec<String> = vec![];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        if let Some(sid) = seller_scope {
+            conds.push("seller_id=?".to_string());
+            params_vec.push(Box::new(sid));
+        }
+        if let Some(st) = status_opt
+            && st != "all"
+        {
+            conds.push("status=?".to_string());
+            params_vec.push(Box::new(st.to_string()));
+        }
+        if let Some(q) = search
+            && !q.trim().is_empty()
+        {
+            let q = q.trim();
+            conds.push("(CAST(user_id AS TEXT) LIKE ? OR channel_id LIKE ?)".to_string());
+            params_vec.push(Box::new(format!("%{}%", q)));
+            params_vec.push(Box::new(format!("%{}%", q)));
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        params_vec.push(Box::new(limit));
+        params_vec.push(Box::new(offset));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Count matching `list_subscriptions_filtered_paged` (for pagination).
+    pub fn count_subscriptions_filtered(
+        &self,
+        seller_scope: Option<i64>,
+        status_opt: Option<&str>,
+        search: Option<&str>,
+    ) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = "SELECT COUNT(*) FROM subscriptions".to_string();
+        let mut conds: Vec<String> = vec![];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        if let Some(sid) = seller_scope {
+            conds.push("seller_id=?".to_string());
+            params_vec.push(Box::new(sid));
+        }
+        if let Some(st) = status_opt
+            && st != "all"
+        {
+            conds.push("status=?".to_string());
+            params_vec.push(Box::new(st.to_string()));
+        }
+        if let Some(q) = search
+            && !q.trim().is_empty()
+        {
+            let q = q.trim();
+            conds.push("(CAST(user_id AS TEXT) LIKE ? OR channel_id LIKE ?)".to_string());
+            params_vec.push(Box::new(format!("%{}%", q)));
+            params_vec.push(Box::new(format!("%{}%", q)));
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let res = stmt.query_row(
+            rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+            |r| r.get::<_, i64>(0),
+        );
+        res.unwrap_or(0)
+    }
+
     pub fn expired_subscriptions(&self) -> Vec<(i64, i64, i64, String)> {
         let conn = self
             .conn
@@ -1873,8 +2402,10 @@ impl Db {
         value_days: Option<i64>,
         max_uses: i64,
         expires_at: Option<&str>,
+        length: usize,
     ) -> String {
-        let code = generate_code();
+        let length = if length == 0 { 12 } else { length.clamp(1, 32) };
+        let code = crate::util::gen_token(length);
         let conn = self
             .conn
             .lock()
@@ -1907,6 +2438,19 @@ impl Db {
         let (id, seller_id, plan_id, value_days, max_uses, uses, expires_at) = self
             .get_code(code)
             .ok_or_else(|| "invalid code".to_string())?;
+        // reject revoked
+        let revoked: i64 = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT revoked FROM activation_codes WHERE code=?1",
+                params![code],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        if revoked != 0 {
+            return Err("code revoked".to_string());
+        }
         if uses >= max_uses {
             return Err("code already used".to_string());
         }
@@ -1931,6 +2475,44 @@ impl Db {
         Ok((seller_id, plan_id, value_days))
     }
 
+    pub fn revoke_code(&self, code: &str, scope: Option<i64>) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE activation_codes SET revoked=1 WHERE code=?1 AND (?2 IS NULL OR seller_id=?2)",
+            params![code, scope],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn reclaim_code(
+        &self,
+        old_code: &str,
+        scope: Option<i64>,
+        length: usize,
+    ) -> Option<String> {
+        // scope check + fetch old
+        let row = self.get_code(old_code)?;
+        let (_id, seller_id, plan_id, value_days, max_uses, _uses, expires_at) = row;
+        if let Some(s) = scope
+            && seller_id != s
+        {
+            return None;
+        }
+        // revoke old
+        let _ = self.revoke_code(old_code, scope);
+        // create new copying fields
+        let new_code = self.create_code(
+            seller_id,
+            plan_id,
+            value_days,
+            max_uses,
+            expires_at.as_deref(),
+            length,
+        );
+        Some(new_code)
+    }
+
     pub fn list_codes(&self, seller_scope: Option<i64>, limit: i64) -> Vec<CodeListRow> {
         let conn = self
             .conn
@@ -1939,9 +2521,9 @@ impl Db {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
-            ("SELECT code,plan_id,value_days,uses,max_uses,seller_id FROM activation_codes WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2".to_string(), vec![Box::new(sid), Box::new(limit)])
+            ("SELECT code,plan_id,value_days,uses,max_uses,seller_id,revoked FROM activation_codes WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2".to_string(), vec![Box::new(sid), Box::new(limit)])
         } else {
-            ("SELECT code,plan_id,value_days,uses,max_uses,seller_id FROM activation_codes ORDER BY id DESC LIMIT ?1".to_string(), vec![Box::new(limit)])
+            ("SELECT code,plan_id,value_days,uses,max_uses,seller_id,revoked FROM activation_codes ORDER BY id DESC LIMIT ?1".to_string(), vec![Box::new(limit)])
         };
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
@@ -1958,8 +2540,55 @@ impl Db {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get::<_, i64>(6)? != 0,
                     ))
                 },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Redemption history for one activation code, newest first. The code
+    /// string is resolved to its row via a join (no separate lookup needed).
+    /// `seller_scope` mirrors the other scoped list methods: `Some(id)`
+    /// (seller role) returns only redemptions of that seller's own code,
+    /// `None` (admin/owner) all of them.
+    pub fn list_code_redemptions(
+        &self,
+        code: &str,
+        seller_scope: Option<i64>,
+        limit: i64,
+    ) -> Vec<CodeRedemptionRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            (
+                "SELECT cr.id,cr.user_id,cr.redeemed_at FROM code_redemptions cr JOIN activation_codes ac ON ac.id=cr.code_id WHERE ac.code=?1 AND ac.seller_id=?2 ORDER BY cr.id DESC LIMIT ?3"
+                    .to_string(),
+                vec![Box::new(code), Box::new(sid), Box::new(limit)],
+            )
+        } else {
+            (
+                "SELECT cr.id,cr.user_id,cr.redeemed_at FROM code_redemptions cr JOIN activation_codes ac ON ac.id=cr.code_id WHERE ac.code=?1 ORDER BY cr.id DESC LIMIT ?2"
+                    .to_string(),
+                vec![Box::new(code), Box::new(limit)],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
         match rows {
@@ -2069,6 +2698,181 @@ impl Db {
             .query_map(params![seller_id, days], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn ai_usage_today_tokens_global(&self) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        conn.query_row(
+            "SELECT COALESCE(SUM(total_tokens),0) FROM ai_usage WHERE created_at LIKE ?1",
+            params![format!("{}%", today)],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    pub fn ai_usage_summary_global(&self, days: i64) -> Vec<(String, i64, i64)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT substr(created_at,1,10) as d, COALESCE(SUM(total_tokens),0), COUNT(*) FROM ai_usage GROUP BY d ORDER BY d DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![days], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn ai_usage_cost_total_global(&self, days: i64) -> f64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = (Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string();
+        conn.query_row(
+            "SELECT COALESCE(SUM(estimated_cost),0.0) FROM ai_usage WHERE created_at >= ?1",
+            params![cutoff],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0)
+    }
+
+    pub fn ai_usage_recent_errors_global(
+        &self,
+        limit: i64,
+    ) -> Vec<(String, String, String, Option<String>, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT created_at, provider, model, error_message, status FROM ai_usage WHERE status != 'ok' OR error_message IS NOT NULL ORDER BY created_at DESC, id DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn ai_usage_recent_errors(
+        &self,
+        seller_id: i64,
+        limit: i64,
+    ) -> Vec<(String, String, String, Option<String>, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT created_at, provider, model, error_message, status FROM ai_usage WHERE seller_id=?1 AND (status != 'ok' OR error_message IS NOT NULL) ORDER BY created_at DESC, id DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![seller_id, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// List AI usage rows for export (newest first). `seller_scope` None = all sellers
+    /// (owner view). Returns (id, seller_id, user_id, provider, model, template,
+    /// prompt_tokens, completion_tokens, total_tokens, estimated_cost, status,
+    /// error_message, created_at).
+    pub fn list_ai_usage(
+        &self,
+        seller_scope: Option<i64>,
+        limit: i64,
+    ) -> Vec<(
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        f64,
+        String,
+        Option<String>,
+        String,
+    )> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            (
+                "SELECT id,seller_id,user_id,provider,model,template,prompt_tokens,completion_tokens,total_tokens,estimated_cost,status,error_message,created_at FROM ai_usage WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2"
+                    .to_string(),
+                vec![Box::new(sid), Box::new(limit)],
+            )
+        } else {
+            (
+                "SELECT id,seller_id,user_id,provider,model,template,prompt_tokens,completion_tokens,total_tokens,estimated_cost,status,error_message,created_at FROM ai_usage ORDER BY id DESC LIMIT ?1"
+                    .to_string(),
+                vec![Box::new(limit)],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ))
+                },
+            )
             .ok();
         match rows {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -2324,8 +3128,410 @@ impl Db {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = conn.execute(
+            "DELETE FROM web_recovery_codes WHERE account_id=?1",
+            params![id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM web_pending_mfa WHERE account_id=?1",
+            params![id],
+        );
         let _ = conn.execute("DELETE FROM web_accounts WHERE id=?1", params![id]);
         let _ = conn.execute("DELETE FROM web_sessions WHERE account_id=?1", params![id]);
+    }
+
+    // ---- MFA / TOTP helpers (Phase 4) ----
+    pub fn set_totp_secret<S>(&self, account_id: i64, secret: Option<S>) -> Result<(), String>
+    where
+        S: AsRef<str>,
+    {
+        let secret = secret.map(|s| s.as_ref().to_string());
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE web_accounts SET totp_secret=?1 WHERE id=?2",
+            params![secret, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_totp_state(&self, account_id: i64) -> (Option<String>, bool, Option<i64>) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT totp_secret, totp_enabled, totp_last_used FROM web_accounts WHERE id=?1",
+            params![account_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1).unwrap_or(0) != 0,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or((None, false, None))
+    }
+
+    pub fn enable_totp<S: AsRef<str>>(&self, account_id: i64, secret: S) -> Result<(), String> {
+        let secret = secret.as_ref().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE web_accounts SET totp_secret=?1, totp_enabled=1 WHERE id=?2",
+            params![secret, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn disable_totp(&self, account_id: i64) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE web_accounts SET totp_secret=NULL, totp_enabled=0, totp_last_used=NULL WHERE id=?1",
+            params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "DELETE FROM web_recovery_codes WHERE account_id=?1",
+            params![account_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM web_pending_mfa WHERE account_id=?1",
+            params![account_id],
+        );
+        Ok(())
+    }
+
+    pub fn update_totp_last_used<T>(&self, account_id: i64, counter: T) -> Result<(), String>
+    where
+        T: TryInto<i64>,
+        T::Error: std::fmt::Debug,
+    {
+        let counter: i64 = counter.try_into().unwrap_or(0);
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE web_accounts SET totp_last_used=?1 WHERE id=?2",
+            params![counter, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn create_pending_mfa<TH, P, TS, E>(
+        &self,
+        token_hash: TH,
+        account_id: i64,
+        purpose: P,
+        totp_secret: Option<TS>,
+        expires_at: E,
+    ) -> Result<(), String>
+    where
+        TH: AsRef<str>,
+        P: AsRef<str>,
+        TS: AsRef<str>,
+        E: ToString,
+    {
+        let token_hash = token_hash.as_ref().to_string();
+        let purpose = purpose.as_ref().to_string();
+        let totp_secret = totp_secret.map(|s| s.as_ref().to_string());
+        let expires_at = expires_at.to_string();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO web_pending_mfa(token_hash,account_id,purpose,totp_secret,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![token_hash, account_id, purpose, totp_secret, expires_at, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_pending_mfa<S: AsRef<str>>(
+        &self,
+        token: S,
+    ) -> Option<(i64, String, Option<String>, String)> {
+        let token = token.as_ref().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT account_id, purpose, totp_secret, expires_at FROM web_pending_mfa WHERE token_hash=?1",
+            params![token],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn delete_pending_mfa<S: AsRef<str>>(&self, token: S) -> Result<(), String> {
+        let token = token.as_ref().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM web_pending_mfa WHERE token_hash=?1",
+            params![token],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_pending_mfa_for_account(&self, account_id: i64) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM web_pending_mfa WHERE account_id=?1",
+            params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn create_recovery_codes<I, S>(&self, account_id: i64, hashed: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        for h in hashed {
+            conn.execute(
+                "INSERT INTO web_recovery_codes(account_id,code_hash,used,created_at) VALUES(?1,?2,0,?3)",
+                params![account_id, h.as_ref().to_string(), now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn verify_recovery_code<S: AsRef<str>>(&self, account_id: i64, code: S) -> bool {
+        let code = code.as_ref().to_string();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // fetch unused hashes
+        let mut stmt = match conn
+            .prepare("SELECT id, code_hash FROM web_recovery_codes WHERE account_id=?1 AND used=0")
+        {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![account_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        for (id, hash) in rows {
+            let ok = bcrypt::verify(&code, &hash).unwrap_or(false);
+            if ok {
+                let _ = conn.execute(
+                    "UPDATE web_recovery_codes SET used=1 WHERE id=?1",
+                    params![id],
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn delete_recovery_codes(&self, account_id: i64) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM web_recovery_codes WHERE account_id=?1",
+            params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_unused_recovery_codes(&self, account_id: i64) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT COUNT(*) FROM web_recovery_codes WHERE account_id=?1 AND used=0",
+            params![account_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Alias matching task wording.
+    pub fn list_unused(&self, account_id: i64) -> i64 {
+        self.list_unused_recovery_codes(account_id)
+    }
+
+    pub fn list_unused_count(&self, account_id: i64) -> i64 {
+        self.list_unused_recovery_codes(account_id)
+    }
+
+    /// CLI recovery: delete all owner accounts and their sessions, mint a
+    /// fresh claim code. All writes run in a single BEGIN IMMEDIATE
+    /// transaction. Returns the new claim code.
+    pub fn delete_owners_and_mint_claim_code(&self) -> String {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = conn.execute_batch("BEGIN IMMEDIATE");
+        let _ = conn.execute(
+            "DELETE FROM web_sessions WHERE account_id IN (SELECT id FROM web_accounts WHERE role = 'owner')",
+            [],
+        );
+        let _ = conn.execute("DELETE FROM web_recovery_codes WHERE account_id IN (SELECT id FROM web_accounts WHERE role = 'owner')", []);
+        let _ = conn.execute("DELETE FROM web_pending_mfa WHERE account_id IN (SELECT id FROM web_accounts WHERE role = 'owner')", []);
+        let _ = conn.execute("DELETE FROM web_accounts WHERE role = 'owner'", []);
+        let code = crate::util::gen_token(12);
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO config(key,value,updated_at) VALUES('claim_code',?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![code, now],
+        );
+        let _ = conn.execute_batch("COMMIT");
+        code
+    }
+
+    /// CLI recovery: create the first owner account if none exists, otherwise
+    /// reset an existing owner account's password (and revoke its sessions).
+    /// All DB writes run in a single BEGIN IMMEDIATE transaction. MFA state
+    /// is cleared where applicable (no-op until MFA columns exist).
+    pub async fn reset_owner_account(&self, username: &str, password: &str) -> Result<(), String> {
+        let password = password.to_string();
+        let hash =
+            tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = conn.execute_batch("BEGIN IMMEDIATE");
+
+        let run = (|| -> Result<(), String> {
+            let owner_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM web_accounts WHERE role = 'owner')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|v| v != 0)
+                .unwrap_or(false);
+
+            if !owner_exists {
+                // Create (or repair) the owner account for this username.
+                let existing_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM web_accounts WHERE username = ?1",
+                        params![username],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                if let Some(id) = existing_id {
+                    conn.execute(
+                        "UPDATE web_accounts SET password_hash = ?1, role = 'owner', seller_id = NULL, totp_secret = NULL, totp_enabled = 0, totp_last_used = NULL WHERE id = ?2",
+                        params![hash, id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    conn.execute(
+                        "DELETE FROM web_sessions WHERE account_id = ?1",
+                        params![id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    let now = Utc::now().to_rfc3339();
+                    conn.execute(
+                        "INSERT INTO web_accounts(username,password_hash,salt,role,seller_id,totp_secret,totp_enabled,totp_last_used,created_at) VALUES(?1,?2,'','owner',NULL,NULL,0,NULL,?3)",
+                        params![username, hash, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            } else {
+                // Reset password on the matching owner account, or all owners if
+                // the requested username is not itself an owner account.
+                let mut ids: Vec<i64> = Vec::new();
+                if let Ok(id) = conn.query_row(
+                    "SELECT id FROM web_accounts WHERE username = ?1 AND role = 'owner'",
+                    params![username],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    ids.push(id);
+                }
+                if ids.is_empty() {
+                    let mut stmt = conn
+                        .prepare("SELECT id FROM web_accounts WHERE role = 'owner'")
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |r| r.get::<_, i64>(0))
+                        .map_err(|e| e.to_string())?;
+                    for id in rows.flatten() {
+                        ids.push(id);
+                    }
+                }
+                for id in ids {
+                    conn.execute(
+                        "UPDATE web_accounts SET password_hash = ?1, totp_secret = NULL, totp_enabled = 0, totp_last_used = NULL WHERE id = ?2",
+                        params![hash, id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    conn.execute(
+                        "DELETE FROM web_sessions WHERE account_id = ?1",
+                        params![id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        })();
+
+        if run.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        } else {
+            let _ = conn.execute_batch("COMMIT");
+        }
+        run
     }
 
     pub async fn update_web_password_by_id(&self, id: i64, password: &str) -> Result<(), String> {
@@ -2568,6 +3774,56 @@ impl Db {
         self.update_refund_status(id, status);
     }
 
+    /// Atomically claim an approved refund for execution: flips
+    /// 'approved' -> 'executing' only if the row is still 'approved', so two
+    /// concurrent executors can never both win the CAS (the loser sees false
+    /// and must not transfer). The claim stamps `updated_at`. This is the
+    /// ONLY sanctioned way to enter the 'executing' state — callers must
+    /// never write 'executing' directly (same contract as
+    /// claim_invoice_for_grant).
+    pub fn begin_refund_execution(&self, id: impl ToString) -> bool {
+        let id = match id.to_string().parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE refunds SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            params![id, now],
+        ) == Ok(1)
+    }
+
+    /// Settle a claimed refund: flips 'executing' -> `status`, only from
+    /// 'executing'. `status` must be "executed" (definite success) or
+    /// "approved" (definite failure: revert so the refund can be re-executed);
+    /// anything else — including a still-ambiguous outcome — is rejected with
+    /// no DB write and returns 0 (leave the row 'executing' and let a fresh
+    /// audit row carry the ambiguity instead). Returns the number of rows
+    /// changed: 1 means this call owned the transition.
+    pub fn finish_refund_execution(&self, id: impl ToString, status: &str) -> usize {
+        if !matches!(status, "executed" | "approved") {
+            return 0;
+        }
+        let id = match id.to_string().parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE refunds SET status=?2, updated_at=?3 WHERE id=?1 AND status='executing'",
+            params![id, status, now],
+        )
+        .unwrap_or(0)
+    }
+
     // ---- Payouts ----
     pub fn create_payout(
         &self,
@@ -2683,6 +3939,73 @@ impl Db {
         self.update_payout_status(id, status);
     }
 
+    /// Atomically claim an approved payout for execution: flips
+    /// 'approved' -> 'executing' only if the row is still 'approved', so two
+    /// concurrent executors can never both win the CAS (the loser sees false
+    /// and must not transfer — the double-transfer fix). The claim stamps
+    /// `updated_at`. This is the ONLY sanctioned way to enter the 'executing'
+    /// state — callers must never write 'executing' directly (same contract
+    /// as claim_invoice_for_grant).
+    pub fn begin_payout_execution(&self, id: impl ToString) -> bool {
+        let id = match id.to_string().parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE payouts SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            params![id, now],
+        ) == Ok(1)
+    }
+
+    /// Settle a claimed payout: flips 'executing' -> `status`, only from
+    /// 'executing'. `status` must be "paid" (definite success) or "approved"
+    /// (definite failure: revert so the payout can be re-executed); anything
+    /// else — including a still-ambiguous outcome — is rejected with no DB
+    /// write and returns 0 (leave the row 'executing' and let a fresh audit
+    /// row carry the ambiguity instead). Returns the number of rows changed:
+    /// 1 means this call owned the transition.
+    pub fn finish_payout_execution(&self, id: impl ToString, status: &str) -> usize {
+        if !matches!(status, "paid" | "approved") {
+            return 0;
+        }
+        let id = match id.to_string().parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE payouts SET status=?2, updated_at=?3 WHERE id=?1 AND status='executing'",
+            params![id, status, now],
+        )
+        .unwrap_or(0)
+    }
+
+    /// Current status of a payout, for executors and recovery sweeps to
+    /// distinguish a row someone still owns ('executing') from one already
+    /// settled ('paid') or reverted ('approved').
+    pub fn get_payout_status(&self, id: impl ToString) -> Option<String> {
+        let id = id.to_string().parse::<i64>().ok()?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row("SELECT status FROM payouts WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     // ---- Audit log ----
     pub fn log_action(
         &self,
@@ -2776,6 +4099,24 @@ impl Db {
             params![hash.as_ref()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         ).optional().ok().flatten()
+    }
+
+    pub fn get_mcp_token_by_hash(
+        &self,
+        hash: &str,
+    ) -> Option<(i64, i64, Option<String>, i64, Option<String>)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id, seller_id, name, revoked, expires_at FROM mcp_tokens WHERE token_hash=?1",
+            params![hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     pub fn get_api_key_by_id(&self, id: i64) -> Option<ApiKeyRow> {
@@ -3508,13 +4849,8 @@ impl Db {
     pub fn ensure_claim_code(&self) -> Option<String> {
         if self.owner_account_exists() {
             if self.claim_code().is_some() {
-                // Cleared, not deleted: the config table has no delete path
-                // and an empty value reads as "no live code" everywhere.
                 self.set_config("claim_code", "");
             }
-            return None;
-        }
-        if self.get_config("setup_done").is_some() {
             return None;
         }
         match self.claim_code() {
@@ -3526,11 +4862,272 @@ impl Db {
             }
         }
     }
-}
 
-fn generate_code() -> String {
-    // CSPRNG-backed via util::gen_token (activation codes must be unguessable).
-    crate::util::gen_token(12)
+    // ---- Subscriptions: extend / bulk revoke ----
+    pub fn extend_subscription(&self, id: i64, days: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT expires_at FROM subscriptions WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(cur) = cur else {
+            return false;
+        };
+        let base = chrono::DateTime::parse_from_rfc3339(&cur)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let now = Utc::now();
+        let start = if base > now { base } else { now };
+        let new_exp = start + chrono::Duration::days(days.clamp(1, 3650));
+        conn.execute(
+            "UPDATE subscriptions SET expires_at=?2 WHERE id=?1",
+            params![id, new_exp.to_rfc3339()],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn bulk_revoke_subscriptions(&self, status: Option<&str>) -> usize {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let n = if let Some(st) = status.filter(|s| !s.trim().is_empty() && *s != "all") {
+            conn.execute(
+                "UPDATE subscriptions SET status='revoked' WHERE status=?1",
+                params![st],
+            )
+        } else {
+            conn.execute(
+                "UPDATE subscriptions SET status='revoked' WHERE status!='revoked'",
+                [],
+            )
+        };
+        let _ = now;
+        n.unwrap_or(0)
+    }
+
+    pub fn get_order(&self, order_id: &str) -> Option<(i64, i64, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT seller_id, buyer_user_id, invoice_id FROM orders WHERE order_id=?1",
+            params![order_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    // ---- Services / slots / bookings ----
+    pub fn create_service(
+        &self,
+        seller_id: i64,
+        name: &str,
+        price: &str,
+        asset: &str,
+        duration_minutes: i64,
+        channel_id: Option<&str>,
+    ) -> Result<i64, String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO services(seller_id,name,price,asset,duration_minutes,channel_id,active,created_at) VALUES(?1,?2,?3,?4,?5,?6,1,?7)",
+            params![seller_id, name, price, asset, duration_minutes, channel_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_services(
+        &self,
+        seller_scope: Option<i64>,
+    ) -> Vec<(i64, i64, String, String, String, i64, Option<String>)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            ("SELECT id,seller_id,name,price,asset,duration_minutes,channel_id FROM services WHERE seller_id=?1 ORDER BY id DESC".to_string(), vec![Box::new(sid)])
+        } else {
+            ("SELECT id,seller_id,name,price,asset,duration_minutes,channel_id FROM services ORDER BY id DESC".to_string(), vec![])
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn find_service_id(&self, seller_id: i64, name: &str) -> Option<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id FROM services WHERE seller_id=?1 AND name=?2",
+            params![seller_id, name],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn create_slot(
+        &self,
+        service_id: i64,
+        seller_id: i64,
+        starts_at: &str,
+        capacity: i64,
+    ) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO slots(service_id,seller_id,starts_at,capacity,status,booked,created_at) VALUES(?1,?2,?3,?4,'available',0,?5)",
+            params![service_id, seller_id, starts_at, capacity, now],
+        );
+        conn.last_insert_rowid()
+    }
+
+    pub fn list_slots(&self, service_id: i64) -> Vec<(i64, String, i64, i64, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare("SELECT id,starts_at,capacity,booked,status FROM slots WHERE service_id=?1 ORDER BY starts_at") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![service_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn create_booking(
+        &self,
+        seller_id: i64,
+        service_id: i64,
+        slot_id: Option<i64>,
+        user_id: i64,
+        invoice_id: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> String {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let bid = crate::util::gen_token(8);
+        let _ = conn.execute(
+            "INSERT INTO bookings(booking_id,seller_id,service_id,slot_id,user_id,status,invoice_id,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,'held',?6,?7,?8)",
+            params![bid, seller_id, service_id, slot_id, user_id, invoice_id, expires_at, now],
+        );
+        if let Some(sid) = slot_id {
+            let _ = conn.execute(
+                "UPDATE slots SET status='held', held_until=?2 WHERE id=?1",
+                params![sid, expires_at],
+            );
+        }
+        bid
+    }
+
+    pub fn list_bookings(
+        &self,
+        seller_scope: Option<i64>,
+    ) -> Vec<(String, i64, i64, i64, String, Option<String>)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            ("SELECT booking_id,seller_id,service_id,user_id,status,expires_at FROM bookings WHERE seller_id=?1 ORDER BY id DESC".to_string(), vec![Box::new(sid)])
+        } else {
+            ("SELECT booking_id,seller_id,service_id,user_id,status,expires_at FROM bookings ORDER BY id DESC".to_string(), vec![])
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn expire_held_bookings(&self) -> usize {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        // free slots
+        let _ = conn.execute("UPDATE slots SET status='available', held_until=NULL WHERE status='held' AND held_until IS NOT NULL AND held_until < ?1", params![now]);
+        conn.execute("UPDATE bookings SET status='expired' WHERE status='held' AND expires_at IS NOT NULL AND expires_at < ?1", params![now])
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -3549,7 +5146,7 @@ mod tests {
         let plans = db.list_plans(Some(1));
         assert_eq!(plans.len(), 1);
         let pid = db.get_plan(1, "P").unwrap().0;
-        let code = db.create_code(1, Some(pid), Some(7), 1, None);
+        let code = db.create_code(1, Some(pid), Some(7), 1, None, 12);
         assert_eq!(code.len(), 12);
         let (_id, sid, p, _vd, _mu, uses, _exp) = db.get_code(&code).unwrap();
         assert_eq!(sid, 1);
@@ -3696,7 +5293,7 @@ mod tests {
         let _ = fs::remove_file(path);
         let db = Db::new(path).unwrap();
         db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let code = db.create_code(1, None, Some(7), 1, None);
+        let code = db.create_code(1, None, Some(7), 1, None, 12);
         assert_eq!(code.len(), 12);
         let got = db.get_code(&code).unwrap();
         assert_eq!(got.1, 1);
@@ -3758,8 +5355,30 @@ mod tests {
         // claim succeeds exactly once (atomic handoff between granters)
         assert!(db.claim_invoice_for_grant("inv_claim"));
         assert!(!db.claim_invoice_for_grant("inv_claim"));
-        // claimed ('granting') invoices stay queued for stuck-grant recovery
+        // a FRESH claim is never re-queued: the live claimer owns the row
+        assert!(!db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
+        // ... but a claim wedged past WEDGED_GRANT_STALE_MINUTES (claimer
+        // crashed between claim and finalize) re-queues for re-verification,
+        // which is safe because both grant branches are existence-guarded.
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let stale = (Utc::now()
+                - chrono::Duration::try_minutes(WEDGED_GRANT_STALE_MINUTES + 1)
+                    .unwrap_or_default())
+            .to_rfc3339();
+            let _ = conn.execute(
+                "UPDATE invoices SET updated_at=?1 WHERE invoice_id='inv_claim'",
+                params![stale],
+            );
+        }
         assert!(db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
+        // release_invoice_claim unwinds ONLY a 'granting' row, exactly once
+        assert!(db.release_invoice_claim("inv_claim"));
+        assert!(!db.release_invoice_claim("inv_claim"));
+        assert_eq!(db.get_invoice("inv_claim").unwrap().2, "active");
+        assert!(db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
+        // re-claim, then the normal grant + finalize flow drops it for good
+        assert!(db.claim_invoice_for_grant("inv_claim"));
         // no subscription yet
         assert!(!db.subscription_exists_for_invoice("inv_claim"));
         db.create_subscription(1, 42, None, "@chan", 7, Some("inv_claim"), None);
@@ -3768,8 +5387,77 @@ mod tests {
         db.finalize_invoice_paid("inv_claim");
         assert_eq!(db.get_invoice("inv_claim").unwrap().2, "paid");
         assert!(!db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
-        // a paid invoice can no longer be claimed
+        // a paid invoice can no longer be claimed, nor released
         assert!(!db.claim_invoice_for_grant("inv_claim"));
+        assert!(!db.release_invoice_claim("inv_claim"));
+    }
+
+    #[test]
+    fn test_seller_has_channel() {
+        let path = "/tmp/opencode/test_seller_has_channel.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        // unknown seller: no channel
+        assert!(!db.seller_has_channel(1));
+        db.upsert_seller(1, Some("alice"), Some("@chan"));
+        assert!(db.seller_has_channel(1));
+        // an empty-string channel reads as NO channel (matches the
+        // seller_channel(..).unwrap_or_default().is_empty() callers do)
+        db.upsert_seller(2, Some("bob"), Some(""));
+        assert!(!db.seller_has_channel(2));
+        assert!(db.seller_channel(2).is_some());
+    }
+
+    #[test]
+    fn test_pending_invoices_includes_products_only() {
+        let path = "/tmp/opencode/test_pending_invoices_includes_products_only.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        db.upsert_seller(1, Some("alice"), Some("@chan"));
+        // Product invoice (plan_id NULL, product_id set): must be queued.
+        db.save_invoice(
+            "inv_prod",
+            1,
+            "5",
+            "USDT",
+            None,
+            "active",
+            None,
+            None,
+            Some(9),
+            Some(3),
+        );
+        // Plan invoice: queued as before.
+        db.save_invoice(
+            "inv_plan",
+            1,
+            "5",
+            "USDT",
+            None,
+            "active",
+            None,
+            Some("gold"),
+            Some(9),
+            None,
+        );
+        // Neither plan nor product: nothing grantable, never queued.
+        db.save_invoice(
+            "inv_bare",
+            1,
+            "5",
+            "USDT",
+            None,
+            "active",
+            None,
+            None,
+            Some(9),
+            None,
+        );
+        let pending = db.pending_invoices();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|r| r.0 == "inv_prod"));
+        assert!(pending.iter().any(|r| r.0 == "inv_plan"));
+        assert!(!pending.iter().any(|r| r.0 == "inv_bare"));
     }
 
     #[test]
@@ -3873,14 +5561,14 @@ mod tests {
             )
             .unwrap();
         // first grant succeeds and decrements stock
-        assert_eq!(db.grant_product(1, 42, pid, "inv_a").unwrap(), true);
+        assert!(db.grant_product(1, 42, pid, "inv_a").unwrap());
         assert_eq!(db.get_product(1, "course").unwrap().7, Some(1));
         assert!(db.product_grant_exists("inv_a"));
         // same invoice again: idempotent no-op, stock untouched
-        assert_eq!(db.grant_product(1, 42, pid, "inv_a").unwrap(), false);
+        assert!(!db.grant_product(1, 42, pid, "inv_a").unwrap());
         assert_eq!(db.get_product(1, "course").unwrap().7, Some(1));
         // second unit sells, stock hits zero
-        assert_eq!(db.grant_product(1, 43, pid, "inv_b").unwrap(), true);
+        assert!(db.grant_product(1, 43, pid, "inv_b").unwrap());
         assert_eq!(db.get_product(1, "course").unwrap().7, Some(0));
         // exhausted: no grant row, no further decrement
         assert_eq!(
@@ -3902,10 +5590,9 @@ mod tests {
             )
             .unwrap();
         for i in 0..5 {
-            assert_eq!(
+            assert!(
                 db.grant_product(1, 50 + i, uid, &format!("inv_u{}", i))
-                    .unwrap(),
-                true
+                    .unwrap()
             );
         }
         assert_eq!(db.get_product(1, "bonus").unwrap().7, None);
@@ -4031,6 +5718,35 @@ mod tests {
     }
 
     #[test]
+    fn test_list_subscriptions_filtered() {
+        let path = "/tmp/opencode/test_list_subscriptions_filtered.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        let id1 = db.create_subscription(1, 42, None, "@chan", 7, Some("inv_a"), None);
+        let id2 = db.create_subscription(1, 43, None, "@chan", 7, Some("inv_b"), None);
+        db.set_subscription_status(id2, "expired");
+        // status filter
+        let active = db.list_subscriptions_filtered(Some(1), Some("active"), 10);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, id1);
+        let expired = db.list_subscriptions_filtered(Some(1), Some("expired"), 10);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, id2);
+        // no status filter returns all
+        let all = db.list_subscriptions_filtered(Some(1), None, 10);
+        assert_eq!(all.len(), 2);
+        // global scope
+        let global = db.list_subscriptions_filtered(None, None, 10);
+        assert_eq!(global.len(), 2);
+        // order by id desc
+        assert!(global[0].0 > global[1].0);
+        // limit
+        let limited = db.list_subscriptions_filtered(Some(1), None, 1);
+        assert_eq!(limited.len(), 1);
+        let _ = id1;
+    }
+
+    #[test]
     fn test_refund_and_payout_state_transitions() {
         let path = "/tmp/opencode/test_refund_and_payout_state_transitions.db";
         let _ = fs::remove_file(path);
@@ -4081,6 +5797,115 @@ mod tests {
         db.set_payout_status(pid, "paid");
         assert_eq!(db.get_payout(pid.to_string()).unwrap().5, "paid");
         assert_eq!(db.list_payouts(Some(2)).len(), 0);
+    }
+
+    /// CAS execution claims on payouts: begin only wins from 'approved',
+    /// exactly one concurrent claimer wins, finish only applies from
+    /// 'executing', and invalid finish statuses are rejected with no write.
+    #[test]
+    fn test_payout_execution_cas_transitions() {
+        let path = "/tmp/opencode/test_payout_execution_cas_transitions.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        db.upsert_seller(1, Some("alice"), Some("@chan"));
+
+        // begin-from-pending is refused; begin-from-approved wins
+        let pid = db.create_payout(1, "5", "USDT", Some("@alice"));
+        assert_eq!(
+            db.get_payout_status(pid.to_string()).as_deref(),
+            Some("pending")
+        );
+        assert!(!db.begin_payout_execution(pid.to_string()));
+        db.set_payout_status(pid, "approved");
+        assert!(db.begin_payout_execution(pid.to_string()));
+        assert_eq!(
+            db.get_payout_status(pid.to_string()).as_deref(),
+            Some("executing")
+        );
+
+        // double-begin loses: the row is no longer 'approved'
+        let pid2 = db.create_payout(1, "7", "USDT", Some("@alice"));
+        db.set_payout_status(pid2, "approved");
+        assert!(db.begin_payout_execution(pid2.to_string()));
+        assert!(!db.begin_payout_execution(pid2.to_string()));
+
+        // finish applies only from 'executing'
+        assert_eq!(db.finish_payout_execution(pid.to_string(), "paid"), 1);
+        assert_eq!(
+            db.get_payout_status(pid.to_string()).as_deref(),
+            Some("paid")
+        );
+        // finish-from-wrong-status (already 'paid') changes nothing
+        assert_eq!(db.finish_payout_execution(pid.to_string(), "approved"), 0);
+        assert_eq!(db.finish_payout_execution(pid.to_string(), "paid"), 0);
+
+        // revert path: 'executing' -> 'approved' is legal, then re-executable
+        assert_eq!(db.finish_payout_execution(pid2.to_string(), "approved"), 1);
+        assert_eq!(
+            db.get_payout_status(pid2.to_string()).as_deref(),
+            Some("approved")
+        );
+        assert!(db.begin_payout_execution(pid2.to_string()));
+        assert_eq!(db.finish_payout_execution(pid2.to_string(), "paid"), 1);
+
+        // invalid status args are rejected with no DB write (row stays
+        // 'executing'); matching is case-sensitive by design
+        let pid3 = db.create_payout(1, "9", "USDT", Some("@alice"));
+        db.set_payout_status(pid3, "approved");
+        assert!(db.begin_payout_execution(pid3.to_string()));
+        for bad in ["failed", "processed", "pending", "executing", "PAID", ""] {
+            assert_eq!(db.finish_payout_execution(pid3.to_string(), bad), 0);
+        }
+        assert_eq!(
+            db.get_payout_status(pid3.to_string()).as_deref(),
+            Some("executing")
+        );
+    }
+
+    /// CAS execution claims on refunds: same contract as payouts, with
+    /// "executed" as the terminal outcome.
+    #[test]
+    fn test_refund_execution_cas_transitions() {
+        let path = "/tmp/opencode/test_refund_execution_cas_transitions.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        db.upsert_seller(1, Some("alice"), Some("@chan"));
+
+        // begin-from-pending is refused; begin-from-approved wins
+        let rid = db.create_refund(1, None, Some(42), "10", "USDT", Some("damaged"));
+        assert!(!db.begin_refund_execution(rid.to_string()));
+        db.set_refund_status(rid, "approved");
+        assert!(db.begin_refund_execution(rid.to_string()));
+        assert_eq!(db.get_refund(rid.to_string()).unwrap().7, "executing");
+
+        // double-begin loses: the row is no longer 'approved'
+        let rid2 = db.create_refund(1, None, Some(43), "3", "TON", None);
+        db.set_refund_status(rid2, "approved");
+        assert!(db.begin_refund_execution(rid2.to_string()));
+        assert!(!db.begin_refund_execution(rid2.to_string()));
+
+        // finish applies only from 'executing'
+        assert_eq!(db.finish_refund_execution(rid.to_string(), "executed"), 1);
+        assert_eq!(db.get_refund(rid.to_string()).unwrap().7, "executed");
+        // finish-from-wrong-status (already 'executed') changes nothing
+        assert_eq!(db.finish_refund_execution(rid.to_string(), "approved"), 0);
+        assert_eq!(db.finish_refund_execution(rid.to_string(), "executed"), 0);
+
+        // revert path: 'executing' -> 'approved' is legal, then re-executable
+        assert_eq!(db.finish_refund_execution(rid2.to_string(), "approved"), 1);
+        assert_eq!(db.get_refund(rid2.to_string()).unwrap().7, "approved");
+        assert!(db.begin_refund_execution(rid2.to_string()));
+        assert_eq!(db.finish_refund_execution(rid2.to_string(), "executed"), 1);
+
+        // invalid status args are rejected with no DB write (row stays
+        // 'executing'); matching is case-sensitive by design
+        let rid3 = db.create_refund(1, None, Some(44), "1", "USDT", None);
+        db.set_refund_status(rid3, "approved");
+        assert!(db.begin_refund_execution(rid3.to_string()));
+        for bad in ["paid", "failed", "processed", "pending", "EXECUTED", ""] {
+            assert_eq!(db.finish_refund_execution(rid3.to_string(), bad), 0);
+        }
+        assert_eq!(db.get_refund(rid3.to_string()).unwrap().7, "executing");
     }
 
     proptest! {
@@ -4341,6 +6166,58 @@ mod tests {
     }
 
     #[test]
+    fn test_ai_usage_global_and_recent_errors() {
+        let path = "/tmp/opencode/test_ai_usage_global_and_recent_errors.db";
+        let _ = fs::remove_file(path);
+        let db = Db::new(path).unwrap();
+        db.upsert_seller(1, Some("alice"), Some("@chan"));
+        db.record_ai_usage(
+            1,
+            Some(42),
+            "openai",
+            "gpt",
+            Some("t1"),
+            10,
+            5,
+            15,
+            0.1,
+            "ok",
+            None,
+        );
+        db.record_ai_usage(
+            1,
+            Some(42),
+            "openai",
+            "gpt",
+            Some("t1"),
+            1,
+            1,
+            2,
+            0.01,
+            "error",
+            Some("boom"),
+        );
+        assert_eq!(db.ai_usage_today_tokens_global(), 17);
+        let gsummary = db.ai_usage_summary_global(7);
+        assert_eq!(gsummary.len(), 1);
+        assert_eq!(gsummary[0].1, 17);
+        assert_eq!(gsummary[0].2, 2);
+        let cost = db.ai_usage_cost_total_global(7);
+        assert!((cost - 0.11).abs() < 1e-9);
+        // global recent errors
+        let errs = db.ai_usage_recent_errors_global(10);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].4, "error");
+        assert_eq!(errs[0].3, Some("boom".to_string()));
+        // seller scoped
+        let serrs = db.ai_usage_recent_errors(1, 10);
+        assert_eq!(serrs.len(), 1);
+        assert_eq!(serrs[0].1, "openai");
+        // no errors for other seller
+        assert!(db.ai_usage_recent_errors(2, 10).is_empty());
+    }
+
+    #[test]
     fn test_scheduled_post_create_and_list_due() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sched.db");
@@ -4383,10 +6260,7 @@ mod tests {
         db.mark_scheduled_failed(id2);
         let all2 = db.list_scheduled_posts(Some(1));
         assert_eq!(
-            all2.iter()
-                .filter(|r| r.0 == id2)
-                .next()
-                .map(|r| r.6.as_str()),
+            all2.iter().find(|r| r.0 == id2).map(|r| r.6.as_str()),
             Some("posted")
         );
     }
@@ -4866,7 +6740,7 @@ mod tests {
             let db = Db::new(path.to_str().unwrap()).unwrap();
             db.add_plan(seller_id, &name, "1", "USDT", 7, None);
             let plans = db.list_plans(Some(seller_id));
-            prop_assert!(plans.len() >= 1);
+            prop_assert!(!plans.is_empty());
         }
 
         #[test]
@@ -4878,7 +6752,7 @@ mod tests {
             let pid = db.get_plan(1, "P").unwrap().0;
             let mut codes = std::collections::HashSet::new();
             for _ in 0..10 {
-                let c = db.create_code(1, Some(pid), Some(7), 1, None);
+                let c = db.create_code(1, Some(pid), Some(7), 1, None, 12);
                 codes.insert(c);
             }
             prop_assert_eq!(codes.len(), 10);
