@@ -102,12 +102,24 @@ pub enum Command {
     Revoke(String),
     /// List subscriptions. /subs
     Subs,
+    /// Add service: /serviceadd name | price | asset | duration_minutes [| channel]
+    ServiceAdd(String),
+    /// List services. /services
+    Services,
+    /// Add slot: /slotadd service | datetime [| capacity]
+    SlotAdd(String),
+    /// Book a service: /book service_name
+    Book(String),
+    /// List bookings. /bookings
+    Bookings,
     /// Run expiry cleanup. /expirecheck
     ExpireCheck,
     /// Broadcast to all users: /broadcast <text>.
     Broadcast(String),
     /// AI generate: /ai <template> | var=val | ...
     Ai(String),
+    /// AI-assisted post: /aipost [@channel] <template> [| key=val ...].
+    AiPost(String),
     /// Set web dashboard password: /setwebpassword <new>.
     SetWebPassword(String),
     /// Show web dashboard login info: /dashboard.
@@ -122,8 +134,13 @@ pub enum Command {
     Sellers,
     /// List web accounts (owner only): /webusers.
     WebUsers,
+    /// Approve a pending refund (admin/owner): /refundapprove [refund_id].
+    RefundApprove(String),
+    /// Approve a pending payout (admin/owner): /payoutapprove [payout_id].
+    PayoutApprove(String),
 }
 
+#[tracing::instrument(skip(bot, msg, dialogue, db, cfg, crypto, ai, reg, cmd))]
 pub async fn cmd_handler(
     bot: Bot,
     msg: Message,
@@ -158,6 +175,8 @@ pub async fn cmd_handler(
             | Command::Buy(_)
             | Command::Paid(_)
             | Command::Redeem(_)
+            | Command::Services
+            | Command::Book(_)
             | Command::Setup(_)
             | Command::BecomeSeller
     );
@@ -189,25 +208,34 @@ pub async fn cmd_handler(
             | Command::Grant(_)
             | Command::Revoke(_)
             | Command::Subs
+            | Command::ServiceAdd(_)
+            | Command::SlotAdd(_)
+            | Command::Bookings
             | Command::ExpireCheck
             | Command::Broadcast(_)
             | Command::Ai(_)
+            | Command::AiPost(_)
             | Command::GenCodes(_)
             | Command::Codes
             | Command::SetWebPassword(_)
             | Command::Dashboard
     );
+    // Admin-tier commands: admin/owner only (sellers and plain users are
+    // excluded here; each handler keeps its own `!is_admin` guard like
+    // /broadcast and /ai). /sellers lives at this tier, matching its
+    // in-handler check and the documented admin access.
+    let admin_cmd = matches!(
+        cmd,
+        Command::Sellers | Command::RefundApprove(_) | Command::PayoutApprove(_)
+    );
     let owner_cmd = matches!(
         cmd,
-        Command::AddAdmin(_)
-            | Command::RemoveAdmin(_)
-            | Command::Admins
-            | Command::Sellers
-            | Command::WebUsers
+        Command::AddAdmin(_) | Command::RemoveAdmin(_) | Command::Admins | Command::WebUsers
     );
     let allowed = user_cmd
         || (is_seller && seller_cmd)
         || (is_admin && seller_cmd)
+        || (is_admin && admin_cmd)
         || (role == roles::Role::Owner && owner_cmd);
     if !allowed {
         // silent ignore for unauthorized commands
@@ -217,17 +245,45 @@ pub async fn cmd_handler(
     let chat_id = msg.chat.id;
     match cmd {
         Command::Help => {
-            let mut help = Command::descriptions().to_string();
+            // Role-aware first touch (buyer review P3#15): plain buyers get
+            // the shopping surface first, then the full list; sellers/admins
+            // keep the plain listing.
+            let mut help = String::new();
+            if role == roles::Role::User {
+                help.push_str(
+                    "For buyers:\n\
+                     /shop — browse the catalogue\n\
+                     /plans — list subscription plans\n\
+                     /buy <name> — buy a plan or product\n\
+                     /paid <invoice_id> — check payment status\n\
+                     /redeem <code> — redeem an activation code\n\
+                     /services — list bookable services\n\
+                     /book <service> — book a service\n\n\
+                     All commands:\n",
+                );
+            }
+            help.push_str(&Command::descriptions().to_string());
             help.push_str(&reg.descriptions());
             bot.send_message(chat_id, help).await?;
         }
         Command::Start => {
-            bot.send_message(chat_id, "Telegram Agent (owner-only). Use /menu or /help.")
+            if is_seller || is_admin {
+                bot.send_message(chat_id, "Telegram Agent (owner-only). Use /menu or /help.")
+                    .await?;
+            } else {
+                // Buyer first touch (P2#10): the shop, not the operator console.
+                bot.send_message(
+                    chat_id,
+                    "Welcome! This is a Telegram shop. Browse /shop and /plans, buy with /buy <name>, redeem a code with /redeem, see /help.",
+                )
+                .reply_markup(buyer_menu_kb())
                 .await?;
-            send_menu(&bot, chat_id).await?;
+                return Ok(());
+            }
+            send_menu(&bot, chat_id, role).await?;
         }
         Command::Menu => {
-            send_menu(&bot, chat_id).await?;
+            send_menu(&bot, chat_id, role).await?;
         }
         Command::Channel => {
             let ch = channel_of(&db, &cfg, Some(user_id), is_admin);
@@ -269,6 +325,14 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, "Usage: /setchannel @channel or id")
                     .await?;
             } else {
+                // Proof of control (L10 BLOCK-3) for non-admin senders: they
+                // may only bind a channel they actually control (admin of the
+                // chat; the bot a member). Admins/owner keep the unvalidated
+                // bootstrap path.
+                if !is_admin && let Some(m) = check_seller_channel_target(&bot, &c, user_id).await {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
                 db.set_seller_channel(user_id, &c);
                 bot.send_message(chat_id, format!("Target channel set to: {}", c))
                     .await?;
@@ -281,9 +345,16 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, "Usage: /post [@channel] <text>")
                     .await?;
             } else {
-                let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+                let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                    Ok(ch) => ch,
+                    Err(m) => {
+                        bot.send_message(chat_id, m).await?;
+                        return Ok(());
+                    }
+                };
                 match bot.send_message(util::to_chat_id(&ch), text.clone()).await {
                     Ok(sent) => {
+                        crate::metrics::bot_sent();
                         let _ = db.log_post(user_id, &ch, sent.id.0, "text", Some(&text));
                         bot.send_message(
                             chat_id,
@@ -299,7 +370,15 @@ pub async fn cmd_handler(
         }
         Command::Schedule(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            // Tenancy gate first: an Err here must not create a scheduled
+            // post pointing at another seller's channel.
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let parts: Vec<&str> = rest.splitn(2, '|').collect();
             if parts.len() < 2 {
                 bot.send_message(chat_id, "Usage: /schedule [@channel] <datetime> | <text>")
@@ -325,7 +404,16 @@ pub async fn cmd_handler(
         Command::PostPhoto(cap) => {
             let (chan, rest) = split_channel_arg(&cap);
             let cap = rest.trim().to_string();
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            // Tenancy gate before arming the dialogue: a rejected channel
+            // must not be written into the global pending_channel that the
+            // photo handler (messages.rs) reads for admins.
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             db.set_config("pending_channel", &ch);
             dialogue.update(State::AwaitingPhoto).await?;
             if cap.is_empty() {
@@ -340,7 +428,13 @@ pub async fn cmd_handler(
         }
         Command::Edit(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let parts: Vec<&str> = rest.splitn(2, '|').collect();
             if parts.len() < 2 {
                 bot.send_message(chat_id, "Usage: /edit [@channel] <msg_id> | <new text>")
@@ -371,7 +465,13 @@ pub async fn cmd_handler(
             // arg may be "@chan 123" or "123"
             let argstr = arg.clone();
             let (chan, rest) = split_channel_arg(&argstr);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let id: i64 = rest.trim().parse().unwrap_or(0);
             if id == 0 {
                 bot.send_message(chat_id, "Usage: /delete [@channel] <msg_id>")
@@ -392,7 +492,13 @@ pub async fn cmd_handler(
         }
         Command::Pin(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let id: i64 = rest.trim().parse().unwrap_or(0);
             if id == 0 {
                 bot.send_message(chat_id, "Usage: /pin [@channel] <msg_id>")
@@ -413,7 +519,13 @@ pub async fn cmd_handler(
         }
         Command::Unpin(arg) => {
             let (chan, _rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             match bot.unpin_all_chat_messages(util::to_chat_id(&ch)).await {
                 Ok(_) => {
                     bot.send_message(chat_id, "Unpinned all.").await?;
@@ -425,7 +537,13 @@ pub async fn cmd_handler(
         }
         Command::UnpinMsg(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let id: i64 = rest.trim().parse().unwrap_or(0);
             if id == 0 {
                 bot.send_message(chat_id, "Usage: /unpinmsg [@channel] <msg_id>")
@@ -447,7 +565,13 @@ pub async fn cmd_handler(
         }
         Command::Invite(arg) => {
             let (chan, _) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             match bot.create_chat_invite_link(util::to_chat_id(&ch)).await {
                 Ok(link) => {
                     bot.send_message(chat_id, format!("Invite: {}", link.invite_link))
@@ -460,7 +584,13 @@ pub async fn cmd_handler(
         }
         Command::SetDesc(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let text = rest.trim().to_string();
             if text.is_empty() {
                 bot.send_message(chat_id, "Usage: /setdesc [@channel] <text>")
@@ -482,7 +612,13 @@ pub async fn cmd_handler(
         }
         Command::SetTitle(arg) => {
             let (chan, rest) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             let text = rest.trim().to_string();
             if text.is_empty() {
                 bot.send_message(chat_id, "Usage: /settitle [@channel] <text>")
@@ -503,7 +639,13 @@ pub async fn cmd_handler(
         }
         Command::Info(arg) => {
             let (chan, _) = split_channel_arg(&arg);
-            let ch = chan.unwrap_or_else(|| channel_of(&db, &cfg, Some(user_id), is_admin));
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
             match bot.get_chat(util::to_chat_id(&ch)).await {
                 Ok(c) => {
                     let title = c.title().unwrap_or("(no title)");
@@ -534,29 +676,52 @@ pub async fn cmd_handler(
         Command::Plans => {
             // Seller-scoped: sellers see their own catalogue (incl. inactive),
             // admins keep the global view, plain users see the active-only
-            // shop lines across sellers.
-            let plans = if role == roles::Role::Seller {
-                db.list_plans(Some(user_id))
-            } else if is_admin {
-                db.list_plans(None)
-            } else {
-                db.list_plans(None).into_iter().filter(|p| p.5).collect()
-            };
-            if plans.is_empty() {
-                bot.send_message(chat_id, "No plans configured.").await?;
-            } else {
-                let mut out = String::from("Plans:\n");
-                for (name, price, asset, days, _ch, active, _seller) in plans {
-                    out.push_str(&format!(
-                        "- {} : {} {} / {} days {}\n",
-                        name,
-                        price,
-                        asset,
-                        days,
-                        if active { "" } else { "(inactive)" }
-                    ));
+            // shop lines across sellers. The seller_id=0 global namespace is
+            // admin-managed and never advertised to buyers (P2#12) — a buyer
+            // could never resolve it through /buy. Buyer lines carry the
+            // seller identifier (P2#11) so /buy <seller>/<name> is
+            // constructible straight from the listing.
+            if role == roles::Role::Seller {
+                let plans = db.list_plans(Some(user_id));
+                if plans.is_empty() {
+                    bot.send_message(
+                        chat_id,
+                        "No plans configured. Add one with /planadd name | price | asset | days.",
+                    )
+                    .await?;
+                } else {
+                    bot.send_message(chat_id, plans_text(plans)).await?;
                 }
-                bot.send_message(chat_id, out).await?;
+            } else if is_admin {
+                let plans = db.list_plans(None);
+                if plans.is_empty() {
+                    bot.send_message(chat_id, "No plans configured.").await?;
+                } else {
+                    bot.send_message(chat_id, plans_text(plans)).await?;
+                }
+            } else {
+                let plans: Vec<crate::db::PlanRow> = db
+                    .list_plans(None)
+                    .into_iter()
+                    .filter(|p| p.5 && p.6 != 0)
+                    .collect();
+                if plans.is_empty() {
+                    bot.send_message(chat_id, "No plans yet — check back soon.")
+                        .await?;
+                } else {
+                    let mut out = String::from("Plans:\n");
+                    for (name, price, asset, days, _ch, _active, seller) in plans {
+                        out.push_str(&format!(
+                            "- {} : {} {} / {} days — by {}\n",
+                            name,
+                            price,
+                            asset,
+                            days,
+                            seller_display(&db, seller)
+                        ));
+                    }
+                    bot.send_message(chat_id, out).await?;
+                }
             }
         }
         Command::PlanAdd(arg) => match parse_plan_add(&arg) {
@@ -735,25 +900,41 @@ pub async fn cmd_handler(
         Command::Shop => {
             // Public catalogue: active products across all sellers, one line
             // each. Delivery payloads are never shown here — they ARE the
-            // paid content.
-            let products = db.list_products(None).into_iter().filter(|p| p.8 != 0);
+            // paid content. Buyers never see the seller_id=0 global namespace
+            // (admin-managed, not resolvable through /buy); admin/owner keep
+            // the full view (P2#12). Lines carry the seller identifier
+            // (P2#11) so /buy <seller>/<name> is constructible.
+            let mut products: Vec<crate::db::ProductRow> = db
+                .list_products(None)
+                .into_iter()
+                .filter(|p| p.8 != 0)
+                .collect();
+            if role == roles::Role::User {
+                products.retain(|p| p.1 != 0);
+            }
             let mut out = String::from("Shop:\n");
             let mut n = 0;
-            for (_id, _seller, name, price, asset, kind, _delivery, _stock, _active) in products {
+            for (_id, seller, name, price, asset, kind, _delivery, _stock, _active) in products {
                 out.push_str(&format!(
-                    "- {} — {} {} ({})\n",
+                    "- {} — {} {} ({}) — by {}\n",
                     name,
                     price,
                     asset,
                     match kind.as_str() {
                         "physical" => "product",
                         _ => "digital",
-                    }
+                    },
+                    seller_display(&db, seller)
                 ));
                 n += 1;
             }
             if n == 0 {
-                bot.send_message(chat_id, "Shop is empty.").await?;
+                let empty = if is_seller {
+                    "Shop is empty. List something with /productadd."
+                } else {
+                    "Shop is empty — check back soon."
+                };
+                bot.send_message(chat_id, empty).await?;
             } else {
                 bot.send_message(chat_id, out).await?;
             }
@@ -818,15 +999,40 @@ pub async fn cmd_handler(
                                             Some(pid),
                                         );
                                     }
-                                    bot.send_message(chat_id, format!("Invoice created for product '{}'.\nPay: {}\nThen run /paid {}", pname, pay_url, inv_id)).await?;
+                                    send_invoice_created(
+                                        &bot,
+                                        chat_id,
+                                        &format!("product '{}'", pname),
+                                        &price,
+                                        &asset,
+                                        pay_url,
+                                        &inv_id,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
-                                    bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                                    // Buyer-safe: raw provider errors never
+                                    // reach the buyer (P1#9).
+                                    tracing::warn!(
+                                        "invoice creation failed for product '{}' (seller {}): {}",
+                                        pname,
+                                        p_seller,
+                                        e
+                                    );
+                                    bot.send_message(chat_id, "Something went wrong creating your invoice. Please try again in a minute.")
+                                        .await?;
                                 }
                             }
                         }
                         None => {
-                            bot.send_message(chat_id, "No crypto token configured.")
+                            // Buyer-safe: seller misconfiguration is never
+                            // surfaced raw (P1#9).
+                            tracing::warn!(
+                                "invoice creation skipped: no crypto token configured (seller {}, product '{}')",
+                                p_seller,
+                                pname
+                            );
+                            bot.send_message(chat_id, "This shop can't take payments right now — the seller is finishing setup. Please contact the seller.")
                                 .await?;
                         }
                     }
@@ -863,15 +1069,40 @@ pub async fn cmd_handler(
                                             None,
                                         );
                                     }
-                                    bot.send_message(chat_id, format!("Invoice created for plan '{}'.\nPay: {}\nThen run /paid {}", name, pay_url, inv_id)).await?;
+                                    send_invoice_created(
+                                        &bot,
+                                        chat_id,
+                                        &format!("plan '{}'", name),
+                                        &price,
+                                        &asset,
+                                        pay_url,
+                                        &inv_id,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
-                                    bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                                    // Buyer-safe: raw provider errors never
+                                    // reach the buyer (P1#9).
+                                    tracing::warn!(
+                                        "invoice creation failed for plan '{}' (seller {}): {}",
+                                        name,
+                                        plan_seller,
+                                        e
+                                    );
+                                    bot.send_message(chat_id, "Something went wrong creating your invoice. Please try again in a minute.")
+                                        .await?;
                                 }
                             }
                         }
                         None => {
-                            bot.send_message(chat_id, "No crypto token configured.")
+                            // Buyer-safe: seller misconfiguration is never
+                            // surfaced raw (P1#9).
+                            tracing::warn!(
+                                "invoice creation skipped: no crypto token configured (seller {}, plan '{}')",
+                                plan_seller,
+                                name
+                            );
+                            bot.send_message(chat_id, "This shop can't take payments right now — the seller is finishing setup. Please contact the seller.")
                                 .await?;
                         }
                     }
@@ -879,7 +1110,10 @@ pub async fn cmd_handler(
                 _ => {
                     bot.send_message(
                         chat_id,
-                        format!("'{}' is ambiguous (multiple items or sellers). Please contact the seller.", name),
+                        format!(
+                            "Multiple sellers sell '{}'. Use /buy <seller>/<name> — see /shop for seller names.",
+                            name
+                        ),
                     )
                     .await?;
                 }
@@ -906,6 +1140,21 @@ pub async fn cmd_handler(
                             .await?;
                         return Ok(());
                     }
+                    if status == "failed" {
+                        // Terminal state from the background granter's bounded
+                        // verification retries (P1#8): distinct, actionable
+                        // copy instead of the misleading "already being
+                        // processed".
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "Payment verification failed permanently (the crypto check didn't confirm in time). Contact the seller with invoice {} — do not pay again before they confirm.",
+                                inv
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     // Claim (active -> granting) so the background granter and
                     // the claim API cannot double-grant while we verify.
                     if !db.claim_invoice_for_grant(inv) {
@@ -923,10 +1172,13 @@ pub async fn cmd_handler(
                     let c = match cp {
                         Some(c) => c,
                         None => {
-                            db.update_invoice_status(inv, "active");
+                            db.release_invoice_claim(inv);
                             bot.send_message(
                                 chat_id,
-                                "Payment verification unavailable: no crypto token configured.",
+                                format!(
+                                    "Payment verification isn't available for this shop yet — the seller is finishing setup. Contact the seller with invoice {}.",
+                                    inv
+                                ),
                             )
                             .await?;
                             return Ok(());
@@ -936,10 +1188,14 @@ pub async fn cmd_handler(
                         Err(e) => {
                             // Verification error: release the claim; the
                             // background granter retries. Never grant on doubt.
-                            db.update_invoice_status(inv, "active");
+                            db.release_invoice_claim(inv);
+                            tracing::warn!(invoice = inv, error = %e, "paid check failed");
                             bot.send_message(
                                 chat_id,
-                                format!("Could not verify payment ({}). Try again later.", e),
+                                format!(
+                                    "Payment couldn't be verified just now. Try /paid {} again in a minute, or contact the seller.",
+                                    inv
+                                ),
                             )
                             .await?;
                         }
@@ -948,7 +1204,7 @@ pub async fn cmd_handler(
                                 .iter()
                                 .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
                             if !paid {
-                                db.update_invoice_status(inv, "active");
+                                db.release_invoice_claim(inv);
                                 bot.send_message(chat_id, "Invoice not paid yet.").await?;
                                 return Ok(());
                             }
@@ -1073,12 +1329,20 @@ pub async fn cmd_handler(
                             };
                             let days = days.clamp(1, MAX_PLAN_DAYS);
                             if ch.is_empty() {
-                                // Paid but ungrantable here: leave 'granting' so
-                                // the background granter retries once the
-                                // seller configures a channel.
+                                // Paid but ungrantable here: release the claim
+                                // ('granting' -> 'active') so the background
+                                // granter keeps retrying once the seller
+                                // configures a channel — the invoice must never
+                                // wedge in 'granting' (P0#3).
+                                db.release_invoice_claim(inv);
+                                tracing::info!(
+                                    "invoice {}: paid but seller {} has no channel; claim released for retry",
+                                    inv,
+                                    inv_seller
+                                );
                                 bot.send_message(
                                     chat_id,
-                                    "Payment confirmed, but no channel is configured to grant access. It will be granted automatically once configured.",
+                                    "The seller's channel isn't configured yet. Your payment will be delivered automatically once they finish setup — no action needed from you.",
                                 )
                                 .await?;
                                 return Ok(());
@@ -1095,7 +1359,21 @@ pub async fn cmd_handler(
                             let link = grant_access(&bot, &ch, target_user, days).await;
                             match link {
                                 Ok(l) => bot.send_message(chat_id, format!("Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}", l, sub_id)).await?,
-                                Err(e) => bot.send_message(chat_id, format!("Granted but invite failed: {}", e)).await?,
+                                Err(e) => {
+                                    // Buyer-safe copy (P2#14): the raw Telegram
+                                    // error never reaches the buyer; it goes to
+                                    // the log only.
+                                    tracing::warn!(
+                                        "invoice {}: subscription granted but invite link failed: {}",
+                                        inv,
+                                        e
+                                    );
+                                    bot.send_message(
+                                        chat_id,
+                                        "Access granted, but the invite link couldn't be created — ask the seller to re-invite you.",
+                                    )
+                                    .await?
+                                }
                             };
                             db.finalize_invoice_paid(inv);
                         }
@@ -1108,6 +1386,20 @@ pub async fn cmd_handler(
         }
         Command::Redeem(code) => {
             let code = code.trim();
+            // Pre-flight (P1#7): redeem_code burns a use unconditionally, so
+            // the code's seller must have a channel to grant INTO before we
+            // consume it. An unknown code falls through to redeem_code for
+            // its normal "invalid code" error.
+            if let Some(c) = db.get_code(code)
+                && !db.seller_has_channel(c.1)
+            {
+                bot.send_message(
+                    chat_id,
+                    "This code is valid, but the seller hasn't finished channel setup. Ask the seller to run /setchannel, then redeem again.",
+                )
+                .await?;
+                return Ok(());
+            }
             match db.redeem_code(code, user_id) {
                 Ok((code_seller, plan_id, value_days)) => {
                     // Days and channel come from the code's own plan/seller —
@@ -1160,8 +1452,18 @@ pub async fn cmd_handler(
                             .await?
                         }
                         Err(e) => {
-                            bot.send_message(chat_id, format!("Redeemed but invite failed: {}", e))
-                                .await?
+                            // Buyer-safe copy (P2#14): the raw Telegram error
+                            // never reaches the buyer; it goes to the log only.
+                            tracing::warn!(
+                                "code redeemed for user {} but invite link failed: {}",
+                                user_id,
+                                e
+                            );
+                            bot.send_message(
+                                chat_id,
+                                "Access granted, but the invite link couldn't be created — ask the seller to re-invite you.",
+                            )
+                            .await?
                         }
                     };
                 }
@@ -1186,7 +1488,7 @@ pub async fn cmd_handler(
                     };
                     let mut out = String::from("Generated codes:\n");
                     for _ in 0..count.min(50) {
-                        let code = db.create_code(seller_id, plan_id, val_days, 1, None);
+                        let code = db.create_code(seller_id, plan_id, val_days, 1, None, 12);
                         out.push_str(&code);
                         out.push('\n');
                     }
@@ -1200,7 +1502,7 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, "No codes.").await?;
             } else {
                 let mut out = String::from("Codes (code | plan_id | value_days | uses/max):\n");
-                for (code, pid, vd, uses, max, _seller) in codes {
+                for (code, pid, vd, uses, max, _seller, _revoked) in codes {
                     out.push_str(&format!(
                         "{} | {:?} | {:?} | {}/{}\n",
                         code, pid, vd, uses, max
@@ -1242,8 +1544,12 @@ pub async fn cmd_handler(
                             .await?
                         }
                         Err(e) => {
-                            bot.send_message(chat_id, format!("Granted but invite failed: {}", e))
-                                .await?
+                            tracing::warn!(sub_id, invite_error = %e, "invite link creation failed");
+                            bot.send_message(
+                                chat_id,
+                                "Access granted, but the invite link couldn't be created — run /invite again for this user.",
+                            )
+                            .await?
                         }
                     };
                 }
@@ -1279,31 +1585,246 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, out).await?;
             }
         }
+        Command::ServiceAdd(arg) => {
+            let parts: Vec<&str> = arg.split('|').map(|s| s.trim()).collect();
+            if parts.len() < 4 {
+                bot.send_message(
+                    chat_id,
+                    "Usage: /serviceadd name | price | asset | duration_minutes [| channel]",
+                )
+                .await?;
+            } else {
+                let name = parts[0];
+                let price = parts[1];
+                let asset = parts[2];
+                let dur: i64 = parts[3].parse().unwrap_or(60);
+                let channel = parts.get(4).copied().filter(|s| !s.is_empty());
+                match db.create_service(user_id, name, price, asset, dur, channel) {
+                    Ok(id) => {
+                        bot.send_message(chat_id, format!("Service #{} created: {}", id, name))
+                            .await?;
+                    }
+                    Err(e) => {
+                        bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                    }
+                };
+            }
+        }
+        Command::Services => {
+            // Now buyer-reachable (P1#6): plain users get the public listing —
+            // name, duration and price only, seller-internal fields (channel,
+            // internal ids) stay hidden. Sellers/admins keep their management
+            // view.
+            if role == roles::Role::User {
+                let svcs: Vec<_> = db
+                    .list_services(None)
+                    .into_iter()
+                    // seller_id=0 rows are admin-managed globals, never the
+                    // buyer-facing bookable catalogue.
+                    .filter(|s| s.1 != 0)
+                    .collect();
+                if svcs.is_empty() {
+                    bot.send_message(chat_id, "No services listed yet — check back soon.")
+                        .await?;
+                } else {
+                    let mut out = String::from("Services:\n");
+                    for (_id, seller, name, price, asset, mins, _ch) in svcs {
+                        let price_part = if price.is_empty() || price == "-" {
+                            String::new()
+                        } else {
+                            format!(" — {} {}", price, asset)
+                        };
+                        out.push_str(&format!(
+                            "- {} — {} min{} — by {}\n",
+                            name,
+                            mins,
+                            price_part,
+                            seller_display(&db, seller)
+                        ));
+                    }
+                    bot.send_message(chat_id, out).await?;
+                }
+            } else {
+                let svcs = db.list_services(if is_admin { None } else { Some(user_id) });
+                if svcs.is_empty() {
+                    let empty = if is_admin {
+                        "No services."
+                    } else {
+                        "No services. Add one with /serviceadd name | price | asset | duration_minutes."
+                    };
+                    bot.send_message(chat_id, empty).await?;
+                } else {
+                    let mut out =
+                        String::from("Services (id | seller | name | price | asset | mins):\n");
+                    for (id, sid, name, price, asset, mins, _ch) in svcs {
+                        out.push_str(&format!(
+                            "{} | {} | {} | {} | {} | {}\n",
+                            id, sid, name, price, asset, mins
+                        ));
+                    }
+                    bot.send_message(chat_id, out).await?;
+                }
+            }
+        }
+        Command::SlotAdd(arg) => {
+            let parts: Vec<&str> = arg.split('|').map(|s| s.trim()).collect();
+            if parts.len() < 2 {
+                bot.send_message(chat_id, "Usage: /slotadd service | datetime [| capacity]")
+                    .await?;
+            } else {
+                let svc_name = parts[0];
+                let dt = parts[1];
+                let cap: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+                match db.find_service_id(user_id, svc_name) {
+                    Some(sid) => {
+                        let id = db.create_slot(sid, user_id, dt, cap);
+                        bot.send_message(
+                            chat_id,
+                            format!("Slot #{} created for {} at {}.", id, svc_name, dt),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        bot.send_message(chat_id, "Service not found.").await?;
+                    }
+                }
+            }
+        }
+        Command::Book(arg) => {
+            let name = arg.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Usage: /book <service_name>")
+                    .await?;
+            } else {
+                // Buyer-reachable (P1#6): buyers book any seller's public
+                // service; sellers book within their own catalogue; admins may
+                // book anything (incl. the global namespace).
+                let svc = if is_admin {
+                    db.list_services(None).into_iter().find(|s| s.2 == name)
+                } else if role == roles::Role::Seller {
+                    db.list_services(Some(user_id))
+                        .into_iter()
+                        .find(|s| s.2 == name)
+                } else {
+                    db.list_services(None)
+                        .into_iter()
+                        .find(|s| s.2 == name && s.1 != 0)
+                };
+                if let Some((service_id, seller_id, svc_name, _p, _a, _d, _ch)) = svc {
+                    // find first available slot
+                    let slots = db.list_slots(service_id);
+                    let avail = slots.into_iter().find(|s| s.4 == "available" && s.2 > s.3);
+                    if let Some((slot_id, starts, _cap, _booked, _st)) = avail {
+                        let expires = (Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
+                        let bid = db.create_booking(
+                            seller_id,
+                            service_id,
+                            Some(slot_id),
+                            user_id,
+                            None,
+                            Some(&expires),
+                        );
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "Booking {} confirmed — {} at {}.\nThe hold expires in 15 minutes.",
+                                bid, svc_name, starts
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        bot.send_message(chat_id, "No available slots.").await?;
+                    }
+                } else {
+                    bot.send_message(chat_id, "Service not found.").await?;
+                }
+            }
+        }
+        Command::Bookings => {
+            let bs = db.list_bookings(if is_admin { None } else { Some(user_id) });
+            if bs.is_empty() {
+                bot.send_message(chat_id, "No bookings.").await?;
+            } else {
+                let mut out =
+                    String::from("Bookings (id | seller | service | user | status | expires):\n");
+                for (bid, sid, svc, uid, st, exp) in bs {
+                    out.push_str(&format!(
+                        "{} | {} | {} | {} | {} | {}\n",
+                        bid,
+                        sid,
+                        svc,
+                        uid,
+                        st,
+                        exp.unwrap_or_default()
+                    ));
+                }
+                bot.send_message(chat_id, out).await?;
+            }
+        }
         Command::ExpireCheck => {
             // Shared with the periodic expiry sweeper in main.rs so the
-            // kick+mark behavior stays single-sourced.
-            let n = crate::expire_subscriptions(&bot, &db).await;
-            bot.send_message(chat_id, format!("Expired and revoked: {}", n))
-                .await?;
+            // kick+mark behavior stays single-sourced. Each expired buyer is
+            // DM'd the renewal notice; a failed DM is logged, never fatal to
+            // the sweep.
+            let expired = crate::expire_subscriptions(&bot, &db).await;
+            let mut notified = 0usize;
+            for (_sub_id, uid, channel) in &expired {
+                match bot
+                    .send_message(
+                        teloxide::types::ChatId(*uid),
+                        format!(
+                            "Your access to {channel} has expired. To renew, use /plans or contact the seller."
+                        ),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        crate::metrics::bot_sent();
+                        notified += 1;
+                    }
+                    Err(e) => tracing::warn!(
+                        "failed to DM user {} about expired access to {}: {}",
+                        uid,
+                        channel,
+                        e
+                    ),
+                }
+            }
+            let mut out = format!("Expired and revoked: {}", expired.len());
+            if !expired.is_empty() {
+                out.push_str(&format!(
+                    " ({} buyer{} notified)",
+                    notified,
+                    if notified == 1 { "" } else { "s" }
+                ));
+            }
+            bot.send_message(chat_id, out).await?;
         }
         Command::Broadcast(text) => {
-            if !is_admin {
-                return Ok(());
-            }
+            // Role-scoped audience: Admin/Owner reach all registered users,
+            // sellers only their own customers (subscription holders). The
+            // seller branch was previously unreachable behind an admin-only
+            // early return; the docs (docs/COMMANDS.md, README) promise
+            // seller-scoped broadcasts.
             let text = text.trim().to_string();
             if text.is_empty() {
                 bot.send_message(chat_id, "Usage: /broadcast <text>")
                     .await?;
             } else {
-                let users = if role == roles::Role::Seller {
-                    db.list_users_for_seller(user_id)
-                } else {
+                let users = if is_admin {
                     db.list_users()
+                } else {
+                    db.list_users_for_seller(user_id)
                 };
-                // Send loop shared with the MCP broadcast tool (crate::broadcast_to_users).
-                let sent = crate::broadcast_to_users(&bot, &users, &text).await;
-                bot.send_message(chat_id, format!("Broadcast sent to {} users.", sent))
-                    .await?;
+                if users.is_empty() {
+                    bot.send_message(chat_id, "No users to broadcast to (no customers found).")
+                        .await?;
+                } else {
+                    // Send loop shared with the MCP broadcast tool (crate::broadcast_to_users).
+                    let sent = crate::broadcast_to_users(&bot, &users, &text).await;
+                    bot.send_message(chat_id, format!("Broadcast sent to {} users.", sent))
+                        .await?;
+                }
             }
         }
         Command::Ai(arg) => {
@@ -1343,12 +1864,108 @@ pub async fn cmd_handler(
                 }
             }
         }
+        Command::AiPost(arg) => {
+            if ai.is_none() {
+                bot.send_message(chat_id, "AI is disabled. Set AI_ENABLED=1 and AI_API_KEY.")
+                    .await?;
+                return Ok(());
+            }
+            let (chan, rest) = split_channel_arg(&arg);
+            // Tenancy gate first: an Err here must not create an AI draft
+            // pointing at another seller's channel (the aipost:publish
+            // callback sends to the draft's channel verbatim).
+            let ch = match resolve_target_channel(&db, &cfg, user_id, is_admin, chan) {
+                Ok(ch) => ch,
+                Err(m) => {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
+            };
+            if ch.is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "Usage: /aipost [@channel] <template> [| key=val ...]",
+                )
+                .await?;
+                return Ok(());
+            }
+            let parts: Vec<&str> = rest.split('|').map(|s| s.trim()).collect();
+            if parts.is_empty() || parts[0].is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "Usage: /aipost [@channel] <template> [| key=val ...]",
+                )
+                .await?;
+                return Ok(());
+            }
+            let template = parts[0];
+            let mut vars = std::collections::HashMap::new();
+            for p in &parts[1..] {
+                if let Some((k, v)) = p.split_once('=') {
+                    vars.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+            let ai = ai.as_ref().unwrap();
+            match ai
+                .generate(user_id, Some(user_id), template, vars, 300)
+                .await
+            {
+                Ok(text) => {
+                    let draft_id =
+                        db.create_ai_post_draft_with_template(user_id, &ch, Some(template), &text);
+                    dialogue
+                        .update(State::AwaitingAiPostConfirm { draft_id })
+                        .await?;
+                    let preview = format!("Draft #{} (channel {}):\n\n{}", draft_id, ch, text);
+                    let kb = InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback(
+                            "Publish",
+                            format!("aipost:publish:{}", draft_id),
+                        ),
+                        InlineKeyboardButton::callback("Edit", format!("aipost:edit:{}", draft_id)),
+                        InlineKeyboardButton::callback(
+                            "Cancel",
+                            format!("aipost:cancel:{}", draft_id),
+                        ),
+                    ]]);
+                    bot.send_message(chat_id, preview).reply_markup(kb).await?;
+                    let role_str = match role {
+                        roles::Role::Owner => "owner",
+                        roles::Role::Admin => "admin",
+                        roles::Role::Seller => "seller",
+                        roles::Role::User => "user",
+                    };
+                    db.log_action(
+                        user_id,
+                        role_str,
+                        "ai_post_draft_created",
+                        "ai_post_draft",
+                        draft_id,
+                        Some(template),
+                    );
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("AI error: {}", e))
+                        .await?;
+                }
+            }
+        }
         Command::Setup(arg) => {
             let (chan, _) = split_channel_arg(&arg);
             let ch = chan
                 .or_else(|| Some(arg.trim().to_string()))
                 .filter(|s| !s.is_empty());
             if let Some(c) = ch {
+                // Proof of control (L10 BLOCK-3) on the seller onboarding
+                // path: /setup registers a seller AND binds their channel, so
+                // it gets the same non-admin rules as /setchannel. The sender
+                // is present in this chat by definition, but the CHANNEL must
+                // still be one they administer (and one the bot is a member
+                // of). Admins/owner keep the unvalidated bootstrap path.
+                if !is_admin && let Some(m) = check_seller_channel_target(&bot, &c, user_id).await {
+                    bot.send_message(chat_id, m).await?;
+                    return Ok(());
+                }
                 db.set_seller_channel(user_id, &c);
                 db.upsert_seller(
                     user_id,
@@ -1510,6 +2127,18 @@ pub async fn cmd_handler(
             }
             bot.send_message(chat_id, msg_text).await?;
         }
+        Command::RefundApprove(arg) => {
+            if !is_admin {
+                return Ok(());
+            }
+            handle_refund_approve(&bot, chat_id, &db, user_id, role, arg.trim()).await?;
+        }
+        Command::PayoutApprove(arg) => {
+            if !is_admin {
+                return Ok(());
+            }
+            handle_payout_approve(&bot, chat_id, &db, user_id, role, arg.trim()).await?;
+        }
     }
     Ok(())
 }
@@ -1533,12 +2162,43 @@ pub async fn cmd_handler(
 ///
 /// Returns (plans, products) in `list_plans`/`list_products` row shapes,
 /// active rows only.
+fn resolve_seller_id(db: &Db, hint: &str) -> Option<i64> {
+    let hint = hint.trim().trim_start_matches('@');
+    if hint.is_empty() {
+        return None;
+    }
+    if let Ok(id) = hint.parse::<i64>() {
+        return Some(id);
+    }
+    db.get_seller_by_username(hint)
+}
+
 fn resolve_buy_candidates(
     db: &Db,
     role: roles::Role,
     user_id: i64,
     name: &str,
 ) -> (Vec<crate::db::PlanRow>, Vec<crate::db::ProductRow>) {
+    let name = name.trim();
+    // /buy seller/name disambiguation syntax: resolve directly inside the
+    // named seller's namespace, bypassing the (seller_id, name) fallback
+    // order used for bare names.
+    if let Some((seller_part, item_part)) = name.split_once('/') {
+        let item_part = item_part.trim();
+        if item_part.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        if let Some(sid) = resolve_seller_id(db, seller_part) {
+            let plans = db.find_plans_by_name(Some(sid), item_part);
+            let products: Vec<crate::db::ProductRow> = db
+                .find_products_by_name(Some(sid), item_part)
+                .into_iter()
+                .filter(|p| p.8 != 0)
+                .collect();
+            return (plans, products);
+        }
+        return (Vec::new(), Vec::new());
+    }
     let mut plans = db.find_plans_by_name(Some(user_id), name);
     let mut products: Vec<crate::db::ProductRow> = db
         .find_products_by_name(Some(user_id), name)
@@ -1582,6 +2242,56 @@ fn resolve_buy_candidates(
     (plans, products)
 }
 
+/// Proof of control for channel binding on the bot side: the sender must be
+/// an administrator of `channel` (creator counts), which also proves the bot
+/// is a member of the chat — `getChatAdministrators` errors otherwise, which
+/// this check treats the same as "not an admin". Timeout-safety: a single
+/// request, no retry loops; the bot client's own request timeout bounds the
+/// call.
+async fn sender_admin_of_channel(bot: &Bot, channel: &str, sender_id: i64) -> bool {
+    let Ok(members) = bot.get_chat_administrators(util::to_chat_id(channel)).await else {
+        return false;
+    };
+    members.iter().any(|m| {
+        m.user.id.0 as i64 == sender_id
+            && matches!(
+                m.kind,
+                teloxide::types::ChatMemberKind::Owner(_)
+                    | teloxide::types::ChatMemberKind::Administrator(_)
+            )
+    })
+}
+
+/// Shared non-admin validation for `/setchannel` and `/setup` channel
+/// targets (proof of control, mirroring `POST /sellers/{id}/channel`):
+/// positive numeric ids are private chats and can never be postable
+/// channels, free-form strings are not resolvable targets, and `@handles`
+/// require the sender to be an administrator of that chat. Negative numeric
+/// ids pass (Telegram channels/groups are negative). Returns the refusal
+/// message to send, or `None` when the target may be used.
+async fn check_seller_channel_target(bot: &Bot, channel: &str, sender_id: i64) -> Option<String> {
+    if let Ok(n) = channel.parse::<i64>() {
+        if n >= 0 {
+            return Some(
+                "Channel id must be a group/channel id (negative) — private chats cannot be target channels."
+                    .to_string(),
+            );
+        }
+        return None;
+    }
+    if !channel.starts_with('@') {
+        return Some("Use a @channelhandle (or a negative group/channel id).".to_string());
+    }
+    if sender_admin_of_channel(bot, channel, sender_id).await {
+        None
+    } else {
+        Some(
+            "You must be an admin of that channel, and the bot must be a member — add the bot first."
+                .to_string(),
+        )
+    }
+}
+
 /// Resolve the target channel for a caller. Sellers may only operate on their
 /// OWN channel (`seller_channel`); the global default fallback is reserved
 /// for Admin/Owner, so a seller can never post/grant into a channel they do
@@ -1598,6 +2308,35 @@ fn channel_of(db: &Db, cfg: &Config, seller_id: Option<i64>, is_admin: bool) -> 
     db.get_config("channel")
         .or_else(|| cfg.default_channel.clone())
         .unwrap_or_default()
+}
+
+/// Resolve the target channel for a channel-scoped command, enforcing seller
+/// tenancy (AUTO_ROUTE.md principle 2: every business entity is
+/// seller-scoped). A seller may only target their OWN `seller_channel` —
+/// never an arbitrary `@channel` or numeric id the bot happens to be a member
+/// of. Admin/Owner keep the historical behavior: an explicit argument wins
+/// verbatim, otherwise the `channel_of` fallback chain. On `Err` the payload
+/// is a ready-to-send one-line reply for the caller.
+fn resolve_target_channel(
+    db: &Db,
+    cfg: &Config,
+    user_id: i64,
+    is_admin: bool,
+    explicit: Option<String>,
+) -> Result<String, String> {
+    if is_admin {
+        return Ok(explicit.unwrap_or_else(|| channel_of(db, cfg, Some(user_id), true)));
+    }
+    let own = channel_of(db, cfg, Some(user_id), false);
+    if own.is_empty() {
+        return Err("No channel set. Use /setchannel @channel first.".to_string());
+    }
+    if let Some(ch) = explicit
+        && ch != own
+    {
+        return Err("You can only target your own channel. Set it with /setchannel.".to_string());
+    }
+    Ok(own)
 }
 
 fn split_channel_arg(input: &str) -> (Option<String>, &str) {
@@ -1723,21 +2462,113 @@ pub(crate) fn parse_gen_codes(input: &str) -> Option<(&str, usize, Option<i64>)>
     Some((parts[0], count, days))
 }
 
-async fn send_menu(bot: &Bot, chat_id: teloxide::types::ChatId) -> HandlerResult {
-    let kb = InlineKeyboardMarkup::new(vec![
+/// Seller/admin plan listing (the historical format): one line per plan with
+/// the (inactive) marker on retired rows.
+fn plans_text(plans: Vec<crate::db::PlanRow>) -> String {
+    let mut out = String::from("Plans:\n");
+    for (name, price, asset, days, _ch, active, _seller) in plans {
+        out.push_str(&format!(
+            "- {} : {} {} / {} days {}\n",
+            name,
+            price,
+            asset,
+            days,
+            if active { "" } else { "(inactive)" }
+        ));
+    }
+    out
+}
+
+/// Seller display name for buyer-facing listings (P2#11): the seller's
+/// Telegram username when the sellers row carries a usable one, else an
+/// `@id:<user_id>` tag. The username form is exactly what
+/// /buy <seller>/<name> accepts, so listings are directly actionable.
+fn seller_display(db: &Db, seller_id: i64) -> String {
+    match db
+        .get_seller(seller_id)
+        .and_then(|s| s.1)
+        .map(|u| u.trim().trim_start_matches('@').to_string())
+        .filter(|u| !u.is_empty())
+    {
+        Some(u) => format!("@{u}"),
+        None => format!("@id:{seller_id}"),
+    }
+}
+
+/// Buyer-facing invoice reply (P2#13): amount, the pay link as a tappable
+/// URL button (when the provider returned a parsable one), and the neutral
+/// /paid hint — the buyer never needs the seller's coaching line.
+async fn send_invoice_created(
+    bot: &Bot,
+    chat_id: teloxide::types::ChatId,
+    label: &str,
+    price: &str,
+    asset: &str,
+    pay_url: &str,
+    inv_id: &str,
+) -> HandlerResult {
+    let mut text = format!("Invoice created for {label}.\nAmount: {price} {asset}\n");
+    if !pay_url.is_empty() {
+        text.push_str("Pay: ");
+        text.push_str(pay_url);
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "You'll receive your item automatically after payment is verified — or run /paid {inv_id} to check now."
+    ));
+    let msg = bot.send_message(chat_id, text);
+    // teloxide URL buttons take a parsed reqwest::Url; an unparsable pay link
+    // degrades to the plain-text message (the URL is still shown as text).
+    match pay_url
+        .parse::<reqwest::Url>()
+        .ok()
+        .map(|u| InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url("Pay now", u)]]))
+    {
+        Some(kb) => msg.reply_markup(kb).await?,
+        None => msg.await?,
+    };
+    Ok(())
+}
+
+/// The buyer menu keyboard: Shop / Plans / Help (P2#10). The callbacks are
+/// answered by callbacks.rs (`menu:*`), which replies role-aware too.
+fn buyer_menu_kb() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("Post", "menu:post"),
-            InlineKeyboardButton::callback("Channel", "menu:channel"),
+            InlineKeyboardButton::callback("Shop", "menu:shop"),
+            InlineKeyboardButton::callback("Plans", "menu:plans"),
         ],
-        vec![
-            InlineKeyboardButton::callback("Crypto", "menu:crypto"),
-            InlineKeyboardButton::callback("Help", "menu:help"),
-        ],
-    ]);
+        vec![InlineKeyboardButton::callback("Help", "menu:help")],
+    ])
+}
+
+#[tracing::instrument(skip_all)]
+async fn send_menu(
+    bot: &Bot,
+    chat_id: teloxide::types::ChatId,
+    role: roles::Role,
+) -> HandlerResult {
+    // Role-aware (P2#10): plain buyers get the shop surface; sellers/admins
+    // keep the operator buttons.
+    let kb = if role == roles::Role::User {
+        buyer_menu_kb()
+    } else {
+        InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback("Post", "menu:post"),
+                InlineKeyboardButton::callback("Channel", "menu:channel"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("Crypto", "menu:crypto"),
+                InlineKeyboardButton::callback("Help", "menu:help"),
+            ],
+        ])
+    };
     bot.send_message(chat_id, "Menu:").reply_markup(kb).await?;
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 async fn handle_crypto(
     bot: &Bot,
     chat_id: teloxide::types::ChatId,
@@ -1911,6 +2742,251 @@ fn crypto_or_load(db: &Db, cfg: &Config, crypto: Option<Arc<CryptoPay>>) -> Opti
     token.map(CryptoPay::new).map(Arc::new)
 }
 
+/// Role string used for audit rows, matching the REST handlers'
+/// `session.role` vocabulary so bot and console approvals are
+/// indistinguishable in the audit log.
+fn audit_role_str(role: roles::Role) -> &'static str {
+    match role {
+        roles::Role::Owner => "owner",
+        roles::Role::Admin => "admin",
+        roles::Role::Seller => "seller",
+        roles::Role::User => "user",
+    }
+}
+
+/// `/refundapprove [refund_id]` — admin/owner approval of pending refunds.
+/// Mirrors the REST state machine (`api::finance_refunds_approve`) exactly:
+/// not-found reply, executed/invalid-state conflicts, approve only from
+/// pending/approved, and the same `refund_approve` audit event with the same
+/// JSON meta. With no id it lists up to 10 pending refunds. The bot never
+/// moves money: the transfer itself stays on the console Finance page or the
+/// REST execute endpoint.
+async fn handle_refund_approve(
+    bot: &Bot,
+    chat_id: teloxide::types::ChatId,
+    db: &Db,
+    user_id: i64,
+    role: roles::Role,
+    arg: &str,
+) -> HandlerResult {
+    if arg.is_empty() {
+        let pending: Vec<_> = db
+            .list_refunds(None)
+            .into_iter()
+            .filter(|r| r.7 == "pending")
+            .take(10)
+            .collect();
+        if pending.is_empty() {
+            bot.send_message(chat_id, "No pending refunds.").await?;
+        } else {
+            let mut out = String::from("Pending refunds:\n");
+            for (id, seller, invoice, _user, amount, asset, _reason, _status) in pending {
+                out.push_str(&format!(
+                    "#{} | seller {} | {} {} | inv {}\n",
+                    id,
+                    seller,
+                    amount,
+                    asset,
+                    invoice.as_deref().unwrap_or("-")
+                ));
+            }
+            out.push_str("Approve with /refundapprove <id>.");
+            bot.send_message(chat_id, out).await?;
+        }
+        return Ok(());
+    }
+    let id: i64 = match arg.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            bot.send_message(chat_id, "Usage: /refundapprove [refund_id]")
+                .await?;
+            return Ok(());
+        }
+    };
+    let refund = match db.get_refund(id) {
+        Some(r) => r,
+        None => {
+            bot.send_message(chat_id, format!("Refund #{} not found.", id))
+                .await?;
+            return Ok(());
+        }
+    };
+    let (_rid, _seller, ref invoice_id, _user, ref amount, ref asset, _reason, ref status, ..) =
+        refund;
+    if status == "executed" {
+        bot.send_message(chat_id, format!("Refund #{} is already executed.", id))
+            .await?;
+        return Ok(());
+    }
+    if status != "pending" && status != "approved" {
+        bot.send_message(
+            chat_id,
+            format!("Cannot approve refund #{} in status '{}'.", id, status),
+        )
+        .await?;
+        return Ok(());
+    }
+    let already_approved = status == "approved";
+    db.set_refund_status(id, "approved");
+    let meta = serde_json::json!({
+        "invoice_id": invoice_id, "amount": amount, "asset": asset,
+    })
+    .to_string();
+    db.log_action(
+        user_id,
+        audit_role_str(role),
+        "refund_approve",
+        "refund",
+        id,
+        Some(&meta),
+    );
+    if already_approved {
+        bot.send_message(
+            chat_id,
+            format!(
+                "Refund #{} was already approved. Approval recorded. Execute the transfer from the web console Finance page or REST (the bot does not move money).",
+                id
+            ),
+        )
+        .await?;
+    } else {
+        bot.send_message(
+            chat_id,
+            format!(
+                "Refund #{} approved. Execute the transfer from the web console Finance page or REST (the bot does not move money).",
+                id
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `/payoutapprove [payout_id]` — admin/owner approval of pending payouts.
+/// Mirrors the REST state machine (`api::finance_payouts_approve`): not-found
+/// reply, executed/invalid-state conflicts, approve only from
+/// pending/approved, and the same `payout_approve` audit event. REST keeps the
+/// two-person money rule structurally (owner-only gate); the bot gate is
+/// admin+, so the rule is enforced explicitly here: nobody may approve a
+/// payout that benefits their own seller account. The bot never transfers:
+/// execution stays on the console Finance page or the REST execute endpoint.
+async fn handle_payout_approve(
+    bot: &Bot,
+    chat_id: teloxide::types::ChatId,
+    db: &Db,
+    user_id: i64,
+    role: roles::Role,
+    arg: &str,
+) -> HandlerResult {
+    if arg.is_empty() {
+        let pending: Vec<_> = db
+            .list_payouts(None)
+            .into_iter()
+            .filter(|p| p.5 == "pending")
+            .take(10)
+            .collect();
+        if pending.is_empty() {
+            bot.send_message(chat_id, "No pending payouts.").await?;
+        } else {
+            let mut out = String::from("Pending payouts:\n");
+            for (id, seller, amount, asset, destination, _status) in pending {
+                let dest = destination.unwrap_or_default();
+                let dest = if dest.is_empty() {
+                    "-".to_string()
+                } else if dest.chars().count() > 12 {
+                    format!("{}…", dest.chars().take(10).collect::<String>())
+                } else {
+                    dest
+                };
+                out.push_str(&format!(
+                    "#{} | seller {} | {} {} | to {}\n",
+                    id, seller, amount, asset, dest
+                ));
+            }
+            out.push_str("Approve with /payoutapprove <id>.");
+            bot.send_message(chat_id, out).await?;
+        }
+        return Ok(());
+    }
+    let id: i64 = match arg.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            bot.send_message(chat_id, "Usage: /payoutapprove [payout_id]")
+                .await?;
+            return Ok(());
+        }
+    };
+    let payout = match db.get_payout(id) {
+        Some(p) => p,
+        None => {
+            bot.send_message(chat_id, format!("Payout #{} not found.", id))
+                .await?;
+            return Ok(());
+        }
+    };
+    let (_pid, seller_id, ref amount, ref asset, ref destination, status, ..) = payout;
+    // Two-person money rule: the beneficiary seller never approves their own
+    // payout (REST enforces this via its owner-only gate; the bot's admin+
+    // gate needs the explicit seller_id check — an admin account may also
+    // carry a seller profile).
+    if seller_id == user_id {
+        bot.send_message(
+            chat_id,
+            "You may not approve a payout that benefits your own seller account.",
+        )
+        .await?;
+        return Ok(());
+    }
+    if status == "paid" {
+        bot.send_message(chat_id, format!("Payout #{} is already executed.", id))
+            .await?;
+        return Ok(());
+    }
+    if status != "pending" && status != "approved" {
+        bot.send_message(
+            chat_id,
+            format!("Cannot approve payout #{} in status '{}'.", id, status),
+        )
+        .await?;
+        return Ok(());
+    }
+    let already_approved = status == "approved";
+    db.set_payout_status(id, "approved");
+    let meta = serde_json::json!({
+        "amount": amount, "asset": asset, "destination": destination,
+    })
+    .to_string();
+    db.log_action(
+        user_id,
+        audit_role_str(role),
+        "payout_approve",
+        "payout",
+        id,
+        Some(&meta),
+    );
+    if already_approved {
+        bot.send_message(
+            chat_id,
+            format!(
+                "Payout #{} was already approved. Approval recorded. Execute the transfer from the web console Finance page or REST (the bot does not move money).",
+                id
+            ),
+        )
+        .await?;
+    } else {
+        bot.send_message(
+            chat_id,
+            format!(
+                "Payout #{} approved. Execute the transfer from the web console Finance page or REST (the bot does not move money).",
+                id
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tracing::instrument(skip_all)]
 async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
     use teloxide::types::BotCommand;
     let cmds = vec![
@@ -1949,16 +3025,22 @@ async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
         BotCommand::new("setup", "Easy seller setup"),
         BotCommand::new("becomeseller", "Become a seller"),
         BotCommand::new("ai", "AI generate content"),
+        BotCommand::new("aipost", "AI-assisted post"),
+        BotCommand::new("refundapprove", "Approve a pending refund"),
+        BotCommand::new("payoutapprove", "Approve a pending payout"),
     ];
     bot.set_my_commands(cmds).await?;
     bot.set_my_description()
-        .description("Owner-only Telegram channel & crypto management agent.")
+        .description(
+            "Telegram shop: digital products, channel memberships, codes and bookings. Browse /shop — buy with /buy.",
+        )
         .await?;
     bot.set_my_short_description()
         .short_description("Channel & crypto agent")
         .await?;
     Ok(())
 }
+#[tracing::instrument(skip_all)]
 async fn grant_access(
     bot: &Bot,
     channel: &str,
@@ -2112,6 +3194,97 @@ mod tests {
             Some("2026-01-02T00:00:00+00:00".into())
         );
         assert_eq!(parse_schedule_datetime("tomorrow"), None);
+    }
+
+    // ---- resolve_target_channel: seller tenancy on channel-scoped commands ----
+
+    fn chan_cfg() -> Config {
+        Config {
+            bot_token: "0:setup-placeholder".to_string(),
+            owner_id: 1,
+            db_path: String::new(),
+            default_channel: None,
+            crypto_token: None,
+            ai_enabled: false,
+            ai_provider: "openai".to_string(),
+            ai_api_style: "openai".to_string(),
+            ai_base_url: "https://api.openai.com/v1".to_string(),
+            ai_api_key: None,
+            ai_model: "gpt-4o-mini".to_string(),
+            ai_daily_token_budget: None,
+            mcp_owner_token: None,
+        }
+    }
+
+    fn chan_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new(dir.path().join("chan.db").to_str().unwrap()).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn target_channel_seller_locked_to_own() {
+        // A seller may only target their own seller_channel: an explicit
+        // @channel matching their own is accepted, any other channel is
+        // rejected, and the no-channel case fails closed with the
+        // /setchannel hint — with or without an explicit argument.
+        let (_d, db) = chan_db();
+        let cfg = chan_cfg();
+        db.set_seller_channel(7, "@mine");
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 7, false, None),
+            Ok("@mine".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 7, false, Some("@mine".into())),
+            Ok("@mine".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 7, false, Some("@other".into())),
+            Err("You can only target your own channel. Set it with /setchannel.".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 8, false, None),
+            Err("No channel set. Use /setchannel @channel first.".to_string())
+        );
+        assert!(
+            resolve_target_channel(&db, &cfg, 8, false, Some("@other".into())).is_err(),
+            "an unconfigured seller may not pass an explicit channel"
+        );
+    }
+
+    #[test]
+    fn target_channel_admin_keeps_explicit_wins() {
+        // Admin/Owner: the explicit argument wins verbatim (any channel the
+        // bot is a member of), otherwise the channel_of fallback chain —
+        // with the caller's own seller channel still taking precedence over
+        // the global default. Sellers never inherit the global default.
+        let (_d, db) = chan_db();
+        let cfg = chan_cfg();
+        db.set_config("channel", "@global");
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 1, true, Some("@any".into())),
+            Ok("@any".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 1, true, None),
+            Ok("@global".to_string())
+        );
+        // An admin who also owns a seller channel: explicit still wins, and
+        // without an argument their own channel comes before the global.
+        db.set_seller_channel(1, "@mine");
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 1, true, Some("@any".into())),
+            Ok("@any".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 1, true, None),
+            Ok("@mine".to_string())
+        );
+        assert_eq!(
+            resolve_target_channel(&db, &cfg, 9, false, None),
+            Err("No channel set. Use /setchannel @channel first.".to_string())
+        );
     }
 
     // ---- /buy resolution over the (seller_id, name) plan namespace ----
