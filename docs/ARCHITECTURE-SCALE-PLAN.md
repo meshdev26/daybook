@@ -152,6 +152,23 @@ fresh instance.
 | 6 products + delivery | ✅ products/product_grants/migration; /productadd,/products,/productdel,/shop; /buy multiplex; claim branches (bg job, /paid, API) grant→deliver(DM)→finalize; stock atomic; dashboard /products page |
 | 7 tests | ✅ +6 unit + 1 property test |
 
-Deferred to v1.3 as planned: orders-lite (physical fulfillment wizard);
-`send_document` re-send for `digital_file` (text DM with file link/id used
-in v1.2); seller-disambiguation syntax for ambiguous `/buy` names.
+Shipped in v1.3: orders-lite (physical fulfillment: `orders` table, `/orders`,
+`/orderset`, dashboard Orders page) and `send_document` re-send for
+`digital_file` (file_id passthrough, link/text fallback) in `services::deliver`.
+Still deferred: seller-disambiguation syntax for ambiguous `/buy` names.
+
+---
+
+## Implementation record — v1.3 (2026-10-26)
+
+**Status: IMPLEMENTED and gated.** Orders-lite + send_document + MCP server +
+skippable setup/claim/settings/channel manager shipped across commits
+`fa9d44e`, `6277adb`, `e5feaa5`.
+
+| Item | Status |
+|---|---|
+| orders-lite (`orders` table, `/orders`, `/orderset`, dashboard Orders) | ✅ shipped |
+| `send_document` re-send for `digital_file` | ✅ shipped (`services::deliver`) |
+| MCP server (tiered tools, approval gate, audit) | ✅ shipped (`/api/v1/mcp`) |
+| Skippable setup / owner claim / in-console settings / channel manager | ✅ shipped |
+| Seller-disambiguation syntax for ambiguous `/buy` | ⏳ deferred |

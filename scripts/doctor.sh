@@ -68,6 +68,11 @@ PORT="${WEB_PORT:-8080}"
 BIND="${WEB_BIND:-127.0.0.1}"
 CURL_HOST="$BIND"
 [[ "$CURL_HOST" == "0.0.0.0" || "$CURL_HOST" == "*" ]] && CURL_HOST="127.0.0.1"
+# Dashboard base path (WEB_BASE_PATH, parsed from the .env above); empty = root.
+# Same normalization as the app: strip trailing "/"s, require a leading "/".
+BASE="${WEB_BASE_PATH:-}"
+BASE="${BASE%/}"
+case "$BASE" in /*) ;; *) BASE="" ;; esac
 
 # --- data ---------------------------------------------------------------
 DATA="${DATABASE_DIR:-}"
@@ -107,7 +112,7 @@ if command -v curl >/dev/null; then
     rm -f "$CFG"
   fi
   CODE="$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
-    "http://${CURL_HOST}:${PORT}/login" 2>/dev/null || echo 000)"
+    "http://${CURL_HOST}:${PORT}${BASE}/login" 2>/dev/null || echo 000)"
   case "$CODE" in
     200|301|302|303) ok "dashboard: responding (HTTP $CODE) on :$PORT" ;;
     000) [[ -n "$BIN" ]] && { warn "dashboard: not running on :$PORT"; hint "make run / systemctl start telegram-agent"; } ;;

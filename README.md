@@ -18,9 +18,10 @@ An **owner-only** Telegram bot that:
 - `/gencodes plan | count` generates activation codes.
 
 ### Two modes
-- **Public (user side)**: any user can `/start`, browse `/plans`, `/buy`, `/paid`, `/redeem`.
+- **Public (user side)**: any user can `/start`, browse `/plans` and `/shop`, `/buy`, `/paid`, `/redeem`, plus `/services` and `/book`.
 - **Admin (server side)**: sellers/admins manage their own channels, plans, codes, broadcasts.
 - `/broadcast <text>` sends a message to a seller's customers (admin: all users).
+- Owner/admin approve refunds and payouts from the bot: `/refundapprove <id>`, `/payoutapprove <id>` (approve only — transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation).
 
 ### Channel management (multi-channel)
 - `/channels` — list known channels.
@@ -97,7 +98,7 @@ The token maps to the **Owner** principal. Tools are tiered so AI use stays safe
 |------|-------|----------|
 | Read | `list_channels`, `list_plans`, `list_posts`, `subs_report`, `list_codes` | Direct; PII and activation codes **masked by default** |
 | Write | `publish_post`, `edit_post` | Direct; every call audited |
-| Sensitive | `gen_codes`, `delete_post`, `broadcast` | **Never execute on the AI's say-so**: the call parks a pending approval and the AI is told to wait; **you** approve via `/approve <id>` in the bot (owner-only, 15-minute expiry). Generated codes are delivered to your Telegram chat — never into the AI's transcript |
+| Sensitive | `gen_codes`, `delete_post`, `broadcast`, `ai_publish_post` | **Never execute on the AI's say-so**: the call parks a pending approval and the AI is told to wait; **you** approve via `/approve <id>` in the bot (owner-only, 15-minute expiry). Generated codes are delivered to your Telegram chat — never into the AI's transcript |
 
 Every tool call and every approve/deny is written to the `mcp_audit` table.
 

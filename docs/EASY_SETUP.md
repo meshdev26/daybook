@@ -23,10 +23,10 @@ encrypted-at-rest placeholders if env is unavailable.
 - Form collects: bot token, owner ID, default channel, crypto token, dashboard username/password.
 - On submit:
   - Validate bot token via `https://api.telegram.org/bot<token>/getMe`.
-  - Write `.env` atomically with mode 0600 (secrets remain in env file, NOT DB).
+  - Write `.env` atomically: the content is staged in a sibling temp file created with mode 0600, then renamed over the target (secrets remain in env file, NOT DB).
   - Seed owner web account + default channel in DB.
   - Show "restart required" page (auto-restart under Docker/systemd).
-- Security: no secrets written to DB; `.env` chmod 600; rate-limit setup endpoint.
+- Security: no secrets written to DB; `.env` chmod 600. Rate-limiting the setup endpoint: ⏳ future (not yet implemented — `/setup` is gated only by the setup-done flag).
 
 ## Phase 2 — Setup-mode runtime (main.rs)
 - Boot DB and web server even when unconfigured.
@@ -46,12 +46,17 @@ encrypted-at-rest placeholders if env is unavailable.
 - Writes `.env` (mode 600), creates data dir.
 - Optional: cargo build --release and/or docker compose up -d --build.
 
-## Phase 5 — Hardening & UX (future)
+## Phase 5 — Hardening & UX (partially shipped in v1.3.x)
 - Encrypt secrets at rest in DB if env cannot be used (AES-256-GCM with key from `MASTER_KEY`
-  env/volume), never plaintext.
-- Auto-restart after wizard (process exit code 0 under Docker/systemd).
-- In-app "Settings" page to rotate tokens (rewrites .env + prompts restart).
-- Backup/restore helper for `data/` volume.
+  env/volume), never plaintext. ⏳ future.
+- Auto-restart after wizard (process exit code 0 under Docker/systemd). ⏳ future.
+- In-app "Settings" page to rotate tokens (rewrites .env + prompts restart). ✅ shipped
+  (`/settings`, owner-only; bot token write-only, owner ID, default channel, Crypto Pay token,
+  dashboard password; reuses the setup env writer).
+- Backup/restore helper for `data/` volume. ✅ shipped (`scripts/backup.sh`, `make backup`,
+  WAL-safe `sqlite3 .backup`).
+- Skippable setup + owner claim mode + managed channels (v1.3.x). ✅ shipped
+  (see `PLAN.md` v1.3.x).
 
 ## Concrete file changes
 - `src/config.rs`: `from_env()` -> `Self` (no hard failure), `is_configured()`, defaults, helpers.

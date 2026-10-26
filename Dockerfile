@@ -2,6 +2,7 @@
 FROM rust:1.98 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml ./
 COPY vendor ./vendor
 COPY src ./src
 COPY schema.sql ./

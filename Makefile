@@ -84,6 +84,10 @@ uninstall: ## Remove the installed service (keeps data)
 backup: ## Back up the database safely (WAL-aware)
 	bash scripts/backup.sh
 
+.PHONY: restore
+restore: ## Restore the database from a backup (args via RESTORE_ARGS='...')
+	bash scripts/restore.sh $(RESTORE_ARGS)
+
 .PHONY: dist-clean
 dist-clean: ## Remove build bundles in dist/
 	rm -rf dist

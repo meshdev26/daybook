@@ -87,9 +87,24 @@ if [[ "$ACTION" == "status" ]]; then
   else
     echo "service:    systemd not present"
   fi
+  # Base path the dashboard is served under. Parsed from the .env without
+  # shell-sourcing it (a crafted file must not execute) — same rule as
+  # doctor.sh. Normalized: strip trailing "/"s, require a leading "/".
+  BASE_PATH=""
+  for f in "$PREFIX/.env" "$ROOT/.env" "/etc/telegram-agent/env"; do
+    [[ -f "$f" ]] || continue
+    while IFS='=' read -r k v || [[ -n "$k" ]]; do
+      case "$k" in
+        WEB_BASE_PATH) BASE_PATH="$v" ;;
+      esac
+    done < "$f"
+    if [[ -n "$BASE_PATH" ]]; then break; fi
+  done
+  BASE_PATH="${BASE_PATH%/}"
+  case "$BASE_PATH" in /*) ;; *) BASE_PATH="" ;; esac
   command -v curl >/dev/null && curl -s -o /dev/null --max-time 3 \
-    -w "dashboard:  HTTP %{http_code} at http://127.0.0.1:${PORT}/login\n" \
-    "http://127.0.0.1:${PORT}/login" || echo "dashboard:  not reachable on :$PORT"
+    -w "dashboard:  HTTP %{http_code} at http://127.0.0.1:${PORT}${BASE_PATH}/login\n" \
+    "http://127.0.0.1:${PORT}${BASE_PATH}/login" || echo "dashboard:  not reachable on :$PORT"
   exit 0
 fi
 

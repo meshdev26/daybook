@@ -46,7 +46,8 @@ This design system is informed by two lenses:
 ### Design system at scale
 - Single source of truth: tokens (color, spacing, type).
 - Component library shared between bot (inline keyboards) and web.
-- Theming: light (default), dark (future).
+- Theming: light (default), dark (shipped — `[data-theme="dark"]` plus
+  `prefers-color-scheme` auto).
 
 ### Product strategy
 - **North star**: time-to-first-sale < 10 minutes.
@@ -61,16 +62,19 @@ This design system is informed by two lenses:
 
 ---
 
-## 3. Design Philosophy (Apple-inspired)
-Clean, minimal, calm, and obvious. Generous whitespace, precise typography,
-subtle depth, single clear action per screen.
+## 3. Design Philosophy (operator's ledger)
+Calm, confident, helpful — never loud. One idea carries the identity: the
+operator's ledger — a commerce back-office set like a well-kept financial
+book. Borders lead, shadows whisper, figures sit in mono, status is a dot
+before a word. No hover-lift theatre, no gradient washes. Generous
+whitespace, precise typography, subtle depth, single clear action per screen.
 
 ## 4. Tokens
 
 ### Typography (Senior UX + CDO)
-- **Font stack**: `-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "Segoe UI", Roboto, sans-serif`. System fonts only — no external font downloads (fast, private, native feel).
-- **CDO rationale**: native system fonts build trust and reduce load time; aligns with Apple/Google/Microsoft platforms.
-- **Senior UX rationale**: system fonts match user's OS, improving readability and accessibility; no FOUT/FOIT.
+- **Font stack (UI)**: `"Plex Sans", -apple-system, "Segoe UI", "Helvetica Neue", sans-serif` (bundled variable woff2, latin subset). **Data/mono**: `"Plex Mono", ui-monospace, "SF Mono", Menlo, monospace` for figures, ids, and code. No system-font-only claim: the operator console ships bundled Plex fonts from the binary (no CDN).
+- **CDO rationale**: bundled Plex fonts keep the ledger aesthetic consistent across OSes; served from the binary (no CDN, no FOUT beyond `font-display: swap`).
+- **Senior UX rationale**: Plex Sans/Mono are highly legible at small sizes; mono figures aid scanning amounts and ids.
 - **Type scale** (modular 1.25):
   - Display: 34px / 600 / 1.1
   - H1: 28px / 600 / 1.2
@@ -83,26 +87,29 @@ subtle depth, single clear action per screen.
 - **Line length**: max 65ch for readability.
 - **Letter spacing**: -0.02em for headings, 0 for body, 0.05em for captions.
 
-### Color
-- Background: `#f5f5f7`
-- Surface: `#ffffff`
-- Text primary: `#1d1d1f`
-- Text secondary: `#6e6e73`
-- Accent: `#0071e3`
-- Destructive: `#ff3b30`
-- Success: `#34c759`
-- Border: `#d2d2d7`
+### Color (ledger-green; tokens in `assets/app.css`)
+Light:
+- Background (paper): `#F4F6F3` (`--bg`)
+- Surface: `#FFFFFF` (`--surface`); recessed `#FAFBF9` (`--surface-2`)
+- Text primary (ink): `#17201C` (`--ink`)
+- Text secondary: `#57645C` (`--ink-2`); faint `#7E8A82` (`--ink-3`)
+- Brand (deep billiard green): `#1E6B52` (`--brand`); hover `#175542`; ink `#F1F7F3`
+- Status: ok `#1E6B52`; warn `#8A5A12`; danger (brick) `#A6392F`
+- Border (hairline): `#DEE3DC` (`--line`); strong `#C4CCC3`
+Dark (`[data-theme="dark"]` / `prefers-color-scheme: dark`): background `#101512`, surface `#171D19`, ink `#E8EDE8`, brand `#4FBE8F`, warn `#D9A94F`, danger `#E07A6E`. All pairs WCAG 2.1 AA (checked in `app.css` header).
 
 ### Spacing (8px grid)
 xs 4, sm 8, md 16, lg 24, xl 32, xxl 48.
 
 ## 5. Components
-- **Card**: white, 16px radius, subtle shadow, 24px padding.
-- **Button primary**: blue fill, white text, 10px radius.
-- **Button secondary**: transparent, blue text.
-- **Input**: 10px radius, 1px border, focus ring blue.
-- **Nav**: minimal text links.
+- **Card/panel**: white surface, 10px radius, 1px hairline border, 20px padding, no shadow.
+- **Button primary**: brand fill, brand-ink text, 7px radius.
+- **Button secondary**: surface fill, ink text, hairline border.
+- **Input**: 7px radius, 1px border (strong), focus ring brand.
+- **Nav**: minimal text links; active = brand tint.
 - **Table**: subtle dividers, generous padding.
+- **Badge/status**: dot before word; success/warn/danger tints.
+- **Stat (metric card)**: `.stat` column with `.stat-value` (24px Plex Mono, tabular figures, weight 600, ink) and `.stat-label` (12px ink-2). Container reuses `.panel`. Used for AI usage, subscription counts, dashboard metrics.
 
 ## 6. Motion
 - 200ms ease transitions.

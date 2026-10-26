@@ -135,6 +135,7 @@ smoke tests.
 
 **Known deferred** (recorded, not lost): seller-scope middleware for the
 remaining `/edit`-family bot commands relies on Telegram-side rights (B5
-partial); plan namespace `(seller, name)` global-lookup fix (P1) pending;
-`Mutex<Connection>` pooling decision (v2, decision 4); api.rs ownership move
-to L7 (decision 1, after services extraction); docs dedupe (L4).
+partial); plan namespace `(seller, name)` global-lookup fix (P1) ✅ retired
+in v1.2 (`get_plan_global` callers removed); `Mutex<Connection>` pooling
+decision (v2, decision 4); api.rs ownership move to L7 (decision 1, after
+services extraction); docs dedupe (L4).

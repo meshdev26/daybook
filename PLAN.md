@@ -27,14 +27,28 @@ Docs: `ARCHITECTURE.md` (system map), `AGENT.md` (handbook + decision log),
 `AUTO_ROUTE.md` (routing), `docs/ARCHITECTURE-SCALE-PLAN.md` (fullness audit,
 gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`.
 
+**2026-10-27 addenda:** `/refundapprove` and `/payoutapprove` bot commands
+(owner/admin, approve-only — execution stays on the console Finance page /
+REST execute endpoint); the seller AI-settings endpoints
+(`GET/POST /sellers/{user_id}/ai-settings`) and the code-redemptions endpoint
+(`GET /codes/{code}/redemptions`) are implemented; new web API-keys page
+(`/keys`); `[@channel]` commands now enforce seller channel ownership (a
+seller can target only their own channel, never the global default).
+Same-day security-remediation wave: CAS-guarded money transfers (`executing`
+claim state, ambiguous-failure semantics, attempt/ambiguous audit events),
+REST MFA parity (`POST /auth/mfa/verify` pending-token exchange), channel
+binding proof-of-control, security-headers middleware, and a WCAG AA floor in
+the console (contrast tokens, labelled controls, skip link).
+
 ## Next milestones
 
 ### Product roadmap (from product review, 2026-10-25 — adoption-ranked)
 1. **Front door (blocking):** push to GitHub + tag; README screenshots, 60-second
    intro, demo. A product without a front door is a private project.
-2. **Owner approvals in Telegram (the one next feature):** `/refundapprove`,
+2. **Owner approvals in Telegram ✅ shipped (approve-only):** `/refundapprove`,
    `/payoutapprove` bot commands (owner/admin-gated) — money decisions belong
-   where the owner lives, on their phone, not only in the web API.
+   where the owner lives, on their phone. Approval only: the transfer itself
+   is executed from the web console Finance page or the REST execute endpoint.
 3. **Empty-state onboarding:** first-login checklist (create first product →
    test-buy → verify delivery); measure time-to-first-sale (<10 min target).
 4. **Trust pack:** public security summary, changelog automation, versioned
@@ -49,7 +63,7 @@ gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`
 - Remove legacy `/process` refund endpoints (S). Changelog automation (S).
 - First real-world pilot: one bot, one channel, one digital + one physical
   product, one refund, backup-restore drill.
-- **MCP server (v1.3.x, in progress).** The fourth thin interface over the
+- **MCP server (v1.3.x) ✅ shipped.** The fourth thin interface over the
   domain core: a hand-rolled MCP (JSON-RPC) endpoint at `POST /api/v1/mcp`
   inside the existing axum router — zero new dependencies, same `WebState`
   (db + cfg + bot). Designed AI-first, because the primary caller is an
@@ -78,7 +92,7 @@ gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`
   - Verification: in-process axum oneshot tests (no network, no real bot) —
     auth, protocol methods, tier annotations, masking, the full
     approval lifecycle, audit rows.
-- **Setup becomes skippable; configuration moves in-console (v1.3.x).**
+- **Setup becomes skippable; configuration moves in-console (v1.3.x) ✅ shipped.**
   The first-run wall is wrong for a product whose bot can also be
   configured later. New flow, security floor intact (B2 semantics):
   1. `/setup` gains **Skip for now** — it sets `setup_done=1` and creates
@@ -105,6 +119,16 @@ gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`
   - Orchestration: L9 core/data (semantics, claim code, channels store,
     env-writer extraction) + L7 web (skip, claim UI, settings, channels
     manager); bot command surface unchanged in v1.
+
+### v1.3.x shipped addenda
+
+- **Orders-lite (v1.3) ✅ shipped.** Physical product purchases create an `orders`
+  row; `/orders` lists (seller-scoped) and `/orderset <order_id> <status> [tracking]`
+  updates status (`pending|shipped|delivered|refunded|cancelled`) with optional
+  tracking; web dashboard **Orders** page.
+- **send_document delivery (v1.3) ✅ shipped.** `digital_file` products now re-send
+  the actual Telegram document via `send_document` when the payload is a `file_id`
+  (link/text payloads fall back to a message); see `services::deliver`.
 
 ### v2 (trigger-driven)
 - Bookings: services/slots/bookings reusing the invoice pipeline.
