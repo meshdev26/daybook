@@ -36,6 +36,60 @@ use crate::roles;
 use crate::web::WebState;
 use tools::{Principal, Tier};
 
+// v2 per-seller MCP tokens (not yet wired into auth). Reserved for the
+// future per-seller bearer-token flow; `authenticate` still uses
+// `MCP_OWNER_TOKEN`.
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone)]
+pub struct McpToken {
+    pub id: i64,
+    pub seller_id: i64,
+    pub name: Option<String>,
+    pub revoked: bool,
+    pub expires_at: Option<String>,
+}
+
+impl McpToken {
+    pub fn lookup(db: &crate::db::Db, token: &str) -> Option<Self> {
+        lookup_mcp_token(db, token)
+    }
+}
+
+pub fn lookup_mcp_token(db: &crate::db::Db, token: &str) -> Option<McpToken> {
+    let hash = {
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        let bytes = h.finalize();
+        let mut s = String::with_capacity(64);
+        for b in bytes.iter() {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    };
+    let (id, seller_id, name, revoked, expires_at) = db.get_mcp_token_by_hash(&hash)?;
+    if revoked != 0 {
+        return None;
+    }
+    if let Some(exp) = &expires_at
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp)
+        && dt.with_timezone(&chrono::Utc) < chrono::Utc::now()
+    {
+        return None;
+    }
+    Some(McpToken {
+        id,
+        seller_id,
+        name,
+        revoked: false,
+        expires_at,
+    })
+}
+
+pub fn lookup_token(db: &crate::db::Db, token: &str) -> Option<McpToken> {
+    lookup_mcp_token(db, token)
+}
+
 // JSON-RPC 2.0 error codes (reserved range).
 const CODE_PARSE: i64 = -32700;
 const CODE_METHOD: i64 = -32601;
@@ -546,6 +600,7 @@ mod tests {
             crypto_token: None,
             ai_enabled: false,
             ai_provider: "openai".to_string(),
+            ai_api_style: "openai".to_string(),
             ai_base_url: "https://api.openai.com/v1".to_string(),
             ai_api_key: None,
             ai_model: "gpt-4o-mini".to_string(),
@@ -557,6 +612,7 @@ mod tests {
             cfg,
             bot: teloxide::Bot::new("0:setup-placeholder"),
             login_attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
             base_path: String::new(),
         };
         (state, dir)
@@ -763,7 +819,7 @@ mod tests {
                 "publish_post" | "edit_post" => {
                     assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
                 }
-                "gen_codes" | "delete_post" | "broadcast" => {
+                "gen_codes" | "delete_post" | "broadcast" | "ai_publish_post" => {
                     assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
                     assert_eq!(annotations["destructiveHint"], true, "{}", t["name"]);
                     assert_eq!(annotations["x-approval-required"], true, "{}", t["name"]);
@@ -782,6 +838,7 @@ mod tests {
             "gen_codes",
             "delete_post",
             "broadcast",
+            "ai_publish_post",
         ] {
             assert!(names.contains(expected), "missing tool {expected}");
         }
@@ -811,7 +868,7 @@ mod tests {
     async fn list_codes_are_masked_on_the_read_path() {
         let (state, _dir) = mcp_state(Some(TOKEN));
         state.db.set_config("channel", "@chan");
-        let full = state.db.create_code(1, None, Some(30), 1, None);
+        let full = state.db.create_code(1, None, Some(30), 1, None, 12);
         let app = router(state.clone());
         let (_, v) = call(
             &app,
@@ -979,7 +1036,7 @@ mod tests {
         let result = result_text(&v);
         assert_eq!(result["requires_approval"], true);
         assert!(result["approval_id"].as_i64().unwrap() > 0);
-        assert_eq!(result["expires_at"].as_str().is_some(), true);
+        assert!(result["expires_at"].as_str().is_some());
         let how = result["how"].as_str().unwrap();
         assert!(how.contains("/approve"), "{how}");
         // No codes exist yet: the call path never executes.

@@ -212,7 +212,8 @@ pub fn registry() -> &'static [ToolSpec] {
                         "count": {"type": "integer", "minimum": 1, "maximum": MAX_CODES},
                         "days": {"type": "integer", "minimum": 1,
                                  "description": "Validity in days (when the code is not plan-bound)."},
-                        "max_uses": {"type": "integer", "minimum": 1, "default": 1}
+                        "max_uses": {"type": "integer", "minimum": 1, "default": 1},
+                        "length": {"type": "integer", "minimum": 1, "maximum": 32, "default": 12}
                     },
                     "required": ["count"]
                 }),
@@ -254,6 +255,23 @@ pub fn registry() -> &'static [ToolSpec] {
                                     "x-approval-required": true}),
                 validate: validate_broadcast,
                 handler: park_fn("broadcast"),
+            },
+            ToolSpec {
+                name: "ai_publish_post",
+                description: "Publish an AI-generated post draft to its channel. Requires \
+                              owner approval.",
+                tier: Tier::Sensitive,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["draft_id"]
+                }),
+                annotations: json!({"readOnlyHint": false, "destructiveHint": true,
+                                    "x-approval-required": true}),
+                validate: validate_ai_publish_post,
+                handler: park_fn("ai_publish_post"),
             },
         ]
     })
@@ -351,6 +369,12 @@ fn validate_gen_codes(args: &Value) -> Result<(), String> {
     {
         return Err("'max_uses' must be >= 1".into());
     }
+    if let Some(v) = get_int(args, "length")? {
+        let l = v.as_i64().unwrap_or(0);
+        if !(1..=32).contains(&l) {
+            return Err("'length' must be between 1 and 32".into());
+        }
+    }
     Ok(())
 }
 
@@ -363,6 +387,17 @@ fn validate_delete_post(args: &Value) -> Result<(), String> {
 
 fn validate_broadcast(args: &Value) -> Result<(), String> {
     validate_text_field(args, "text")
+}
+
+fn validate_ai_publish_post(args: &Value) -> Result<(), String> {
+    if get_int(args, "draft_id")?.is_none() {
+        return Err("missing required integer argument 'draft_id'".into());
+    }
+    let id = args.get("draft_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if id < 1 {
+        return Err("'draft_id' must be >= 1".into());
+    }
+    Ok(())
 }
 
 // ---- Helpers shared by handlers ----
@@ -497,7 +532,7 @@ async fn subs_report(state: WebState, principal: Principal, args: Value) -> Resu
 }
 
 async fn list_codes(state: WebState, principal: Principal, args: Value) -> Result<Value, String> {
-    // CodeListRow: (code, plan_id, value_days, uses, max_uses, seller_id)
+    // CodeListRow: (code, plan_id, value_days, uses, max_uses, seller_id, revoked)
     let items: Vec<Value> = state
         .db
         .list_codes(principal.seller_id, list_limit(&args))
@@ -505,7 +540,7 @@ async fn list_codes(state: WebState, principal: Principal, args: Value) -> Resul
         .map(|c| {
             json!({
                 "code": mask_code(&c.0), "plan_id": c.1, "value_days": c.2,
-                "uses": c.3, "max_uses": c.4, "seller_id": c.5,
+                "uses": c.3, "max_uses": c.4, "seller_id": c.5, "revoked": c.6,
             })
         })
         .collect();
@@ -538,6 +573,7 @@ async fn publish_post(state: WebState, principal: Principal, args: Value) -> Res
         .await
     {
         Ok(sent) => {
+            crate::metrics::bot_sent();
             let seller_id = principal.seller_id.unwrap_or(0);
             let _ = state
                 .db
@@ -578,12 +614,17 @@ async fn exec_gen_codes(
         .and_then(|v| v.as_i64())
         .map(|d| d.clamp(1, crate::handlers::commands::MAX_PLAN_DAYS));
     let max_uses = args.get("max_uses").and_then(|v| v.as_i64()).unwrap_or(1);
+    let length = args
+        .get("length")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(12)
+        .clamp(1, 32) as usize;
     let seller_id = principal.seller_id.unwrap_or(0);
     let codes: Vec<String> = (0..count)
         .map(|_| {
             state
                 .db
-                .create_code(seller_id, plan_id, days, max_uses, None)
+                .create_code(seller_id, plan_id, days, max_uses, None, length)
         })
         .collect();
     Ok(json!({
@@ -630,6 +671,41 @@ async fn exec_broadcast(
     Ok(json!({"sent": sent, "total": total}))
 }
 
+async fn exec_ai_publish_post(
+    state: WebState,
+    _principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let draft_id = args.get("draft_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let draft = state
+        .db
+        .get_ai_post_draft(draft_id)
+        .ok_or_else(|| "draft not found".to_string())?;
+    let (_id, seller_id, channel, _template, content, _status, _c, _u, _m) = draft;
+    match state
+        .bot
+        .send_message(crate::util::to_chat_id(&channel), content.clone())
+        .await
+    {
+        Ok(sent) => {
+            crate::metrics::bot_sent();
+            let _ = state
+                .db
+                .log_post(seller_id, &channel, sent.id.0, "text", Some(&content));
+            let _ = state
+                .db
+                .mark_ai_post_draft_published(draft_id, sent.id.0 as i64);
+            Ok(json!({
+                "ok": true,
+                "draft_id": draft_id,
+                "message_id": sent.id.0,
+                "channel": channel
+            }))
+        }
+        Err(e) => Err(format!("send failed: {e}")),
+    }
+}
+
 /// Execute an approved sensitive tool. This is the ONLY path that runs the
 /// sensitive executors, and it re-runs the tool's own validator first so the
 /// approval replay can never drift from what the call path would have done.
@@ -648,6 +724,7 @@ pub async fn execute_sensitive(
         "gen_codes" => exec_gen_codes(state, principal.clone(), args).await,
         "delete_post" => exec_delete_post(state, principal.clone(), args).await,
         "broadcast" => exec_broadcast(state, principal.clone(), args).await,
+        "ai_publish_post" => exec_ai_publish_post(state, principal.clone(), args).await,
         other => Err(format!("no executor for tool '{other}'")),
     }
 }

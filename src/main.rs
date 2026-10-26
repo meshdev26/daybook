@@ -55,6 +55,39 @@ fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
     attempts
 }
 
+/// Security headers on every response of the merged router (L10). All values
+/// are static, so `HeaderValue::from_static` is valid for each. Applied
+/// outside the request-timeout layer so aborted requests still carry them;
+/// the metrics layer stays outermost so those responses are still counted.
+async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderName, HeaderValue, header};
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        ),
+    );
+    resp
+}
+
 #[tokio::main]
 async fn main() {
     config::load_dotenv();
@@ -65,6 +98,125 @@ async fn main() {
     metrics::note_process_start();
 
     let cfg = Config::from_env();
+    // CLI recovery subcommand: `telegram-agent reset-owner ...`. Handled
+    // before any server/bot startup so it works in setup mode (missing
+    // bot token / .env). Exits the process when invoked.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let cmd_idx = if args.get(1).map(String::as_str) == Some("reset-owner") {
+            Some(1usize)
+        } else if args.first().map(String::as_str) == Some("reset-owner") {
+            Some(0usize)
+        } else {
+            None
+        };
+        if let Some(ci) = cmd_idx {
+            // parse flags
+            let mut print_claim = false;
+            let mut delete_owner = false;
+            let mut username: Option<String> = None;
+            let mut password: Option<String> = None;
+            let mut i = ci + 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--print-claim-code" => {
+                        print_claim = true;
+                        i += 1;
+                    }
+                    "--delete-owner" => {
+                        delete_owner = true;
+                        i += 1;
+                    }
+                    "--username" => {
+                        if i + 1 < args.len() {
+                            username = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--password" => {
+                        if i + 1 < args.len() {
+                            password = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+
+            let db = match Db::new(&cfg.db_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("DB error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if delete_owner {
+                let code = db.delete_owners_and_mint_claim_code();
+                db.log_action(
+                    0,
+                    "system",
+                    "owner_reset",
+                    "owner",
+                    "all",
+                    Some("delete-owner"),
+                );
+                eprintln!("{}", code);
+                std::process::exit(0);
+            }
+
+            if let Some(uname) = username {
+                let pw = match password {
+                    Some(p) if !p.is_empty() => p,
+                    _ => {
+                        let g = util::gen_token(16);
+                        eprintln!("{}", g);
+                        g
+                    }
+                };
+                match db.reset_owner_account(&uname, &pw).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("reset failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                db.log_action(
+                    0,
+                    "system",
+                    "owner_reset",
+                    "owner",
+                    &uname,
+                    Some("password_reset"),
+                );
+                std::process::exit(0);
+            }
+
+            if print_claim {
+                let code = if db.owner_account_exists() {
+                    db.claim_code()
+                } else {
+                    db.ensure_claim_code()
+                };
+                match code {
+                    Some(c) => eprintln!("{}", c),
+                    None => eprintln!("No claim code available."),
+                }
+                std::process::exit(0);
+            }
+
+            // No recognized mode.
+            eprintln!(
+                "Usage: telegram-agent reset-owner [--print-claim-code] [--delete-owner] [--username X --password Y]"
+            );
+            std::process::exit(2);
+        }
+    }
+
     if !cfg.is_configured() {
         eprintln!("Setup mode: open the web UI to configure (bot token / owner id missing).");
     }
@@ -129,27 +281,39 @@ async fn main() {
         .map(Arc::new);
 
     let ai_service: Option<Arc<ai::AiService>> = if cfg.ai_enabled {
-        let provider: Arc<dyn ai::AiProvider> = match cfg.ai_provider.as_str() {
+        let provider: Option<Arc<dyn ai::AiProvider>> = match cfg.ai_api_style.as_str() {
             "anthropic" => {
                 let key = cfg.ai_api_key.clone().unwrap_or_default();
-                Arc::new(ai::anthropic::AnthropicProvider::new(key))
+                let base = cfg.ai_base_url.clone();
+                match ai::anthropic::AnthropicProvider::new(base, key) {
+                    Ok(p) => Some(Arc::new(p) as Arc<dyn ai::AiProvider>),
+                    Err(e) => {
+                        eprintln!("failed to build anthropic provider: {}", e);
+                        None
+                    }
+                }
             }
             _ => {
                 let key = cfg.ai_api_key.clone().unwrap_or_default();
-                Arc::new(ai::openai::OpenAiProvider::new(
-                    cfg.ai_base_url.clone(),
-                    key,
-                ))
+                match ai::openai::OpenAiProvider::new(cfg.ai_base_url.clone(), key) {
+                    Ok(p) => Some(Arc::new(p) as Arc<dyn ai::AiProvider>),
+                    Err(e) => {
+                        eprintln!("failed to build openai provider: {}", e);
+                        None
+                    }
+                }
             }
         };
-        Some(Arc::new(ai::AiService {
-            provider,
-            model: cfg.ai_model.clone(),
-            db: db.clone(),
-            rate_limiter: ai::rate_limit::RateLimiter::new(20),
-            daily_token_budget_global: cfg.ai_daily_token_budget,
-            enabled: true,
-        }))
+        provider.map(|p| {
+            Arc::new(ai::AiService {
+                provider: p,
+                model: cfg.ai_model.clone(),
+                db: db.clone(),
+                rate_limiter: ai::rate_limit::RateLimiter::new(20),
+                daily_token_budget_global: cfg.ai_daily_token_budget,
+                enabled: true,
+            })
+        })
     } else {
         None
     };
@@ -176,13 +340,17 @@ async fn main() {
 
     let owner_id = cfg.owner_id;
 
-    // Auto-selling background processor: verifies pending invoices and grants access.
+    // Auto-selling background processor: verifies pending invoices and grants
+    // access. pending_invoices() feeds the queue: every grantable 'active'
+    // invoice (plan or product; webhook events enqueue via 'active') plus
+    // 'granting' rows stale past the wedged-grant threshold (crash recovery).
     // Each invoice is claimed ('active' -> 'granting') before verification so
     // concurrent granters (this loop, /paid, the claim API) can never
     // double-grant; losers simply skip. Nothing is ever granted without a
-    // verified 'paid' from the provider (fail-closed): unresolvable claims are
-    // either released back to 'active' (not settled) or left 'granting' so the
-    // next cycle retries (pending_invoices() includes 'granting').
+    // verified 'paid' from the provider (fail-closed): a not-settled claim is
+    // released back to 'active', an unresolvable claim (no token, no channel)
+    // either ages out to terminal 'failed' at the attempt cap or is retried
+    // once stale.
     {
         let bot_bg = bot.clone();
         let db_bg = db.clone();
@@ -255,9 +423,11 @@ async fn main() {
                         .iter()
                         .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
                     if !paid {
-                        // Not settled yet: release the claim so future cycles
-                        // (and /paid) re-verify cleanly.
-                        db_bg.update_invoice_status(&inv_id, "active");
+                        // Not settled yet: release the claim ('granting' ->
+                        // 'active') so future cycles (and /paid) re-verify
+                        // cleanly. release_invoice_claim is the sanctioned
+                        // unwinder — never write the release by hand.
+                        db_bg.release_invoice_claim(&inv_id);
                         continue;
                     }
                     // (d-bis) Product invoices: grant the purchase and DM the
@@ -396,18 +566,44 @@ async fn main() {
                         .await
                         .ok()
                         .map(|l| l.invite_link);
-                    if let Some(l) = link {
-                        // Metrics hook only (L8): bot_messages_sent_total on
-                        // the success arm.
-                        match bot_bg
-                            .send_message(
-                                teloxide::types::ChatId(target_user),
-                                format!("Payment confirmed. Access granted.\\nInvite: {}\\nSubscription #{}", l, sub_id),
-                            )
-                            .await
-                        {
-                            Err(e) => tracing::warn!("failed to send grant message: {}", e),
-                            Ok(_) => metrics::bot_sent(),
+                    match link {
+                        Some(l) => {
+                            match bot_bg
+                                .send_message(
+                                    teloxide::types::ChatId(target_user),
+                                    format!(
+                                        "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
+                                        l, sub_id
+                                    ),
+                                )
+                                .await
+                            {
+                                Err(e) => tracing::warn!("failed to send grant message: {}", e),
+                                Ok(_) => metrics::bot_sent(),
+                            }
+                        }
+                        None => {
+                            // Money settled and the subscription row exists,
+                            // but no invite link could be created: still
+                            // finalize (the grant is durable), then tell the
+                            // buyer honestly — never leave them waiting on a
+                            // link that will not come. DM failures are logged,
+                            // never propagated: the sweeper/granter must not
+                            // die on a send error.
+                            match bot_bg
+                                .send_message(
+                                    teloxide::types::ChatId(target_user),
+                                    "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.",
+                                )
+                                .await
+                            {
+                                Err(e) => tracing::warn!(
+                                    "invoice {}: granted without invite link and buyer notice failed: {}",
+                                    inv_id,
+                                    e
+                                ),
+                                Ok(_) => metrics::bot_sent(),
+                            }
                         }
                     }
                     // (f) Terminal: verified paid + granted.
@@ -481,7 +677,9 @@ async fn main() {
         });
     }
     // Expiry sweeper: periodically revoke expired subscriptions (kick + mark)
-    // so lapsed members lose access even if nobody runs /expirecheck.
+    // so lapsed members lose access even if nobody runs /expirecheck. Each
+    // revoked buyer is DM'd the renewal notice; a failed DM is logged and
+    // never propagated — the sweeper must not die on a send error.
     {
         let bot_bg = bot.clone();
         let db_bg = db.clone();
@@ -489,9 +687,42 @@ async fn main() {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
-                let n = expire_subscriptions(&bot_bg, &db_bg).await;
+                let expired = expire_subscriptions(&bot_bg, &db_bg).await;
+                for (_sub_id, uid, channel) in &expired {
+                    match bot_bg
+                        .send_message(
+                            teloxide::types::ChatId(*uid),
+                            format!(
+                                "Your access to {channel} has expired. To renew, use /plans or contact the seller."
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(_) => metrics::bot_sent(),
+                        Err(e) => tracing::warn!(
+                            "expiry sweeper: failed to DM user {} about expired access to {}: {}",
+                            uid,
+                            channel,
+                            e
+                        ),
+                    }
+                }
+                if !expired.is_empty() {
+                    tracing::info!("expiry sweeper revoked {} subscriptions", expired.len());
+                }
+            }
+        });
+    }
+    // Held-slot sweeper: release booking holds that expired.
+    {
+        let db_bg = db.clone();
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+                let n = db_bg.expire_held_bookings();
                 if n > 0 {
-                    tracing::info!("expiry sweeper revoked {} subscriptions", n);
+                    tracing::info!("held-slot sweeper expired {} bookings", n);
                 }
             }
         });
@@ -506,6 +737,12 @@ async fn main() {
     let cfg_photo = cfg.clone();
     let db_crypto = db.clone();
     let cfg_crypto = cfg.clone();
+    let db_ai_confirm = db.clone();
+    let cfg_ai_confirm = cfg.clone();
+    let db_ai_edit = db.clone();
+    let cfg_ai_edit = cfg.clone();
+    let db_cb = db.clone();
+    let cfg_cb = cfg.clone();
 
     // Plugin commands registered at startup (see handlers::registry). The
     // binary registers only the MCP approval commands (/approvals, /approve,
@@ -520,6 +757,7 @@ async fn main() {
         login_attempts: std::sync::Arc::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
+        ai_test_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         base_path: base.clone(),
     };
     let mut registry = CommandRegistry::new();
@@ -579,6 +817,36 @@ async fn main() {
                         async move { handlers::messages::awaiting_photo_handler(bot, msg, dialogue, db, cfg).await }
                     },
                 ))
+                .branch(dptree::case![State::AwaitingAiPostConfirm { draft_id }].endpoint(
+                    move |bot: Bot,
+                          msg: Message,
+                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                          draft_id: i64| {
+                        let db = db_ai_confirm.clone();
+                        let cfg = cfg_ai_confirm.clone();
+                        async move {
+                            handlers::messages::awaiting_ai_post_confirm_handler(
+                                bot, msg, dialogue, db, cfg, draft_id,
+                            )
+                            .await
+                        }
+                    },
+                ))
+                .branch(dptree::case![State::AwaitingAiPostEdit { draft_id }].endpoint(
+                    move |bot: Bot,
+                          msg: Message,
+                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                          draft_id: i64| {
+                        let db = db_ai_edit.clone();
+                        let cfg = cfg_ai_edit.clone();
+                        async move {
+                            handlers::messages::awaiting_ai_post_edit_handler(
+                                bot, msg, dialogue, db, cfg, draft_id,
+                            )
+                            .await
+                        }
+                    },
+                ))
                 // Catch-all for the remaining dialogue state (CryptoInvoice):
                 // dptree's case! cannot bind struct-variant fields, and Idle/
                 // AwaitingPhoto are handled above, so whatever falls through
@@ -599,7 +867,21 @@ async fn main() {
                     ),
                 ),
         )
-        .branch(Update::filter_callback_query().endpoint(handlers::callbacks::callback_handler));
+        .branch(
+            Update::filter_callback_query()
+                .enter_dialogue::<CallbackQuery, ErasedStorage<State>, State>()
+                .branch(dptree::endpoint(
+                    move |bot: Bot,
+                          q: CallbackQuery,
+                          dialogue: Dialogue<State, ErasedStorage<State>>| {
+                        let db = db_cb.clone();
+                        let cfg = cfg_cb.clone();
+                        async move {
+                            handlers::callbacks::callback_handler(bot, q, dialogue, db, cfg).await
+                        }
+                    },
+                )),
+        );
 
     // Inject dependencies.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
@@ -620,6 +902,10 @@ async fn main() {
             // is two DB writes, so nothing legitimate needs longer (see
             // web::REQUEST_TIMEOUT).
             .layer(axum::middleware::from_fn(web::request_timeout))
+            // Security headers on every response (L10): outside the timeout
+            // layer so aborted requests still carry them; metrics below stays
+            // outermost so those responses are still counted.
+            .layer(axum::middleware::from_fn(security_headers))
             // HTTP metrics outermost, so requests aborted by the timeout
             // layer are still counted (status_class="5xx"); labels come from
             // the matched route template only (see src/metrics.rs).
