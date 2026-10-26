@@ -1,0 +1,12 @@
+# Keep secrets, live data and build junk out of the Docker build context.
+# This also protects selective-COPY forks of the Dockerfile: whatever a fork
+# chooses to COPY, .env and data/ can never be baked into an image layer.
+# (vendor/ is deliberately NOT ignored — the offline build needs it.)
+.env
+.env.*
+data/
+backups/
+target/
+dist/
+.git/
+fuzz/
