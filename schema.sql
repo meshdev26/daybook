@@ -314,14 +314,16 @@ CREATE TABLE IF NOT EXISTS mcp_approvals (
 CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approvals(status);
 
 -- MCP audit: one row per tool-call outcome (ok or err), detail truncated by
--- the insert helper so secrets never land here.
+-- the insert helper so secrets never land here. seller_id records which
+-- seller principal ran the tool (v1.4 D6); owner rows stay NULL.
 CREATE TABLE IF NOT EXISTS mcp_audit (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     tool       TEXT NOT NULL,
     role       TEXT NOT NULL,
     ok         INTEGER NOT NULL,
     detail     TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    seller_id  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at);
 

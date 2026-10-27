@@ -29,6 +29,24 @@ type InvoiceRow = (
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
 
+/// Booking row for the console table and `/mybookings` (L7/L8), adjusted to
+/// the real columns of schema.sql: (bookings.id, bookings.booking_id public
+/// token, buyer user_id, service name, slot starts_at, slot ends_at, status,
+/// expires_at, service seller_id). starts_at/ends_at are None for legacy rows
+/// without a slot; expires_at is None on legacy rows predating the hold
+/// window; seller_id is None only if the service row itself is gone.
+pub type BookingListRow = (
+    i64,            // bookings.id
+    String,         // bookings.booking_id (public 8-char token)
+    i64,            // bookings.user_id (buyer)
+    String,         // services.name
+    Option<String>, // slots.starts_at
+    Option<String>, // slots.ends_at
+    String,         // bookings.status
+    Option<String>, // bookings.expires_at
+    Option<i64>,    // services.seller_id
+);
+
 /// How long an invoice may sit in 'granting' before pending_invoices()
 /// treats the claim as wedged (claimer crashed between
 /// claim_invoice_for_grant and finalize_invoice_paid) and re-queues it for
@@ -36,6 +54,17 @@ pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>)
 /// finalize takes seconds — is never raced, and the claim stamps updated_at
 /// so the clock starts at claim acquisition.
 const WEDGED_GRANT_STALE_MINUTES: i64 = 5;
+/// D3 (ARCHITECTURE-V1.4 §2): the booking hold IS the seller-response window —
+/// `expires_at = min(now + BOOKING_HOLD_MINUTES, slot start)`. Single tuning
+/// point for the whole booking state machine; pub so the bot copy (L8) and
+/// console copy (L7) quote the same number instead of a hardcoded string.
+pub const BOOKING_HOLD_MINUTES: i64 = 60;
+/// TTL in minutes for one-time console setup links (D7): the DM'd link dies
+/// unclaimed after this long.
+pub const SETUP_LINK_TTL_MINUTES: i64 = 15;
+/// Purpose tag one-time setup links carry in `web_pending_mfa.purpose` (D7);
+/// pub because the claim routes (L7) validate the same string on GET/POST.
+pub const SETUP_LINK_PURPOSE: &str = "setup_link";
 // Named-field row (not a tuple alias) — a new public surface consumed by the
 // web channels manager; seller_id 0 = global namespace, is_default flags the
 // single global default.
@@ -126,6 +155,21 @@ type McpApprovalRow = (
     Option<String>, // executed_at
 );
 type McpAuditRow = (i64, String, String, bool, Option<String>, String);
+
+/// SHA-256 hex digest of `input` — the one-time-credential storage recipe:
+/// api_keys.key_hash, web_sessions.token_hash, web_pending_mfa.token_hash and
+/// mcp_tokens.token_hash all store the hex digest, never the raw secret.
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    let bytes = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in bytes.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
 
 // Invariant: every lock of `conn` recovers from poisoning via
 // `.unwrap_or_else(|poisoned| poisoned.into_inner())` — a panic in one caller
@@ -304,7 +348,7 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approvals(status)",
             [],
         );
-        let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, role TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS mcp_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, role TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL, seller_id INTEGER)", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mcp_audit_created ON mcp_audit(created_at)",
             [],
@@ -384,6 +428,22 @@ impl Db {
             .flatten();
         if invoices_has_product_id.is_none() {
             let _ = conn.execute("ALTER TABLE invoices ADD COLUMN product_id INTEGER", []);
+        }
+        // v1.4 mcp_audit.seller_id (ARCHITECTURE-V1.4 §3, D6): which seller
+        // principal a tool call ran as — owner rows stay NULL. Idempotent
+        // additive column add, the invoices.product_id precedent; appended
+        // last so legacy (ALTERed) and fresh (schema.sql) layouts match.
+        let mcp_audit_has_seller_id = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('mcp_audit') WHERE name = 'seller_id'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if mcp_audit_has_seller_id.is_none() {
+            let _ = conn.execute("ALTER TABLE mcp_audit ADD COLUMN seller_id INTEGER", []);
         }
         // Retry-cap counters (2026-10-25 review, "leaving for retry" forever):
         // the invoice verifier and the scheduled-post sender need a bounded
@@ -3317,6 +3377,48 @@ impl Db {
         Ok(())
     }
 
+    /// Mint a one-time console setup link token (D7, ARCHITECTURE-V1.4 §4):
+    /// `gen_token(48)` stored SHA-256-hashed in web_pending_mfa under
+    /// purpose 'setup_link' with a 15-minute TTL (the pending-MFA expiry
+    /// writing style). Returns the RAW token exactly once — the caller builds
+    /// the URL; the database never sees the raw value.
+    pub fn create_setup_link(&self, account_id: i64) -> String {
+        let raw = crate::util::gen_token(48);
+        let hash = sha256_hex(&raw);
+        let expires = (Utc::now() + chrono::Duration::minutes(SETUP_LINK_TTL_MINUTES)).to_rfc3339();
+        let _ = self.create_pending_mfa(
+            hash,
+            account_id,
+            SETUP_LINK_PURPOSE,
+            None::<String>,
+            expires,
+        );
+        raw
+    }
+
+    /// Atomic single-use claim of a pending token (D7): deletes the row and
+    /// returns its account in ONE statement (SQLite RETURNING), so exactly one
+    /// caller can win — replays, unknown and expired tokens are all None with
+    /// no oracle. `purpose` keeps the MFA verify flow and setup links in
+    /// separate lanes; the raw token is hashed here, matching
+    /// create_pending_mfa's storage recipe.
+    pub fn consume_pending_token(&self, raw_token: &str, purpose: &str) -> Option<i64> {
+        let hash = sha256_hex(raw_token);
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "DELETE FROM web_pending_mfa WHERE token_hash=?1 AND purpose=?2 AND expires_at > ?3 RETURNING account_id",
+            params![hash, purpose, now],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn create_recovery_codes<I, S>(&self, account_id: i64, hashed: I) -> Result<(), String>
     where
         I: IntoIterator<Item = S>,
@@ -4119,6 +4221,92 @@ impl Db {
         .flatten()
     }
 
+    /// Mint a per-seller MCP bearer token (D6): `gen_token(48)` stored
+    /// SHA-256-hashed with an 8-char display prefix — the create_api_key_full
+    /// convention verbatim, including the raw-return-once pattern (only the
+    /// hash and prefix are persisted; the raw token exists in this return
+    /// value and nowhere else).
+    pub fn create_mcp_token(&self, seller_id: i64, name: Option<&str>) -> (i64, String) {
+        let raw = crate::util::gen_token(48);
+        let hash = sha256_hex(&raw);
+        let prefix = raw.chars().take(8).collect::<String>();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO mcp_tokens(seller_id,token_hash,token_prefix,name,revoked,created_at) VALUES(?1,?2,?3,?4,0,?5)",
+            params![seller_id, hash, prefix, name, now],
+        );
+        (conn.last_insert_rowid(), raw)
+    }
+
+    /// A seller's own tokens, masked (D6 `/mcptoken list`): rows of
+    /// (id, name, token_prefix, created_at, revoked) — never the hash, never
+    /// the raw token.
+    pub fn list_mcp_tokens(
+        &self,
+        seller_id: i64,
+    ) -> Vec<(i64, Option<String>, Option<String>, String, i64)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id, name, token_prefix, created_at, revoked FROM mcp_tokens WHERE seller_id=?1 ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![seller_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Revoke one of the seller's tokens (D6 `/mcptoken revoke`), scoped like
+    /// every seller write: `Some(seller)` only touches that seller's own rows,
+    /// `None` acts on any row. Idempotent — an already-revoked row still
+    /// reports true; only unknown ids / wrong scope report false.
+    pub fn revoke_mcp_token(&self, id: i64, seller_scope: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE mcp_tokens SET revoked=1 WHERE id=?1 AND (?2 IS NULL OR seller_id=?2)",
+            params![id, seller_scope],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Stamp last_used_at on a token after a successful authenticated call
+    /// (best-effort by contract: the auth path must not fail because
+    /// bookkeeping did).
+    pub fn touch_mcp_token(&self, id: i64) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = conn.execute(
+            "UPDATE mcp_tokens SET last_used_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), id],
+        );
+    }
+
     pub fn get_api_key_by_id(&self, id: i64) -> Option<ApiKeyRow> {
         let conn = self
             .conn
@@ -4407,6 +4595,31 @@ impl Db {
         out
     }
 
+    /// Per-asset paid revenue — the L5 ruling (CRYPTO_PAY.md, ruling 5):
+    /// summing CAST(amount AS REAL) across assets (0.5 BTC + 50 USDT) is a
+    /// meaningless number and a display defect, so revenue is reported per
+    /// asset and must never be totalled cross-asset downstream. Same
+    /// paid-invoice basis as revenue_total: `WHERE status='paid'`.
+    pub fn revenue_by_asset(&self) -> Vec<(String, f64)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE status='paid' GROUP BY asset ORDER BY asset",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
     // ---- MCP approvals & audit ----
     /// Park a sensitive tool call: row starts 'pending' and is executed only
     /// after the owner approves it in the bot. Returns the approval id.
@@ -4538,7 +4751,18 @@ impl Db {
     /// One row per MCP tool-call outcome. `detail` is truncated to 200 chars
     /// here (the single choke point) so an over-verbose caller can never leak
     /// a large payload — and generated codes must never be passed as detail.
-    pub fn mcp_audit(&self, tool: &str, role: &str, ok: bool, detail: Option<&str>) {
+    /// One row per MCP tool-call outcome (v1.4 D6): `seller_id` records which
+    /// seller principal ran the tool (owner rows stay NULL) so "which token
+    /// did what" is answerable. Detail is truncated here so secrets never
+    /// land in the audit trail.
+    pub fn mcp_audit(
+        &self,
+        tool: &str,
+        role: &str,
+        seller_id: Option<i64>,
+        ok: bool,
+        detail: Option<&str>,
+    ) {
         let detail = detail.map(|d| d.chars().take(200).collect::<String>());
         let conn = self
             .conn
@@ -4546,8 +4770,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         let _ = conn.execute(
-            "INSERT INTO mcp_audit(tool,role,ok,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![tool, role, ok, detail, now],
+            "INSERT INTO mcp_audit(tool,role,seller_id,ok,detail,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![tool, role, seller_id, ok, detail, now],
         );
     }
 
@@ -5049,32 +5273,102 @@ impl Db {
         }
     }
 
+    /// Atomic slot claim (D4, ARCHITECTURE-V1.4 §2): ONE `BEGIN IMMEDIATE`
+    /// transaction re-checks the slot (exists, belongs to `service_id`,
+    /// status 'available', starts in the future), holds it, and inserts the
+    /// 'held' booking with
+    /// `expires_at = min(now + BOOKING_HOLD_MINUTES, slot start)` as RFC3339.
+    /// Returns the integer booking row id. `Ok(None)` when the slot is gone,
+    /// held/booked (claim-race losers included), in the past, or not the
+    /// named service's slot; `Err("slot time is invalid")` only when the
+    /// stored starts_at cannot be parsed — slots are expected to be created
+    /// with a validated time, the db refuses nonsense rather than guessing.
+    /// The seller is attributed from the slot row (slots.seller_id).
     pub fn create_booking(
         &self,
-        seller_id: i64,
         service_id: i64,
-        slot_id: Option<i64>,
+        slot_id: i64,
         user_id: i64,
-        invoice_id: Option<&str>,
-        expires_at: Option<&str>,
-    ) -> String {
+    ) -> Result<Option<i64>, String> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Utc::now().to_rfc3339();
-        let bid = crate::util::gen_token(8);
-        let _ = conn.execute(
-            "INSERT INTO bookings(booking_id,seller_id,service_id,slot_id,user_id,status,invoice_id,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,'held',?6,?7,?8)",
-            params![bid, seller_id, service_id, slot_id, user_id, invoice_id, expires_at, now],
-        );
-        if let Some(sid) = slot_id {
-            let _ = conn.execute(
-                "UPDATE slots SET status='held', held_until=?2 WHERE id=?1",
-                params![sid, expires_at],
-            );
+        let now = Utc::now();
+        let _ = conn.execute_batch("BEGIN IMMEDIATE");
+        let slot: Option<(i64, i64, String)> = match conn
+            .query_row(
+                "SELECT service_id, seller_id, starts_at FROM slots WHERE id = ?1 AND service_id = ?2",
+                params![slot_id, service_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.to_string());
+            }
+        };
+        let Some((_svc_id, seller_id, starts_at)) = slot else {
+            // slot gone, or not this service's slot
+            let _ = conn.execute_batch("ROLLBACK");
+            return Ok(None);
+        };
+        let start = match DateTime::parse_from_rfc3339(&starts_at) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err("slot time is invalid".to_string());
+            }
+        };
+        if start <= now {
+            // past slots are never bookable
+            let _ = conn.execute_batch("ROLLBACK");
+            return Ok(None);
         }
-        bid
+        let expires = std::cmp::min(now + chrono::Duration::minutes(BOOKING_HOLD_MINUTES), start)
+            .to_rfc3339();
+        // The claim itself, guarded on status: 'available' is the only state a
+        // hold may move off. BEGIN IMMEDIATE already serialized us against
+        // other Db callers; the guard keeps that invariant local to the SQL.
+        let claimed = match conn.execute(
+            "UPDATE slots SET status='held', held_until=?2 WHERE id=?1 AND status='available'",
+            params![slot_id, expires],
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.to_string());
+            }
+        };
+        if claimed == 0 {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Ok(None);
+        }
+        let token = crate::util::gen_token(8);
+        let inserted = conn.execute(
+            "INSERT INTO bookings(booking_id,seller_id,service_id,slot_id,user_id,status,invoice_id,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,'held',NULL,?6,?7)",
+            params![
+                token,
+                seller_id,
+                service_id,
+                slot_id,
+                user_id,
+                expires,
+                now.to_rfc3339()
+            ],
+        );
+        match inserted {
+            Ok(_) => {
+                let _ = conn.execute_batch("COMMIT");
+                Ok(Some(conn.last_insert_rowid()))
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e.to_string())
+            }
+        }
     }
 
     pub fn list_bookings(
@@ -5117,16 +5411,392 @@ impl Db {
         }
     }
 
-    pub fn expire_held_bookings(&self) -> usize {
+    /// Console booking list (BOOKINGS_UX_SPEC §3.3, §10.1): JOINed service
+    /// name + slot times so the page renders without N+1 lookups. Scope:
+    /// `Some(seller)` → bookings of that seller's services only, `None` →
+    /// every booking (admin/owner). `status` filters at the SQL level when
+    /// given (filter-after-LIMIT would silently hide matching rows); `limit`
+    /// caps the rows (the console passes 200). Ordered by slot start, newest
+    /// first, booking id as the tiebreaker.
+    pub fn list_bookings_filtered(
+        &self,
+        seller_scope: Option<i64>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Vec<BookingListRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = String::from(
+            "SELECT b.id, b.booking_id, b.user_id, COALESCE(sv.name,''), s.starts_at, s.ends_at, b.status, b.expires_at, sv.seller_id FROM bookings b LEFT JOIN slots s ON s.id = b.slot_id LEFT JOIN services sv ON sv.id = b.service_id",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(sid) = seller_scope {
+            sql.push_str(" WHERE sv.seller_id = ?1");
+            params_vec.push(Box::new(sid));
+        }
+        if let Some(st) = status {
+            if seller_scope.is_some() {
+                sql.push_str(" AND b.status = ?2");
+            } else {
+                sql.push_str(" WHERE b.status = ?1");
+            }
+            params_vec.push(Box::new(st.to_string()));
+        }
+        sql.push_str(&format!(
+            " ORDER BY s.starts_at DESC, b.id DESC LIMIT ?{}",
+            params_vec.len() + 1
+        ));
+        params_vec.push(Box::new(limit));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Buyer-scoped list for `/mybookings` (D8): the caller's own bookings,
+    /// newest first, same row shape as the console list.
+    pub fn list_bookings_for_user(&self, user_id: i64, limit: i64) -> Vec<BookingListRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT b.id, b.booking_id, b.user_id, COALESCE(sv.name,''), s.starts_at, s.ends_at, b.status, b.expires_at, sv.seller_id FROM bookings b LEFT JOIN slots s ON s.id = b.slot_id LEFT JOIN services sv ON sv.id = b.service_id WHERE b.user_id = ?1 ORDER BY b.id DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![user_id, limit], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                ))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Console/buyer cancel (BOOKINGS_UX_SPEC §10.2): `held|confirmed →
+    /// cancelled`, scoped — `Some(seller)` must match the booking's service
+    /// seller, `None` (admin/owner) acts on any row. The slot is returned to
+    /// 'available' ONLY when it has not started and the hold on it is this
+    /// booking's own (a slot re-claimed by another buyer after an expiry is
+    /// left untouched). One transaction; true iff the booking row moved.
+    pub fn cancel_booking_scoped(&self, booking_id: i64, seller_scope: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now();
+        let _ = conn.execute_batch("BEGIN IMMEDIATE");
+        let row = match conn.query_row(
+            "SELECT b.status, b.slot_id, b.expires_at, sv.seller_id FROM bookings b LEFT JOIN services sv ON sv.id = b.service_id WHERE b.id = ?1",
+            params![booking_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return false;
+            }
+        };
+        let (status, slot_id, expires_at, seller_id) = row;
+        if seller_scope.is_some() && seller_id != seller_scope {
+            let _ = conn.execute_batch("ROLLBACK");
+            return false;
+        }
+        if status != "held" && status != "confirmed" {
+            // terminal (declined/cancelled) or unknown — nothing to cancel
+            let _ = conn.execute_batch("ROLLBACK");
+            return false;
+        }
+        if let Some(sid) = slot_id {
+            let slot: Option<(String, String, Option<String>)> = match conn
+                .query_row(
+                    "SELECT starts_at, status, held_until FROM slots WHERE id = ?1",
+                    params![sid],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return false;
+                }
+            };
+            if let Some((starts_at, slot_status, held_until)) = slot {
+                // Unparseable time counts as started: never free what we
+                // cannot prove is still in the future.
+                let started = DateTime::parse_from_rfc3339(&starts_at)
+                    .map(|dt| dt.with_timezone(&Utc) <= now)
+                    .unwrap_or(true);
+                // 'booked' can only be this confirmed booking's own slot
+                // (nothing else can claim a held/booked slot); a 'held' slot is
+                // ours only when its stamp matches the booking's expiry — both
+                // were written together at claim time.
+                let ours =
+                    slot_status == "booked" || held_until.as_deref() == expires_at.as_deref();
+                if !started && ours {
+                    let freed = conn.execute(
+                        "UPDATE slots SET status='available', held_until=NULL WHERE id=?1 AND (status='booked' OR held_until=?2)",
+                        params![sid, expires_at],
+                    );
+                    if freed.is_err() {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return false;
+                    }
+                }
+            }
+        }
+        let n = conn
+            .execute(
+                "UPDATE bookings SET status='cancelled' WHERE id=?1 AND status IN ('held','confirmed')",
+                params![booking_id],
+            )
+            .unwrap_or(0);
+        if n == 1 {
+            let _ = conn.execute_batch("COMMIT");
+            true
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+            false
+        }
+    }
+
+    /// Seller confirm/decline (D3/D8): the `held|expired → confirmed|declined`
+    /// transitions, scoped like every other booking write — `Some(seller)`
+    /// must match the booking's service seller, `None` (admin/owner) acts on
+    /// any row. Only "confirmed"/"declined" are accepted (allowlist in code).
+    /// Confirm requires the slot to still be in the future and — for the D3
+    /// resurrection path (expired hold) — the slot to be free: still
+    /// 'available', or 'held' with THIS booking's own hold stamp; a slot
+    /// re-claimed by another booking makes the confirm lose (false, nothing
+    /// mutated). Decline frees the slot back to 'available' when the hold on
+    /// it is this booking's own. One transaction; true iff the booking moved.
+    pub fn set_booking_status(
+        &self,
+        booking_id: i64,
+        seller_scope: Option<i64>,
+        status: &str,
+    ) -> bool {
+        let confirm = match status {
+            "confirmed" => true,
+            "declined" => false,
+            _ => return false, // allowlist: nothing else is a legal target
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now();
+        let _ = conn.execute_batch("BEGIN IMMEDIATE");
+        let row = match conn.query_row(
+            "SELECT b.status, b.slot_id, b.expires_at, sv.seller_id FROM bookings b LEFT JOIN services sv ON sv.id = b.service_id WHERE b.id = ?1",
+            params![booking_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return false;
+            }
+        };
+        let (booking_status, slot_id, expires_at, seller_id) = row;
+        if seller_scope.is_some() && seller_id != seller_scope {
+            let _ = conn.execute_batch("ROLLBACK");
+            return false;
+        }
+        if booking_status != "held" && booking_status != "expired" {
+            // terminal states are closed; unknown statuses too
+            let _ = conn.execute_batch("ROLLBACK");
+            return false;
+        }
+        if confirm {
+            if let Some(sid) = slot_id {
+                let slot: Option<(String, String, Option<String>)> = match conn
+                    .query_row(
+                        "SELECT starts_at, status, held_until FROM slots WHERE id = ?1",
+                        params![sid],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return false;
+                    }
+                };
+                let Some((starts_at, slot_status, held_until)) = slot else {
+                    // slot vanished: a confirm without a time cannot be honored
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return false;
+                };
+                // A confirm always needs a future slot (past = nothing to
+                // deliver); unparseable stored times refuse the same way.
+                let future = DateTime::parse_from_rfc3339(&starts_at)
+                    .map(|dt| dt.with_timezone(&Utc) > now)
+                    .unwrap_or(false);
+                // Free for THIS booking: unclaimed, or still carrying this
+                // booking's own hold stamp (live hold, or the stale hold of an
+                // expired booking the sweeper has not freed). 'booked' and a
+                // foreign hold stamp both mean another booking took it.
+                let free =
+                    slot_status == "available" || held_until.as_deref() == expires_at.as_deref();
+                if !future || !free {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return false;
+                }
+                let claimed = conn.execute(
+                    "UPDATE slots SET status='booked', held_until=NULL WHERE id=?1 AND (status='available' OR (status='held' AND held_until=?2))",
+                    params![sid, expires_at],
+                );
+                match claimed {
+                    Ok(1) => {}
+                    _ => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return false;
+                    }
+                }
+            }
+            // Legacy slot-less bookings confirm without slot gating.
+        } else if let Some(sid) = slot_id {
+            // Decline always frees the slot — but only when the hold on it is
+            // this booking's own ('booked' is never ours on a decline path:
+            // another booking may have re-claimed and confirmed it).
+            let freed = conn.execute(
+                "UPDATE slots SET status='available', held_until=NULL WHERE id=?1 AND status='held' AND held_until=?2",
+                params![sid, expires_at],
+            );
+            if freed.is_err() {
+                let _ = conn.execute_batch("ROLLBACK");
+                return false;
+            }
+        }
+        let target = if confirm { "confirmed" } else { "declined" };
+        let n = conn
+            .execute(
+                "UPDATE bookings SET status=?2 WHERE id=?1 AND status IN ('held','expired')",
+                params![booking_id, target],
+            )
+            .unwrap_or(0);
+        if n == 1 {
+            let _ = conn.execute_batch("COMMIT");
+            true
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+            false
+        }
+    }
+
+    /// Expire held bookings past their response window (D3/D5): frees the
+    /// slots first, then transitions `held → expired` — both statements carry
+    /// the same predicates as before — and returns the transitioned rows as
+    /// (bookings.id, buyer user_id, service name) so the sweeper can DM each
+    /// buyer. The status transition is the exactly-once guard for those DMs:
+    /// the returned list is only returned when its size matches the rows the
+    /// UPDATE actually moved (a mismatch would risk double-DMing, so nothing
+    /// is returned instead).
+    pub fn expire_held_bookings(&self) -> Vec<(i64, i64, String)> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
-        // free slots
-        let _ = conn.execute("UPDATE slots SET status='available', held_until=NULL WHERE status='held' AND held_until IS NOT NULL AND held_until < ?1", params![now]);
-        conn.execute("UPDATE bookings SET status='expired' WHERE status='held' AND expires_at IS NOT NULL AND expires_at < ?1", params![now])
-            .unwrap_or(0)
+        // free slots — unchanged transition
+        let _ = conn.execute(
+            "UPDATE slots SET status='available', held_until=NULL WHERE status='held' AND held_until IS NOT NULL AND held_until < ?1",
+            params![now],
+        );
+        // collect the expiring rows (same predicate as the transition below)
+        let rows: Vec<(i64, i64, String)> = {
+            let mut stmt = match conn.prepare(
+                "SELECT b.id, b.user_id, COALESCE(sv.name,'') FROM bookings b LEFT JOIN services sv ON sv.id = b.service_id WHERE b.status='held' AND b.expires_at IS NOT NULL AND b.expires_at < ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
+            let mapped = stmt.query_map(params![now], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            });
+            match mapped {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => return vec![],
+            }
+        };
+        let n = conn
+            .execute(
+                "UPDATE bookings SET status='expired' WHERE status='held' AND expires_at IS NOT NULL AND expires_at < ?1",
+                params![now],
+            )
+            .unwrap_or(0);
+        if n == rows.len() { rows } else { Vec::new() }
     }
 }
 
@@ -5156,6 +5826,438 @@ mod tests {
         assert!(res.is_ok());
         let code2 = db.get_code(&code).unwrap();
         assert_eq!(code2.5, 1);
+    }
+
+    // ---- v1.4 bookings / setup links / MCP tokens / per-asset revenue ----
+
+    fn booking_db(tag: &str) -> (Db, String) {
+        let path = format!("/tmp/opencode/test_bookings_{tag}.db");
+        let _ = fs::remove_file(&path);
+        let db = Db::new(&path).unwrap();
+        (db, path)
+    }
+
+    fn service_with_slot(db: &Db, seller: i64, name: &str, starts_at: &str) -> (i64, i64) {
+        let svc = db
+            .create_service(seller, name, "10", "USDT", 60, None)
+            .expect("service created");
+        let slot = db.create_slot(svc, seller, starts_at, 1);
+        (svc, slot)
+    }
+
+    fn rfc_in_minutes(minutes: i64) -> String {
+        (Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339()
+    }
+
+    /// Point a booking and its slot's hold stamp into the past — exactly the
+    /// values claim time wrote together — so the next expire_held_bookings()
+    /// pass transitions the booking and frees the slot like real clock time
+    /// would (tests must not wait out BOOKING_HOLD_MINUTES).
+    fn force_expiry(path: &str, booking_id: i64) {
+        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE bookings SET expires_at=?1 WHERE id=?2",
+            params![past, booking_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE slots SET held_until=(SELECT expires_at FROM bookings WHERE id=?1) WHERE id=(SELECT slot_id FROM bookings WHERE id=?1)",
+            params![booking_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_booking_claim_is_atomic() {
+        let (db, _path) = booking_db("claim");
+        let (svc, slot) = service_with_slot(&db, 11, "consult", &rfc_in_minutes(120));
+        let mut won = Vec::new();
+        for u in 1..=8i64 {
+            if let Ok(Some(id)) = db.create_booking(svc, slot, 100 + u) {
+                won.push(id);
+            }
+        }
+        assert_eq!(won.len(), 1, "exactly one buyer wins the slot");
+
+        let slots = db.list_slots(svc);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].4, "held");
+        assert_eq!(db.list_bookings(Some(11)).len(), 1);
+    }
+
+    #[test]
+    fn test_booking_claim_rejects_missing_past_and_nonsense() {
+        let (db, _path) = booking_db("reject");
+        let (svc, slot) = service_with_slot(&db, 11, "consult", &rfc_in_minutes(60));
+        // unknown slot id
+        assert_eq!(db.create_booking(svc, 999_999, 1).unwrap(), None);
+        // past slot
+        let (svc_past, slot_past) = service_with_slot(&db, 11, "past", &rfc_in_minutes(-60));
+        assert_eq!(db.create_booking(svc_past, slot_past, 1).unwrap(), None);
+        // unparseable stored time — the db refuses nonsense
+        let (svc_bad, slot_bad) = service_with_slot(&db, 11, "bad", "not-a-timestamp");
+        assert_eq!(
+            db.create_booking(svc_bad, slot_bad, 1).unwrap_err(),
+            "slot time is invalid"
+        );
+        // service/slot pair mismatch: the slot belongs to svc, not svc_past
+        assert_eq!(db.create_booking(svc_past, slot, 1).unwrap(), None);
+        // nothing mutated by any rejected claim
+        assert_eq!(db.list_bookings(Some(11)).len(), 0);
+        assert_eq!(db.list_slots(svc)[0].4, "available");
+    }
+
+    #[test]
+    fn test_booking_expires_at_is_min_of_hold_and_start() {
+        let (db, _path) = booking_db("expiry_window");
+        // slot sooner than the hold window: expires_at == slot start (D3)
+        let (svc, slot) = service_with_slot(&db, 11, "soon", &rfc_in_minutes(10));
+        assert!(db.create_booking(svc, slot, 1).unwrap().is_some());
+        let row = &db.list_bookings_for_user(1, 10)[0];
+        let exp = DateTime::parse_from_rfc3339(row.7.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let start = DateTime::parse_from_rfc3339(&rfc_in_minutes(10))
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!((exp - start).num_seconds().abs() < 5);
+        // slot later than the hold window: expires_at ≈ now + BOOKING_HOLD_MINUTES
+        let (svc2, slot2) = service_with_slot(&db, 11, "far", &rfc_in_minutes(240));
+        assert!(db.create_booking(svc2, slot2, 2).unwrap().is_some());
+        let row2 = &db.list_bookings_for_user(2, 10)[0];
+        let exp2 = DateTime::parse_from_rfc3339(row2.7.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected = Utc::now() + chrono::Duration::minutes(BOOKING_HOLD_MINUTES);
+        assert!((exp2 - expected).num_seconds().abs() < 10);
+    }
+
+    #[test]
+    fn test_list_bookings_filtered_scope_status_limit() {
+        let (db, _path) = booking_db("filtered");
+        let (svc1, slot1) = service_with_slot(&db, 11, "alpha", &rfc_in_minutes(60));
+        let (svc2, slot2) = service_with_slot(&db, 22, "beta", &rfc_in_minutes(120));
+        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
+        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
+        assert!(db.set_booking_status(b2, Some(22), "confirmed"));
+
+        // scope: seller 11 sees only their own rows
+        let s1 = db.list_bookings_filtered(Some(11), None, 100);
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].0, b1);
+        assert_eq!(s1[0].1.len(), 8, "public booking token present");
+        assert_eq!(s1[0].2, 100);
+        assert_eq!(s1[0].3, "alpha");
+        assert!(s1[0].4.is_some(), "slot starts_at joined");
+        assert_eq!(s1[0].6, "held");
+        assert!(s1[0].7.is_some(), "expires_at joined");
+        assert_eq!(s1[0].8, Some(11));
+
+        // status filter at SQL level
+        let held = db.list_bookings_filtered(None, Some("held"), 100);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, b1);
+        let confirmed = db.list_bookings_filtered(Some(22), Some("confirmed"), 100);
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].0, b2);
+        assert_eq!(
+            db.list_bookings_filtered(None, Some("cancelled"), 100)
+                .len(),
+            0
+        );
+
+        // limit caps the rows; ordering is slot start DESC (beta starts later)
+        assert_eq!(db.list_bookings_filtered(None, None, 1).len(), 1);
+        let all = db.list_bookings_filtered(None, None, 100);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, b2);
+        assert_eq!(all[1].0, b1);
+    }
+
+    #[test]
+    fn test_list_bookings_for_user() {
+        let (db, _path) = booking_db("for_user");
+        let (svc1, slot1) = service_with_slot(&db, 11, "alpha", &rfc_in_minutes(60));
+        let (svc2, slot2) = service_with_slot(&db, 22, "beta", &rfc_in_minutes(90));
+        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
+        let b2 = db.create_booking(svc2, slot2, 100).unwrap().unwrap();
+        let rows = db.list_bookings_for_user(100, 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b2, "newest first");
+        assert_eq!(rows[1].0, b1);
+        assert!(rows.iter().all(|r| r.2 == 100));
+        assert_eq!(db.list_bookings_for_user(999, 10).len(), 0);
+        assert_eq!(db.list_bookings_for_user(100, 1).len(), 1);
+    }
+
+    #[test]
+    fn test_cancel_booking_scoped_rules() {
+        let (db, path) = booking_db("cancel");
+        // held + future slot: the owning seller cancels, slot freed
+        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(60));
+        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
+        assert!(
+            !db.cancel_booking_scoped(b1, Some(99)),
+            "wrong seller scope"
+        );
+        assert!(db.cancel_booking_scoped(b1, Some(11)));
+        assert_eq!(db.list_slots(svc1)[0].4, "available");
+        assert_eq!(db.list_bookings(Some(11))[0].4, "cancelled");
+        assert!(!db.cancel_booking_scoped(b1, Some(11)), "terminal now");
+
+        // admin (None) may cancel another seller's booking
+        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(60));
+        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
+        assert!(db.cancel_booking_scoped(b2, None));
+        assert_eq!(db.list_slots(svc2)[0].4, "available");
+
+        // confirmed booking on a future slot: cancel frees the 'booked' slot
+        let (svc3, slot3) = service_with_slot(&db, 33, "c", &rfc_in_minutes(60));
+        let b3 = db.create_booking(svc3, slot3, 300).unwrap().unwrap();
+        assert!(db.set_booking_status(b3, Some(33), "confirmed"));
+        assert_eq!(db.list_slots(svc3)[0].4, "booked");
+        assert!(db.cancel_booking_scoped(b3, Some(33)));
+        assert_eq!(db.list_slots(svc3)[0].4, "available");
+
+        // confirmed booking whose slot already started: cancelled, but the
+        // slot is NOT freed back to available
+        let (svc4, slot4) = service_with_slot(&db, 44, "d", &rfc_in_minutes(60));
+        let b4 = db.create_booking(svc4, slot4, 400).unwrap().unwrap();
+        assert!(db.set_booking_status(b4, Some(44), "confirmed"));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE slots SET starts_at=?1 WHERE id=?2",
+                params![rfc_in_minutes(-30), slot4],
+            )
+            .unwrap();
+        }
+        assert!(db.cancel_booking_scoped(b4, Some(44)));
+        assert_eq!(db.list_slots(svc4)[0].4, "booked", "started slot stays");
+    }
+
+    #[test]
+    fn test_set_booking_status_confirm_decline_and_resurrection() {
+        let (db, path) = booking_db("status");
+        // held → confirmed books the future slot
+        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(60));
+        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
+        assert!(
+            !db.set_booking_status(b1, Some(99), "confirmed"),
+            "wrong seller"
+        );
+        assert!(!db.set_booking_status(b1, Some(11), "pending"), "allowlist");
+        assert!(db.set_booking_status(b1, Some(11), "confirmed"));
+        assert_eq!(db.list_slots(svc1)[0].4, "booked");
+        assert_eq!(db.list_bookings(Some(11))[0].4, "confirmed");
+        assert!(!db.set_booking_status(b1, Some(11), "declined"), "terminal");
+        assert!(
+            !db.set_booking_status(b1, Some(11), "confirmed"),
+            "terminal"
+        );
+
+        // confirm refuses a past slot; decline still frees it
+        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(60));
+        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE slots SET starts_at=?1 WHERE id=?2",
+                params![rfc_in_minutes(-5), slot2],
+            )
+            .unwrap();
+        }
+        assert!(!db.set_booking_status(b2, Some(22), "confirmed"));
+        assert_eq!(db.list_bookings(Some(22))[0].4, "held", "unchanged");
+        assert_eq!(db.list_slots(svc2)[0].4, "held", "slot untouched");
+        assert!(db.set_booking_status(b2, Some(22), "declined"));
+        assert_eq!(db.list_bookings(Some(22))[0].4, "declined");
+        assert_eq!(db.list_slots(svc2)[0].4, "available");
+
+        // D3 resurrection: expired hold whose slot was freed → confirm re-books
+        let (svc3, slot3) = service_with_slot(&db, 33, "c", &rfc_in_minutes(120));
+        let b3 = db.create_booking(svc3, slot3, 300).unwrap().unwrap();
+        force_expiry(&path, b3);
+        assert_eq!(db.expire_held_bookings().len(), 1);
+        assert_eq!(db.list_slots(svc3)[0].4, "available");
+        assert!(db.set_booking_status(b3, Some(33), "confirmed"));
+        assert_eq!(db.list_slots(svc3)[0].4, "booked");
+        assert_eq!(db.list_bookings(Some(33))[0].4, "confirmed");
+
+        // resurrection loses when another booking re-claimed the slot
+        let (svc4, slot4) = service_with_slot(&db, 44, "d", &rfc_in_minutes(120));
+        let b4 = db.create_booking(svc4, slot4, 400).unwrap().unwrap();
+        force_expiry(&path, b4);
+        db.expire_held_bookings();
+        assert!(db.create_booking(svc4, slot4, 401).unwrap().is_some());
+        assert!(
+            !db.set_booking_status(b4, Some(44), "confirmed"),
+            "slot taken"
+        );
+        let rows = db.list_bookings_filtered(Some(44), None, 100);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().find(|r| r.2 == 400).unwrap().6,
+            "expired",
+            "loser untouched"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.2 == 401).unwrap().6,
+            "held",
+            "winner intact"
+        );
+    }
+
+    #[test]
+    fn test_expire_held_bookings_returns_each_row_once() {
+        let (db, path) = booking_db("sweep");
+        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(120));
+        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(240));
+        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
+        let _b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
+        force_expiry(&path, b1);
+        let rows = db.expire_held_bookings();
+        assert_eq!(rows, vec![(b1, 100, "a".to_string())]);
+        // exactly-once: the second pass returns nothing
+        assert!(db.expire_held_bookings().is_empty());
+        // the untouched booking keeps its hold; b1's slot was freed
+        assert_eq!(db.list_bookings(Some(22))[0].4, "held");
+        assert_eq!(db.list_slots(svc2)[0].4, "held");
+        assert_eq!(db.list_slots(svc1)[0].4, "available");
+    }
+
+    #[test]
+    fn test_setup_link_single_use_purpose_and_ttl() {
+        let (db, path) = booking_db("setup");
+        let raw = db.create_setup_link(42);
+        assert_eq!(raw.len(), 48);
+        // single use: exactly one consume wins
+        assert_eq!(db.consume_pending_token(&raw, SETUP_LINK_PURPOSE), Some(42));
+        assert_eq!(db.consume_pending_token(&raw, SETUP_LINK_PURPOSE), None);
+        assert_eq!(db.consume_pending_token("nope", SETUP_LINK_PURPOSE), None);
+        // purpose separation: an MFA verify token is not a setup link
+        let verify_raw = crate::util::gen_token(48);
+        let expires = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        db.create_pending_mfa(
+            sha256_hex(&verify_raw),
+            42,
+            "verify",
+            None::<String>,
+            expires,
+        )
+        .unwrap();
+        assert_eq!(
+            db.consume_pending_token(&verify_raw, SETUP_LINK_PURPOSE),
+            None
+        );
+        assert_eq!(db.consume_pending_token(&verify_raw, "verify"), Some(42));
+        // TTL: an expired setup link dies with the same generic None
+        let raw2 = db.create_setup_link(43);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE web_pending_mfa SET expires_at=?1 WHERE account_id=43",
+                params![(Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.consume_pending_token(&raw2, SETUP_LINK_PURPOSE), None);
+    }
+
+    #[test]
+    fn test_mcp_token_lifecycle_and_masking() {
+        let (db, path) = booking_db("mcp");
+        let (id, raw) = db.create_mcp_token(7, Some("ci"));
+        assert_eq!(raw.len(), 48);
+        // the hash-lookup path mcp::lookup_mcp_token already consumes
+        let row = db
+            .get_mcp_token_by_hash(&sha256_hex(&raw))
+            .expect("hash finds the token");
+        assert_eq!(row.0, id);
+        assert_eq!(row.1, 7);
+        assert_eq!(row.2.as_deref(), Some("ci"));
+        assert_eq!(row.3, 0, "not revoked");
+
+        // masked list: prefix + name only — never the raw token or the hash
+        let list = db.list_mcp_tokens(7);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, id);
+        assert_eq!(list[0].1.as_deref(), Some("ci"));
+        let prefix = list[0].2.as_deref().expect("prefix stored");
+        assert_eq!(prefix.len(), 8);
+        assert!(raw.starts_with(prefix), "prefix is a prefix, not the token");
+        assert_eq!(list[0].4, 0);
+        assert!(
+            db.list_mcp_tokens(8).is_empty(),
+            "other sellers see nothing"
+        );
+
+        // scoped revoke: wrong seller loses, owner and admin win, idempotent
+        assert!(!db.revoke_mcp_token(id, Some(8)));
+        assert!(db.revoke_mcp_token(id, Some(7)));
+        assert_eq!(db.get_mcp_token_by_hash(&sha256_hex(&raw)).unwrap().3, 1);
+        assert!(db.revoke_mcp_token(id, Some(7)), "idempotent");
+        assert!(!db.revoke_mcp_token(999_999, None), "unknown id");
+        let (id2, raw2) = db.create_mcp_token(7, None);
+        assert!(
+            db.revoke_mcp_token(id2, None),
+            "admin scope acts on any row"
+        );
+        assert_eq!(db.get_mcp_token_by_hash(&sha256_hex(&raw2)).unwrap().3, 1);
+
+        // touch stamps last_used_at (best-effort bookkeeping)
+        db.touch_mcp_token(id);
+        {
+            let conn = Connection::open(&path).unwrap();
+            let used: Option<String> = conn
+                .query_row(
+                    "SELECT last_used_at FROM mcp_tokens WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(used.is_some());
+        }
+    }
+
+    #[test]
+    fn test_mcp_audit_carries_seller_id() {
+        let (db, path) = booking_db("audit");
+        db.mcp_audit("list_plans", "seller", Some(9), true, None);
+        db.mcp_audit("owner_tool", "owner", None, false, Some("boom"));
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT role, seller_id, ok FROM mcp_audit ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, Option<i64>, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("seller".to_string(), Some(9), 1));
+        assert_eq!(rows[1], ("owner".to_string(), None, 0));
+    }
+
+    #[test]
+    fn test_revenue_by_asset_per_asset_lines() {
+        let (db, _path) = booking_db("revasset");
+        db.save_invoice("i1", 1, "50", "USDT", None, "paid", None, None, None, None);
+        db.save_invoice("i2", 1, "20", "USDT", None, "paid", None, None, None, None);
+        db.save_invoice("i3", 1, "0.5", "BTC", None, "paid", None, None, None, None);
+        // unpaid invoices stay out of the per-asset lines
+        db.save_invoice(
+            "i4", 1, "100", "USDT", None, "active", None, None, None, None,
+        );
+        let rows = db.revenue_by_asset();
+        assert_eq!(
+            rows,
+            vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 70.0)]
+        );
+        // revenue_total's cross-asset behavior is deliberately unchanged
+        // (L5 ruling 5: the sum is a display defect handled at the callers)
+        assert!((db.revenue_total(None) - 70.5).abs() < 1e-9);
     }
 
     #[tokio::test]
