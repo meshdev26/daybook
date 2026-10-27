@@ -6,7 +6,8 @@
 - Web MFA: TOTP (RFC 6238) enrollment is mandatory for owner/admin web accounts at first login (QR code plus a copyable `otpauth://` URI for manual entry). Code verification is throttled (5 attempts per 15 min); a pending MFA challenge cookie lives 5 minutes. Recovery codes: 10, bcrypt-hashed at rest, shown once at issuance and regenerable from Settings; the owner can reset a user's MFA from the Web users page. Plaintext secrets are never rendered after enrollment. Disabling MFA or regenerating recovery codes requires the current second factor (a valid TOTP code, or an unused recovery code, which is consumed).
 
 ## Authorization
-- Public commands: start, help, menu, plans, buy, paid, redeem, setup, becomeseller.
+- Public commands: start, help, menu, plans, shop, buy, paid, redeem, services, book, bookings, mybookings, cancelbooking, setup, becomeseller.
+- Seller commands: channel/plan/product/code/booking/crypto/AI surfaces and `/mcptoken`; each scoped to the caller's own data (admins see all).
 - Admin commands: require `is_admin`.
 
 ## Payments
@@ -24,8 +25,8 @@
 ## Secrets at rest (planned)
 - Future: encrypt sensitive columns (tokens, secrets) at rest with AES-256-GCM keyed by a `MASTER_KEY` env var. Not yet implemented; currently relies on filesystem permissions (SQLite file, `.env` mode 600).
 
-## MCP tokens (v2, planned)
-- Per-seller bearer tokens will live in the `mcp_tokens` table (schema.sql + migration), scoped by `seller_id`, with `McpToken` lookup in `src/mcp/mod.rs`. Not yet wired into `authenticate`; `MCP_OWNER_TOKEN` remains the only live credential.
+## MCP tokens (v1.4, live)
+- Per-seller bearer tokens live in the `mcp_tokens` table, scoped by `seller_id`, stored SHA-256-hashed with an 8-char display prefix (raw shown once at mint). `authenticate` in `src/mcp/mod.rs` tries the owner env token first, then the hash lookup; revoked/expired rows never authenticate and every failure returns the same 401. Minted/revoked by the seller via `/mcptoken` (10 active max). See the 2026-10-27 additions below for the Sensitive-tier owner-only gate.
 
 ## Data
 - SQLite file permissions; back up regularly.
@@ -54,3 +55,5 @@
 - **Channel binding proof of control:** non-admin callers of `POST /api/v1/sellers/{user_id}/channel` may bind only channels they control — a `@handle` where the calling seller is a chat administrator (verified live through the bot via `getChatAdministrators`) or a negative group/channel id; freeform names and a bot-not-in-channel target are rejected. Admins/owner are exempt (bootstrap path).
 - **REST MFA parity:** a correct password alone never mints a REST session for a TOTP-enabled account — `POST /api/v1/auth/login` returns a 5-minute single-use pending token, exchanged (with a TOTP or recovery code) at `POST /api/v1/auth/mfa/verify` for the session; failed verifies are throttled 5 per 15 min per pending token. Privileged roles without TOTP enrolled get 401 `mfa_required`; enrollment remains web-console-only.
 - **Console accessibility floor (WCAG 2.1 AA):** CSS text tokens held at >= 4.5:1 contrast on their surfaces, labelled form controls and icon buttons, and a skip-to-content link.
+- **One-time setup links replace DM'd passwords:** `/becomeseller` and `/dashboard` DM a single-use claim link (`/setup/claim?token=…`) instead of a plaintext password. The token is a 48-character CSPRNG value, stored only as a SHA-256 hash with a 15-minute TTL, and consumed atomically on POST (`DELETE … RETURNING` — exactly one caller can win; expired, reused, unknown and wrong-purpose tokens all land on one generic no-oracle page). A successful claim sets the password, creates the claimant's session and signs out every other session of the account; the claim POST shares the login throttle (5 attempts / 15 min), and the raw token is never logged or echoed. Accepted with notes: the link holder can set a password without a second factor — strictly less exposure than the prior plaintext-password DM (a TOTP challenge on claim is the noted v1.5 follow-up) — and the token travels in the URL; the app never logs it, but reverse-proxy access logs containing `/setup/claim?token=` are an operator-side consideration (see `docs/RELEASING.md`).
+- **MCP Sensitive tier is owner-only (fail-closed):** per-seller MCP tokens authenticate as seller principals scoped to their own data, but a Sensitive-tier tool call (`gen_codes`, `delete_post`, `broadcast`, `ai_publish_post`) from any non-owner principal is refused with JSON-RPC error `-32001 "sensitive tools require the owner credential"` before anything parks an approval or validates arguments — no side effects, audited as a seller-role failure. The gate is deliberate: the `/approve` flow is requester-blind (it executes whatever is parked), so the benefiting party must never be able to create a pending row; the owner's park → `/approve` → execute flow is unchanged.

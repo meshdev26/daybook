@@ -132,6 +132,17 @@ python3 scripts/verify-agent-tiers.py
   transfer + audit + grant revoke/kick), .env rewrite preserves unknown keys,
   plan lookups seller-scoped, docs deduped. See
   docs/ARCHITECTURE-SCALE-PLAN.md implementation record.
+- 2026-10-27 v1.4 "Close the loop" architected (L11, docs/ARCHITECTURE-V1.4.md):
+  bookings move to the appointment model (1 slot = 1 booking; slots.booked dead),
+  free-confirmation-only with priced bookings deferred to v1.5 pending the L5
+  ruling (ARCHITECTURE-V1.4.md §2 Q1); slot claiming moves into Db::create_booking
+  as one transaction (kills the handler-side TOCTOU); held-booking sweeper DMs
+  buyers; MCP per-seller tokens wired into authenticate() (owner env-token keeps
+  priority, hash lookup → Principal{Seller, Some(seller_id)}, mcp_audit +seller_id);
+  /becomeseller //dashboard stop DMing passwords — single-use 15-min hashed
+  /setup/claim links reusing web_pending_mfa (purpose='setup_link'); console
+  /bookings page (bookings actions + read-only services). Trust pack: CHANGELOG.md
+  (Keep a Changelog), docs/RELEASING.md, Cargo 0.N.0 tracks milestone vN.
 
 ## 12. Contacts
 - Maintainer: repository owner.

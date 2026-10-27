@@ -3,13 +3,13 @@
 Role-based access: Owner > Admin > Seller > User. Sellers manage their own data; admins/owner see all.
 
 ## Roles
-- **User (public)**: `/start`, `/help`, `/menu`, `/plans`, `/shop`, `/buy`, `/paid`, `/redeem`, `/services`, `/book`, `/setup`, `/becomeseller`.
-- **Seller**: user commands + channel, plans, codes, subscriptions, crypto, broadcast, AI, web dashboard.
+- **User (public)**: `/start`, `/help`, `/menu`, `/plans`, `/shop`, `/buy`, `/paid`, `/redeem`, `/services`, `/book`, `/mybookings`, `/cancelbooking`, `/setup`, `/becomeseller`.
+- **Seller**: user commands + channel, plans, codes, subscriptions, crypto, broadcast, AI, bookings confirm/decline, MCP tokens, web dashboard.
 - **Admin**: seller commands (global view) + `/sellers`, `/refundapprove`, `/payoutapprove`.
 - **Owner**: admin commands + `/addadmin`, `/removeadmin`, `/admins`, `/webusers`.
 
 ## Web dashboard
-- `/dashboard` — show web dashboard URL and credentials (creates account if missing).
+- `/dashboard` — DM a one-time dashboard sign-in link (valid 15 minutes; opening it lets you set a password and signs you in). Creates the account if missing. Legacy plaintext fallback only when `WEB_URL` is unset.
 - `/setwebpassword <new>` — change web dashboard password.
 
 ## General
@@ -49,10 +49,14 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 
 ## Services & bookings
 - `/services` — buyers: the public bookable catalogue, one line per service (name, duration, price, `— by @seller`; the legacy seller-0 global namespace is excluded). Sellers/admins keep the management view.
-- `/book <service_name>` — book the first available slot. The confirmation states the slot time and that the hold expires in 15 minutes; "No available slots." when none is free.
+- `/book <service_name>` — request the first available slot. One slot holds one booking and is claimed atomically, so a race loser gets "Slot no longer available." The reply states the slot time, that the booking is **requested — not confirmed**, and that the seller has up to 60 minutes to respond; "No available slots." when none is free.
+- `/mybookings` — your bookings: id (a public token), service, time and status, with the seller's response deadline for held rows and the seller name for confirmed ones. (public)
+- `/cancelbooking <booking_id>` — cancel one of your own bookings (held or confirmed); the seller is DM'd and the slot is freed. Accepts the token id, the integer id or `#id`. (public)
 - `/serviceadd name | price | asset | duration_minutes [| channel]` — add a bookable service (seller).
-- `/slotadd service | datetime [| capacity]` — add a slot for one of your services (seller).
-- `/bookings` — list bookings (seller: own; admin/owner: all).
+- `/slotadd service | datetime [| capacity]` — add a slot for one of your services (seller). Datetime must be a future UTC time in RFC3339 or `YYYY-MM-DD HH:MM` form; anything else (or a past time) is rejected. `capacity` is accepted for CLI stability but clamped to 1 — one slot holds exactly one booking.
+- `/bookings` — list bookings (seller: own; admin/owner: all). Buyers get pointed at `/mybookings`.
+- `/bookingconfirm <booking_id>` — confirm a booking (seller; admin/owner are pointed at the web console `/bookings` page instead). The buyer is DM'd; an expired hold can still be confirmed while the slot is free — if it was re-taken, the confirm fails with "the slot is already taken."
+- `/bookingdecline <booking_id>` — decline a booking (seller; admin/owner via the console). The buyer is DM'd and the slot is freed.
 
 ## Activation codes
 - `/gencodes plan | count | [days]` — generate codes.
@@ -70,7 +74,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 
 ## Bot
 - `/setupbot` — configure bot profile/commands. Sets the bot description to: "Telegram shop: digital products, channel memberships, codes and bookings. Browse /shop — buy with /buy."
-- `/becomeseller` — onboard as a seller (creates web dashboard account).
+- `/becomeseller` — onboard as a seller (creates web dashboard account); DMs a one-time 15-minute setup link instead of a password. Legacy plaintext-password DM only when `WEB_URL` is unset.
 
 ## Admin (owner-only)
 - `/addadmin <user_id> [username]` — add platform admin.
@@ -114,8 +118,14 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/approve <id>` — approve and execute a pending MCP tool call (owner only; 15-min expiry).
 - `/deny <id>` — deny a pending MCP tool call (owner only).
 
+## MCP tokens (v1.4, seller self-service)
+- `/mcptoken create <name>` — mint a per-seller MCP bearer token. The raw token is shown once with a store-it-now warning; the reply carries the 8-char prefix and the name. Capped at 10 active tokens per seller (revoke one to free a slot).
+- `/mcptoken list` — your tokens as `id | prefix | name | created | status` — prefix-masked, never the raw token.
+- `/mcptoken revoke <id>` — revoke one of your own tokens (immediate: clients using it start getting 401s). An unknown id and another seller's id get the same refusal.
+- Admins/owners manage only their own tokens here — there is no admin-mints-for-seller flow. Tokens never expire unless revoked.
+
 ## MCP tools (AI agents)
-Endpoint: `POST /api/v1/mcp` (bearer `MCP_OWNER_TOKEN`; disabled when unset).
+Endpoint: `POST /api/v1/mcp`. Bearer auth: the owner's `MCP_OWNER_TOKEN` (disabled when unset) or a per-seller token minted with `/mcptoken` — seller tokens see only their own data (see `docs/API.md` → MCP for the exact auth model). Tool tiers:
 - Read: `list_channels`, `list_plans`, `list_posts`, `subs_report`, `list_codes` (PII/codes masked by default).
 - Write: `publish_post`, `edit_post`.
-- Sensitive (approval-gated): `gen_codes`, `delete_post`, `broadcast`, `ai_publish_post`.
+- Sensitive (owner-only, approval-gated): `gen_codes`, `delete_post`, `broadcast`, `ai_publish_post`. A non-owner principal calling any of them is refused with JSON-RPC error `-32001 "sensitive tools require the owner credential"` — nothing parks, nothing executes; the owner's park → `/approve` → execute flow is unchanged.
