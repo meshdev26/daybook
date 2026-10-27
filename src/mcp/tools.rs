@@ -32,6 +32,13 @@ const APPROVAL_TTL_SECS: i64 = 15 * 60;
 pub const MAX_CODES: i64 = 50;
 pub const DEFAULT_LIST_LIMIT: i64 = 20;
 pub const MAX_LIST_LIMIT: i64 = 50;
+/// How far back `edit_post` scans a seller's own posts to verify ownership.
+/// `Db` has no get-post-by-id, so the check re-uses the read tool's scoped
+/// `list_posts(Some(seller_id), …)` with a generous window (500 rows, ~10x
+/// the list tool's cap): any realistic seller history fits, and a target
+/// outside the window is refused exactly like a foreign or nonexistent post
+/// — no oracle either way.
+const EDIT_POST_OWNERSHIP_SCAN_LIMIT: i64 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -584,7 +591,7 @@ async fn publish_post(state: WebState, principal: Principal, args: Value) -> Res
     }
 }
 
-async fn edit_post(state: WebState, _principal: Principal, args: Value) -> Result<Value, String> {
+async fn edit_post(state: WebState, principal: Principal, args: Value) -> Result<Value, String> {
     let post_id = args
         .get("post_id")
         .and_then(|v| v.as_i64())
@@ -593,6 +600,23 @@ async fn edit_post(state: WebState, _principal: Principal, args: Value) -> Resul
         .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    // Tenancy: the update itself is by-id and unscoped, so a seller principal
+    // must first prove the target is one of their own posts. The check re-uses
+    // the read tool's exact scoped query (`list_posts(Some(seller_id), …)`,
+    // bounded by EDIT_POST_OWNERSHIP_SCAN_LIMIT); owner principals (no seller
+    // id) keep the historical unscoped behavior. A foreign post and a
+    // nonexistent one answer with the SAME failure — the message never
+    // distinguishes existence.
+    if let Some(seller_id) = principal.seller_id {
+        let owns = state
+            .db
+            .list_posts(Some(seller_id), EDIT_POST_OWNERSHIP_SCAN_LIMIT)
+            .into_iter()
+            .any(|p| p.0 == post_id);
+        if !owns {
+            return Err("post not found or not yours".into());
+        }
+    }
     match state.db.update_post_content(post_id, text) {
         Ok(()) => Ok(json!({"ok": true, "post_id": post_id,
                             "note": "stored record updated; the sent Telegram message was not rewritten"})),

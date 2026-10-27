@@ -12,7 +12,8 @@
 //! - **Stateless JSON-RPC 2.0**: single response per request, no
 //!   `Mcp-Session-Id`; notifications (no `id`) get HTTP 202 + empty body.
 //! - **Tiered tools** (see [`tools`]): Read / Write execute; Sensitive park a
-//!   pending approval and return `requires_approval`.
+//!   pending approval and return `requires_approval` — owner callers only: a
+//!   non-owner principal is refused before anything parks (see `dispatch`).
 //! - **Audited**: every `tools/call` outcome — ok or err, every tier — lands
 //!   in `mcp_audit`.
 
@@ -36,9 +37,10 @@ use crate::roles;
 use crate::web::WebState;
 use tools::{Principal, Tier};
 
-// v2 per-seller MCP tokens (not yet wired into auth). Reserved for the
-// future per-seller bearer-token flow; `authenticate` still uses
-// `MCP_OWNER_TOKEN`.
+// Per-seller MCP bearer tokens (v1.4 D6): `authenticate` tries the owner env
+// token first (back-compat, constant-time), then falls back to the SHA-256
+// hash lookup below — revoked/expired rows never authenticate, and every
+// failure path returns the same 401 with no oracle.
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,9 @@ const CODE_PARAMS: i64 = -32602;
 const CODE_INTERNAL: i64 = -32603;
 /// Server-range code for transport-level refusals (disabled / auth / rate).
 const CODE_SERVER: i64 = -32000;
+/// Server-range code for an authenticated caller refused at method level —
+/// the Sensitive tier is owner-only (see the gate in `dispatch`).
+const CODE_FORBIDDEN: i64 = -32001;
 
 /// MCP endpoint budget: same per-principal token-bucket pattern as the AI
 /// service (`RateLimiter::new(20)` there); v1 has one principal (the owner).
@@ -144,8 +149,9 @@ fn rpc_result(id: Value, result: Value) -> Response {
         .into_response()
 }
 
-/// Bearer-token auth, run before the body is even parsed. Returns the Owner
-/// principal or a ready-made error response (boxed: clippy::result_large_err).
+/// Bearer-token auth, run before the body is even parsed. Returns the
+/// authenticated principal — the owner (env token) or a seller (per-seller
+/// token) — or a ready-made error response (boxed: clippy::result_large_err).
 fn authenticate(web: &WebState, headers: &HeaderMap) -> Result<Principal, Box<Response>> {
     // Secure default OFF: no configured token means the endpoint does not
     // exist as far as any caller is concerned. Checked BEFORE token
@@ -163,24 +169,39 @@ fn authenticate(web: &WebState, headers: &HeaderMap) -> Result<Principal, Box<Re
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    // Constant-time compare (the same helper guards webhook signatures).
-    // An empty presentation can never match (config rejects empty tokens).
-    if presented.is_empty() || !crate::util::ct_eq(presented, expected) {
-        return Err(Box::new(rpc_error(
-            StatusCode::UNAUTHORIZED,
-            Value::Null,
-            CODE_SERVER,
-            "unauthorized",
-        )));
+    // Owner env token keeps priority: constant-time compare (the same helper
+    // guards webhook signatures). An empty presentation can never match
+    // (config rejects empty tokens).
+    if !presented.is_empty() && crate::util::ct_eq(presented, expected) {
+        return Ok(Principal::OWNER);
     }
-    Ok(Principal::OWNER)
+    // Per-seller token (D6): SHA-256 hash lookup. The helper rejects revoked
+    // and expired rows itself, so unknown / revoked / expired / malformed
+    // bearers all fall through to the SAME 401 — no oracle in the failure
+    // path.
+    if let Some(t) = lookup_mcp_token(&web.db, presented) {
+        // Best-effort by contract: bookkeeping must never fail the auth path.
+        web.db.touch_mcp_token(t.id);
+        return Ok(Principal {
+            role: roles::Role::Seller,
+            seller_id: Some(t.seller_id),
+        });
+    }
+    Err(Box::new(rpc_error(
+        StatusCode::UNAUTHORIZED,
+        Value::Null,
+        CODE_SERVER,
+        "unauthorized",
+    )))
 }
 
-/// Rate-limit key: v1 has exactly one principal (the owner), so the role
-/// discriminates the single bucket. v2 per-seller tokens will pass
-/// `seller_id` here instead.
+/// Rate-limit key: one bucket per principal — a seller is keyed by their
+/// seller id (a real Telegram user id, never colliding with the
+/// small-integer role keys), so exhausting one seller's bucket never
+/// throttles the owner or another seller. Principals without a seller id
+/// (the owner) keep the role-keyed bucket.
 fn principal_key(principal: &Principal) -> i64 {
-    principal.role as i64
+    principal.seller_id.unwrap_or(principal.role as i64)
 }
 
 /// Fixed label for `mcp_tool_calls_total{tier}` — tier names are static
@@ -320,18 +341,48 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                 st.web.db.mcp_audit(
                     name,
                     tools::role_name(principal.role),
+                    principal.seller_id,
                     false,
                     Some("unknown tool"),
                 );
                 crate::metrics::mcp_tool(None, "unknown", false);
                 return rpc_error(StatusCode::OK, id, CODE_PARAMS, "unknown tool");
             };
+            // Sensitive tier is owner-only (v1.4 fail-closed floor). The
+            // approval flow is requester-blind: /approve executes whatever is
+            // parked without any record of who asked, so the two-person design
+            // is only sound when the sole possible requester IS the approver.
+            // If a seller token could park rows, the benefiting seller would
+            // sit inside the approval path and could launder a global
+            // broadcast / gen_codes / delete_post past a blind owner click.
+            // Non-owner principals are therefore refused here: no pending
+            // approval row, no execution, not even an arg-validation oracle.
+            // (tools/list still advertises the names — capability discovery is
+            // fine; calling is what is gated.) Owner principals keep the
+            // unchanged park -> /approve -> execute flow below.
+            if spec.tier == Tier::Sensitive && principal.role != roles::Role::Owner {
+                st.web.db.mcp_audit(
+                    spec.name,
+                    tools::role_name(principal.role),
+                    principal.seller_id,
+                    false,
+                    Some("forbidden: sensitive tools require the owner credential"),
+                );
+                crate::metrics::mcp_tool(Some(spec.name), tier_label(spec.tier), false);
+                return rpc_error(
+                    StatusCode::OK,
+                    id,
+                    CODE_FORBIDDEN,
+                    "sensitive tools require the owner credential",
+                );
+            }
             // Validate BEFORE anything runs: bad args are -32602 with zero
             // side effects — a sensitive tool must not even park an approval.
             if let Err(msg) = (spec.validate)(&args) {
                 st.web.db.mcp_audit(
                     spec.name,
                     tools::role_name(principal.role),
+                    principal.seller_id,
                     false,
                     Some(&format!("invalid args: {msg}")),
                 );
@@ -355,6 +406,7 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                     st.web.db.mcp_audit(
                         spec.name,
                         tools::role_name(principal.role),
+                        principal.seller_id,
                         true,
                         Some(&detail),
                     );
@@ -363,6 +415,7 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                     st.web.db.mcp_audit(
                         spec.name,
                         tools::role_name(principal.role),
+                        principal.seller_id,
                         false,
                         Some(e),
                     );
@@ -439,6 +492,7 @@ pub async fn cmd_approve(state: &WebState, args: &str) -> String {
         state.db.mcp_audit(
             &row.1,
             "owner",
+            None,
             false,
             Some(&format!("approval #{id} expired")),
         );
@@ -449,6 +503,7 @@ pub async fn cmd_approve(state: &WebState, args: &str) -> String {
         state.db.mcp_audit(
             &row.1,
             "owner",
+            None,
             false,
             Some(&format!("approval #{id} already decided")),
         );
@@ -463,6 +518,7 @@ pub async fn cmd_approve(state: &WebState, args: &str) -> String {
             state.db.mcp_audit(
                 &row.1,
                 "owner",
+                None,
                 true,
                 Some(&format!("approved #{id} executed")),
             );
@@ -475,6 +531,7 @@ pub async fn cmd_approve(state: &WebState, args: &str) -> String {
             state.db.mcp_audit(
                 &row.1,
                 "owner",
+                None,
                 false,
                 Some(&format!("approved #{id} execution failed: {e}")),
             );
@@ -497,7 +554,7 @@ pub async fn cmd_deny(state: &WebState, args: &str) -> String {
     if state.db.mcp_decide_approval(id, "denied") {
         state
             .db
-            .mcp_audit(&tool, "owner", true, Some(&format!("denied #{id}")));
+            .mcp_audit(&tool, "owner", None, true, Some(&format!("denied #{id}")));
         format!("Approval #{id} denied.")
     } else {
         match state.db.mcp_get_approval(id) {
@@ -1017,6 +1074,75 @@ mod tests {
         assert_eq!(posts[0].5.as_deref(), Some("after"));
     }
 
+    /// Tenancy regression: a seller token may edit only its OWN stored posts.
+    /// A foreign post and a nonexistent one must be indistinguishable (same
+    /// refusal text, no oracle) and the foreign record must stay untouched.
+    #[tokio::test]
+    async fn edit_post_is_tenancy_scoped_for_seller_tokens() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        // Seller 7 owns one post, seller 8 another; a real per-seller token
+        // authenticates the request as the seller-7 principal.
+        let _ = state.db.log_post(7, "@chan", 11, "text", Some("mine"));
+        let _ = state.db.log_post(8, "@chan", 22, "text", Some("theirs"));
+        let (_, raw) = state.db.create_mcp_token(7, Some("ci"));
+        let posts = state.db.list_posts(None, 10);
+        let own_id = posts.iter().find(|p| p.1 == 7).unwrap().0;
+        let foreign_id = posts.iter().find(|p| p.1 == 8).unwrap().0;
+        let nonexistent_id = posts.iter().map(|p| p.0).max().unwrap() + 1000;
+        let app = router(state.clone());
+        // Own post: ok, unchanged response shape, and the write really lands.
+        let (_, v) = send(
+            &app,
+            Some(&raw),
+            rpc(
+                1,
+                "tools/call",
+                json!({"name": "edit_post", "arguments": {"post_id": own_id, "text": "after"}}),
+            )
+            .to_string(),
+        )
+        .await;
+        let result = result_text(&v);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["post_id"], own_id);
+        let posts = state.db.list_posts(None, 10);
+        assert_eq!(
+            posts.iter().find(|p| p.0 == own_id).unwrap().5.as_deref(),
+            Some("after")
+        );
+        // Foreign (exists, other seller) and nonexistent: the exact same
+        // error for both, so existence is never distinguishable.
+        let mut errors = Vec::new();
+        for (i, id) in [foreign_id, nonexistent_id].into_iter().enumerate() {
+            let (_, v) = send(
+                &app,
+                Some(&raw),
+                rpc(
+                    (i + 2) as i64,
+                    "tools/call",
+                    json!({"name": "edit_post", "arguments": {"post_id": id, "text": "hijack"}}),
+                )
+                .to_string(),
+            )
+            .await;
+            assert_eq!(v["result"]["isError"], true, "post {id} must fail");
+            errors.push(result_text(&v)["error"].as_str().unwrap_or("").to_string());
+        }
+        assert_eq!(errors[0], "post not found or not yours");
+        assert_eq!(errors[0], errors[1], "no oracle: same error for both");
+        // And the foreign record was never written.
+        let posts = state.db.list_posts(None, 10);
+        assert_eq!(
+            posts
+                .iter()
+                .find(|p| p.0 == foreign_id)
+                .unwrap()
+                .5
+                .as_deref(),
+            Some("theirs")
+        );
+    }
+
     // ---- Sensitive tier: the approval gate ----
 
     #[tokio::test]
@@ -1065,6 +1191,46 @@ mod tests {
         .await;
         assert_eq!(err_code(&v), CODE_PARAMS);
         assert!(state.db.mcp_list_approvals(Some("pending"), 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn seller_token_cannot_call_sensitive_tools_and_parks_nothing() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        // A real per-seller token row: the request authenticates as a seller
+        // principal, which is exactly the caller class the owner-only floor
+        // exists to keep out of the (requester-blind) approval path.
+        let (_, raw) = state.db.create_mcp_token(7, Some("ci"));
+        let before_codes = state.db.count_codes(None);
+        let app = router(state.clone());
+        // Valid args on purpose: the refusal must be the tier gate, not an
+        // argument error — every sensitive tool answers with the same
+        // forbidden envelope and leaves zero side effects.
+        for (name, args) in [
+            ("gen_codes", json!({"count": 1})),
+            ("delete_post", json!({"post_id": 1})),
+            ("broadcast", json!({"text": "hi"})),
+            ("ai_publish_post", json!({"draft_id": 1})),
+        ] {
+            let (status, v) = send(
+                &app,
+                Some(&raw),
+                rpc(1, "tools/call", json!({"name": name, "arguments": args})).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(err_code(&v), CODE_FORBIDDEN, "{name}");
+            assert_eq!(
+                v["error"]["message"], "sensitive tools require the owner credential",
+                "{name}"
+            );
+        }
+        // Nothing parked, nothing executed.
+        assert!(state.db.mcp_list_approvals(Some("pending"), 10).is_empty());
+        assert_eq!(state.db.count_codes(None), before_codes);
+        // The refusals are audited as seller-role failures.
+        let audit = state.db.mcp_list_audit(10);
+        assert_eq!(audit.len(), 4);
+        assert!(audit.iter().all(|a| a.2 == "seller" && !a.3));
     }
 
     #[tokio::test]

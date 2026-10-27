@@ -20,6 +20,12 @@ type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 /// identical. Public because the bin and fuzz targets are separate crates.
 pub const MAX_PLAN_DAYS: i64 = 3650;
 
+/// Active (non-revoked) MCP tokens a seller may hold at once (D6). The
+/// per-seller cap is enforced HERE by counting `list_mcp_tokens` rows before
+/// minting — the Db layer has no cap check, so this handler is the single
+/// gate (coordinator decision; the spec copy quotes the same number).
+const MCP_TOKEN_CAP: usize = 10;
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
@@ -112,6 +118,14 @@ pub enum Command {
     Book(String),
     /// List bookings. /bookings
     Bookings,
+    /// Your bookings: /mybookings
+    MyBookings,
+    /// Cancel your booking: /cancelbooking <booking_id>
+    CancelBooking(String),
+    /// Confirm a booking (seller): /bookingconfirm <booking_id>
+    BookingConfirm(String),
+    /// Decline a booking (seller): /bookingdecline <booking_id>
+    BookingDecline(String),
     /// Run expiry cleanup. /expirecheck
     ExpireCheck,
     /// Broadcast to all users: /broadcast <text>.
@@ -122,6 +136,8 @@ pub enum Command {
     AiPost(String),
     /// Set web dashboard password: /setwebpassword <new>.
     SetWebPassword(String),
+    /// Manage MCP API tokens: /mcptoken create <name> | list | revoke <id>.
+    McpToken(String),
     /// Show web dashboard login info: /dashboard.
     Dashboard,
     /// Add platform admin (owner only): /addadmin <user_id> [username].
@@ -177,6 +193,9 @@ pub async fn cmd_handler(
             | Command::Redeem(_)
             | Command::Services
             | Command::Book(_)
+            | Command::Bookings
+            | Command::MyBookings
+            | Command::CancelBooking(_)
             | Command::Setup(_)
             | Command::BecomeSeller
     );
@@ -211,6 +230,8 @@ pub async fn cmd_handler(
             | Command::ServiceAdd(_)
             | Command::SlotAdd(_)
             | Command::Bookings
+            | Command::BookingConfirm(_)
+            | Command::BookingDecline(_)
             | Command::ExpireCheck
             | Command::Broadcast(_)
             | Command::Ai(_)
@@ -218,6 +239,7 @@ pub async fn cmd_handler(
             | Command::GenCodes(_)
             | Command::Codes
             | Command::SetWebPassword(_)
+            | Command::McpToken(_)
             | Command::Dashboard
     );
     // Admin-tier commands: admin/owner only (sellers and plain users are
@@ -258,7 +280,9 @@ pub async fn cmd_handler(
                      /paid <invoice_id> — check payment status\n\
                      /redeem <code> — redeem an activation code\n\
                      /services — list bookable services\n\
-                     /book <service> — book a service\n\n\
+                     /book <service> — book a service\n\
+                     /mybookings — your bookings\n\
+                     /cancelbooking <id> — cancel a booking\n\n\
                      All commands:\n",
                 );
             }
@@ -1673,19 +1697,41 @@ pub async fn cmd_handler(
                     .await?;
             } else {
                 let svc_name = parts[0];
-                let dt = parts[1];
-                let cap: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                match db.find_service_id(user_id, svc_name) {
-                    Some(sid) => {
-                        let id = db.create_slot(sid, user_id, dt, cap);
-                        bot.send_message(
-                            chat_id,
-                            format!("Slot #{} created for {} at {}.", id, svc_name, dt),
-                        )
-                        .await?;
+                let dt_raw = parts[1];
+                // D4 (v1.4): the stored time must be unambiguous and future —
+                // RFC3339 or "YYYY-MM-DD HH:MM" (read as UTC and normalized to
+                // RFC3339 so create_booking's parser accepts it). Everything
+                // else, and any past timestamp, is rejected up front.
+                match parse_slot_datetime(dt_raw).filter(|dt| *dt > Utc::now()) {
+                    Some(dt) => {
+                        // D1: one slot holds exactly one booking in v1.4. The
+                        // capacity argument stays for CLI stability but is
+                        // clamped to 1, with the spec's notice.
+                        let cap_arg = parts.get(2).and_then(|s| s.parse::<i64>().ok());
+                        let clamp = cap_arg.map(|c| c > 1).unwrap_or(false);
+                        let cap = if clamp { 1 } else { cap_arg.unwrap_or(1) };
+                        match db.find_service_id(user_id, svc_name) {
+                            Some(sid) => {
+                                let rfc = dt.to_rfc3339();
+                                let id = db.create_slot(sid, user_id, &rfc, cap);
+                                let mut out =
+                                    format!("Slot #{} created for {} at {}.", id, svc_name, dt_raw);
+                                if clamp {
+                                    out.push_str("\nCapacity > 1 is reserved for class bookings (v1.5); slot created with capacity 1.");
+                                }
+                                bot.send_message(chat_id, out).await?;
+                            }
+                            None => {
+                                bot.send_message(chat_id, "Service not found.").await?;
+                            }
+                        }
                     }
                     None => {
-                        bot.send_message(chat_id, "Service not found.").await?;
+                        bot.send_message(
+                            chat_id,
+                            "Could not create the slot. Use a future UTC time, format YYYY-MM-DD HH:MM.",
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1710,30 +1756,50 @@ pub async fn cmd_handler(
                         .into_iter()
                         .find(|s| s.2 == name && s.1 != 0)
                 };
-                if let Some((service_id, seller_id, svc_name, _p, _a, _d, _ch)) = svc {
-                    // find first available slot
-                    let slots = db.list_slots(service_id);
-                    let avail = slots.into_iter().find(|s| s.4 == "available" && s.2 > s.3);
-                    if let Some((slot_id, starts, _cap, _booked, _st)) = avail {
-                        let expires = (Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
-                        let bid = db.create_booking(
-                            seller_id,
-                            service_id,
-                            Some(slot_id),
-                            user_id,
-                            None,
-                            Some(&expires),
-                        );
-                        bot.send_message(
-                            chat_id,
-                            format!(
-                                "Booking {} confirmed — {} at {}.\nThe hold expires in 15 minutes.",
-                                bid, svc_name, starts
-                            ),
-                        )
-                        .await?;
-                    } else {
-                        bot.send_message(chat_id, "No available slots.").await?;
+                if let Some((service_id, _seller_id, svc_name, _p, _a, _d, _ch)) = svc {
+                    // D1: slot status is the only bookability state — pick the
+                    // first 'available' slot as the claim candidate; the past /
+                    // race / scope checks all live inside create_booking's one
+                    // transaction (the old handler-side availability check is
+                    // gone on purpose: it was a TOCTOU).
+                    let candidate = db
+                        .list_slots(service_id)
+                        .into_iter()
+                        .find(|s| s.4 == "available");
+                    match candidate {
+                        Some((slot_id, starts, ..)) => {
+                            match db.create_booking(service_id, slot_id, user_id) {
+                                Ok(Some(bid)) => {
+                                    // Hold = seller-response window (D3): the same
+                                    // number the Db claims with, never a hardcoded
+                                    // lie; "requested" is the truthful word.
+                                    bot.send_message(
+                                    chat_id,
+                                    format!(
+                                        "Booking #{bid} requested — {svc_name} at {starts}.\n\nThe seller has up to {} minutes to respond. You'll get a message when they confirm or decline.\nCancel anytime: /cancelbooking #{bid}",
+                                        crate::db::BOOKING_HOLD_MINUTES
+                                    ),
+                                )
+                                .await?;
+                                }
+                                // Race loser, past slot, or already-claimed: one
+                                // truthful line, no details leaked.
+                                Ok(None) => {
+                                    bot.send_message(chat_id, "Slot no longer available.")
+                                        .await?;
+                                }
+                                Err(_) => {
+                                    bot.send_message(
+                                    chat_id,
+                                    "That slot's time is invalid — ask the seller to recreate it.",
+                                )
+                                .await?;
+                                }
+                            }
+                        }
+                        None => {
+                            bot.send_message(chat_id, "No available slots.").await?;
+                        }
                     }
                 } else {
                     bot.send_message(chat_id, "Service not found.").await?;
@@ -1741,24 +1807,174 @@ pub async fn cmd_handler(
             }
         }
         Command::Bookings => {
-            let bs = db.list_bookings(if is_admin { None } else { Some(user_id) });
-            if bs.is_empty() {
-                bot.send_message(chat_id, "No bookings.").await?;
+            if role == roles::Role::User {
+                // Buyers are pointed at their own view (BOOKINGS_UX_SPEC §4.7);
+                // sellers/admins keep the list below.
+                bot.send_message(
+                    chat_id,
+                    "Bookings are a seller view. See your own bookings with /mybookings.",
+                )
+                .await?;
             } else {
-                let mut out =
-                    String::from("Bookings (id | seller | service | user | status | expires):\n");
-                for (bid, sid, svc, uid, st, exp) in bs {
+                let bs = db.list_bookings(if is_admin { None } else { Some(user_id) });
+                if bs.is_empty() {
+                    bot.send_message(chat_id, "No bookings.").await?;
+                } else {
+                    let mut out = String::from(
+                        "Bookings (id | seller | service | user | status | expires):\n",
+                    );
+                    for (bid, sid, svc, uid, st, exp) in bs {
+                        out.push_str(&format!(
+                            "{} | {} | {} | {} | {} | {}\n",
+                            bid,
+                            sid,
+                            svc,
+                            uid,
+                            st,
+                            exp.unwrap_or_default()
+                        ));
+                    }
+                    bot.send_message(chat_id, out).await?;
+                }
+            }
+        }
+        Command::MyBookings => {
+            let rows = db.list_bookings_for_user(user_id, 20);
+            if rows.is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "You have no bookings. Browse /services and book with /book <service_name>.",
+                )
+                .await?;
+            } else {
+                let mut out = String::from("Your bookings (id | service | time | status):\n");
+                let mut actionable = false;
+                // The public 8-char token is the buyer-facing reference (the
+                // integer id only ever appears in /book's confirmation line).
+                for (_id, token, _buyer, service, starts, _ends, status, expires, seller) in rows {
                     out.push_str(&format!(
-                        "{} | {} | {} | {} | {} | {}\n",
-                        bid,
-                        sid,
-                        svc,
-                        uid,
-                        st,
-                        exp.unwrap_or_default()
+                        "{} | {} | {} | {}\n",
+                        token,
+                        service,
+                        starts.as_deref().unwrap_or("—"),
+                        status
                     ));
+                    match status.as_str() {
+                        "held" => {
+                            actionable = true;
+                            out.push_str(&format!(
+                                "The seller has until {} to respond.\n",
+                                expires.as_deref().unwrap_or("—")
+                            ));
+                        }
+                        "confirmed" => {
+                            actionable = true;
+                            out.push_str(&format!(
+                                "Seller: {}.\n",
+                                seller_display(&db, seller.unwrap_or(0))
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if actionable {
+                    out.push_str("Cancel: /cancelbooking <booking_id>\n");
                 }
                 bot.send_message(chat_id, out).await?;
+            }
+        }
+        Command::CancelBooking(arg) => {
+            let key = arg.trim();
+            if key.is_empty() {
+                bot.send_message(chat_id, "Usage: /cancelbooking <booking_id>")
+                    .await?;
+            } else {
+                // Ownership check lives HERE, before any write: the scoped
+                // cancel accepts an admin/owner scope (None), so the only safe
+                // path is to resolve the id against the CALLER's own list —
+                // every returned row already has buyer_user_id == caller.
+                // Matching by integer id or public token, nothing else.
+                let owned =
+                    db.list_bookings_for_user(user_id, 200)
+                        .into_iter()
+                        .find(|(id, token, ..)| {
+                            *token == key || id.to_string() == key || format!("#{id}") == key
+                        });
+                match owned {
+                    Some((id, _token, _buyer, service, _starts, _ends, _status, _exp, seller)) => {
+                        if db.cancel_booking_scoped(id, None) {
+                            bot.send_message(
+                                chat_id,
+                                format!(
+                                    "Booking #{id} cancelled. The seller has been notified and the slot is free again."
+                                ),
+                            )
+                            .await?;
+                            // Seller DM (BOOKINGS_UX_SPEC §4.4): best-effort —
+                            // a failed DM is logged, never propagated. Global
+                            // services (seller_id 0) have no seller to notify.
+                            if let Some(sid) = seller.filter(|s| *s != 0) {
+                                match bot
+                                    .send_message(
+                                        teloxide::types::ChatId(sid),
+                                        format!(
+                                            "Booking #{id} ({service}) was cancelled by the buyer. The slot is free again."
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => crate::metrics::bot_sent(),
+                                    Err(e) => tracing::warn!(
+                                        "cancelbooking: failed to DM seller {} about cancelled booking #{}: {}",
+                                        sid,
+                                        id,
+                                        e
+                                    ),
+                                }
+                            }
+                        } else {
+                            // Terminal (declined/cancelled) or lost a race —
+                            // one no-oracle message per the spec.
+                            bot.send_message(chat_id, "Booking not found or already closed.")
+                                .await?;
+                        }
+                    }
+                    None => {
+                        bot.send_message(chat_id, "Booking not found or already closed.")
+                            .await?;
+                    }
+                }
+            }
+        }
+        Command::BookingConfirm(arg) => {
+            if is_admin {
+                // Admins/owner respond via the console /bookings page, not the
+                // bot: confirming another seller's booking is out of scope for
+                // the bot on purpose.
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "Booking confirm/decline are seller commands. Admins and owners respond to all bookings in the web console: {}/bookings",
+                        cfg.web_url()
+                    ),
+                )
+                .await?;
+            } else {
+                booking_respond(&bot, &db, chat_id, user_id, &arg, true).await?;
+            }
+        }
+        Command::BookingDecline(arg) => {
+            if is_admin {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "Booking confirm/decline are seller commands. Admins and owners respond to all bookings in the web console: {}/bookings",
+                        cfg.web_url()
+                    ),
+                )
+                .await?;
+            } else {
+                booking_respond(&bot, &db, chat_id, user_id, &arg, false).await?;
             }
         }
         Command::ExpireCheck => {
@@ -1989,6 +2205,9 @@ pub async fn cmd_handler(
                 .clone()
                 .unwrap_or_else(|| format!("seller_{}", user_id));
             if db.get_web_account_by_username(&username).is_none() {
+                // The placeholder password is written to the account row but
+                // never displayed when setup links are available (D7): the DM
+                // carries only the one-time claim link.
                 let password = util::gen_token(12);
                 if let Err(e) = db
                     .create_web_account(&username, &password, "seller", Some(user_id))
@@ -2000,15 +2219,31 @@ pub async fn cmd_handler(
                     )
                     .await?;
                 } else {
+                    let link = db
+                        .get_web_account_by_username(&username)
+                        .and_then(|(id, ..)| setup_claim_url(&db, id));
+                    if let Some(url) = link {
+                        bot.send_message(chat_id, format!(
+                            "You are now a seller. Use /setup @channel to link your channel.\n\nSet up your web dashboard with this one-time link (valid {} minutes):\n{url}\n\nDashboard username: {username}\nThe link lets you choose a password and signs you in. It works once — if it expires, send /dashboard for a new one. Never share it.",
+                            crate::db::SETUP_LINK_TTL_MINUTES
+                        )).await?;
+                        return Ok(());
+                    }
+                    // WEB_URL unset: the legacy plaintext fallback, with the
+                    // one-line operator hint (and a warn — the token-less link
+                    // flow is the intended posture). The raw setup token is
+                    // never logged; here none was minted.
+                    tracing::warn!(
+                        "WEB_URL is not set: /becomeseller DM-ed a plaintext dashboard password to account '{username}'; set WEB_URL to receive secure setup links instead of passwords."
+                    );
                     let url = cfg.web_url();
                     bot.send_message(chat_id, format!(
-                        "You are now a seller. Use /setup @channel to link your channel.\n\nWeb dashboard login:\nURL: {}\nUsername: {}\nPassword: {}\nChange with /setwebpassword.",
-                        url, username, password
+                        "You are now a seller. Use /setup @channel to link your channel.\n\nWeb dashboard login:\nURL: {url}\nUsername: {username}\nPassword: {password}\nChange with /setwebpassword.\n\nSet WEB_URL to receive secure setup links instead of passwords."
                     )).await?;
                     return Ok(());
                 }
             }
-            bot.send_message(chat_id, "You are now a seller. Use /setup @channel to link your channel. Web account already exists; use /dashboard for login info.").await?;
+            bot.send_message(chat_id, "You are now a seller. Use /setup @channel to link your channel. Dashboard account already exists; send /dashboard for a sign-in link.").await?;
         }
         Command::SetWebPassword(newpw) => {
             let uname = msg
@@ -2028,34 +2263,170 @@ pub async fn cmd_handler(
                     .await?;
             }
         }
+        Command::McpToken(arg) => {
+            // Seller self-service for per-seller MCP bearer tokens (D6):
+            // admins/owners manage only their OWN tokens here (scope is the
+            // caller's seller id; there is no admin-mints-for-seller flow).
+            let parts: Vec<&str> = arg.split_whitespace().collect();
+            match parts.first().copied() {
+                Some("create") => {
+                    let name = parts
+                        .get(1..)
+                        .map(|rest| rest.join(" "))
+                        .unwrap_or_default();
+                    let name = name.trim();
+                    if name.is_empty() {
+                        bot.send_message(chat_id, "Usage: /mcptoken create <name>")
+                            .await?;
+                    } else if name.chars().count() > 64 {
+                        bot.send_message(chat_id, "Token name must be 64 characters or fewer.")
+                            .await?;
+                    } else if db
+                        .list_mcp_tokens(user_id)
+                        .iter()
+                        .filter(|t| t.4 == 0)
+                        .count()
+                        >= MCP_TOKEN_CAP
+                    {
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "Token limit reached: {MCP_TOKEN_CAP} active tokens. Revoke one with /mcptoken revoke <id>, then create again."
+                            ),
+                        )
+                        .await?;
+                    } else {
+                        let (id, raw) = db.create_mcp_token(user_id, Some(name));
+                        // The raw token exists in this reply and nowhere else
+                        // (the Db stores the SHA-256 hash + 8-char prefix) —
+                        // it is never logged or echoed again.
+                        let prefix: String = raw.chars().take(8).collect();
+                        bot.send_message(chat_id, format!(
+                            "MCP token created — {name} (prefix {prefix}…)\n\n{raw}\n\nShown once — store it now. It authenticates as you against the MCP endpoint; see docs/API.md → MCP section.\nExpires: never"
+                        )).await?;
+                        tracing::info!("minted MCP token #{} for seller {}", id, user_id);
+                    }
+                }
+                Some("list") => {
+                    let rows = db.list_mcp_tokens(user_id);
+                    if rows.is_empty() {
+                        bot.send_message(
+                            chat_id,
+                            "No MCP tokens. Create one with /mcptoken create <name>.",
+                        )
+                        .await?;
+                    } else {
+                        let mut out = String::from(
+                            "Your MCP tokens (id | prefix | name | created | status):\n",
+                        );
+                        for (id, name, prefix, created, revoked) in rows {
+                            out.push_str(&format!(
+                                "{} | {} | {} | {} | {}\n",
+                                id,
+                                prefix
+                                    .map(|p| format!("{p}…"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                                name.unwrap_or_else(|| "—".to_string()),
+                                rfc3339_date(&created),
+                                if revoked != 0 { "revoked" } else { "active" }
+                            ));
+                        }
+                        bot.send_message(chat_id, out).await?;
+                    }
+                }
+                Some("revoke") => {
+                    let Some(id) = parts.get(1).and_then(|s| s.parse::<i64>().ok()) else {
+                        bot.send_message(chat_id, "Usage: /mcptoken revoke <id>")
+                            .await?;
+                        return Ok(());
+                    };
+                    // Seller-scoped: an unknown id and another seller's id are
+                    // the same no-oracle message; revoking an already-revoked
+                    // own token is idempotent success.
+                    if db.revoke_mcp_token(id, Some(user_id)) {
+                        bot.send_message(
+                            chat_id,
+                            format!("Token {id} revoked. Clients using it get errors immediately."),
+                        )
+                        .await?;
+                    } else {
+                        bot.send_message(
+                            chat_id,
+                            "Token not found (or it does not belong to you).",
+                        )
+                        .await?;
+                    }
+                }
+                _ => {
+                    bot.send_message(
+                        chat_id,
+                        "MCP tokens let external tools call this shop's MCP endpoint as you — they see only your own data.\n\n/mcptoken create <name> — mint a token\n/mcptoken list — list your tokens\n/mcptoken revoke <id> — revoke a token\n\nHow to use a token: docs/API.md → MCP section.",
+                    )
+                    .await?;
+                }
+            }
+        }
         Command::Dashboard => {
             let uname = msg
                 .from
                 .as_ref()
                 .and_then(|u| u.username.clone())
                 .unwrap_or_else(|| format!("seller_{}", user_id));
-            let url = cfg.web_url();
-            if db.get_web_account_by_username(&uname).is_some() {
-                bot.send_message(chat_id, format!("Web dashboard: {}\nUsername: {}\n(Use /setwebpassword to change password.)", url, uname)).await?;
-            } else {
-                let password = util::gen_token(12);
-                match db
-                    .create_web_account(&uname, &password, "seller", Some(user_id))
-                    .await
-                {
-                    Ok(_) => {
+            match db.get_web_account_by_username(&uname) {
+                Some((account_id, ..)) => {
+                    // D7: a sign-in/reset link instead of login info; the DM
+                    // never carries a credential.
+                    if let Some(url) = setup_claim_url(&db, account_id) {
+                        bot.send_message(chat_id, format!(
+                            "One-time dashboard link (valid {} minutes):\n{url}\n\nDashboard username: {uname}\nOpening it lets you set a new password and signs you in. It works once — if it expires, send /dashboard again.",
+                            crate::db::SETUP_LINK_TTL_MINUTES
+                        )).await?;
+                    } else {
+                        tracing::warn!(
+                            "WEB_URL is not set: /dashboard could not mint a setup link for account '{uname}'; set WEB_URL to receive secure setup links instead of passwords."
+                        );
+                        let url = cfg.web_url();
                         bot.send_message(
                             chat_id,
                             format!(
-                                "Web dashboard created.\nURL: {}\nUsername: {}\nPassword: {}",
-                                url, uname, password
+                                "Web dashboard: {url}\nUsername: {uname}\n(Use /setwebpassword to change password.)\n\nSet WEB_URL to receive secure setup links instead of passwords."
                             ),
                         )
                         .await?;
                     }
-                    Err(e) => {
-                        bot.send_message(chat_id, format!("Failed to create web account: {}", e))
+                }
+                None => {
+                    let password = util::gen_token(12);
+                    match db
+                        .create_web_account(&uname, &password, "seller", Some(user_id))
+                        .await
+                    {
+                        Ok(_) => {
+                            let link = db
+                                .get_web_account_by_username(&uname)
+                                .and_then(|(id, ..)| setup_claim_url(&db, id));
+                            if let Some(url) = link {
+                                bot.send_message(chat_id, format!(
+                                    "Web dashboard created.\nDashboard username: {uname}\nOne-time setup link (valid {} minutes):\n{url}\n\nThe link lets you choose a password and signs you in. It works once — if it expires, send /dashboard for a new one. Never share it.",
+                                    crate::db::SETUP_LINK_TTL_MINUTES
+                                )).await?;
+                            } else {
+                                tracing::warn!(
+                                    "WEB_URL is not set: /dashboard DM-ed a plaintext dashboard password to account '{uname}'; set WEB_URL to receive secure setup links instead of passwords."
+                                );
+                                let url = cfg.web_url();
+                                bot.send_message(chat_id, format!(
+                                    "Web dashboard created.\nURL: {url}\nUsername: {uname}\nPassword: {password}\n\nSet WEB_URL to receive secure setup links instead of passwords."
+                                )).await?;
+                            }
+                        }
+                        Err(e) => {
+                            bot.send_message(
+                                chat_id,
+                                format!("Failed to create web account: {}", e),
+                            )
                             .await?;
+                        }
                     }
                 }
             }
@@ -2372,6 +2743,151 @@ fn parse_schedule_datetime(input: &str) -> Option<String> {
         return Some(nd.and_utc().to_rfc3339());
     }
     None
+}
+
+/// Strict slot-time validation (D4, v1.4): RFC3339, or the bot-friendly
+/// "YYYY-MM-DD HH:MM" read as UTC — normalized to RFC3339 either way, since
+/// `create_booking` parses the stored value with RFC3339 only. Unlike
+/// `parse_schedule_datetime` this is deliberately strict: no date-only, no
+/// seconds-only variants — a booking slot must be unambiguous. Past-ness is
+/// checked by the caller (it needs `Utc::now()` anyway).
+fn parse_slot_datetime(input: &str) -> Option<chrono::DateTime<Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(input) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M").ok()?;
+    Some(naive.and_utc())
+}
+
+/// `YYYY-MM-DD` rendering of an RFC3339 timestamp for bot-width lines
+/// (`/mcptoken list`); unparseable input renders as an em-dash placeholder.
+fn rfc3339_date(s: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|_| "—".to_string())
+}
+
+/// The console base URL for one-time setup links (D7) — `Some` only when
+/// WEB_URL is explicitly configured (same check `Config::web_url` applies).
+/// Without it the bot would DM a localhost link no seller can reach, so the
+/// legacy plaintext-password DM stays the fallback until WEB_URL is set.
+/// The raw setup token is NEVER logged — only the caller builds the URL.
+fn web_base_url() -> Option<String> {
+    match std::env::var("WEB_URL") {
+        Ok(u) if !u.trim().is_empty() => Some(u.trim().trim_end_matches('/').to_string()),
+        _ => None,
+    }
+}
+
+/// Mint a one-time setup link for `account_id` and return the full claim URL
+/// (`{web_base}/setup/claim?token={raw}`); `None` when WEB_URL is unset —
+/// the caller falls back to the legacy password DM. The raw token exists
+/// only inside the returned string (and the DM).
+fn setup_claim_url(db: &Db, account_id: i64) -> Option<String> {
+    let base = web_base_url()?;
+    let raw = db.create_setup_link(account_id);
+    Some(format!("{base}/setup/claim?token={raw}"))
+}
+
+/// Shared seller confirm/decline body (BOOKINGS_UX_SPEC §4.5/§4.6): the
+/// booking is resolved against the CALLER's own scoped list only (a foreign
+/// or unknown id is the same "not found" message — no oracle), the Db write
+/// is seller-scoped, and the buyer DM is best-effort (logged, never fatal).
+/// `confirm` picks the transition; sellers only — admins/owner are routed to
+/// the console by the caller.
+async fn booking_respond(
+    bot: &Bot,
+    db: &Db,
+    chat_id: teloxide::types::ChatId,
+    seller_id: i64,
+    arg: &str,
+    confirm: bool,
+) -> HandlerResult {
+    let key = arg.trim();
+    let usage = if confirm {
+        "Usage: /bookingconfirm <booking_id>"
+    } else {
+        "Usage: /bookingdecline <booking_id>"
+    };
+    if key.is_empty() {
+        bot.send_message(chat_id, usage).await?;
+        return Ok(());
+    }
+    // The id may be the integer row id or the public 8-char token — sellers
+    // see the token in the console table and /bookings. Matching against the
+    // seller's own scoped rows keeps foreign ids indistinguishable.
+    let find = |rows: Vec<crate::db::BookingListRow>| {
+        rows.into_iter().find(|(id, token, ..)| {
+            *token == key || id.to_string() == key || format!("#{id}") == key
+        })
+    };
+    let Some((id, _token, buyer, service, starts, _ends, _status, _expires, _sid)) =
+        find(db.list_bookings_filtered(Some(seller_id), None, 200))
+    else {
+        bot.send_message(chat_id, "Booking not found or already closed.")
+            .await?;
+        return Ok(());
+    };
+    let target = if confirm { "confirmed" } else { "declined" };
+    if !db.set_booking_status(id, Some(seller_id), target) {
+        // The row was held/expired a moment ago, so a false here is a lost
+        // race (slot re-taken on confirm) or a concurrent terminal
+        // transition. Re-read the row to answer precisely instead of
+        // guessing — still no oracle: only the caller's own row is read.
+        let now_status = find(db.list_bookings_filtered(Some(seller_id), None, 200))
+            .map(|(_, _, _, _, _, _, st, _, _)| st)
+            .unwrap_or_else(|| "gone".to_string());
+        match now_status.as_str() {
+            "confirmed" | "declined" | "cancelled" => {
+                bot.send_message(chat_id, format!("Booking #{id} is already {now_status}."))
+                    .await?;
+            }
+            _ if confirm => {
+                bot.send_message(
+                    chat_id,
+                    format!("Could not confirm #{id}: the slot is already taken."),
+                )
+                .await?;
+            }
+            _ => {
+                bot.send_message(chat_id, "Booking not found or already closed.")
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+    // Notify the buyer FIRST, so the seller's success line ("The buyer has
+    // been notified") is as truthful as the copy can be. A failed DM is
+    // logged and never fails the command.
+    let starts_shown = starts.as_deref().unwrap_or("—");
+    let dm = if confirm {
+        format!(
+            "Booking #{id} confirmed — {service} at {starts_shown}.\nSeller: {}\nChange of plans? /cancelbooking #{id}",
+            seller_display(db, seller_id)
+        )
+    } else {
+        format!(
+            "Booking #{id} ({service}) was declined by the seller. Find another time via /services."
+        )
+    };
+    match bot.send_message(teloxide::types::ChatId(buyer), dm).await {
+        Ok(_) => crate::metrics::bot_sent(),
+        Err(e) => {
+            tracing::warn!(
+                "booking_respond: failed to DM buyer {} about booking #{}: {}",
+                buyer,
+                id,
+                e
+            )
+        }
+    }
+    let reply = if confirm {
+        format!("Booking #{id} confirmed. The buyer has been notified.")
+    } else {
+        format!("Booking #{id} declined. The buyer has been notified.")
+    };
+    bot.send_message(chat_id, reply).await?;
+    Ok(())
 }
 
 /// Parse `/planadd name | price | asset | days` into
@@ -3024,6 +3540,11 @@ async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
         BotCommand::new("broadcast", "Broadcast to all users"),
         BotCommand::new("setup", "Easy seller setup"),
         BotCommand::new("becomeseller", "Become a seller"),
+        BotCommand::new("mybookings", "Your bookings"),
+        BotCommand::new("cancelbooking", "Cancel your booking"),
+        BotCommand::new("bookingconfirm", "Confirm a booking (sellers)"),
+        BotCommand::new("bookingdecline", "Decline a booking (sellers)"),
+        BotCommand::new("mcptoken", "Manage MCP API tokens (sellers)"),
         BotCommand::new("ai", "AI generate content"),
         BotCommand::new("aipost", "AI-assisted post"),
         BotCommand::new("refundapprove", "Approve a pending refund"),

@@ -713,16 +713,40 @@ async fn main() {
             }
         });
     }
-    // Held-slot sweeper: release booking holds that expired.
+    // Held-slot sweeper: release booking holds that expired (D5) and DM each
+    // buyer whose request expired — the status transition inside
+    // expire_held_bookings is the exactly-once guard for the DM. Mirrors the
+    // subscription sweeper above: a failed DM is logged, never propagated,
+    // and sellers are never DM'd on expiry (noise control).
     {
+        let bot_bg = bot.clone();
         let db_bg = db.clone();
         tokio::spawn(async move {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(5 * 60)).await;
-                let n = db_bg.expire_held_bookings();
-                if n > 0 {
-                    tracing::info!("held-slot sweeper expired {} bookings", n);
+                let expired = db_bg.expire_held_bookings();
+                for (booking_id, buyer, service) in &expired {
+                    match bot_bg
+                        .send_message(
+                            teloxide::types::ChatId(*buyer),
+                            format!(
+                                "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(_) => metrics::bot_sent(),
+                        Err(e) => tracing::warn!(
+                            "held-slot sweeper: failed to DM buyer {} about expired booking #{}: {}",
+                            buyer,
+                            booking_id,
+                            e
+                        ),
+                    }
+                }
+                if !expired.is_empty() {
+                    tracing::info!("held-slot sweeper expired {} bookings", expired.len());
                 }
             }
         });
