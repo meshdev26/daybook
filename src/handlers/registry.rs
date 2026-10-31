@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use teloxide::prelude::*;
 
-use crate::{config::Config, db::Db, roles};
+use crate::{config::SharedConfig, db::Db, roles};
 
 /// Everything a registered command handler receives. `args` is the message
 /// text after the command word; `role` is the caller's resolved role.
@@ -20,7 +20,7 @@ pub struct CommandContext {
     pub bot: Bot,
     pub msg: Message,
     pub db: Arc<Db>,
-    pub cfg: Config,
+    pub cfg: SharedConfig,
     pub args: String,
     pub role: roles::Role,
 }

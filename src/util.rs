@@ -39,6 +39,52 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     out.copy_from_slice(&outer);
     out
 }
+/// Word list for human-friendly recovery codes (crypto-wallet style). Kept
+/// small and lowercase so codes are easy to write down and type. Each code
+/// is 4 words joined by hyphens (~32 bits of entropy) which is ample for
+/// one-time-use, bcrypt-hashed recovery codes.
+const RECOVERY_WORDS: &[&str] = &[
+    "able", "acid", "aged", "also", "area", "army", "away", "baby", "back", "ball", "band", "bank",
+    "base", "bath", "bean", "bear", "beat", "been", "bell", "belt", "best", "bill", "bird", "bite",
+    "blue", "boat", "body", "bone", "book", "boot", "born", "boss", "both", "bowl", "bulk", "burn",
+    "bush", "busy", "cake", "call", "calm", "came", "camp", "card", "care", "cart", "case", "cash",
+    "cast", "cell", "chat", "chip", "city", "club", "coal", "coat", "code", "cold", "come", "cook",
+    "cool", "copy", "core", "cost", "crew", "crop", "dark", "data", "date", "dawn", "days", "dead",
+    "deal", "dear", "debt", "deep", "desk", "dial", "diet", "disk", "does", "done", "door", "dose",
+    "down", "draw", "drop", "drum", "dual", "duck", "duly", "dust", "duty", "each", "earn", "ease",
+    "east", "easy", "edge", "else", "emit", "epic", "even", "ever", "evil", "exam", "exit", "face",
+    "fact", "fail", "fair", "fall", "farm", "fast", "fate", "fear", "feed", "feel", "feet", "fell",
+    "felt", "file", "fill", "film", "find", "fine", "fire", "firm", "fish", "five", "flag", "flat",
+    "flow", "food", "foot", "ford", "form", "fort", "four", "free", "from", "fuel", "full", "fund",
+    "gain", "game", "gate", "gave", "gear", "gene", "gift", "girl", "give", "glad", "glow", "goal",
+    "goes", "gold", "gone", "good", "grab", "gray", "grew", "grid", "grip", "grow", "gulf", "hair",
+    "half", "hall", "hand", "hang", "hard", "harm", "hate", "have", "head", "heal", "heap", "hear",
+    "heat", "held", "help", "here", "hero", "high", "hill", "hire", "hold", "hole", "holy", "home",
+    "hope", "host", "hour", "huge", "hunt", "hurt", "idea", "idle", "inch", "into", "iron", "item",
+    "join", "jump", "just", "keep", "kept", "kick", "kill", "kind", "king", "knee", "knew", "know",
+    "lack", "lady", "laid", "lake", "land", "lane", "last", "late", "lead", "leaf", "left", "lend",
+    "less", "life", "lift", "like", "limb", "line", "link", "list", "live", "load", "loan", "lock",
+    "logo", "long", "look", "loop", "lose", "loss", "lost", "loud", "love", "luck", "made", "mail",
+    "main", "make", "male", "mall", "many", "mark", "mask", "mass", "mate", "math", "meal", "mean",
+    "meat", "meet", "menu", "mere", "mile", "milk", "mill", "mind", "mine", "miss", "mode", "mood",
+    "moon", "more", "most", "move", "much", "must", "name", "navy", "near", "neck", "need", "next",
+];
+
+/// Generate a human-friendly recovery code (4 random words joined by hyphens).
+pub fn gen_recovery_code() -> String {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("OS entropy unavailable");
+    let mut out = String::new();
+    for i in 0..4usize {
+        let idx = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as usize % RECOVERY_WORDS.len();
+        if i > 0 {
+            out.push('-');
+        }
+        out.push_str(RECOVERY_WORDS[idx]);
+    }
+    out
+}
+
 pub fn gen_token(len: usize) -> String {
     // CSPRNG-backed: tokens must be unguessable (sessions, API keys).
     // On OS entropy failure there is no safe fallback -- treat it as an

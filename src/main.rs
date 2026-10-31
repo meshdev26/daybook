@@ -8,14 +8,15 @@ use teloxide::{
 use tracing_subscriber::EnvFilter;
 
 use telegram_agent::{
-    ai, api, config,
+    ai, api, bots, config,
+    config::AppConfig,
     config::Config,
     crypto,
     db::Db,
     dialogue::State,
     expire_subscriptions, handlers,
     handlers::registry::{CommandContext, CommandRegistry},
-    mcp, metrics, roles, services, util, web,
+    identity, mcp, metrics, roles, services, util, web,
 };
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -97,7 +98,8 @@ async fn main() {
     // Pin the metrics uptime gauge to process start (L8 observability).
     metrics::note_process_start();
 
-    let cfg = Config::from_env();
+    let app_cfg = AppConfig::from_env();
+    let cfg: Config = app_cfg.shared.clone();
     // CLI recovery subcommand: `telegram-agent reset-owner ...`. Handled
     // before any server/bot startup so it works in setup mode (missing
     // bot token / .env). Exits the process when invoked.
@@ -217,7 +219,7 @@ async fn main() {
         }
     }
 
-    if !cfg.is_configured() {
+    if !app_cfg.is_configured() {
         eprintln!("Setup mode: open the web UI to configure (bot token / owner id missing).");
     }
 
@@ -229,8 +231,11 @@ async fn main() {
         }
     };
 
+    // Backfill bots table once (when empty) from configured bots.
+    db.backfill_bots_at_startup(&app_cfg.bots);
+
     // Seed owner web account (idempotent) only when configured.
-    if cfg.is_configured() {
+    if app_cfg.is_configured() {
         {
             let uname = cfg.web_username();
             // Never fall back to the (public) owner id as the password: when
@@ -252,9 +257,10 @@ async fn main() {
         }
     }
 
-    // Ensure default channel from env is stored if not set.
+    // Ensure default channel from env (primary bot) is stored if not set.
+    let primary_default_channel = app_cfg.bots.first().and_then(|b| b.default_channel.clone());
     if db.get_config("channel").is_none()
-        && let Some(ch) = &cfg.default_channel
+        && let Some(ch) = &primary_default_channel
     {
         db.set_config("channel", ch);
     }
@@ -318,11 +324,53 @@ async fn main() {
         None
     };
 
-    let bot = if cfg.is_configured() {
-        Bot::new(cfg.bot_token.clone())
+    // Build BotContexts from app_cfg (enabled bots only).
+    let mut bot_contexts: Vec<Arc<bots::BotContext>> = Vec::new();
+    for bc in &app_cfg.bots {
+        if bc.token.trim().is_empty() || bc.owner_id == 0 {
+            continue;
+        }
+        let bot_id = db.create_bot(&bc.key, bc.owner_id, None, bc.name.trim());
+        if let Some(rec) = db.get_bot(bot_id)
+            && !rec.enabled
+        {
+            continue;
+        }
+        let ctx = Arc::new(bots::BotContext {
+            id: bot_id,
+            key: bc.key.clone(),
+            bot: Bot::new(bc.token.clone()),
+            owner_id: bc.owner_id,
+            shared: Arc::new(cfg.clone()),
+            db: db.clone(),
+        });
+        bot_contexts.push(ctx);
+    }
+
+    let primary_ctx: Arc<bots::BotContext> = if let Some(first) = bot_contexts.first().cloned() {
+        first
     } else {
-        Bot::new("0:setup-placeholder".to_string())
+        Arc::new(bots::BotContext {
+            id: 0,
+            key: "primary".to_string(),
+            bot: Bot::new("0:setup-placeholder".to_string()),
+            owner_id: 0,
+            shared: Arc::new(cfg.clone()),
+            db: db.clone(),
+        })
     };
+    let bot = primary_ctx.bot.clone();
+    // Personal-account identity actor (user-identity design Phase 1):
+    // spawned alongside the bot dispatchers; every caller shares the
+    // cloneable handle. Session material stays inside the task. The db is
+    // the channel-allowlist source (design decision 5).
+    let identity = identity::IdentityManager::spawn(&cfg, &config::data_dir(), db.clone());
+    let bot_manager: Arc<bots::BotManager> = Arc::new(bots::BotManager {
+        bots: bot_contexts.clone(),
+        primary: primary_ctx.clone(),
+        db: db.clone(),
+        identity: identity.clone(),
+    });
 
     // Dialogue storage (persistent).
     let dialogue_path = std::path::Path::new(&cfg.db_path)
@@ -338,8 +386,6 @@ async fn main() {
             .expect("open dialogue storage")
             .erase();
 
-    let owner_id = cfg.owner_id;
-
     // Auto-selling background processor: verifies pending invoices and grants
     // access. pending_invoices() feeds the queue: every grantable 'active'
     // invoice (plan or product; webhook events enqueue via 'active') plus
@@ -351,222 +397,230 @@ async fn main() {
     // released back to 'active', an unresolvable claim (no token, no channel)
     // either ages out to terminal 'failed' at the attempt cap or is retried
     // once stale.
-    {
-        let bot_bg = bot.clone();
-        let db_bg = db.clone();
-        let cfg_bg = cfg.clone();
-        let crypto_bg = crypto.clone();
-        tokio::spawn(async move {
-            use std::time::Duration;
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                let pending = db_bg.pending_invoices();
-                for (inv_id, plan_name, uid, inv_seller) in pending {
-                    // (a) Claim: only the winner verifies and grants.
-                    if !db_bg.claim_invoice_for_grant(&inv_id) {
-                        continue;
-                    }
-                    // (b) Resolve a crypto token; without one there is no way to
-                    // verify payment — leave the claim for a later cycle, no grant.
-                    let cp = if let Some(c) = &crypto_bg {
-                        Some(c.clone())
-                    } else {
-                        db_bg
-                            .get_config("crypto_token")
-                            .or_else(|| cfg_bg.crypto_token.clone())
-                            .map(crypto::CryptoPay::new)
-                            .map(std::sync::Arc::new)
-                    };
-                    let cp = match cp {
-                        Some(c) => c,
-                        None => {
-                            // Bounded retry (VERIFY_ATTEMPT_CAP): a missing
-                            // token is a permanent misconfiguration, not a
-                            // transient condition — age the invoice out.
-                            let attempts =
-                                bump_invoice_failure(&db_bg, &inv_id, "no crypto token configured");
-                            if attempts < VERIFY_ATTEMPT_CAP {
-                                tracing::warn!(
-                                    "invoice {} claimed but no crypto token configured; leaving for retry (attempt {}/{})",
-                                    inv_id,
-                                    attempts,
-                                    VERIFY_ATTEMPT_CAP
-                                );
-                            }
+    if !bot_contexts.is_empty() {
+        for bot_ctx in bot_contexts.clone() {
+            let bot_bg = bot_ctx.bot.clone();
+            let db_bg = db.clone();
+            let cfg_bg = cfg.clone();
+            let crypto_bg = crypto.clone();
+            let bm = bot_manager.clone();
+            let this_id = bot_ctx.id;
+            tokio::spawn(async move {
+                use std::time::Duration;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let pending = db_bg.pending_invoices();
+                    for (inv_id, plan_name, uid, inv_seller) in pending {
+                        if bm.for_seller(inv_seller).id != this_id {
                             continue;
                         }
-                    };
-                    // (c) Verify with the provider; any error stays fail-closed.
-                    let v = match cp.get_invoice(&inv_id).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Bounded retry: N consecutive provider errors
-                            // age the invoice out instead of looping forever.
-                            let attempts = bump_invoice_failure(
-                                &db_bg,
-                                &inv_id,
-                                &format!("provider verification error: {}", e),
-                            );
-                            if attempts < VERIFY_ATTEMPT_CAP {
-                                tracing::warn!(
-                                    "invoice {} verification failed: {}; leaving for retry (attempt {}/{})",
-                                    inv_id,
-                                    e,
-                                    attempts,
-                                    VERIFY_ATTEMPT_CAP
-                                );
-                            }
+                        // (a) Claim: only the winner verifies and grants.
+                        if !db_bg.claim_invoice_for_grant(&inv_id) {
                             continue;
                         }
-                    };
-                    let paid = crate::api::extract_invoice_items(&v)
-                        .iter()
-                        .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
-                    if !paid {
-                        // Not settled yet: release the claim ('granting' ->
-                        // 'active') so future cycles (and /paid) re-verify
-                        // cleanly. release_invoice_claim is the sanctioned
-                        // unwinder — never write the release by hand.
-                        db_bg.release_invoice_claim(&inv_id);
-                        continue;
-                    }
-                    // (d-bis) Product invoices: grant the purchase and DM the
-                    // delivery payload. Plan invoices take the subscription
-                    // path below; the branch is selected by invoices.product_id.
-                    if let Some((pid, kind, pname, delivery)) =
-                        db_bg.invoice_product_delivery(&inv_id)
-                    {
+                        // (b) Resolve a crypto token; without one there is no way to
+                        // verify payment — leave the claim for a later cycle, no grant.
+                        let cp = if let Some(c) = &crypto_bg {
+                            Some(c.clone())
+                        } else {
+                            db_bg
+                                .get_config("crypto_token")
+                                .or_else(|| cfg_bg.crypto_token.clone())
+                                .map(crypto::CryptoPay::new)
+                                .map(std::sync::Arc::new)
+                        };
+                        let cp = match cp {
+                            Some(c) => c,
+                            None => {
+                                // Bounded retry (VERIFY_ATTEMPT_CAP): a missing
+                                // token is a permanent misconfiguration, not a
+                                // transient condition — age the invoice out.
+                                let attempts = bump_invoice_failure(
+                                    &db_bg,
+                                    &inv_id,
+                                    "no crypto token configured",
+                                );
+                                if attempts < VERIFY_ATTEMPT_CAP {
+                                    tracing::warn!(
+                                        "invoice {} claimed but no crypto token configured; leaving for retry (attempt {}/{})",
+                                        inv_id,
+                                        attempts,
+                                        VERIFY_ATTEMPT_CAP
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        // (c) Verify with the provider; any error stays fail-closed.
+                        let v = match cp.get_invoice(&inv_id).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // Bounded retry: N consecutive provider errors
+                                // age the invoice out instead of looping forever.
+                                let attempts = bump_invoice_failure(
+                                    &db_bg,
+                                    &inv_id,
+                                    &format!("provider verification error: {}", e),
+                                );
+                                if attempts < VERIFY_ATTEMPT_CAP {
+                                    tracing::warn!(
+                                        "invoice {} verification failed: {}; leaving for retry (attempt {}/{})",
+                                        inv_id,
+                                        e,
+                                        attempts,
+                                        VERIFY_ATTEMPT_CAP
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        let paid = crate::api::extract_invoice_items(&v)
+                            .iter()
+                            .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
+                        if !paid {
+                            // Not settled yet: release the claim ('granting' ->
+                            // 'active') so future cycles (and /paid) re-verify
+                            // cleanly. release_invoice_claim is the sanctioned
+                            // unwinder — never write the release by hand.
+                            db_bg.release_invoice_claim(&inv_id);
+                            continue;
+                        }
+                        // (d-bis) Product invoices: grant the purchase and DM the
+                        // delivery payload. Plan invoices take the subscription
+                        // path below; the branch is selected by invoices.product_id.
+                        if let Some((pid, kind, pname, delivery)) =
+                            db_bg.invoice_product_delivery(&inv_id)
+                        {
+                            let target_user = uid.unwrap_or(0);
+                            if target_user == 0 {
+                                // Verified paid but nobody bound to deliver to:
+                                // finalize so it stops re-queueing.
+                                tracing::info!(
+                                    "invoice {} paid but has no bound user; finalizing without product grant",
+                                    inv_id
+                                );
+                                db_bg.finalize_invoice_paid(&inv_id);
+                                continue;
+                            }
+                            if !db_bg.product_grant_exists(&inv_id) {
+                                match db_bg.grant_product(inv_seller, target_user, pid, &inv_id) {
+                                    Ok(true) => {
+                                        if let Err(e) = services::deliver::deliver(
+                                            &bot_bg,
+                                            target_user,
+                                            &kind,
+                                            &pname,
+                                            delivery.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "invoice {}: product '{}' granted but delivery DM failed: {}",
+                                                inv_id,
+                                                pname,
+                                                e
+                                            );
+                                        }
+                                    }
+                                    // A concurrent granter (/paid, claim API) won
+                                    // the UNIQUE(invoice_id) race; nothing to do.
+                                    Ok(false) => {}
+                                    // e.g. out of stock: money settled, grant not —
+                                    // surface loudly and finalize so the invoice
+                                    // stops re-queueing (manual fulfillment).
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "invoice {}: product grant failed ({}); finalizing without delivery",
+                                            inv_id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            // Terminal: verified paid + grant attempted.
+                            db_bg.finalize_invoice_paid(&inv_id);
+                            continue;
+                        }
+                        // (d) Idempotency: if a subscription already exists for this
+                        // invoice, only finalize.
+                        if db_bg.subscription_exists_for_invoice(&inv_id) {
+                            db_bg.finalize_invoice_paid(&inv_id);
+                            continue;
+                        }
+                        // (e) Grant: subscription + single-use invite link + notice.
                         let target_user = uid.unwrap_or(0);
                         if target_user == 0 {
-                            // Verified paid but nobody bound to deliver to:
-                            // finalize so it stops re-queueing.
+                            // Verified paid but nobody is bound to grant to: finalize
+                            // so it stops re-queueing instead of spinning forever.
                             tracing::info!(
-                                "invoice {} paid but has no bound user; finalizing without product grant",
+                                "invoice {} paid but has no bound user; finalizing without grant",
                                 inv_id
                             );
                             db_bg.finalize_invoice_paid(&inv_id);
                             continue;
                         }
-                        if !db_bg.product_grant_exists(&inv_id) {
-                            match db_bg.grant_product(inv_seller, target_user, pid, &inv_id) {
-                                Ok(true) => {
-                                    if let Err(e) = services::deliver::deliver(
-                                        &bot_bg,
-                                        target_user,
-                                        &kind,
-                                        &pname,
-                                        delivery.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            "invoice {}: product '{}' granted but delivery DM failed: {}",
-                                            inv_id,
-                                            pname,
-                                            e
-                                        );
-                                    }
-                                }
-                                // A concurrent granter (/paid, claim API) won
-                                // the UNIQUE(invoice_id) race; nothing to do.
-                                Ok(false) => {}
-                                // e.g. out of stock: money settled, grant not —
-                                // surface loudly and finalize so the invoice
-                                // stops re-queueing (manual fulfillment).
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "invoice {}: product grant failed ({}); finalizing without delivery",
-                                        inv_id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        // Terminal: verified paid + grant attempted.
-                        db_bg.finalize_invoice_paid(&inv_id);
-                        continue;
-                    }
-                    // (d) Idempotency: if a subscription already exists for this
-                    // invoice, only finalize.
-                    if db_bg.subscription_exists_for_invoice(&inv_id) {
-                        db_bg.finalize_invoice_paid(&inv_id);
-                        continue;
-                    }
-                    // (e) Grant: subscription + single-use invite link + notice.
-                    let target_user = uid.unwrap_or(0);
-                    if target_user == 0 {
-                        // Verified paid but nobody is bound to grant to: finalize
-                        // so it stops re-queueing instead of spinning forever.
-                        tracing::info!(
-                            "invoice {} paid but has no bound user; finalizing without grant",
-                            inv_id
-                        );
-                        db_bg.finalize_invoice_paid(&inv_id);
-                        continue;
-                    }
-                    // Seller-scoped plan lookup: the invoice's plan is
-                    // resolved under the invoice's own seller, never a global
-                    // same-name plan owned by someone else.
-                    // Tuple: (id, price, asset, name, days, channel).
-                    let plan_info = plan_name
-                        .as_ref()
-                        .and_then(|pn| db_bg.get_plan(inv_seller, pn));
-                    let days = plan_info
-                        .as_ref()
-                        .map(|p| p.4)
-                        .unwrap_or(30)
-                        .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
-                    let seller_id = inv_seller;
-                    let ch = plan_info
-                        .as_ref()
-                        .and_then(|p| p.5.clone())
-                        .or_else(|| db_bg.seller_channel(seller_id))
-                        .or_else(|| db_bg.get_config("channel"))
-                        .or_else(|| cfg_bg.default_channel.clone())
-                        .unwrap_or_default();
-                    if ch.is_empty() {
-                        // Paid but not grantable yet: leave the claim so the
-                        // next cycle retries once a channel is configured.
-                        // Bounded retry: an unresolvable channel is a
-                        // misconfiguration, not a buyer-side condition.
-                        let attempts = bump_invoice_failure(
-                            &db_bg,
-                            &inv_id,
-                            &format!("no channel resolvable for seller {}", seller_id),
-                        );
-                        if attempts < VERIFY_ATTEMPT_CAP {
-                            tracing::warn!(
-                                "invoice {} paid but no channel resolvable for seller {}; leaving for retry (attempt {}/{})",
-                                inv_id,
-                                seller_id,
-                                attempts,
-                                VERIFY_ATTEMPT_CAP
+                        // Seller-scoped plan lookup: the invoice's plan is
+                        // resolved under the invoice's own seller, never a global
+                        // same-name plan owned by someone else.
+                        // Tuple: (id, price, asset, name, days, channel).
+                        let plan_info = plan_name
+                            .as_ref()
+                            .and_then(|pn| db_bg.get_plan(inv_seller, pn));
+                        let days = plan_info
+                            .as_ref()
+                            .map(|p| p.4)
+                            .unwrap_or(30)
+                            .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+                        let seller_id = inv_seller;
+                        let ch = plan_info
+                            .as_ref()
+                            .and_then(|p| p.5.clone())
+                            .or_else(|| db_bg.seller_channel(seller_id))
+                            .or_else(|| db_bg.get_config("channel"))
+                            .unwrap_or_default();
+                        if ch.is_empty() {
+                            // Paid but not grantable yet: leave the claim so the
+                            // next cycle retries once a channel is configured.
+                            // Bounded retry: an unresolvable channel is a
+                            // misconfiguration, not a buyer-side condition.
+                            let attempts = bump_invoice_failure(
+                                &db_bg,
+                                &inv_id,
+                                &format!("no channel resolvable for seller {}", seller_id),
                             );
+                            if attempts < VERIFY_ATTEMPT_CAP {
+                                tracing::warn!(
+                                    "invoice {} paid but no channel resolvable for seller {}; leaving for retry (attempt {}/{})",
+                                    inv_id,
+                                    seller_id,
+                                    attempts,
+                                    VERIFY_ATTEMPT_CAP
+                                );
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    let sub_id = db_bg.create_subscription(
-                        seller_id,
-                        target_user,
-                        None,
-                        &ch,
-                        days,
-                        Some(&inv_id),
-                        None,
-                    );
-                    // grant invite link (checked expiry math; defensive even
-                    // behind the clamp above)
-                    let expire = chrono::Duration::try_days(days)
-                        .and_then(|d| chrono::Utc::now().checked_add_signed(d))
-                        .unwrap_or_else(chrono::Utc::now);
-                    let link = bot_bg
-                        .create_chat_invite_link(util::to_chat_id(&ch))
-                        .member_limit(1)
-                        .expire_date(expire)
-                        .await
-                        .ok()
-                        .map(|l| l.invite_link);
-                    match link {
+                        let sub_id = db_bg.create_subscription(
+                            seller_id,
+                            target_user,
+                            None,
+                            &ch,
+                            days,
+                            Some(&inv_id),
+                            None,
+                        );
+                        // grant invite link (checked expiry math; defensive even
+                        // behind the clamp above)
+                        let expire = chrono::Duration::try_days(days)
+                            .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+                            .unwrap_or_else(chrono::Utc::now);
+                        let link = bot_bg
+                            .create_chat_invite_link(util::to_chat_id(&ch))
+                            .member_limit(1)
+                            .expire_date(expire)
+                            .await
+                            .ok()
+                            .map(|l| l.invite_link);
+                        match link {
                         Some(l) => {
                             match bot_bg
                                 .send_message(
@@ -606,15 +660,16 @@ async fn main() {
                             }
                         }
                     }
-                    // (f) Terminal: verified paid + granted.
-                    db_bg.finalize_invoice_paid(&inv_id);
+                        // (f) Terminal: verified paid + granted.
+                        db_bg.finalize_invoice_paid(&inv_id);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
-    // Scheduled posts background processor.
+    // Scheduled posts background processor: the sending bot is resolved per due row from the target channel (BotManager::for_channel, multi-bot design §7) — never a single primary sender, and never from the row's seller_id (owner-scheduled posts carry seller_id 0, which would resolve the primary bot for another bot's channel).
     {
-        let bot_bg = bot.clone();
+        let bm_bg = bot_manager.clone();
         let db_bg = db.clone();
         tokio::spawn(async move {
             use std::time::Duration;
@@ -634,14 +689,27 @@ async fn main() {
                 ) in due
                 {
                     let text = content.clone().unwrap_or_default();
-                    match bot_bg
+                    // Resolve the sender from the authoritative target channel
+                    // (channels.bot_id, then the channel's seller, then
+                    // primary): owner-scheduled posts carry seller_id 0, so
+                    // seller-based resolution would pick the primary bot for
+                    // a channel owned by another bot.
+                    let bot_ctx = bm_bg.for_channel(&chat_id);
+                    let bot = bot_ctx.bot.clone();
+                    match bot
                         .send_message(util::to_chat_id(&chat_id), text.clone())
                         .await
                     {
                         Ok(sent) => {
                             let _ = db_bg.mark_scheduled_posted(id, sent.id.0);
-                            let _ =
-                                db_bg.log_post(seller_id, &chat_id, sent.id.0, &kind, Some(&text));
+                            let _ = db_bg.log_post(
+                                seller_id,
+                                &chat_id,
+                                sent.id.0,
+                                &kind,
+                                Some(&text),
+                                "bot",
+                            );
                             tracing::info!("scheduled post {} posted", id);
                             // Metrics hook only (L8): bot_messages_sent_total.
                             metrics::bot_sent();
@@ -677,19 +745,22 @@ async fn main() {
         });
     }
     // Expiry sweeper: periodically revoke expired subscriptions (kick + mark)
-    // so lapsed members lose access even if nobody runs /expirecheck. Each
-    // revoked buyer is DM'd the renewal notice; a failed DM is logged and
-    // never propagated — the sweeper must not die on a send error.
+    // so lapsed members lose access even if nobody runs /expirecheck. The kick
+    // and the notice both go through the bot that owns each row's seller
+    // (multi-bot design §7), so bot A never kicks/DMs for bot B; a failed DM
+    // is logged and never propagated — the sweeper must not die on a send
+    // error.
     {
-        let bot_bg = bot.clone();
+        let bm_bg = bot_manager.clone();
         let db_bg = db.clone();
         tokio::spawn(async move {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
-                let expired = expire_subscriptions(&bot_bg, &db_bg).await;
-                for (_sub_id, uid, channel) in &expired {
-                    match bot_bg
+                let expired = expire_subscriptions(&bm_bg, &db_bg).await;
+                for (_sub_id, seller_id, uid, channel) in &expired {
+                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
+                    match bot
                         .send_message(
                             teloxide::types::ChatId(*uid),
                             format!(
@@ -715,19 +786,22 @@ async fn main() {
     }
     // Held-slot sweeper: release booking holds that expired (D5) and DM each
     // buyer whose request expired — the status transition inside
-    // expire_held_bookings is the exactly-once guard for the DM. Mirrors the
+    // expire_held_bookings is the exactly-once guard for the DM. The DM goes
+    // through the bot that owns the row's seller (multi-bot design §7), so a
+    // buyer is never messaged by another seller's bot. Mirrors the
     // subscription sweeper above: a failed DM is logged, never propagated,
     // and sellers are never DM'd on expiry (noise control).
     {
-        let bot_bg = bot.clone();
+        let bm_bg = bot_manager.clone();
         let db_bg = db.clone();
         tokio::spawn(async move {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(5 * 60)).await;
                 let expired = db_bg.expire_held_bookings();
-                for (booking_id, buyer, service) in &expired {
-                    match bot_bg
+                for (booking_id, buyer, service, seller_id) in &expired {
+                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
+                    match bot
                         .send_message(
                             teloxide::types::ChatId(*buyer),
                             format!(
@@ -778,6 +852,8 @@ async fn main() {
         db: db.clone(),
         cfg: cfg.clone(),
         bot: bot.clone(),
+        bots: bot_manager.clone(),
+        identity,
         login_attempts: std::sync::Arc::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
@@ -795,39 +871,60 @@ async fn main() {
                 .enter_dialogue::<Message, ErasedStorage<State>, State>()
                 .branch(
                     dptree::case![State::Idle]
-                        .branch(dptree::entry().filter_command::<handlers::commands::Command>().endpoint(
-                            move |bot: Bot,
-                                  msg: Message,
-                                  dialogue: Dialogue<State, ErasedStorage<State>>,
-                                  cmd: handlers::commands::Command| {
-                                let db = db_cmd.clone();
-                                let cfg = cfg_cmd.clone();
-                                let crypto = crypto_cmd.clone();
-                                let ai = ai_cmd.clone();
-                                let reg = registry_for_commands.clone();
-                                async move {
-                                    handlers::commands::cmd_handler(bot, msg, dialogue, db, cfg, crypto, ai, reg, cmd).await
-                                }
-                            },
-                        ))
+                        .branch(
+                            dptree::entry()
+                                .filter_command::<handlers::commands::Command>()
+                                .endpoint(
+                                    move |bot: Bot,
+                                          msg: Message,
+                                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                                          cmd: handlers::commands::Command,
+                                          bot_ctx: Arc<bots::BotContext>,
+                                          bot_manager: Arc<bots::BotManager>,
+                                          owner_id: i64| {
+                                        let db = db_cmd.clone();
+                                        let cfg = cfg_cmd.clone();
+                                        let crypto = crypto_cmd.clone();
+                                        let ai = ai_cmd.clone();
+                                        let reg = registry_for_commands.clone();
+                                        async move {
+                                            handlers::commands::cmd_handler(
+                                                bot,
+                                                msg,
+                                                dialogue,
+                                                db,
+                                                cfg,
+                                                bot_ctx,
+                                                bot_manager,
+                                                owner_id,
+                                                crypto,
+                                                ai,
+                                                reg,
+                                                cmd,
+                                            )
+                                            .await
+                                        }
+                                    },
+                                ),
+                        )
                         // Registered plugin commands: matched only when the
                         // text is `/name ...` naming a registered command
                         // (falls through otherwise), then role-gated like the
                         // built-ins before the handler runs.
                         .branch(
-                            dptree::filter(
-                                |reg: Arc<CommandRegistry>, msg: Message| {
-                                    plugin_command_name(&msg, &reg).is_some()
-                                },
-                            )
+                            dptree::filter(|reg: Arc<CommandRegistry>, msg: Message| {
+                                plugin_command_name(&msg, &reg).is_some()
+                            })
                             .endpoint(
                                 move |bot: Bot,
                                       msg: Message,
-                                      reg: Arc<CommandRegistry>| {
+                                      reg: Arc<CommandRegistry>,
+                                      owner_id: i64| {
                                     let db = db_plugin.clone();
                                     let cfg = cfg_plugin.clone();
                                     async move {
-                                        plugin_command_handler(bot, msg, db, cfg, reg).await
+                                        plugin_command_handler(bot, msg, db, cfg, reg, owner_id)
+                                            .await
                                     }
                                 },
                             ),
@@ -835,61 +932,77 @@ async fn main() {
                         .branch(dptree::endpoint(non_command_handler)),
                 )
                 .branch(dptree::case![State::AwaitingPhoto].endpoint(
-                    move |bot: Bot, msg: Message, dialogue: Dialogue<State, ErasedStorage<State>>| {
+                    move |bot: Bot,
+                          msg: Message,
+                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                          bot_ctx: Arc<bots::BotContext>,
+                          owner_id: i64| {
                         let db = db_photo.clone();
                         let cfg = cfg_photo.clone();
-                        async move { handlers::messages::awaiting_photo_handler(bot, msg, dialogue, db, cfg).await }
-                    },
-                ))
-                .branch(dptree::case![State::AwaitingAiPostConfirm { draft_id }].endpoint(
-                    move |bot: Bot,
-                          msg: Message,
-                          dialogue: Dialogue<State, ErasedStorage<State>>,
-                          draft_id: i64| {
-                        let db = db_ai_confirm.clone();
-                        let cfg = cfg_ai_confirm.clone();
                         async move {
-                            handlers::messages::awaiting_ai_post_confirm_handler(
-                                bot, msg, dialogue, db, cfg, draft_id,
+                            handlers::messages::awaiting_photo_handler(
+                                bot, msg, dialogue, db, cfg, bot_ctx, owner_id,
                             )
                             .await
                         }
                     },
                 ))
-                .branch(dptree::case![State::AwaitingAiPostEdit { draft_id }].endpoint(
-                    move |bot: Bot,
-                          msg: Message,
-                          dialogue: Dialogue<State, ErasedStorage<State>>,
-                          draft_id: i64| {
-                        let db = db_ai_edit.clone();
-                        let cfg = cfg_ai_edit.clone();
-                        async move {
-                            handlers::messages::awaiting_ai_post_edit_handler(
-                                bot, msg, dialogue, db, cfg, draft_id,
-                            )
-                            .await
-                        }
-                    },
-                ))
+                .branch(
+                    dptree::case![State::AwaitingAiPostConfirm { draft_id }].endpoint(
+                        move |bot: Bot,
+                              msg: Message,
+                              dialogue: Dialogue<State, ErasedStorage<State>>,
+                              draft_id: i64,
+                              bot_ctx: Arc<bots::BotContext>| {
+                            let db = db_ai_confirm.clone();
+                            let cfg = cfg_ai_confirm.clone();
+                            async move {
+                                handlers::messages::awaiting_ai_post_confirm_handler(
+                                    bot, msg, dialogue, db, cfg, bot_ctx, draft_id,
+                                )
+                                .await
+                            }
+                        },
+                    ),
+                )
+                .branch(
+                    dptree::case![State::AwaitingAiPostEdit { draft_id }].endpoint(
+                        move |bot: Bot,
+                              msg: Message,
+                              dialogue: Dialogue<State, ErasedStorage<State>>,
+                              draft_id: i64,
+                              bot_ctx: Arc<bots::BotContext>| {
+                            let db = db_ai_edit.clone();
+                            let cfg = cfg_ai_edit.clone();
+                            async move {
+                                handlers::messages::awaiting_ai_post_edit_handler(
+                                    bot, msg, dialogue, db, cfg, bot_ctx, draft_id,
+                                )
+                                .await
+                            }
+                        },
+                    ),
+                )
                 // Catch-all for the remaining dialogue state (CryptoInvoice):
                 // dptree's case! cannot bind struct-variant fields, and Idle/
                 // AwaitingPhoto are handled above, so whatever falls through
                 // here is the invoice wizard. The handler reads the state
                 // itself from the dialogue.
-                .branch(
-                    dptree::endpoint(
-                        move |bot: Bot,
-                              msg: Message,
-                              dialogue: Dialogue<State, ErasedStorage<State>>| {
-                            let db = db_crypto.clone();
-                            let cfg = cfg_crypto.clone();
-                            async move {
-                                handlers::messages::crypto_invoice_handler(bot, msg, dialogue, db, cfg)
-                                    .await
-                            }
-                        },
-                    ),
-                ),
+                .branch(dptree::endpoint(
+                    move |bot: Bot,
+                          msg: Message,
+                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                          bot_ctx: Arc<bots::BotContext>| {
+                        let db = db_crypto.clone();
+                        let cfg = cfg_crypto.clone();
+                        async move {
+                            handlers::messages::crypto_invoice_handler(
+                                bot, msg, dialogue, db, cfg, bot_ctx,
+                            )
+                            .await
+                        }
+                    },
+                )),
         )
         .branch(
             Update::filter_callback_query()
@@ -897,21 +1010,23 @@ async fn main() {
                 .branch(dptree::endpoint(
                     move |bot: Bot,
                           q: CallbackQuery,
-                          dialogue: Dialogue<State, ErasedStorage<State>>| {
+                          dialogue: Dialogue<State, ErasedStorage<State>>,
+                          bot_ctx: Arc<bots::BotContext>,
+                          owner_id: i64| {
                         let db = db_cb.clone();
                         let cfg = cfg_cb.clone();
                         async move {
-                            handlers::callbacks::callback_handler(bot, q, dialogue, db, cfg).await
+                            handlers::callbacks::callback_handler(
+                                bot, q, dialogue, db, cfg, bot_ctx, owner_id,
+                            )
+                            .await
                         }
                     },
                 )),
         );
 
-    // Inject dependencies.
-    let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
-        .dependencies(dptree::deps![storage.clone(), owner_id, registry.clone()])
-        .enable_ctrlc_handler()
-        .build();
+    // Inject dependencies. One Dispatcher per bot is built lazily below
+    // (see bot_task) so each closes over its own bot handle.
 
     // Web UI state.
     let web_router = web::router(web_state.clone());
@@ -957,8 +1072,35 @@ async fn main() {
     // Setup mode: without a bot token the poller cannot start (Telegram
     // rejects getMe and teloxide aborts the task), so run the web UI only —
     // configure there, then restart to bring the bot online.
-    let bot_task = if cfg.is_configured() {
-        Some(tokio::spawn(async move { dispatcher.dispatch().await }))
+    let bot_task = if app_cfg.is_configured() && !bot_contexts.is_empty() {
+        let mut tasks = Vec::new();
+        let mut first = true;
+        for ctx in bot_contexts.clone() {
+            let mut builder = Dispatcher::builder(ctx.bot.clone(), handler.clone()).dependencies(
+                // `bot_manager` is injected (not captured per
+                // endpoint) so per-seller moderation such as
+                // /expirecheck acts through the bot a seller is bound
+                // to, not the bot that received the command.
+                dptree::deps![
+                    storage.clone(),
+                    ctx.clone(),
+                    ctx.owner_id,
+                    registry.clone(),
+                    bot_manager.clone()
+                ],
+            );
+            if first {
+                builder = builder.enable_ctrlc_handler();
+                first = false;
+            }
+            let mut dispatcher = builder.build();
+            tasks.push(tokio::spawn(async move { dispatcher.dispatch().await }));
+        }
+        Some(tokio::spawn(async move {
+            for t in tasks {
+                let _ = t.await;
+            }
+        }))
     } else {
         tracing::info!("bot polling disabled until configured (setup mode)");
         None
@@ -1026,6 +1168,7 @@ async fn plugin_command_handler(
     db: Arc<Db>,
     cfg: Config,
     reg: Arc<CommandRegistry>,
+    owner_id: i64,
 ) -> HandlerResult {
     let Some(name) = plugin_command_name(&msg, &reg) else {
         return Ok(());
@@ -1039,7 +1182,7 @@ async fn plugin_command_handler(
         .map(|(_, rest)| rest.trim().to_string())
         .unwrap_or_default();
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let role = roles::role_of(&db, user_id, cfg.owner_id);
+    let role = roles::role_of(&db, user_id, owner_id);
     if role < spec.min_role {
         return Ok(());
     }

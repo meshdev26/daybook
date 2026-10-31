@@ -36,9 +36,9 @@ it may decide alone — not a title. It is enforced by the permission maps in
 | L5 | senior-finance | "What should this cost? What is the user owed?" | Pricing & billing spec — `docs/CRYPTO_PAY.md` |
 | L6 | senior-design-ux | "Make this look and behave like one product." | UX spec, a11y floors — `design-system/**` |
 | L6-C | chief-design-officer | "Does this honor the token contract and brand?" | Charter: `DESIGN.md` only — specifies, never rewrites client trees |
-| L7 | staff-client-platforms | "Implement it on the web/bot surface." | `src/web.rs`, `src/handlers/callbacks.rs`, `design-system/**` |
-| L8 | staff-server | "Build the bot flow / endpoint / migration." | `src/handlers/**`, `src/main.rs`, `src/ai/**`, `src/dialogue.rs`, `src/roles.rs`, `src/api.rs`, `schema.sql` |
-| L9 | staff-core-systems | "Change the data layer, crypto, config, or build." | `src/db.rs`, `src/crypto.rs`, `src/config.rs`, `src/util.rs`, `Cargo.toml`, `vendor/**`, `Dockerfile`, `deny.toml`, `Makefile`, `scripts/**` (package/install/doctor/icons), release CI |
+| L7 | staff-client-platforms | "Implement it on the web/bot surface." | `src/web.rs`, `src/web/**`, `src/handlers/callbacks.rs`, `design-system/**` |
+| L8 | staff-server | "Build the bot flow / endpoint / migration." | `src/handlers/**`, `src/handlers/commands/**`, `src/main.rs`, `src/ai/**`, `src/dialogue.rs`, `src/roles.rs`, `src/api.rs`, `src/api/**`, `schema.sql` |
+| L9 | staff-core-systems | "Change the data layer, crypto, config, or build." | `src/db.rs`, `src/db/**`, `src/crypto.rs`, `src/config.rs`, `src/util.rs`, `Cargo.toml`, `vendor/**`, `Dockerfile`, `deny.toml`, `Makefile`, `scripts/**` (package/install/doctor/icons), release CI |
 | L10 | principal-security | "Is this safe? Is this a leak?" | Security review, `docs/SECURITY.md` — blocks; never remediates itself |
 | L11 | fellow-architect | "What should the interface between domains be?" | `ARCHITECTURE.md`, `AGENT.md`, module boundaries |
 
@@ -148,7 +148,53 @@ python3 scripts/verify-agent-tiers.py   # routing contract
 - Scope all business data by `seller_id`.
 - Log via `tracing`; never log secrets.
 
-## 8. Sub-agent dispatch rules
+## 8. File & module hygiene
+
+Size budgets keep a rung's territory reviewable. All line counts are physical
+lines; "excluding tests" means the file's inline `#[cfg(test)] mod tests` block
+or its sibling `<module>/tests.rs` is counted separately.
+
+| Unit | Target | Hard cap | What happens at the cap |
+|------|--------|----------|--------------------------|
+| Production source file, tests excluded | ≤ 800 lines | 1,500 lines | At target: schedule a split. At cap: no further growth — the next change splits first. |
+| Whole module file, inline tests included | — | 2,500 lines | The test module must already live in a sibling file. |
+| Extracted test file (`<module>/tests.rs`) | ≤ 2,000 lines | 2,000 lines | Split by fixture/domain (`tests/auth.rs`, `tests/payments.rs`). |
+| Function body | ≤ 100 lines | 100 lines | Handlers delegate to `Db`/service methods instead of growing. |
+
+Rules:
+
+1. **Tests move out first.** Once a module file exceeds 800 lines, its tests
+   live in a sibling `<module>/tests.rs`; the parent keeps exactly one line,
+   `#[cfg(test)] mod tests;`. Child modules read parent privates through
+   `use super::*;`, so this extraction is mechanical, not a redesign.
+2. **Splits are move-only.** A split changes no behavior in the same change:
+   the public surface is identical (the parent file stays a façade that
+   re-exports with `pub use`), the test count is identical, and no logic is
+   edited. It is reviewed as a rename, not a rewrite. Behavior changes ride in
+   a separate, later change.
+3. **Boy-scout rule.** Any change that pushes a file over a cap must split that
+   file in the same PR. Files already over a cap are tracked debt in `PLAN.md`
+   and get reduced when touched — never grown further.
+4. **Exemptions are named, not assumed.** `vendor/**`, generated files,
+   `schema.sql`, and single-purpose data tables are exempt only when listed as
+   exemptions in `PLAN.md`. Without that entry the budget applies.
+5. **Routing the split.** A split creates paths (`src/web/**`, `src/db/**`,
+    `src/api/**`, `src/handlers/commands/**`) that the owning rung's permission
+    map must already allow. Expanding `.opencode/agents/*.md` and
+    `.qoder/agents/*.md` is orchestrator/human work and lands *before* the split,
+    never as part of it.
+6. **Big-tech size target.** Production source files must stay at or below the
+    800-line target (hard cap 1,500); extracted test files at or below 2,000;
+    function bodies at or below 100. Any change that touches a file already over
+    target must reduce it. L3 fails review on a *new* violation, and no
+    exemption is assumed without a named entry in `PLAN.md`.
+7. **Enforcement today.** L3 reports file sizes in verification and fails review
+   on a *new* violation; L10 may block a structural/security-adjacent split that
+   would obscure a security-relevant diff (§5, floor first). A size check inside
+   `scripts/verify-agent-tiers.py` would automate the report, but that script is
+   orchestrator/human territory and is not changed to make a split pass.
+
+## 9. Sub-agent dispatch rules
 
 - Launch parallel sub-agents (one per area) in a single message when areas are
   independent; serialize dependent steps.
@@ -162,7 +208,7 @@ python3 scripts/verify-agent-tiers.py   # routing contract
 - Before dispatching: does the artifact exist? Is the work already done
   (`git status`)? Did you name the exact paths in the brief?
 
-## 9. Escalation
+## 10. Escalation
 
 - Cross-cutting / architectural → **L11** fellow-architect.
 - Security / payment / secret concern → **L10** principal-security.
@@ -170,7 +216,7 @@ python3 scripts/verify-agent-tiers.py   # routing contract
 - Data integrity / scaling / build → **L9** staff-core-systems.
 - Anything in §2's T2 list → **human**, always.
 
-## 10. Non-goals (v1)
+## 11. Non-goals (v1)
 
 - No Kubernetes, microservices, or ML.
 - No real-time chat beyond Telegram.

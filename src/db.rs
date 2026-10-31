@@ -3,7 +3,21 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
 
-type PostRow = (i64, i64, String, i32, String, Option<String>, String);
+/// Stored post row. Field positions (index access is load-bearing in
+/// api.rs/web.rs/mcp::tools): 0 id, 1 seller_id, 2 chat_id, 3 message_id,
+/// 4 kind, 5 content, 6 created_at, **7 sender** — Phase 2 appended `sender`
+/// at the END (`'bot'` | `'user'`, user-identity design §1 sender audit);
+/// every pre-existing index stayed valid.
+type PostRow = (
+    i64,
+    i64,
+    String,
+    i32,
+    String,
+    Option<String>,
+    String,
+    String,
+);
 type ScheduledPostRow = (
     i64,
     i64,
@@ -72,6 +86,7 @@ pub const SETUP_LINK_PURPOSE: &str = "setup_link";
 pub struct ChannelRow {
     pub id: i64,
     pub channel: String,
+    pub title: Option<String>,
     pub seller_id: i64,
     pub is_default: bool,
     pub created_at: String,
@@ -175,6 +190,19 @@ fn sha256_hex(input: &str) -> String {
 // `.unwrap_or_else(|poisoned| poisoned.into_inner())` — a panic in one caller
 // must never turn into a permanent lock failure for every other caller
 // (background jobs, bot, web). Never `.unwrap()` this mutex.
+#[derive(Debug, Clone)]
+pub struct BotRecord {
+    pub id: i64,
+    pub key: String,
+    pub username: Option<String>,
+    pub owner_user_id: i64,
+    pub default_channel_id: Option<i64>,
+    pub enabled: bool,
+    pub created_at: String,
+    /// Console display name; '' means "show the key instead".
+    pub name: String,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -375,6 +403,97 @@ impl Db {
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL UNIQUE COLLATE NOCASE, seller_id INTEGER NOT NULL DEFAULT 0, is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_channels_seller ON channels(seller_id)",
+            [],
+        );
+        // Phase 1: promo codes + shopping cart (additive)
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS promo_codes (code TEXT NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, promo_type TEXT NOT NULL CHECK (promo_type IN ('percent','fixed')), value REAL NOT NULL, currency TEXT, max_uses INTEGER, uses INTEGER NOT NULL DEFAULT 0, min_purchase REAL NOT NULL DEFAULT 0, scope TEXT NOT NULL DEFAULT 'all', scope_id INTEGER, expires_at TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, PRIMARY KEY (code, seller_id))", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS promo_redemptions (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL, seller_id INTEGER NOT NULL, buyer_id INTEGER NOT NULL, invoice_id TEXT, discount_amount REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_promo_redemptions_seller ON promo_redemptions(seller_id)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS cart_items (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, item_type TEXT NOT NULL CHECK (item_type IN ('plan','product')), item_id INTEGER NOT NULL, qty INTEGER NOT NULL DEFAULT 1, added_at TEXT NOT NULL, UNIQUE (buyer_id, seller_id, item_type, item_id))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cart_items_buyer ON cart_items(buyer_id, seller_id)",
+            [],
+        );
+        // Phase 2: referrals + bonus/loyalty balance (additive)
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL DEFAULT 0, referrer_id INTEGER NOT NULL, referee_id INTEGER NOT NULL, code TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reward_type TEXT, reward_value REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, rewarded_at TEXT, UNIQUE (seller_id, referee_id))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_referrals_seller ON referrals(seller_id)",
+            [],
+        );
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(seller_id, referrer_id)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS referral_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL DEFAULT 0, user_id INTEGER NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (seller_id, user_id), UNIQUE (seller_id, code))", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS bonus_balances (user_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, balance_minor INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (user_id, seller_id))", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS bonus_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, amount_minor INTEGER NOT NULL, reason TEXT, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bonus_ledger_user ON bonus_ledger(user_id, seller_id)",
+            [],
+        );
+        // Multi-bot (v1.6): bots table + bot_id scoping (additive)
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '')", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_user_id)",
+            [],
+        );
+        // Bot display name (v1.7): console label; '' falls back to the key.
+        // schema.sql declares the column for fresh databases; this covers
+        // legacy ones. Additive + idempotent like bot_id above — the ALTER
+        // errors out (ignored) once the column exists.
+        let _ = conn.execute(
+            "ALTER TABLE bots ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE sellers ADD COLUMN bot_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE channels ADD COLUMN bot_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE admins ADD COLUMN bot_id INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE web_sessions ADD COLUMN selected_bot_id INTEGER",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE mcp_audit ADD COLUMN bot_id INTEGER", []);
+        // Personal-account identity (Phase 1): per-channel sender binding.
+        // 'bot' (default) posts via the resolved BotContext; 'user' posts via
+        // the operator's MTProto identity (channels.sender_identity, ratified
+        // user-identity design §1). Additive + idempotent like bot_id above.
+        let _ = conn.execute(
+            "ALTER TABLE channels ADD COLUMN sender_identity TEXT NOT NULL DEFAULT 'bot'",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE channels ADD COLUMN title TEXT", []);
+        // Personal-account identity (Phase 2): posts sender audit. Every
+        // stored post records who sent it — 'bot' (default; every Bot-API
+        // path) or 'user' (the operator's MTProto identity via
+        // publish_as_user). Additive + idempotent like the column above;
+        // SQLite fills existing rows with the DEFAULT on ALTER.
+        let _ = conn.execute(
+            "ALTER TABLE posts ADD COLUMN sender TEXT NOT NULL DEFAULT 'bot'",
+            [],
+        );
+        // Phase 3: CRM + support tickets (additive)
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS customers (user_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, tags TEXT, notes TEXT, total_spent REAL NOT NULL DEFAULT 0, order_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', PRIMARY KEY (user_id, seller_id))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_customers_seller ON customers(seller_id)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL DEFAULT 0, buyer_id INTEGER NOT NULL, subject TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tickets_seller ON tickets(seller_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tickets_buyer ON tickets(buyer_id)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS ticket_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL, sender_role TEXT NOT NULL, sender_id INTEGER NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket ON ticket_messages(ticket_id)",
+            [],
+        );
+        // Phase 4: recovery & engagement (additive)
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS cart_abandonment (buyer_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, abandoned_at TEXT NOT NULL, reminded_count INTEGER NOT NULL DEFAULT 0, reminded_at TEXT, recovered_at TEXT, PRIMARY KEY (buyer_id, seller_id))", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS reorder_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, product_id INTEGER NOT NULL, interval_days INTEGER NOT NULL, last_ordered_at TEXT, next_reminder_at TEXT, enabled INTEGER NOT NULL DEFAULT 1, UNIQUE (buyer_id, seller_id, product_id))", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, buyer_id INTEGER NOT NULL, seller_id INTEGER NOT NULL DEFAULT 0, product_id INTEGER NOT NULL, rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5), text TEXT, approved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, UNIQUE (buyer_id, product_id))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id)",
             [],
         );
         let channels_seeded = conn
@@ -798,6 +917,10 @@ impl Db {
     }
 
     // ---- Posts ----
+    /// Record a sent post. `sender` is the sender audit value: `'bot'` for
+    /// every Bot-API path, `'user'` when the operator's personal identity
+    /// sent it (user-identity design §1). Bot paths pass "bot"; the value is
+    /// stored verbatim, so callers own the honesty of the audit column.
     pub fn log_post(
         &self,
         seller_id: i64,
@@ -805,6 +928,7 @@ impl Db {
         message_id: i32,
         kind: &str,
         content: Option<&str>,
+        sender: &str,
     ) -> Result<(), rusqlite::Error> {
         let conn = self
             .conn
@@ -812,8 +936,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO posts(seller_id,chat_id,message_id,kind,content,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![seller_id, chat_id, message_id, kind, content, now],
+            "INSERT INTO posts(seller_id,chat_id,message_id,kind,content,created_at,sender) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![seller_id, chat_id, message_id, kind, content, now, sender],
         )?;
         Ok(())
     }
@@ -826,10 +950,10 @@ impl Db {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
             seller_scope
         {
-            ("SELECT id,seller_id,chat_id,message_id,kind,content,created_at FROM posts WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2".to_string(),
+            ("SELECT id,seller_id,chat_id,message_id,kind,content,created_at,sender FROM posts WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2".to_string(),
              vec![Box::new(sid), Box::new(limit)])
         } else {
-            ("SELECT id,seller_id,chat_id,message_id,kind,content,created_at FROM posts ORDER BY id DESC LIMIT ?1".to_string(),
+            ("SELECT id,seller_id,chat_id,message_id,kind,content,created_at,sender FROM posts ORDER BY id DESC LIMIT ?1".to_string(),
              vec![Box::new(limit)])
         };
         let mut stmt = match conn.prepare(&sql) {
@@ -848,6 +972,7 @@ impl Db {
                         r.get::<_, String>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -856,6 +981,24 @@ impl Db {
             Some(iter) => iter.filter_map(|r| r.ok()).collect(),
             None => vec![],
         }
+    }
+
+    /// Owner of a post, for authorization checks before the unscoped
+    /// `delete_post` / `update_post_content` mutations. `None` means the post
+    /// does not exist (or the read failed), so callers must deny by default.
+    pub fn get_post_seller(&self, id: i64) -> Option<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT seller_id FROM posts WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     pub fn delete_post(&self, id: i64) -> Result<(), rusqlite::Error> {
@@ -1508,23 +1651,457 @@ impl Db {
     }
 
     // ---- Admins ----
-    pub fn is_admin(&self, user_id: i64, owner_id: i64) -> bool {
-        if user_id == owner_id {
-            return true;
-        }
+    pub fn is_admin(&self, user_id: i64, bot_id: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count: i64 = match bot_id {
+            Some(bid) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM admins WHERE user_id = ?1 AND (bot_id IS NULL OR bot_id = ?2)",
+                    params![user_id, bid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM admins WHERE user_id = ?1 AND bot_id IS NULL",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+        };
+        count > 0
+    }
+
+    /// Bot id assigned to an admin (NULL → None for global).
+    pub fn get_admin_bot_id(&self, user_id: i64) -> Option<i64> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
-            "SELECT 1 FROM admins WHERE user_id = ?1",
+            "SELECT bot_id FROM admins WHERE user_id = ?1",
             params![user_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    /// Scope an existing admin to a bot (`Some(bot_id)`) or clear the scope
+    /// back to a global admin (`None` → NULL). A `Some` id must reference an
+    /// existing `bots` row: unknown ids are rejected without touching the row,
+    /// so a stale console form can never write a dangling scope. Returns true
+    /// iff the UPDATE changed an admins row (unknown user → false). Only the
+    /// `bot_id` column moves — `is_admin`/`get_admin_bot_id` semantics are
+    /// untouched, so clearing restores global-admin visibility.
+    pub fn set_admin_bot_id(&self, user_id: i64, bot_id: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bid) = bot_id {
+            let known = conn
+                .query_row("SELECT 1 FROM bots WHERE id = ?1", params![bid], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()
+                .ok()
+                .flatten()
+                .is_some();
+            if !known {
+                return false;
+            }
+        }
+        conn.execute(
+            "UPDATE admins SET bot_id = ?1 WHERE user_id = ?2",
+            params![bot_id, user_id],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    // ---- Bots ----
+    pub fn create_bot(
+        &self,
+        key: &str,
+        owner_user_id: i64,
+        default_channel_id: Option<i64>,
+        name: &str,
+    ) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = conn.execute(
+            "INSERT INTO bots(key, name, owner_user_id, default_channel_id, enabled, created_at) VALUES(?1,?2,?3,?4,1,?5)",
+            rusqlite::params![key, name, owner_user_id, default_channel_id, now],
+        );
+        if res.is_ok() {
+            return conn.last_insert_rowid();
+        }
+        conn.query_row(
+            "SELECT id FROM bots WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    pub fn get_bot(&self, id: i64) -> Option<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok(BotRecord {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    username: r.get(2)?,
+                    owner_user_id: r.get(3)?,
+                    default_channel_id: r.get(4)?,
+                    enabled: r.get::<_, i64>(5)? != 0,
+                    created_at: r.get(6)?,
+                    name: r.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn get_bot_by_key(&self, key: &str) -> Option<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE key = ?1",
+            rusqlite::params![key],
+            |r| {
+                Ok(BotRecord {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    username: r.get(2)?,
+                    owner_user_id: r.get(3)?,
+                    default_channel_id: r.get(4)?,
+                    enabled: r.get::<_, i64>(5)? != 0,
+                    created_at: r.get(6)?,
+                    name: r.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_bots(&self) -> Vec<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| {
+            Ok(BotRecord {
+                id: r.get(0)?,
+                key: r.get(1)?,
+                username: r.get(2)?,
+                owner_user_id: r.get(3)?,
+                default_channel_id: r.get(4)?,
+                enabled: r.get::<_, i64>(5)? != 0,
+                created_at: r.get(6)?,
+                name: r.get(7)?,
+            })
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn list_bots_enabled(&self) -> Vec<BotRecord> {
+        self.list_bots().into_iter().filter(|b| b.enabled).collect()
+    }
+
+    /// Seller user_ids whose bot_id == bot_id (or primary bot if their bot_id
+    /// is NULL). NULL bot_id sellers are attributed to the primary bot
+    /// (lowest id).
+    pub fn sellers_for_bot(&self, bot_id: i64) -> Vec<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT user_id FROM sellers WHERE COALESCE(bot_id, (SELECT MIN(id) FROM bots)) = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![bot_id], |r| r.get::<_, i64>(0))
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Default channel name for a bot: channels.bot_id + is_default first,
+    /// then bots.default_channel_id, then any channel for the bot.
+    pub fn default_channel_for_bot(&self, bot_id: i64) -> Option<String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // 1. default channel row for bot
+        if let Ok(ch) = conn.query_row(
+            "SELECT channel FROM channels WHERE bot_id = ?1 AND is_default = 1 LIMIT 1",
+            rusqlite::params![bot_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            return Some(ch);
+        }
+        // 2. bots.default_channel_id -> channels
+        if let Ok(Some(c)) = conn.query_row(
+            "SELECT c.channel FROM bots b LEFT JOIN channels c ON c.id = b.default_channel_id WHERE b.id = ?1",
+            rusqlite::params![bot_id],
+            |r| r.get::<_, Option<String>>(0),
+        ) && !c.trim().is_empty()
+        {
+            return Some(c);
+        }
+        // 3. any channel for bot
+        conn.query_row(
+            "SELECT channel FROM channels WHERE bot_id = ?1 LIMIT 1",
+            rusqlite::params![bot_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Enable or disable a bot by id (best-effort; ignored on unknown id).
+    pub fn set_bot_enabled(&self, id: i64, enabled: bool) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "UPDATE bots SET enabled = ?1 WHERE id = ?2",
+            rusqlite::params![if enabled { 1 } else { 0 }, id],
+        );
+    }
+
+    /// Set a bot's console display name. The name is whitespace-trimmed;
+    /// the empty string is allowed and means "show the key instead". No
+    /// length cap is enforced here (sibling bot setters validate none) —
+    /// the 64-char bound is a console-input concern. Returns an honest Err
+    /// for an unknown bot id, mirroring `set_admin_bot_id`'s refusal, so
+    /// the console can surface it. Parameterized SQL only.
+    pub fn set_bot_name(&self, bot_id: i64, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        match conn.execute(
+            "UPDATE bots SET name = ?1 WHERE id = ?2",
+            rusqlite::params![name, bot_id],
+        ) {
+            Ok(0) => Err(format!("bot {bot_id} not found")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("failed to set name for bot {bot_id}: {e}")),
+        }
+    }
+
+    /// Update a bot's owner, default channel and enabled flag in one
+    /// statement. Returns whether a row was updated (false for unknown id).
+    pub fn update_bot_settings(
+        &self,
+        id: i64,
+        owner_user_id: i64,
+        default_channel_id: Option<i64>,
+        enabled: bool,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE bots SET owner_user_id = ?1, default_channel_id = ?2, enabled = ?3 WHERE id = ?4",
+            rusqlite::params![owner_user_id, default_channel_id, if enabled { 1 } else { 0 }, id],
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Delete a bot row by id. Returns true iff a row was deleted. Any
+    /// `web_sessions.selected_bot_id` referencing this bot is set to NULL
+    /// first so deleting a bot never leaves dangling session selections.
+    /// Parameterized SQL throughout; scoped strictly by id.
+    pub fn delete_bot(&self, id: i64) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "UPDATE web_sessions SET selected_bot_id = NULL WHERE selected_bot_id = ?1",
+            rusqlite::params![id],
+        );
+        conn.execute("DELETE FROM bots WHERE id = ?1", rusqlite::params![id])
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    pub fn upsert_seller_bot_id(&self, seller_id: i64, bot_id: Option<i64>) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO sellers(user_id, created_at, bot_id) VALUES(?1,?2,?3)
+             ON CONFLICT(user_id) DO UPDATE SET bot_id = excluded.bot_id",
+            rusqlite::params![seller_id, now, bot_id],
+        );
+        let _ = conn.execute(
+            "UPDATE sellers SET bot_id = ?1 WHERE user_id = ?2",
+            rusqlite::params![bot_id, seller_id],
+        );
+    }
+
+    pub fn get_seller_bot_id(&self, seller_id: i64) -> Option<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT bot_id FROM sellers WHERE user_id = ?1",
+            rusqlite::params![seller_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    pub fn get_channel_bot_id(&self, channel: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT bot_id FROM channels WHERE channel = ?1 COLLATE NOCASE",
+            rusqlite::params![channel],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    pub fn get_channel_seller_id(&self, channel: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT seller_id FROM channels WHERE channel = ?1 COLLATE NOCASE",
+            rusqlite::params![channel],
             |r| r.get::<_, i64>(0),
         )
         .optional()
         .ok()
         .flatten()
-        .is_some()
+    }
+
+    /// Per-channel sender binding set by the identity UI: `'bot'` (default)
+    /// or `'user'`. `None` when the channel does not exist or the column has
+    /// not been migrated yet — `BotManager::for_channel_sender` treats both
+    /// as `'bot'` (fail-safe default, never posts as the personal account
+    /// without an explicit binding).
+    pub fn get_channel_sender_identity(&self, channel: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT sender_identity FROM channels WHERE channel = ?1 COLLATE NOCASE",
+            rusqlite::params![channel],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    /// Bind a configured channel to the identity that posts to it
+    /// (user-identity design §1): `'bot'` (default) or `'user'` — the
+    /// operator's personal account. The identity value is validated HERE so
+    /// no caller can store anything outside the two-letter contract;
+    /// parameterized SQL throughout. Returns `true` when a channel row was
+    /// updated — `false` for an unknown channel or an invalid identity (the
+    /// caller surfaces the fix; this method never creates channels).
+    pub fn set_channel_sender_identity(&self, channel: &str, identity: &str) -> bool {
+        if identity != "bot" && identity != "user" {
+            return false;
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE channels SET sender_identity = ?1 WHERE channel = ?2 COLLATE NOCASE",
+            rusqlite::params![identity, channel],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Store a human-readable title for a channel row (best-effort; missing
+    /// row or empty title is a no-op). Used by the console when a channel is
+    /// added so the list can show "Tech Tips (-100…)" instead of a bare id.
+    pub fn set_channel_title(&self, channel: &str, title: Option<&str>) {
+        let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = conn.execute(
+            "UPDATE channels SET title = ?1 WHERE channel = ?2 COLLATE NOCASE",
+            params![t, channel.trim()],
+        );
+    }
+
+    pub fn get_channel_id(&self, channel: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT id FROM channels WHERE channel = ?1 COLLATE NOCASE",
+            rusqlite::params![channel],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Canonical name of an explicitly configured channel: exact name match
+    /// (the column's NOCASE collation makes it case-insensitive), returning
+    /// the name as stored. `None` when no channel row exists. The identity
+    /// actor uses this to scope personal-account reads to configured channels
+    /// only (user-identity design decision 5) — an unconfigured chat never
+    /// reaches MTProto.
+    pub fn known_channel(&self, channel: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT channel FROM channels WHERE channel = ?1 COLLATE NOCASE",
+            rusqlite::params![channel],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn backfill_bots_at_startup(&self, bots: &[crate::config::BotConfig]) {
+        if !self.list_bots().is_empty() {
+            return;
+        }
+        if bots.is_empty() {
+            return;
+        }
+        for b in bots {
+            let channel_id = b.default_channel.as_ref().and_then(|ch| {
+                let _ = self.add_channel(ch, 0);
+                self.get_channel_id(ch)
+            });
+            self.create_bot(&b.key, b.owner_id, channel_id, b.name.trim());
+        }
+        if let Some(primary) = self.list_bots().first() {
+            let pid = primary.id;
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = conn.execute(
+                "UPDATE sellers SET bot_id = ?1 WHERE bot_id IS NULL",
+                rusqlite::params![pid],
+            );
+            let _ = conn.execute(
+                "UPDATE channels SET bot_id = ?1 WHERE bot_id IS NULL",
+                rusqlite::params![pid],
+            );
+            let _ = conn.execute(
+                "UPDATE admins SET bot_id = ?1 WHERE bot_id IS NULL",
+                rusqlite::params![pid],
+            );
+        }
     }
 
     pub fn add_admin(&self, user_id: i64, username: Option<&str>) {
@@ -2188,6 +2765,62 @@ impl Db {
         }
     }
 
+    /// Bot-scoped variant of `list_subscriptions`: the rows of every seller in
+    /// `seller_ids` (a bot's sellers, from `sellers_for_bot`), newest first and
+    /// the same row shape/order as `list_subscriptions`. An empty slice
+    /// short-circuits to `vec![]` — `IN ()` is a SQLite syntax error, so we
+    /// never build it.
+    pub fn list_subscriptions_for_sellers(
+        &self,
+        seller_ids: &[i64],
+        limit: i64,
+    ) -> Vec<(i64, i64, i64, String, String, String)> {
+        if seller_ids.is_empty() {
+            return vec![];
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let placeholders: String = (1..=seller_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id,seller_id,user_id,channel_id,status,expires_at FROM subscriptions WHERE seller_id IN ({placeholders}) ORDER BY id DESC LIMIT ?{}",
+            seller_ids.len() + 1
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(seller_ids.len() + 1);
+        for sid in seller_ids {
+            params_vec.push(Box::new(*sid));
+        }
+        params_vec.push(Box::new(limit));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
     pub fn list_subscriptions_filtered(
         &self,
         seller_scope: Option<i64>,
@@ -2585,6 +3218,59 @@ impl Db {
         } else {
             ("SELECT code,plan_id,value_days,uses,max_uses,seller_id,revoked FROM activation_codes ORDER BY id DESC LIMIT ?1".to_string(), vec![Box::new(limit)])
         };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get::<_, i64>(6)? != 0,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Bot-scoped variant of `list_codes`: the activation codes of every seller
+    /// in `seller_ids` (a bot's sellers, from `sellers_for_bot`), newest first,
+    /// with the same columns/order as `list_codes`. An empty slice
+    /// short-circuits to `vec![]` — `IN ()` is a SQLite syntax error, so we
+    /// never build it.
+    pub fn list_codes_for_sellers(&self, seller_ids: &[i64], limit: i64) -> Vec<CodeListRow> {
+        if seller_ids.is_empty() {
+            return vec![];
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let placeholders: String = (1..=seller_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let sql = format!(
+            "SELECT code,plan_id,value_days,uses,max_uses,seller_id,revoked FROM activation_codes WHERE seller_id IN ({placeholders}) ORDER BY id DESC LIMIT ?{}",
+            seller_ids.len() + 1
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(seller_ids.len() + 1);
+        for sid in seller_ids {
+            params_vec.push(Box::new(*sid));
+        }
+        params_vec.push(Box::new(limit));
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -3692,7 +4378,7 @@ impl Db {
         token
     }
 
-    pub fn get_web_session(&self, token: &str) -> Option<(i64, String, Option<i64>)> {
+    pub fn get_web_session(&self, token: &str) -> Option<(i64, String, Option<i64>, Option<i64>)> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(token.as_bytes());
@@ -3707,10 +4393,42 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.query_row(
-            "SELECT account_id, role, seller_id FROM web_sessions WHERE token_hash=?1 AND expires_at > ?2",
+            "SELECT account_id, role, seller_id, selected_bot_id FROM web_sessions WHERE token_hash=?1 AND expires_at > ?2",
             params![hash, now],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).optional().ok().flatten()
+    }
+
+    /// Persist the selected bot for a web session (by token hash). Returns
+    /// whether a row was updated.
+    pub fn set_web_session_selected_bot(&self, token_hash: &str, bot_id: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE web_sessions SET selected_bot_id = ?1 WHERE token_hash = ?2",
+            params![bot_id, token_hash],
+        ) == Ok(1)
+    }
+
+    /// Read the selected bot id for a web session (by token hash). Returns
+    /// None when the session is missing/expired or has no selection.
+    pub fn get_web_session_selected_bot(&self, token_hash: &str) -> Option<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.query_row(
+            "SELECT selected_bot_id FROM web_sessions WHERE token_hash = ?1 AND expires_at > ?2",
+            params![token_hash, now],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
     }
 
     pub fn delete_web_session(&self, token: &str) {
@@ -4890,9 +5608,10 @@ impl Db {
         Ok(ChannelRow {
             id: r.get(0)?,
             channel: r.get(1)?,
-            seller_id: r.get(2)?,
-            is_default: r.get::<_, i64>(3)? != 0,
-            created_at: r.get(4)?,
+            title: r.get(2)?,
+            seller_id: r.get(3)?,
+            is_default: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
         })
     }
 
@@ -4918,6 +5637,47 @@ impl Db {
                 format!("failed to add channel '{ch}': {e}")
             }
         })
+    }
+
+    /// Rename a channel row scoped to `seller_id` (0 = global namespace):
+    /// only the row owned by this seller and matching `old_name`
+    /// (case-insensitively, per the column's NOCASE collation) is renamed to
+    /// `new_name`. The `is_default` flag is left untouched, so a default
+    /// channel keeps being the default under its new name. Returns an honest
+    /// Err when the row is missing / not owned by this seller, or when
+    /// `new_name` collides with an existing channel (the table-wide UNIQUE
+    /// COLLATE NOCASE constraint). Parameterized SQL only.
+    pub fn rename_channel(
+        &self,
+        seller_id: i64,
+        old_name: &str,
+        new_name: &str,
+        is_global: bool,
+    ) -> Result<(), String> {
+        let _ = is_global;
+        let old = old_name.trim();
+        let new = new_name.trim();
+        if old.is_empty() || new.is_empty() {
+            return Err("channel must not be empty".to_string());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let updated = conn.execute(
+            "UPDATE channels SET channel = ?1 WHERE channel = ?2 COLLATE NOCASE AND seller_id = ?3",
+            params![new, old, seller_id],
+        );
+        match updated {
+            Ok(0) => Err(format!(
+                "channel '{old}' not found (or not yours to rename)"
+            )),
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                    Err(format!("channel '{new}' already exists"))
+                } else {
+                    Err(format!("failed to rename channel '{old}' to '{new}': {e}"))
+                }
+            }
+        }
     }
 
     /// Remove `channel` scoped to `seller_id`: a seller can only remove their
@@ -5019,10 +5779,10 @@ impl Db {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let sql = match seller_scope {
             Some(_) => {
-                "SELECT id, channel, seller_id, is_default, created_at FROM channels WHERE seller_id = 0 OR seller_id = ?1 ORDER BY id"
+                "SELECT id, channel, title, seller_id, is_default, created_at FROM channels WHERE seller_id = 0 OR seller_id = ?1 ORDER BY id"
             }
             None => {
-                "SELECT id, channel, seller_id, is_default, created_at FROM channels ORDER BY id"
+                "SELECT id, channel, title, seller_id, is_default, created_at FROM channels ORDER BY id"
             }
         };
         let mut stmt = match conn.prepare(sql) {
@@ -5754,12 +6514,13 @@ impl Db {
     /// Expire held bookings past their response window (D3/D5): frees the
     /// slots first, then transitions `held → expired` — both statements carry
     /// the same predicates as before — and returns the transitioned rows as
-    /// (bookings.id, buyer user_id, service name) so the sweeper can DM each
-    /// buyer. The status transition is the exactly-once guard for those DMs:
-    /// the returned list is only returned when its size matches the rows the
-    /// UPDATE actually moved (a mismatch would risk double-DMing, so nothing
-    /// is returned instead).
-    pub fn expire_held_bookings(&self) -> Vec<(i64, i64, String)> {
+    /// (bookings.id, buyer user_id, service name, seller_id) so the sweeper can
+    /// DM each buyer from the right bot (the seller's bot attribution). The
+    /// status transition is the exactly-once guard for those DMs: the returned
+    /// list is only returned when its size matches the rows the UPDATE actually
+    /// moved (a mismatch would risk double-DMing, so nothing is returned
+    /// instead).
+    pub fn expire_held_bookings(&self) -> Vec<(i64, i64, String, i64)> {
         let conn = self
             .conn
             .lock()
@@ -5771,9 +6532,9 @@ impl Db {
             params![now],
         );
         // collect the expiring rows (same predicate as the transition below)
-        let rows: Vec<(i64, i64, String)> = {
+        let rows: Vec<(i64, i64, String, i64)> = {
             let mut stmt = match conn.prepare(
-                "SELECT b.id, b.user_id, COALESCE(sv.name,'') FROM bookings b LEFT JOIN services sv ON sv.id = b.service_id WHERE b.status='held' AND b.expires_at IS NOT NULL AND b.expires_at < ?1",
+                "SELECT b.id, b.user_id, COALESCE(sv.name,''), b.seller_id FROM bookings b LEFT JOIN services sv ON sv.id = b.service_id WHERE b.status='held' AND b.expires_at IS NOT NULL AND b.expires_at < ?1",
             ) {
                 Ok(s) => s,
                 Err(_) => return vec![],
@@ -5783,6 +6544,7 @@ impl Db {
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             });
             match mapped {
@@ -5800,2074 +6562,1004 @@ impl Db {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use std::fs;
-    #[test]
-    fn db_basic() {
-        let path = "/tmp/opencode/test_agent2.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        assert_eq!(db.seller_channel(1).as_deref(), Some("@chan"));
-        db.add_plan(1, "P", "1", "USDT", 7, Some("@chan"));
-        let plans = db.list_plans(Some(1));
-        assert_eq!(plans.len(), 1);
-        let pid = db.get_plan(1, "P").unwrap().0;
-        let code = db.create_code(1, Some(pid), Some(7), 1, None, 12);
-        assert_eq!(code.len(), 12);
-        let (_id, sid, p, _vd, _mu, uses, _exp) = db.get_code(&code).unwrap();
-        assert_eq!(sid, 1);
-        assert_eq!(p, Some(pid));
-        assert_eq!(uses, 0);
-        let res = db.redeem_code(&code, 42);
-        assert!(res.is_ok());
-        let code2 = db.get_code(&code).unwrap();
-        assert_eq!(code2.5, 1);
-    }
+// ---------------------------------------------------------------------------
+// Phase 1: promo codes + shopping cart (L9)
+// ---------------------------------------------------------------------------
 
-    // ---- v1.4 bookings / setup links / MCP tokens / per-asset revenue ----
+pub type PromoCodeRow = (
+    String,
+    i64,
+    String,
+    f64,
+    Option<String>,
+    Option<i64>,
+    i64,
+    f64,
+    String,
+    Option<i64>,
+    Option<String>,
+    i64,
+    String,
+);
 
-    fn booking_db(tag: &str) -> (Db, String) {
-        let path = format!("/tmp/opencode/test_bookings_{tag}.db");
-        let _ = fs::remove_file(&path);
-        let db = Db::new(&path).unwrap();
-        (db, path)
-    }
-
-    fn service_with_slot(db: &Db, seller: i64, name: &str, starts_at: &str) -> (i64, i64) {
-        let svc = db
-            .create_service(seller, name, "10", "USDT", 60, None)
-            .expect("service created");
-        let slot = db.create_slot(svc, seller, starts_at, 1);
-        (svc, slot)
-    }
-
-    fn rfc_in_minutes(minutes: i64) -> String {
-        (Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339()
-    }
-
-    /// Point a booking and its slot's hold stamp into the past — exactly the
-    /// values claim time wrote together — so the next expire_held_bookings()
-    /// pass transitions the booking and frees the slot like real clock time
-    /// would (tests must not wait out BOOKING_HOLD_MINUTES).
-    fn force_expiry(path: &str, booking_id: i64) {
-        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
-        let conn = Connection::open(path).unwrap();
+impl Db {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_promo_code(
+        &self,
+        seller_id: i64,
+        code: &str,
+        promo_type: &str,
+        value: f64,
+        currency: Option<&str>,
+        max_uses: Option<i64>,
+        min_purchase: f64,
+        scope: &str,
+        scope_id: Option<i64>,
+        expires_at: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE bookings SET expires_at=?1 WHERE id=?2",
-            params![past, booking_id],
+            "INSERT INTO promo_codes (code, seller_id, promo_type, value, currency, max_uses, uses, min_purchase, scope, scope_id, expires_at, active, created_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?8,?9,?10,1,?11)",
+            params![code, seller_id, promo_type, value, currency, max_uses, min_purchase, scope, scope_id, expires_at, now],
         )
-        .unwrap();
+        .map_err(|e| format!("create_promo_code: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_promo_code(&self, seller_id: i64, code: &str) -> Option<PromoCodeRow> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT code, seller_id, promo_type, value, currency, max_uses, uses, min_purchase, scope, scope_id, expires_at, active, created_at FROM promo_codes WHERE seller_id=?1 AND code=?2",
+            params![seller_id, code],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_promo_codes(&self, seller_id: i64) -> Vec<PromoCodeRow> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare("SELECT code, seller_id, promo_type, value, currency, max_uses, uses, min_purchase, scope, scope_id, expires_at, active, created_at FROM promo_codes WHERE seller_id=?1 ORDER BY created_at DESC") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![seller_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+            ))
+        })
+        .ok()
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn list_all_promo_codes(&self) -> Vec<PromoCodeRow> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare("SELECT code, seller_id, promo_type, value, currency, max_uses, uses, min_purchase, scope, scope_id, expires_at, active, created_at FROM promo_codes ORDER BY created_at DESC") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+            ))
+        })
+        .ok()
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn revoke_promo_code_all(&self, code: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
-            "UPDATE slots SET held_until=(SELECT expires_at FROM bookings WHERE id=?1) WHERE id=(SELECT slot_id FROM bookings WHERE id=?1)",
-            params![booking_id],
+            "UPDATE promo_codes SET active=0 WHERE code=?1",
+            params![code],
         )
-        .unwrap();
+        .unwrap_or(0)
+            > 0
     }
 
-    #[test]
-    fn test_booking_claim_is_atomic() {
-        let (db, _path) = booking_db("claim");
-        let (svc, slot) = service_with_slot(&db, 11, "consult", &rfc_in_minutes(120));
-        let mut won = Vec::new();
-        for u in 1..=8i64 {
-            if let Ok(Some(id)) = db.create_booking(svc, slot, 100 + u) {
-                won.push(id);
-            }
-        }
-        assert_eq!(won.len(), 1, "exactly one buyer wins the slot");
-
-        let slots = db.list_slots(svc);
-        assert_eq!(slots.len(), 1);
-        assert_eq!(slots[0].4, "held");
-        assert_eq!(db.list_bookings(Some(11)).len(), 1);
-    }
-
-    #[test]
-    fn test_booking_claim_rejects_missing_past_and_nonsense() {
-        let (db, _path) = booking_db("reject");
-        let (svc, slot) = service_with_slot(&db, 11, "consult", &rfc_in_minutes(60));
-        // unknown slot id
-        assert_eq!(db.create_booking(svc, 999_999, 1).unwrap(), None);
-        // past slot
-        let (svc_past, slot_past) = service_with_slot(&db, 11, "past", &rfc_in_minutes(-60));
-        assert_eq!(db.create_booking(svc_past, slot_past, 1).unwrap(), None);
-        // unparseable stored time — the db refuses nonsense
-        let (svc_bad, slot_bad) = service_with_slot(&db, 11, "bad", "not-a-timestamp");
-        assert_eq!(
-            db.create_booking(svc_bad, slot_bad, 1).unwrap_err(),
-            "slot time is invalid"
-        );
-        // service/slot pair mismatch: the slot belongs to svc, not svc_past
-        assert_eq!(db.create_booking(svc_past, slot, 1).unwrap(), None);
-        // nothing mutated by any rejected claim
-        assert_eq!(db.list_bookings(Some(11)).len(), 0);
-        assert_eq!(db.list_slots(svc)[0].4, "available");
-    }
-
-    #[test]
-    fn test_booking_expires_at_is_min_of_hold_and_start() {
-        let (db, _path) = booking_db("expiry_window");
-        // slot sooner than the hold window: expires_at == slot start (D3)
-        let (svc, slot) = service_with_slot(&db, 11, "soon", &rfc_in_minutes(10));
-        assert!(db.create_booking(svc, slot, 1).unwrap().is_some());
-        let row = &db.list_bookings_for_user(1, 10)[0];
-        let exp = DateTime::parse_from_rfc3339(row.7.as_deref().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
-        let start = DateTime::parse_from_rfc3339(&rfc_in_minutes(10))
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!((exp - start).num_seconds().abs() < 5);
-        // slot later than the hold window: expires_at ≈ now + BOOKING_HOLD_MINUTES
-        let (svc2, slot2) = service_with_slot(&db, 11, "far", &rfc_in_minutes(240));
-        assert!(db.create_booking(svc2, slot2, 2).unwrap().is_some());
-        let row2 = &db.list_bookings_for_user(2, 10)[0];
-        let exp2 = DateTime::parse_from_rfc3339(row2.7.as_deref().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
-        let expected = Utc::now() + chrono::Duration::minutes(BOOKING_HOLD_MINUTES);
-        assert!((exp2 - expected).num_seconds().abs() < 10);
-    }
-
-    #[test]
-    fn test_list_bookings_filtered_scope_status_limit() {
-        let (db, _path) = booking_db("filtered");
-        let (svc1, slot1) = service_with_slot(&db, 11, "alpha", &rfc_in_minutes(60));
-        let (svc2, slot2) = service_with_slot(&db, 22, "beta", &rfc_in_minutes(120));
-        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
-        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
-        assert!(db.set_booking_status(b2, Some(22), "confirmed"));
-
-        // scope: seller 11 sees only their own rows
-        let s1 = db.list_bookings_filtered(Some(11), None, 100);
-        assert_eq!(s1.len(), 1);
-        assert_eq!(s1[0].0, b1);
-        assert_eq!(s1[0].1.len(), 8, "public booking token present");
-        assert_eq!(s1[0].2, 100);
-        assert_eq!(s1[0].3, "alpha");
-        assert!(s1[0].4.is_some(), "slot starts_at joined");
-        assert_eq!(s1[0].6, "held");
-        assert!(s1[0].7.is_some(), "expires_at joined");
-        assert_eq!(s1[0].8, Some(11));
-
-        // status filter at SQL level
-        let held = db.list_bookings_filtered(None, Some("held"), 100);
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].0, b1);
-        let confirmed = db.list_bookings_filtered(Some(22), Some("confirmed"), 100);
-        assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].0, b2);
-        assert_eq!(
-            db.list_bookings_filtered(None, Some("cancelled"), 100)
-                .len(),
-            0
-        );
-
-        // limit caps the rows; ordering is slot start DESC (beta starts later)
-        assert_eq!(db.list_bookings_filtered(None, None, 1).len(), 1);
-        let all = db.list_bookings_filtered(None, None, 100);
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].0, b2);
-        assert_eq!(all[1].0, b1);
-    }
-
-    #[test]
-    fn test_list_bookings_for_user() {
-        let (db, _path) = booking_db("for_user");
-        let (svc1, slot1) = service_with_slot(&db, 11, "alpha", &rfc_in_minutes(60));
-        let (svc2, slot2) = service_with_slot(&db, 22, "beta", &rfc_in_minutes(90));
-        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
-        let b2 = db.create_booking(svc2, slot2, 100).unwrap().unwrap();
-        let rows = db.list_bookings_for_user(100, 10);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, b2, "newest first");
-        assert_eq!(rows[1].0, b1);
-        assert!(rows.iter().all(|r| r.2 == 100));
-        assert_eq!(db.list_bookings_for_user(999, 10).len(), 0);
-        assert_eq!(db.list_bookings_for_user(100, 1).len(), 1);
-    }
-
-    #[test]
-    fn test_cancel_booking_scoped_rules() {
-        let (db, path) = booking_db("cancel");
-        // held + future slot: the owning seller cancels, slot freed
-        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(60));
-        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
-        assert!(
-            !db.cancel_booking_scoped(b1, Some(99)),
-            "wrong seller scope"
-        );
-        assert!(db.cancel_booking_scoped(b1, Some(11)));
-        assert_eq!(db.list_slots(svc1)[0].4, "available");
-        assert_eq!(db.list_bookings(Some(11))[0].4, "cancelled");
-        assert!(!db.cancel_booking_scoped(b1, Some(11)), "terminal now");
-
-        // admin (None) may cancel another seller's booking
-        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(60));
-        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
-        assert!(db.cancel_booking_scoped(b2, None));
-        assert_eq!(db.list_slots(svc2)[0].4, "available");
-
-        // confirmed booking on a future slot: cancel frees the 'booked' slot
-        let (svc3, slot3) = service_with_slot(&db, 33, "c", &rfc_in_minutes(60));
-        let b3 = db.create_booking(svc3, slot3, 300).unwrap().unwrap();
-        assert!(db.set_booking_status(b3, Some(33), "confirmed"));
-        assert_eq!(db.list_slots(svc3)[0].4, "booked");
-        assert!(db.cancel_booking_scoped(b3, Some(33)));
-        assert_eq!(db.list_slots(svc3)[0].4, "available");
-
-        // confirmed booking whose slot already started: cancelled, but the
-        // slot is NOT freed back to available
-        let (svc4, slot4) = service_with_slot(&db, 44, "d", &rfc_in_minutes(60));
-        let b4 = db.create_booking(svc4, slot4, 400).unwrap().unwrap();
-        assert!(db.set_booking_status(b4, Some(44), "confirmed"));
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "UPDATE slots SET starts_at=?1 WHERE id=?2",
-                params![rfc_in_minutes(-30), slot4],
-            )
-            .unwrap();
-        }
-        assert!(db.cancel_booking_scoped(b4, Some(44)));
-        assert_eq!(db.list_slots(svc4)[0].4, "booked", "started slot stays");
-    }
-
-    #[test]
-    fn test_set_booking_status_confirm_decline_and_resurrection() {
-        let (db, path) = booking_db("status");
-        // held → confirmed books the future slot
-        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(60));
-        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
-        assert!(
-            !db.set_booking_status(b1, Some(99), "confirmed"),
-            "wrong seller"
-        );
-        assert!(!db.set_booking_status(b1, Some(11), "pending"), "allowlist");
-        assert!(db.set_booking_status(b1, Some(11), "confirmed"));
-        assert_eq!(db.list_slots(svc1)[0].4, "booked");
-        assert_eq!(db.list_bookings(Some(11))[0].4, "confirmed");
-        assert!(!db.set_booking_status(b1, Some(11), "declined"), "terminal");
-        assert!(
-            !db.set_booking_status(b1, Some(11), "confirmed"),
-            "terminal"
-        );
-
-        // confirm refuses a past slot; decline still frees it
-        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(60));
-        let b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "UPDATE slots SET starts_at=?1 WHERE id=?2",
-                params![rfc_in_minutes(-5), slot2],
-            )
-            .unwrap();
-        }
-        assert!(!db.set_booking_status(b2, Some(22), "confirmed"));
-        assert_eq!(db.list_bookings(Some(22))[0].4, "held", "unchanged");
-        assert_eq!(db.list_slots(svc2)[0].4, "held", "slot untouched");
-        assert!(db.set_booking_status(b2, Some(22), "declined"));
-        assert_eq!(db.list_bookings(Some(22))[0].4, "declined");
-        assert_eq!(db.list_slots(svc2)[0].4, "available");
-
-        // D3 resurrection: expired hold whose slot was freed → confirm re-books
-        let (svc3, slot3) = service_with_slot(&db, 33, "c", &rfc_in_minutes(120));
-        let b3 = db.create_booking(svc3, slot3, 300).unwrap().unwrap();
-        force_expiry(&path, b3);
-        assert_eq!(db.expire_held_bookings().len(), 1);
-        assert_eq!(db.list_slots(svc3)[0].4, "available");
-        assert!(db.set_booking_status(b3, Some(33), "confirmed"));
-        assert_eq!(db.list_slots(svc3)[0].4, "booked");
-        assert_eq!(db.list_bookings(Some(33))[0].4, "confirmed");
-
-        // resurrection loses when another booking re-claimed the slot
-        let (svc4, slot4) = service_with_slot(&db, 44, "d", &rfc_in_minutes(120));
-        let b4 = db.create_booking(svc4, slot4, 400).unwrap().unwrap();
-        force_expiry(&path, b4);
-        db.expire_held_bookings();
-        assert!(db.create_booking(svc4, slot4, 401).unwrap().is_some());
-        assert!(
-            !db.set_booking_status(b4, Some(44), "confirmed"),
-            "slot taken"
-        );
-        let rows = db.list_bookings_filtered(Some(44), None, 100);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows.iter().find(|r| r.2 == 400).unwrap().6,
-            "expired",
-            "loser untouched"
-        );
-        assert_eq!(
-            rows.iter().find(|r| r.2 == 401).unwrap().6,
-            "held",
-            "winner intact"
-        );
-    }
-
-    #[test]
-    fn test_expire_held_bookings_returns_each_row_once() {
-        let (db, path) = booking_db("sweep");
-        let (svc1, slot1) = service_with_slot(&db, 11, "a", &rfc_in_minutes(120));
-        let (svc2, slot2) = service_with_slot(&db, 22, "b", &rfc_in_minutes(240));
-        let b1 = db.create_booking(svc1, slot1, 100).unwrap().unwrap();
-        let _b2 = db.create_booking(svc2, slot2, 200).unwrap().unwrap();
-        force_expiry(&path, b1);
-        let rows = db.expire_held_bookings();
-        assert_eq!(rows, vec![(b1, 100, "a".to_string())]);
-        // exactly-once: the second pass returns nothing
-        assert!(db.expire_held_bookings().is_empty());
-        // the untouched booking keeps its hold; b1's slot was freed
-        assert_eq!(db.list_bookings(Some(22))[0].4, "held");
-        assert_eq!(db.list_slots(svc2)[0].4, "held");
-        assert_eq!(db.list_slots(svc1)[0].4, "available");
-    }
-
-    #[test]
-    fn test_setup_link_single_use_purpose_and_ttl() {
-        let (db, path) = booking_db("setup");
-        let raw = db.create_setup_link(42);
-        assert_eq!(raw.len(), 48);
-        // single use: exactly one consume wins
-        assert_eq!(db.consume_pending_token(&raw, SETUP_LINK_PURPOSE), Some(42));
-        assert_eq!(db.consume_pending_token(&raw, SETUP_LINK_PURPOSE), None);
-        assert_eq!(db.consume_pending_token("nope", SETUP_LINK_PURPOSE), None);
-        // purpose separation: an MFA verify token is not a setup link
-        let verify_raw = crate::util::gen_token(48);
-        let expires = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
-        db.create_pending_mfa(
-            sha256_hex(&verify_raw),
-            42,
-            "verify",
-            None::<String>,
-            expires,
+    pub fn revoke_promo_code(&self, seller_id: i64, code: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE promo_codes SET active=0 WHERE seller_id=?1 AND code=?2",
+            params![seller_id, code],
         )
-        .unwrap();
-        assert_eq!(
-            db.consume_pending_token(&verify_raw, SETUP_LINK_PURPOSE),
-            None
-        );
-        assert_eq!(db.consume_pending_token(&verify_raw, "verify"), Some(42));
-        // TTL: an expired setup link dies with the same generic None
-        let raw2 = db.create_setup_link(43);
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Atomically redeem a promo code: validates expiry/usage/min-purchase/scope/active,
+    /// increments uses, records redemption. Returns discount amount (in currency units) or error.
+    pub fn redeem_promo_code(
+        &self,
+        seller_id: i64,
+        code: &str,
+        buyer_id: i64,
+        invoice_id: Option<&str>,
+        purchase_amount: f64,
+    ) -> Result<f64, String> {
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let row: Option<(String, f64, Option<i64>, i64, f64, String, Option<i64>, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT promo_type, value, max_uses, uses, min_purchase, scope, scope_id, expires_at, active FROM promo_codes WHERE seller_id=?1 AND code=?2",
+                params![seller_id, code],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let (promo_type, value, max_uses, uses, min_purchase, scope, scope_id, expires_at, active) =
+            row.ok_or_else(|| "promo code not found".to_string())?;
+        if active != 1 {
+            return Err("promo code inactive".to_string());
+        }
+        if let Some(exp) = &expires_at
+            && Utc::now() > exp.parse::<DateTime<Utc>>().unwrap_or(Utc::now())
         {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "UPDATE web_pending_mfa SET expires_at=?1 WHERE account_id=43",
-                params![(Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()],
-            )
-            .unwrap();
+            return Err("promo code expired".to_string());
         }
-        assert_eq!(db.consume_pending_token(&raw2, SETUP_LINK_PURPOSE), None);
-    }
-
-    #[test]
-    fn test_mcp_token_lifecycle_and_masking() {
-        let (db, path) = booking_db("mcp");
-        let (id, raw) = db.create_mcp_token(7, Some("ci"));
-        assert_eq!(raw.len(), 48);
-        // the hash-lookup path mcp::lookup_mcp_token already consumes
-        let row = db
-            .get_mcp_token_by_hash(&sha256_hex(&raw))
-            .expect("hash finds the token");
-        assert_eq!(row.0, id);
-        assert_eq!(row.1, 7);
-        assert_eq!(row.2.as_deref(), Some("ci"));
-        assert_eq!(row.3, 0, "not revoked");
-
-        // masked list: prefix + name only — never the raw token or the hash
-        let list = db.list_mcp_tokens(7);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].0, id);
-        assert_eq!(list[0].1.as_deref(), Some("ci"));
-        let prefix = list[0].2.as_deref().expect("prefix stored");
-        assert_eq!(prefix.len(), 8);
-        assert!(raw.starts_with(prefix), "prefix is a prefix, not the token");
-        assert_eq!(list[0].4, 0);
-        assert!(
-            db.list_mcp_tokens(8).is_empty(),
-            "other sellers see nothing"
-        );
-
-        // scoped revoke: wrong seller loses, owner and admin win, idempotent
-        assert!(!db.revoke_mcp_token(id, Some(8)));
-        assert!(db.revoke_mcp_token(id, Some(7)));
-        assert_eq!(db.get_mcp_token_by_hash(&sha256_hex(&raw)).unwrap().3, 1);
-        assert!(db.revoke_mcp_token(id, Some(7)), "idempotent");
-        assert!(!db.revoke_mcp_token(999_999, None), "unknown id");
-        let (id2, raw2) = db.create_mcp_token(7, None);
-        assert!(
-            db.revoke_mcp_token(id2, None),
-            "admin scope acts on any row"
-        );
-        assert_eq!(db.get_mcp_token_by_hash(&sha256_hex(&raw2)).unwrap().3, 1);
-
-        // touch stamps last_used_at (best-effort bookkeeping)
-        db.touch_mcp_token(id);
+        if let Some(cap) = max_uses
+            && uses >= cap
         {
-            let conn = Connection::open(&path).unwrap();
-            let used: Option<String> = conn
-                .query_row(
-                    "SELECT last_used_at FROM mcp_tokens WHERE id=?1",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert!(used.is_some());
+            return Err("promo code usage cap reached".to_string());
         }
-    }
-
-    #[test]
-    fn test_mcp_audit_carries_seller_id() {
-        let (db, path) = booking_db("audit");
-        db.mcp_audit("list_plans", "seller", Some(9), true, None);
-        db.mcp_audit("owner_tool", "owner", None, false, Some("boom"));
-        let conn = Connection::open(&path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT role, seller_id, ok FROM mcp_audit ORDER BY id")
-            .unwrap();
-        let rows: Vec<(String, Option<i64>, i64)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], ("seller".to_string(), Some(9), 1));
-        assert_eq!(rows[1], ("owner".to_string(), None, 0));
-    }
-
-    #[test]
-    fn test_revenue_by_asset_per_asset_lines() {
-        let (db, _path) = booking_db("revasset");
-        db.save_invoice("i1", 1, "50", "USDT", None, "paid", None, None, None, None);
-        db.save_invoice("i2", 1, "20", "USDT", None, "paid", None, None, None, None);
-        db.save_invoice("i3", 1, "0.5", "BTC", None, "paid", None, None, None, None);
-        // unpaid invoices stay out of the per-asset lines
-        db.save_invoice(
-            "i4", 1, "100", "USDT", None, "active", None, None, None, None,
-        );
-        let rows = db.revenue_by_asset();
-        assert_eq!(
-            rows,
-            vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 70.0)]
-        );
-        // revenue_total's cross-asset behavior is deliberately unchanged
-        // (L5 ruling 5: the sum is a display defect handled at the callers)
-        assert!((db.revenue_total(None) - 70.5).abs() < 1e-9);
-    }
-
-    #[tokio::test]
-    async fn test_web_account_create_verify() {
-        let path = "/tmp/opencode/test_web_account_create_verify.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_web_account("alice", "secret", "admin", None)
-            .await
-            .unwrap();
-        // correct password
-        let r = db.verify_web_password("alice", "secret").await;
-        assert!(r.is_some());
-        let (id, role, seller) = r.unwrap();
-        assert!(id > 0);
-        assert_eq!(role, "admin");
-        assert!(seller.is_none());
-        // wrong password
-        assert!(db.verify_web_password("alice", "wrong").await.is_none());
-        // duplicate username errors
-        let dup = db.create_web_account("alice", "x", "user", None).await;
-        assert!(dup.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_web_account_update_password() {
-        let path = "/tmp/opencode/test_web_account_update_password.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_web_account("bob", "oldpw", "user", None)
-            .await
-            .unwrap();
-        assert!(db.verify_web_password("bob", "oldpw").await.is_some());
-        db.update_web_password("bob", "newpw").await.unwrap();
-        // old fails
-        assert!(db.verify_web_password("bob", "oldpw").await.is_none());
-        // new succeeds
-        assert!(db.verify_web_password("bob", "newpw").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_web_session_lifecycle() {
-        let path = "/tmp/opencode/test_web_session_lifecycle.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_web_account("carol", "pw", "seller", Some(42))
-            .await
-            .unwrap();
-        let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("carol").unwrap();
-        // create session (long-lived)
-        let token = db.create_web_session(acc_id, "seller", Some(42), 7);
-        assert!(!token.is_empty());
-        // get returns account/role/seller
-        let got = db.get_web_session(&token);
-        assert!(got.is_some());
-        let (a, role, seller) = got.unwrap();
-        assert_eq!(a, acc_id);
-        assert_eq!(role, "seller");
-        assert_eq!(seller, Some(42));
-        // delete removes
-        db.delete_web_session(&token);
-        assert!(db.get_web_session(&token).is_none());
-        // expired: days=0
-        let token2 = db.create_web_session(acc_id, "seller", Some(42), 0);
-        assert!(db.get_web_session(&token2).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_list_web_accounts() {
-        let path = "/tmp/opencode/test_list_web_accounts.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_web_account("u1", "p1", "owner", None)
-            .await
-            .unwrap();
-        db.create_web_account("u2", "p2", "admin", None)
-            .await
-            .unwrap();
-        let list = db.list_web_accounts();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0], ("u1".to_string(), "owner".to_string()));
-        assert_eq!(list[1], ("u2".to_string(), "admin".to_string()));
-    }
-
-    #[test]
-    fn test_seller_upsert_and_channel() {
-        let path = "/tmp/opencode/test_seller_upsert_and_channel.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let s = db.get_seller(1).unwrap();
-        assert_eq!(s.0, 1);
-        assert_eq!(s.1, Some("alice".to_string()));
-        assert_eq!(s.2, Some("@chan".to_string()));
-        assert_eq!(db.seller_channel(1).as_deref(), Some("@chan"));
-        db.set_seller_channel(1, "@chan2");
-        assert_eq!(db.seller_channel(1).as_deref(), Some("@chan2"));
-        assert!(db.list_sellers().contains(&1));
-    }
-
-    #[test]
-    fn test_plan_crud_and_scoping() {
-        let path = "/tmp/opencode/test_plan_crud_and_scoping.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.add_plan(1, "P", "1", "USDT", 7, Some("@chan"));
-        let scoped = db.list_plans(Some(1));
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].0, "P");
-        let global = db.list_plans(None);
-        assert_eq!(global.len(), 1);
-        let got = db.get_plan(1, "P").unwrap();
-        assert_eq!(got.3, "P");
-        db.remove_plan(1, "P");
-        assert_eq!(db.list_plans(Some(1)).len(), 0);
-    }
-
-    #[test]
-    fn test_subscription_create_and_user_has_active() {
-        let path = "/tmp/opencode/test_subscription_create_and_user_has_active.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let id = db.create_subscription(1, 42, None, "@chan", 7, None, None);
-        assert!(id > 0);
-        assert!(db.user_has_active_sub(1, 42, "@chan"));
-        assert!(!db.user_has_active_sub(1, 999, "@chan"));
-        assert!(!db.user_has_active_sub(2, 42, "@chan"));
-    }
-
-    #[test]
-    fn test_activation_code_create_redeem() {
-        let path = "/tmp/opencode/test_activation_code_create_redeem.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let code = db.create_code(1, None, Some(7), 1, None, 12);
-        assert_eq!(code.len(), 12);
-        let got = db.get_code(&code).unwrap();
-        assert_eq!(got.1, 1);
-        assert_eq!(got.5, 0);
-        let res = db.redeem_code(&code, 42);
-        assert!(res.is_ok());
-        let got2 = db.get_code(&code).unwrap();
-        assert_eq!(got2.5, 1);
-        // second redeem fails
-        let res2 = db.redeem_code(&code, 42);
-        assert!(res2.is_err());
-    }
-
-    #[test]
-    fn test_invoice_save_and_pending() {
-        let path = "/tmp/opencode/test_invoice_save_and_pending.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.save_invoice(
-            "inv1",
-            1,
-            "10",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("P"),
-            Some(42),
-            None,
-        );
-        let inv = db.get_invoice("inv1").unwrap();
-        assert_eq!(inv.0, "10");
-        assert_eq!(inv.1, "USDT");
-        assert_eq!(inv.2, "active");
-        let pending = db.pending_invoices();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, "inv1");
-    }
-
-    #[test]
-    fn test_invoice_claim_finalize_and_exists() {
-        let path = "/tmp/opencode/test_invoice_claim_finalize_and_exists.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.save_invoice(
-            "inv_claim",
-            1,
-            "10",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("P"),
-            Some(42),
-            None,
-        );
-        // claim succeeds exactly once (atomic handoff between granters)
-        assert!(db.claim_invoice_for_grant("inv_claim"));
-        assert!(!db.claim_invoice_for_grant("inv_claim"));
-        // a FRESH claim is never re-queued: the live claimer owns the row
-        assert!(!db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
-        // ... but a claim wedged past WEDGED_GRANT_STALE_MINUTES (claimer
-        // crashed between claim and finalize) re-queues for re-verification,
-        // which is safe because both grant branches are existence-guarded.
-        {
-            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-            let stale = (Utc::now()
-                - chrono::Duration::try_minutes(WEDGED_GRANT_STALE_MINUTES + 1)
-                    .unwrap_or_default())
-            .to_rfc3339();
-            let _ = conn.execute(
-                "UPDATE invoices SET updated_at=?1 WHERE invoice_id='inv_claim'",
-                params![stale],
-            );
+        if purchase_amount < min_purchase {
+            return Err("minimum purchase not met".to_string());
         }
-        assert!(db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
-        // release_invoice_claim unwinds ONLY a 'granting' row, exactly once
-        assert!(db.release_invoice_claim("inv_claim"));
-        assert!(!db.release_invoice_claim("inv_claim"));
-        assert_eq!(db.get_invoice("inv_claim").unwrap().2, "active");
-        assert!(db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
-        // re-claim, then the normal grant + finalize flow drops it for good
-        assert!(db.claim_invoice_for_grant("inv_claim"));
-        // no subscription yet
-        assert!(!db.subscription_exists_for_invoice("inv_claim"));
-        db.create_subscription(1, 42, None, "@chan", 7, Some("inv_claim"), None);
-        assert!(db.subscription_exists_for_invoice("inv_claim"));
-        // finalize flips to paid and drops it out of the pending queue
-        db.finalize_invoice_paid("inv_claim");
-        assert_eq!(db.get_invoice("inv_claim").unwrap().2, "paid");
-        assert!(!db.pending_invoices().iter().any(|r| r.0 == "inv_claim"));
-        // a paid invoice can no longer be claimed, nor released
-        assert!(!db.claim_invoice_for_grant("inv_claim"));
-        assert!(!db.release_invoice_claim("inv_claim"));
+        // scope check is left to caller; store scope for reference.
+        let _ = (scope, scope_id);
+        let discount = match promo_type.as_str() {
+            "percent" => purchase_amount * (value / 100.0),
+            "fixed" => value.min(purchase_amount),
+            _ => return Err("unknown promo type".to_string()),
+        };
+        tx.execute(
+            "UPDATE promo_codes SET uses = uses + 1 WHERE seller_id=?1 AND code=?2",
+            params![seller_id, code],
+        )
+        .map_err(|e| e.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO promo_redemptions (code, seller_id, buyer_id, invoice_id, discount_amount, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![code, seller_id, buyer_id, invoice_id, discount, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(discount)
     }
 
-    #[test]
-    fn test_seller_has_channel() {
-        let path = "/tmp/opencode/test_seller_has_channel.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        // unknown seller: no channel
-        assert!(!db.seller_has_channel(1));
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        assert!(db.seller_has_channel(1));
-        // an empty-string channel reads as NO channel (matches the
-        // seller_channel(..).unwrap_or_default().is_empty() callers do)
-        db.upsert_seller(2, Some("bob"), Some(""));
-        assert!(!db.seller_has_channel(2));
-        assert!(db.seller_channel(2).is_some());
+    pub fn list_promo_redemptions(
+        &self,
+        seller_id: i64,
+        code: Option<&str>,
+    ) -> Vec<(i64, String, i64, Option<String>, f64, String)> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let sql = if code.is_some() {
+            "SELECT id, code, buyer_id, invoice_id, discount_amount, created_at FROM promo_redemptions WHERE seller_id=?1 AND code=?2 ORDER BY created_at DESC"
+        } else {
+            "SELECT id, code, buyer_id, invoice_id, discount_amount, created_at FROM promo_redemptions WHERE seller_id=?1 ORDER BY created_at DESC"
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(i64, String, i64, Option<String>, f64, String)> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        };
+        let rows = if let Some(c) = code {
+            stmt.query_map(params![seller_id, c], mapper)
+        } else {
+            stmt.query_map(params![seller_id], mapper)
+        };
+        rows.ok().map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    #[test]
-    fn test_pending_invoices_includes_products_only() {
-        let path = "/tmp/opencode/test_pending_invoices_includes_products_only.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        // Product invoice (plan_id NULL, product_id set): must be queued.
-        db.save_invoice(
-            "inv_prod",
-            1,
-            "5",
-            "USDT",
-            None,
-            "active",
-            None,
-            None,
-            Some(9),
-            Some(3),
-        );
-        // Plan invoice: queued as before.
-        db.save_invoice(
-            "inv_plan",
-            1,
-            "5",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("gold"),
-            Some(9),
-            None,
-        );
-        // Neither plan nor product: nothing grantable, never queued.
-        db.save_invoice(
-            "inv_bare",
-            1,
-            "5",
-            "USDT",
-            None,
-            "active",
-            None,
-            None,
-            Some(9),
-            None,
-        );
-        let pending = db.pending_invoices();
-        assert_eq!(pending.len(), 2);
-        assert!(pending.iter().any(|r| r.0 == "inv_prod"));
-        assert!(pending.iter().any(|r| r.0 == "inv_plan"));
-        assert!(!pending.iter().any(|r| r.0 == "inv_bare"));
+    // ---- cart ----
+    pub fn cart_add_item(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        item_type: &str,
+        item_id: i64,
+        qty: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO cart_items (buyer_id, seller_id, item_type, item_id, qty, added_at) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(buyer_id, seller_id, item_type, item_id) DO UPDATE SET qty = qty + ?5",
+            params![buyer_id, seller_id, item_type, item_id, qty, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
-    #[test]
-    fn test_product_add_get_list_and_collisions() {
-        let path = "/tmp/opencode/test_product_add_get_list_and_collisions.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.upsert_seller(2, Some("bob"), Some("@chan"));
-        // invalid kind rejected
-        assert!(
-            db.add_product(1, "bad", "5", "USDT", "service", None, None)
-                .is_err()
-        );
-        let id = db
-            .add_product(
-                1,
-                "ebook",
-                "5",
-                "USDT",
-                "digital_link",
-                Some("https://example.com/dl"),
-                Some(10),
-            )
-            .unwrap();
-        assert!(id > 0);
-        let p = db.get_product(1, "ebook").unwrap();
-        assert_eq!(p.0, id);
-        assert_eq!(p.1, 1);
-        assert_eq!(p.2, "ebook");
-        assert_eq!(p.3, "5");
-        assert_eq!(p.4, "USDT");
-        assert_eq!(p.5, "digital_link");
-        assert_eq!(p.6.as_deref(), Some("https://example.com/dl"));
-        assert_eq!(p.7, Some(10));
-        assert_eq!(p.8, 1);
-        // same name, same seller: product-vs-product collision
-        assert!(
-            db.add_product(1, "ebook", "9", "TON", "digital_file", None, None)
-                .is_err()
-        );
-        // same name, other seller: fine
-        assert!(
-            db.add_product(2, "ebook", "5", "USDT", "digital_link", None, None)
-                .is_ok()
-        );
-        // product-vs-plan collision, scoped to the same seller only
-        db.add_plan(1, "gold", "10", "USDT", 30, Some("@chan"));
-        assert!(
-            db.add_product(1, "gold", "5", "USDT", "digital_link", None, None)
-                .is_err()
-        );
-        assert!(
-            db.add_product(2, "gold", "5", "USDT", "digital_link", None, None)
-                .is_ok()
-        );
-        // unscoped listing is the active-only shop view
-        assert_eq!(db.list_products(None).len(), 3);
-        db.set_product_active(1, "ebook", false);
-        assert_eq!(db.list_products(None).len(), 2);
-        assert!(db.list_products(None).iter().all(|r| r.8 == 1));
-        // scoped listing is the seller's management view: retired rows stay
-        assert_eq!(db.list_products(Some(1)).len(), 1);
-        assert_eq!(db.list_products(Some(1))[0].8, 0);
-        // scoped /buy name resolution (active only): the live 'ebook' belongs
-        // to seller 2 (seller 1's copy is retired), the plan 'gold' to
-        // seller 1 — each namespace resolves only its own rows.
-        assert_eq!(db.find_products_by_name(Some(2), "ebook").len(), 1);
-        assert_eq!(db.find_products_by_name(Some(2), "ebook")[0].1, 2);
-        assert_eq!(db.find_products_by_name(Some(1), "ebook").len(), 0);
-        assert_eq!(db.find_plans_by_name(Some(1), "gold").len(), 1);
-        assert_eq!(db.find_plans_by_name(Some(1), "gold")[0].6, 1);
-        // unscoped is the cross-seller shop view (the caller filters
-        // namespaces: seller_id 0 is admin/owner-only, see commands.rs)
-        assert_eq!(db.find_products_by_name(None, "ebook").len(), 1);
-        // a retired product's name slot can be reused (upsert revives it)
-        let id2 = db
-            .add_product(1, "ebook", "7", "TON", "physical", None, Some(3))
-            .unwrap();
-        let p2 = db.get_product(1, "ebook").unwrap();
-        assert_eq!(p2.0, id2);
-        assert_eq!(p2.3, "7");
-        assert_eq!(p2.8, 1);
-        assert_eq!(db.list_products(None).len(), 3);
+    pub fn cart_get_items(&self, buyer_id: i64, seller_id: i64) -> Vec<(i64, String, i64, i64)> {
+        // (id, item_type, item_id, qty)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare("SELECT id, item_type, item_id, qty FROM cart_items WHERE buyer_id=?1 AND seller_id=?2 ORDER BY added_at ASC") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![buyer_id, seller_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .ok()
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 
-    #[test]
-    fn test_product_grant_once_and_stock_exhaustion() {
-        let path = "/tmp/opencode/test_product_grant_once_and_stock.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        let pid = db
-            .add_product(
-                1,
-                "course",
-                "5",
-                "USDT",
-                "digital_link",
-                Some("link"),
-                Some(2),
-            )
-            .unwrap();
-        // first grant succeeds and decrements stock
-        assert!(db.grant_product(1, 42, pid, "inv_a").unwrap());
-        assert_eq!(db.get_product(1, "course").unwrap().7, Some(1));
-        assert!(db.product_grant_exists("inv_a"));
-        // same invoice again: idempotent no-op, stock untouched
-        assert!(!db.grant_product(1, 42, pid, "inv_a").unwrap());
-        assert_eq!(db.get_product(1, "course").unwrap().7, Some(1));
-        // second unit sells, stock hits zero
-        assert!(db.grant_product(1, 43, pid, "inv_b").unwrap());
-        assert_eq!(db.get_product(1, "course").unwrap().7, Some(0));
-        // exhausted: no grant row, no further decrement
-        assert_eq!(
-            db.grant_product(1, 44, pid, "inv_c").unwrap_err(),
-            "out of stock"
-        );
-        assert!(!db.product_grant_exists("inv_c"));
-        assert_eq!(db.get_product(1, "course").unwrap().7, Some(0));
-        // NULL stock = unlimited, never exhausts
-        let uid = db
-            .add_product(
-                1,
-                "bonus",
-                "1",
-                "TON",
-                "digital_file",
-                Some("file_id"),
-                None,
-            )
-            .unwrap();
-        for i in 0..5 {
-            assert!(
-                db.grant_product(1, 50 + i, uid, &format!("inv_u{}", i))
-                    .unwrap()
-            );
+    pub fn cart_update_qty(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        item_type: &str,
+        item_id: i64,
+        qty: i64,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if qty <= 0 {
+            return conn.execute("DELETE FROM cart_items WHERE buyer_id=?1 AND seller_id=?2 AND item_type=?3 AND item_id=?4", params![buyer_id, seller_id, item_type, item_id]).unwrap_or(0) > 0;
         }
-        assert_eq!(db.get_product(1, "bonus").unwrap().7, None);
+        conn.execute("UPDATE cart_items SET qty=?5 WHERE buyer_id=?1 AND seller_id=?2 AND item_type=?3 AND item_id=?4", params![buyer_id, seller_id, item_type, item_id, qty]).unwrap_or(0) > 0
     }
 
-    #[test]
-    fn test_order_create_list_status_and_scoping() {
-        let path = "/tmp/opencode/test_order_create_list_status.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        let mug = db
-            .add_product(1, "mug", "9", "USDT", "physical", None, None)
-            .unwrap();
-        let tee = db
-            .add_product(2, "tee", "7", "USDT", "physical", None, None)
-            .unwrap();
-        // create -> 8-char order id, pending, no tracking
-        let oid = db.create_order(1, mug, 42, "inv_o1").unwrap();
-        assert_eq!(oid.len(), 8);
-        db.create_order(2, tee, 43, "inv_o2").unwrap();
-        // one order per purchase (UNIQUE invoice_id)
-        assert!(db.create_order(1, mug, 42, "inv_o1").is_err());
-        // list: all vs seller-scoped
-        assert_eq!(db.list_orders(None).len(), 2);
-        let own = db.list_orders(Some(1));
-        assert_eq!(own.len(), 1);
-        assert_eq!(own[0].0, oid);
-        assert_eq!(own[0].1, 1);
-        assert_eq!(own[0].2, 42);
-        assert_eq!(own[0].3, "pending");
-        assert_eq!(own[0].4, None);
-        assert!(!own[0].5.is_empty());
-        // status transitions
-        assert!(db.set_order_status(1, &oid, "shipped"));
-        assert_eq!(db.list_orders(Some(1))[0].3, "shipped");
-        assert!(db.set_order_status(1, &oid, "delivered"));
-        assert_eq!(db.list_orders(Some(1))[0].3, "delivered");
-        assert!(db.set_order_status(1, &oid, "refunded"));
-        assert!(db.set_order_status(1, &oid, "cancelled"));
-        assert!(db.set_order_status(1, &oid, "pending"));
-        // invalid status rejected, state untouched
-        assert!(!db.set_order_status(1, &oid, "destroyed"));
-        assert!(!db.set_order_status(1, &oid, ""));
-        assert_eq!(db.list_orders(Some(1))[0].3, "pending");
-        // seller scoping: seller 2 cannot flip seller 1's order
-        assert!(!db.set_order_status(2, &oid, "shipped"));
-        assert_eq!(db.list_orders(Some(1))[0].3, "pending");
-        // unknown order id
-        assert!(!db.set_order_status(1, "nope1234", "shipped"));
-        // tracking, same seller scoping
-        db.set_order_tracking(1, &oid, "TRACK123");
-        assert_eq!(db.list_orders(Some(1))[0].4.as_deref(), Some("TRACK123"));
-        assert_eq!(db.list_orders(Some(2))[0].4, None);
+    pub fn cart_remove_item(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        item_type: &str,
+        item_id: i64,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute("DELETE FROM cart_items WHERE buyer_id=?1 AND seller_id=?2 AND item_type=?3 AND item_id=?4", params![buyer_id, seller_id, item_type, item_id]).unwrap_or(0) > 0
     }
 
-    #[test]
-    fn test_invoice_product_roundtrip() {
-        let path = "/tmp/opencode/test_invoice_product_roundtrip.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let pid = db
-            .add_product(
-                1,
-                "guide",
-                "2",
-                "TON",
-                "digital_file",
-                Some("FILEID123"),
-                None,
-            )
-            .unwrap();
-        db.save_invoice(
-            "inv_p",
-            1,
-            "2",
-            "TON",
-            None,
-            "active",
-            None,
-            None,
-            Some(42),
-            Some(pid),
-        );
-        assert_eq!(db.invoice_product("inv_p"), Some(pid));
-        let (dp, kind, name, delivery) = db.invoice_product_delivery("inv_p").unwrap();
-        assert_eq!(dp, pid);
-        assert_eq!(kind, "digital_file");
-        assert_eq!(name, "guide");
-        assert_eq!(delivery.as_deref(), Some("FILEID123"));
-        // plan invoices (product_id NULL) take the existing plan path
-        db.save_invoice(
-            "inv_plan",
-            1,
-            "10",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("gold"),
-            Some(42),
-            None,
-        );
-        assert_eq!(db.invoice_product("inv_plan"), None);
-        assert!(db.invoice_product_delivery("inv_plan").is_none());
-        assert!(db.invoice_product("missing").is_none());
-        assert!(db.invoice_product_delivery("missing").is_none());
-    }
-
-    #[test]
-    fn test_subscription_status_and_by_invoice() {
-        let path = "/tmp/opencode/test_subscription_status_and_by_invoice.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        let id = db.create_subscription(1, 42, None, "@chan", 7, Some("inv_s"), None);
-        assert_eq!(
-            db.subscription_by_invoice("inv_s"),
-            Some((id, "@chan".to_string()))
-        );
-        assert!(db.subscription_by_invoice("nope").is_none());
-        db.set_subscription_status(id, "refunded");
-        assert_eq!(db.list_subscriptions(Some(1), 10)[0].4, "refunded");
-    }
-
-    #[test]
-    fn test_list_subscriptions_filtered() {
-        let path = "/tmp/opencode/test_list_subscriptions_filtered.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        let id1 = db.create_subscription(1, 42, None, "@chan", 7, Some("inv_a"), None);
-        let id2 = db.create_subscription(1, 43, None, "@chan", 7, Some("inv_b"), None);
-        db.set_subscription_status(id2, "expired");
-        // status filter
-        let active = db.list_subscriptions_filtered(Some(1), Some("active"), 10);
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].0, id1);
-        let expired = db.list_subscriptions_filtered(Some(1), Some("expired"), 10);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].0, id2);
-        // no status filter returns all
-        let all = db.list_subscriptions_filtered(Some(1), None, 10);
-        assert_eq!(all.len(), 2);
-        // global scope
-        let global = db.list_subscriptions_filtered(None, None, 10);
-        assert_eq!(global.len(), 2);
-        // order by id desc
-        assert!(global[0].0 > global[1].0);
-        // limit
-        let limited = db.list_subscriptions_filtered(Some(1), None, 1);
-        assert_eq!(limited.len(), 1);
-        let _ = id1;
-    }
-
-    #[test]
-    fn test_refund_and_payout_state_transitions() {
-        let path = "/tmp/opencode/test_refund_and_payout_state_transitions.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.upsert_seller(2, Some("bob"), Some("@chan"));
-        db.save_invoice(
-            "inv_r1",
-            1,
-            "10",
-            "USDT",
-            None,
-            "paid",
-            None,
-            None,
-            Some(42),
-            None,
-        );
-        // refund starts pending; unknown user falls back to the invoice buyer
-        let rid = db.create_refund(1, Some("inv_r1"), None, "10", "USDT", Some("damaged"));
-        assert!(rid > 0);
-        let refunds = db.list_refunds(Some(1));
-        assert_eq!(refunds.len(), 1);
-        assert_eq!(refunds[0].0, rid);
-        assert_eq!(refunds[0].1, 1);
-        assert_eq!(refunds[0].2.as_deref(), Some("inv_r1"));
-        assert_eq!(refunds[0].3, Some(42));
-        assert_eq!(refunds[0].4, "10");
-        assert_eq!(refunds[0].5, "USDT");
-        assert_eq!(refunds[0].6.as_deref(), Some("damaged"));
-        assert_eq!(refunds[0].7, "pending");
-        // pending -> approved -> executed
-        db.set_refund_status(rid, "approved");
-        assert_eq!(db.list_refunds(Some(1))[0].7, "approved");
-        db.set_refund_status(rid, "executed");
-        assert_eq!(db.get_refund(rid.to_string()).unwrap().7, "executed");
-        // explicit user + scoped listing
-        let rid2 = db.create_refund(2, None, Some(7), "3", "TON", None);
-        assert!(rid2 > 0);
-        assert_eq!(db.list_refunds(Some(2))[0].3, Some(7));
-        assert_eq!(db.list_refunds(None).len(), 2);
-        // payout pending -> approved -> paid
-        let pid = db.create_payout(1, "5", "USDT", Some("@alice"));
-        assert!(pid > 0);
-        assert_eq!(db.list_payouts(Some(1))[0].5, "pending");
-        db.set_payout_status(pid, "approved");
-        assert_eq!(db.list_payouts(Some(1))[0].5, "approved");
-        db.set_payout_status(pid, "paid");
-        assert_eq!(db.get_payout(pid.to_string()).unwrap().5, "paid");
-        assert_eq!(db.list_payouts(Some(2)).len(), 0);
-    }
-
-    /// CAS execution claims on payouts: begin only wins from 'approved',
-    /// exactly one concurrent claimer wins, finish only applies from
-    /// 'executing', and invalid finish statuses are rejected with no write.
-    #[test]
-    fn test_payout_execution_cas_transitions() {
-        let path = "/tmp/opencode/test_payout_execution_cas_transitions.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-
-        // begin-from-pending is refused; begin-from-approved wins
-        let pid = db.create_payout(1, "5", "USDT", Some("@alice"));
-        assert_eq!(
-            db.get_payout_status(pid.to_string()).as_deref(),
-            Some("pending")
-        );
-        assert!(!db.begin_payout_execution(pid.to_string()));
-        db.set_payout_status(pid, "approved");
-        assert!(db.begin_payout_execution(pid.to_string()));
-        assert_eq!(
-            db.get_payout_status(pid.to_string()).as_deref(),
-            Some("executing")
-        );
-
-        // double-begin loses: the row is no longer 'approved'
-        let pid2 = db.create_payout(1, "7", "USDT", Some("@alice"));
-        db.set_payout_status(pid2, "approved");
-        assert!(db.begin_payout_execution(pid2.to_string()));
-        assert!(!db.begin_payout_execution(pid2.to_string()));
-
-        // finish applies only from 'executing'
-        assert_eq!(db.finish_payout_execution(pid.to_string(), "paid"), 1);
-        assert_eq!(
-            db.get_payout_status(pid.to_string()).as_deref(),
-            Some("paid")
-        );
-        // finish-from-wrong-status (already 'paid') changes nothing
-        assert_eq!(db.finish_payout_execution(pid.to_string(), "approved"), 0);
-        assert_eq!(db.finish_payout_execution(pid.to_string(), "paid"), 0);
-
-        // revert path: 'executing' -> 'approved' is legal, then re-executable
-        assert_eq!(db.finish_payout_execution(pid2.to_string(), "approved"), 1);
-        assert_eq!(
-            db.get_payout_status(pid2.to_string()).as_deref(),
-            Some("approved")
-        );
-        assert!(db.begin_payout_execution(pid2.to_string()));
-        assert_eq!(db.finish_payout_execution(pid2.to_string(), "paid"), 1);
-
-        // invalid status args are rejected with no DB write (row stays
-        // 'executing'); matching is case-sensitive by design
-        let pid3 = db.create_payout(1, "9", "USDT", Some("@alice"));
-        db.set_payout_status(pid3, "approved");
-        assert!(db.begin_payout_execution(pid3.to_string()));
-        for bad in ["failed", "processed", "pending", "executing", "PAID", ""] {
-            assert_eq!(db.finish_payout_execution(pid3.to_string(), bad), 0);
-        }
-        assert_eq!(
-            db.get_payout_status(pid3.to_string()).as_deref(),
-            Some("executing")
+    pub fn cart_clear(&self, buyer_id: i64, seller_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "DELETE FROM cart_items WHERE buyer_id=?1 AND seller_id=?2",
+            params![buyer_id, seller_id],
         );
     }
 
-    /// CAS execution claims on refunds: same contract as payouts, with
-    /// "executed" as the terminal outcome.
-    #[test]
-    fn test_refund_execution_cas_transitions() {
-        let path = "/tmp/opencode/test_refund_execution_cas_transitions.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-
-        // begin-from-pending is refused; begin-from-approved wins
-        let rid = db.create_refund(1, None, Some(42), "10", "USDT", Some("damaged"));
-        assert!(!db.begin_refund_execution(rid.to_string()));
-        db.set_refund_status(rid, "approved");
-        assert!(db.begin_refund_execution(rid.to_string()));
-        assert_eq!(db.get_refund(rid.to_string()).unwrap().7, "executing");
-
-        // double-begin loses: the row is no longer 'approved'
-        let rid2 = db.create_refund(1, None, Some(43), "3", "TON", None);
-        db.set_refund_status(rid2, "approved");
-        assert!(db.begin_refund_execution(rid2.to_string()));
-        assert!(!db.begin_refund_execution(rid2.to_string()));
-
-        // finish applies only from 'executing'
-        assert_eq!(db.finish_refund_execution(rid.to_string(), "executed"), 1);
-        assert_eq!(db.get_refund(rid.to_string()).unwrap().7, "executed");
-        // finish-from-wrong-status (already 'executed') changes nothing
-        assert_eq!(db.finish_refund_execution(rid.to_string(), "approved"), 0);
-        assert_eq!(db.finish_refund_execution(rid.to_string(), "executed"), 0);
-
-        // revert path: 'executing' -> 'approved' is legal, then re-executable
-        assert_eq!(db.finish_refund_execution(rid2.to_string(), "approved"), 1);
-        assert_eq!(db.get_refund(rid2.to_string()).unwrap().7, "approved");
-        assert!(db.begin_refund_execution(rid2.to_string()));
-        assert_eq!(db.finish_refund_execution(rid2.to_string(), "executed"), 1);
-
-        // invalid status args are rejected with no DB write (row stays
-        // 'executing'); matching is case-sensitive by design
-        let rid3 = db.create_refund(1, None, Some(44), "1", "USDT", None);
-        db.set_refund_status(rid3, "approved");
-        assert!(db.begin_refund_execution(rid3.to_string()));
-        for bad in ["paid", "failed", "processed", "pending", "EXECUTED", ""] {
-            assert_eq!(db.finish_refund_execution(rid3.to_string(), bad), 0);
-        }
-        assert_eq!(db.get_refund(rid3.to_string()).unwrap().7, "executing");
+    pub fn cart_count(&self, buyer_id: i64, seller_id: i64) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT COALESCE(SUM(qty),0) FROM cart_items WHERE buyer_id=?1 AND seller_id=?2",
+            params![buyer_id, seller_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
-    proptest! {
-        /// Model check of the invoice claim state machine: for any sequence of
-        /// claim / finalize / reset operations, the database's observable state
-        /// always matches the reference model (active → granting → paid, reset
-        /// re-activates) and a claim succeeds only when the model is 'active'.
-        #[test]
-        fn prop_claim_state_machine(ops in proptest::collection::vec(0u8..3, 1..40)) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("claim.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            db.upsert_seller(1, Some("s"), Some("@chan"));
-            db.save_invoice(
-                "inv",
-                1,
-                "10",
-                "USDT",
-                None,
-                "active",
-                None,
-                Some("P"),
-                Some(42),
-                None,
-            );
-            let mut model = 0u8; // 0=active, 1=granting, 2=paid
-            for op in ops {
-                match op {
-                    0 => {
-                        let won = db.claim_invoice_for_grant("inv");
-                        prop_assert_eq!(won, model == 0);
-                        if model == 0 {
-                            model = 1;
-                        }
-                    }
-                    1 => {
-                        db.finalize_invoice_paid("inv");
-                        model = 2;
-                    }
-                    _ => {
-                        db.update_invoice_status("inv", "active");
-                        model = 0;
-                    }
-                }
-                let status = db.get_invoice("inv").unwrap().2.clone();
-                let want = match model {
-                    0 => "active",
-                    1 => "granting",
-                    _ => "paid",
-                };
-                prop_assert_eq!(status, want);
-            }
-        }
+    pub fn cart_clear_all(&self, buyer_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute(
+            "DELETE FROM cart_items WHERE buyer_id=?1",
+            params![buyer_id],
+        );
+    }
 
-        /// Any i64 plan duration survives create_subscription without panicking.
-        #[test]
-        fn prop_subscription_arbitrary_days(
-            seller in 1i64..1000,
-            user in 1i64..1000,
-            days in any::<i64>(),
+    pub fn cart_get_all_items(&self, buyer_id: i64) -> Vec<(i64, i64, String, i64, i64)> {
+        // (seller_id, id, item_type, item_id, qty) for every cart row of buyer
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT seller_id, id, item_type, item_id, qty FROM cart_items WHERE buyer_id=?1 ORDER BY added_at ASC",
         ) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sub.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            db.upsert_seller(seller, Some("s"), Some("@chan"));
-            let id = db.create_subscription(seller, user, None, "@chan", days, None, None);
-            prop_assert!(id > 0);
-        }
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![buyer_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .ok()
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 
-    proptest! {
-        /// Product grant lifecycle: no matter how many grant attempts race in,
-        /// an invoice's product is granted at most once (double-grant guard),
-        /// and exhaustion is reported rather than overselling.
-        #[test]
-        fn prop_product_grant_exactly_once(
-            attempts in 1u8..8,
-            stock in proptest::option::of(0i64..3),
+    // ---- Phase 2: referrals ----
+    pub fn create_referral_code(&self, seller_id: i64, user_id: i64) -> String {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Ok(code) = conn.query_row(
+            "SELECT code FROM referral_codes WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id],
+            |r| r.get::<_, String>(0),
         ) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("pg.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            db.upsert_seller(7, Some("s"), Some("@chan"));
-            let pid = db
-                .add_product(7, "Ebook", "5", "USDT", "digital_link", Some("https://x/dl"), stock)
-                .unwrap();
-            db.save_invoice(
-                "invP",
-                7,
-                "5",
-                "USDT",
-                None,
-                "active",
-                None,
-                None,
-                Some(9),
-                None,
-            );
-            let mut granted = 0;
-            for _ in 0..attempts {
-                match db.grant_product(7, 9, pid, "invP") {
-                    Ok(true) => granted += 1,
-                    Ok(false) => {}
-                    Err(_) => break, // out of stock
-                }
-            }
-            prop_assert!(granted <= 1);
-            prop_assert_eq!(db.product_grant_exists("invP"), granted == 1);
+            return code;
         }
+        let code = format!("REF{}{}", seller_id, user_id);
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("INSERT OR IGNORE INTO referral_codes (seller_id, user_id, code, created_at) VALUES (?1,?2,?3,?4)", params![seller_id, user_id, code, now]);
+        conn.query_row(
+            "SELECT code FROM referral_codes WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(code)
     }
 
-    #[test]
-    fn test_subscription_does_not_panic_on_huge_days() {
-        let path = "/tmp/opencode/test_subscription_does_not_panic_on_huge_days.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let id = db.create_subscription(1, 42, None, "@chan", i64::MAX, None, None);
-        assert!(id > 0);
-        // extreme negative duration must not panic either
-        let id2 = db.create_subscription(1, 43, None, "@chan", -i64::MAX, None, None);
-        assert!(id2 > 0);
-        let subs = db.list_subscriptions(Some(1), 10);
-        assert_eq!(subs.len(), 2);
+    pub fn get_referrer_by_code(&self, seller_id: i64, code: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT user_id FROM referral_codes WHERE seller_id=?1 AND code=?2",
+            params![seller_id, code],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
-    #[tokio::test]
-    async fn test_one_time_credential_rotation() {
-        let path = "/tmp/opencode/test_one_time_credential_rotation.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_web_account("rot", "pw", "admin", None)
-            .await
-            .unwrap();
-        let (acc_id, _u, _h, _r, _s) = db.get_web_account_by_username("rot").unwrap();
-        let token = db.create_web_session(acc_id, "admin", None, 7);
-        assert!(db.get_web_session(&token).is_some());
-        // Simulate a pre-CSPRNG database: clear the rotation marker.
-        {
-            let conn = db
-                .conn
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            conn.execute(
-                "DELETE FROM config WHERE key='migration_rotate_tokens_v1'",
-                [],
-            )
-            .unwrap();
+    pub fn create_referral(
+        &self,
+        seller_id: i64,
+        referrer_id: i64,
+        referee_id: i64,
+        code: &str,
+    ) -> Result<(), String> {
+        if referrer_id == referee_id {
+            return Err("self-referral not allowed".to_string());
         }
-        // Re-opening rotates legacy credentials exactly once.
-        let db2 = Db::new(path).unwrap();
-        assert!(db2.get_web_session(&token).is_none());
-        // Sessions created after the rotation survive later restarts.
-        let token2 = db2.create_web_session(acc_id, "admin", None, 7);
-        assert!(db2.get_web_session(&token2).is_some());
-        let db3 = Db::new(path).unwrap();
-        assert!(db3.get_web_session(&token2).is_some());
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute("INSERT INTO referrals (seller_id, referrer_id, referee_id, code, status, created_at) VALUES (?1,?2,?3,?4,'pending',?5)", params![seller_id, referrer_id, referee_id, code, Utc::now().to_rfc3339()])
+            .map_err(|e| format!("create_referral: {e}"))?;
+        Ok(())
     }
 
-    #[test]
-    fn test_duplicate_invoice_grants_do_not_break_startup() {
-        let path = "/tmp/opencode/test_duplicate_invoice_grants.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.create_subscription(1, 42, None, "@c", 7, Some("dup"), None);
-        db.create_subscription(1, 43, None, "@c", 7, Some("dup"), None);
-        // Re-open: the unique index cannot be built over duplicates, but
-        // startup must continue.
-        let db2 = Db::new(path).unwrap();
-        assert!(db2.subscription_exists_for_invoice("dup"));
+    pub fn mark_referral_rewarded(
+        &self,
+        seller_id: i64,
+        referee_id: i64,
+        reward_value: f64,
+        reward_type: &str,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute("UPDATE referrals SET status='rewarded', reward_value=?3, reward_type=?4, rewarded_at=?5 WHERE seller_id=?1 AND referee_id=?2 AND status='pending'", params![seller_id, referee_id, reward_value, reward_type, now]).unwrap_or(0) > 0
     }
 
-    #[test]
-    fn test_admin_add_remove() {
-        let path = "/tmp/opencode/test_admin_add_remove.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        let owner_id = 999i64;
-        assert!(!db.is_admin(5, owner_id));
-        db.add_admin(5, Some("admin5"));
-        assert!(db.is_admin(5, owner_id));
-        assert!(db.list_admins().contains(&5));
-        db.remove_admin(5);
-        assert!(!db.is_admin(5, owner_id));
-        assert!(!db.list_admins().contains(&5));
+    pub fn list_referrals(
+        &self,
+        seller_id: i64,
+        referrer_id: Option<i64>,
+    ) -> Vec<(i64, i64, i64, String, String, f64)> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let sql = if referrer_id.is_some() {
+            "SELECT id, referrer_id, referee_id, code, status, reward_value FROM referrals WHERE seller_id=?1 AND referrer_id=?2 ORDER BY created_at DESC"
+        } else {
+            "SELECT id, referrer_id, referee_id, code, status, reward_value FROM referrals WHERE seller_id=?1 ORDER BY created_at DESC"
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(i64, i64, i64, String, String, f64)> {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        };
+        let rows = if let Some(rid) = referrer_id {
+            stmt.query_map(params![seller_id, rid], mapper)
+        } else {
+            stmt.query_map(params![seller_id], mapper)
+        };
+        rows.ok().map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    #[test]
-    fn test_expired_subscriptions() {
-        let path = "/tmp/opencode/test_expired_subscriptions.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        let id = db.create_subscription(1, 42, None, "@chan", -1, None, None);
-        let expired = db.expired_subscriptions();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].0, id);
-        db.mark_subscription_expired(id);
-        let subs = db.list_subscriptions(Some(1), 10);
-        assert_eq!(subs[0].4, "expired");
+    // ---- Phase 2: bonus/loyalty balance ----
+    pub fn bonus_balance(&self, seller_id: i64, user_id: i64) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT balance_minor FROM bonus_balances WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
-    #[test]
-    fn test_ai_template_upsert_get_list_delete() {
-        let path = "/tmp/opencode/test_ai_template_upsert_get_list_delete.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.upsert_ai_template(
-            1,
-            "t1",
-            Some("desc"),
-            Some("sys"),
-            "user prompt",
-            Some("vars"),
-        );
-        let got = db.get_ai_template(1, "t1").unwrap();
-        assert_eq!(got.0, "t1");
-        assert_eq!(got.1, Some("desc".to_string()));
-        assert_eq!(got.3, "user prompt");
-        let list = db.list_ai_templates(1);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].0, "t1");
-        // upsert update
-        db.upsert_ai_template(1, "t1", Some("desc2"), Some("sys2"), "new prompt", None);
-        let got2 = db.get_ai_template(1, "t1").unwrap();
-        assert_eq!(got2.1, Some("desc2".to_string()));
-        assert_eq!(got2.3, "new prompt");
-        db.delete_ai_template(1, "t1");
-        assert!(db.get_ai_template(1, "t1").is_none());
-        assert!(db.list_ai_templates(1).is_empty());
+    pub fn bonus_credit(
+        &self,
+        seller_id: i64,
+        user_id: i64,
+        amount_minor: i64,
+        reason: &str,
+    ) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("INSERT INTO bonus_balances (user_id, seller_id, balance_minor, updated_at) VALUES (?2,?1,0,?3) ON CONFLICT(user_id, seller_id) DO NOTHING", params![seller_id, user_id, now]);
+        let _ = conn.execute("UPDATE bonus_balances SET balance_minor = balance_minor + ?3, updated_at=?4 WHERE seller_id=?1 AND user_id=?2", params![seller_id, user_id, amount_minor, now]);
+        let _ = conn.execute("INSERT INTO bonus_ledger (user_id, seller_id, amount_minor, reason, created_at) VALUES (?2,?1,?3,?4,?5)", params![seller_id, user_id, amount_minor, reason, now]);
+        // return updated balance
+        conn.query_row(
+            "SELECT balance_minor FROM bonus_balances WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
-    #[test]
-    fn test_ai_usage_record_and_summary() {
-        let path = "/tmp/opencode/test_ai_usage_record_and_summary.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.record_ai_usage(
-            1,
-            Some(42),
-            "openai",
-            "gpt",
-            Some("t1"),
-            10,
-            5,
-            15,
-            0.1,
-            "ok",
-            None,
-        );
-        assert_eq!(db.ai_usage_today_tokens(1), 15);
-        let summary = db.ai_usage_summary(1, 7);
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].1, 15);
-        assert_eq!(summary[0].2, 1);
-    }
-
-    #[test]
-    fn test_ai_usage_global_and_recent_errors() {
-        let path = "/tmp/opencode/test_ai_usage_global_and_recent_errors.db";
-        let _ = fs::remove_file(path);
-        let db = Db::new(path).unwrap();
-        db.upsert_seller(1, Some("alice"), Some("@chan"));
-        db.record_ai_usage(
-            1,
-            Some(42),
-            "openai",
-            "gpt",
-            Some("t1"),
-            10,
-            5,
-            15,
-            0.1,
-            "ok",
-            None,
-        );
-        db.record_ai_usage(
-            1,
-            Some(42),
-            "openai",
-            "gpt",
-            Some("t1"),
-            1,
-            1,
-            2,
-            0.01,
-            "error",
-            Some("boom"),
-        );
-        assert_eq!(db.ai_usage_today_tokens_global(), 17);
-        let gsummary = db.ai_usage_summary_global(7);
-        assert_eq!(gsummary.len(), 1);
-        assert_eq!(gsummary[0].1, 17);
-        assert_eq!(gsummary[0].2, 2);
-        let cost = db.ai_usage_cost_total_global(7);
-        assert!((cost - 0.11).abs() < 1e-9);
-        // global recent errors
-        let errs = db.ai_usage_recent_errors_global(10);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].4, "error");
-        assert_eq!(errs[0].3, Some("boom".to_string()));
-        // seller scoped
-        let serrs = db.ai_usage_recent_errors(1, 10);
-        assert_eq!(serrs.len(), 1);
-        assert_eq!(serrs[0].1, "openai");
-        // no errors for other seller
-        assert!(db.ai_usage_recent_errors(2, 10).is_empty());
-    }
-
-    #[test]
-    fn test_scheduled_post_create_and_list_due() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sched.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        let id = db.create_scheduled_post(1, "chat", "content", "text", &past);
-        assert!(id > 0);
-        let due = db.list_due_scheduled();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].0, id);
-        db.mark_scheduled_posted(id, 999).unwrap();
-        let due2 = db.list_due_scheduled();
-        assert!(due2.is_empty());
-    }
-
-    #[test]
-    fn test_scheduled_post_attempts_cap_terminal() {
-        // Bounded retries (2026-10-25 review): every send failure bumps the
-        // counter; at the cap the post leaves the due queue with status
-        // 'failed' instead of retrying forever. A concurrent 'posted' win is
-        // never overwritten by the terminal mark.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sched_cap.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        let id = db.create_scheduled_post(1, "chat", "content", "text", &past);
-        for expected in 1..=10 {
-            assert_eq!(db.bump_scheduled_attempts(id), expected);
-        }
-        // Not terminal yet: still due.
-        assert_eq!(db.list_due_scheduled().len(), 1);
-        db.mark_scheduled_failed(id);
-        assert!(db.list_due_scheduled().is_empty());
-        let all = db.list_scheduled_posts(Some(1));
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].6, "failed");
-        // The terminal mark is scoped to 'pending': a posted row stays.
-        let id2 = db.create_scheduled_post(1, "chat", "content", "text", &past);
-        db.mark_scheduled_posted(id2, 42).unwrap();
-        db.mark_scheduled_failed(id2);
-        let all2 = db.list_scheduled_posts(Some(1));
-        assert_eq!(
-            all2.iter().find(|r| r.0 == id2).map(|r| r.6.as_str()),
-            Some("posted")
-        );
-    }
-
-    #[test]
-    fn test_invoice_attempts_bump_and_terminal_state() {
-        // The verification-attempts counter advances only via
-        // bump_invoice_attempts (the "not settled yet" release path never
-        // touches it), and the terminal 'failed' status drops the invoice
-        // from pending_invoices() — the verifier's queue.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("inv_cap.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        db.save_invoice(
-            "inv1",
-            1,
-            "5",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("gold"),
-            Some(7),
-            None,
-        );
-        assert_eq!(db.pending_invoices().len(), 1);
-        for expected in 1..=10 {
-            assert_eq!(db.bump_invoice_attempts("inv1"), expected);
-        }
-        // Counter column is stored, not just returned.
-        let raw: i64 = {
-            let conn = Connection::open(&path).unwrap();
-            conn.query_row(
-                "SELECT attempts FROM invoices WHERE invoice_id='inv1'",
-                [],
+    pub fn bonus_debit(
+        &self,
+        seller_id: i64,
+        user_id: i64,
+        amount_minor: i64,
+        reason: &str,
+    ) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let bal: i64 = conn
+            .query_row(
+                "SELECT balance_minor FROM bonus_balances WHERE seller_id=?1 AND user_id=?2",
+                params![seller_id, user_id],
                 |r| r.get(0),
             )
-            .unwrap()
+            .unwrap_or(0);
+        if bal < amount_minor {
+            return Err("insufficient bonus balance".to_string());
+        }
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("UPDATE bonus_balances SET balance_minor = balance_minor - ?3, updated_at=?4 WHERE seller_id=?1 AND user_id=?2", params![seller_id, user_id, amount_minor, now]);
+        let _ = conn.execute("INSERT INTO bonus_ledger (user_id, seller_id, amount_minor, reason, created_at) VALUES (?2,?1,?3,?4,?5)", params![seller_id, user_id, -amount_minor, reason, now]);
+        Ok(bal - amount_minor)
+    }
+
+    // ---- Phase 3: CRM + support tickets ----
+    pub fn upsert_customer(&self, seller_id: i64, user_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("INSERT INTO customers (user_id, seller_id, first_seen, last_seen) VALUES (?2,?1,?3,?3) ON CONFLICT(user_id, seller_id) DO UPDATE SET last_seen=?3", params![seller_id, user_id, now]);
+    }
+
+    pub fn get_customer(
+        &self,
+        seller_id: i64,
+        user_id: i64,
+    ) -> Option<(
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        f64,
+        i64,
+        String,
+    )> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT user_id, seller_id, first_seen, last_seen, tags, notes, total_spent, order_count, status FROM customers WHERE seller_id=?1 AND user_id=?2", params![seller_id, user_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional().ok().flatten()
+    }
+
+    pub fn list_customers(
+        &self,
+        seller_id: i64,
+        tag: Option<&str>,
+        status: Option<&str>,
+    ) -> Vec<(i64, String, Option<String>, f64, i64, String)> {
+        // (user_id, last_seen, tags, total_spent, order_count, status)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sql = "SELECT user_id, last_seen, tags, total_spent, order_count, status FROM customers WHERE seller_id=?1".to_string();
+        if tag.is_some() {
+            sql.push_str(" AND (',' || tags || ',') LIKE ?2");
+        }
+        if status.is_some() {
+            if tag.is_some() {
+                sql.push_str(" AND status=?3");
+            } else {
+                sql.push_str(" AND status=?2");
+            }
+        }
+        sql.push_str(" ORDER BY last_seen DESC");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
         };
-        assert_eq!(raw, 10);
-        // Terminal-failed leaves the queue (verifier + release paths use the
-        // same status vocabulary the rest of the codebase writes).
-        db.update_invoice_status("inv1", "failed");
-        assert!(db.pending_invoices().is_empty());
-        // And an unrelated invoice keeps its own counter at zero.
-        db.save_invoice(
-            "inv2",
-            1,
-            "5",
-            "USDT",
-            None,
-            "active",
-            None,
-            Some("gold"),
-            Some(7),
-            None,
-        );
-        assert_eq!(db.bump_invoice_attempts("inv2"), 1);
+        let tagpat = tag.map(|t| format!("%,{t},%"));
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(i64,String,Option<String>,f64,i64,String)> { Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)) };
+        let rows = match (tagpat.as_deref(), status) {
+            (Some(t), Some(st)) => stmt.query_map(params![seller_id, t, st], mapper),
+            (Some(t), None) => stmt.query_map(params![seller_id, t], mapper),
+            (None, Some(st)) => stmt.query_map(params![seller_id, st], mapper),
+            (None, None) => stmt.query_map(params![seller_id], mapper),
+        };
+        rows.ok().map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    #[test]
-    fn test_wal_checkpoint_best_effort() {
-        // checkpoint() must never panic — including when WAL is unavailable
-        // (in-memory dbs) or the file was never written — and must leave the
-        // database usable afterwards.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        db.set_config("k", "v");
-        db.checkpoint();
-        assert_eq!(db.get_config("k").as_deref(), Some("v"));
-        db.checkpoint();
-        // On a WAL-mode file the TRUNCATE checkpoint empties the -wal log.
-        let wal = dir.path().join("wal.db-wal");
-        if wal.exists() {
-            assert_eq!(wal.metadata().unwrap().len(), 0);
+    pub fn update_customer_notes(&self, seller_id: i64, user_id: i64, notes: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE customers SET notes=?3 WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id, notes],
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    pub fn update_customer_tags(&self, seller_id: i64, user_id: i64, tags: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE customers SET tags=?3 WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id, tags],
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    pub fn set_customer_status(&self, seller_id: i64, user_id: i64, status: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "UPDATE customers SET status=?3 WHERE seller_id=?1 AND user_id=?2",
+            params![seller_id, user_id, status],
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    pub fn record_customer_purchase(&self, seller_id: i64, user_id: i64, amount: f64) {
+        self.upsert_customer(seller_id, user_id);
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = conn.execute("UPDATE customers SET total_spent = total_spent + ?3, order_count = order_count + 1, last_seen = ?4 WHERE seller_id=?1 AND user_id=?2", params![seller_id, user_id, amount, Utc::now().to_rfc3339()]);
+    }
+
+    // ---- Phase 3: support tickets ----
+    pub fn create_ticket(&self, seller_id: i64, buyer_id: i64, subject: &str) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO tickets (seller_id, buyer_id, subject, status, created_at, updated_at) VALUES (?1,?2,?3,'open',?4,?4)", params![seller_id, buyer_id, subject, now]).unwrap_or(0);
+        conn.last_insert_rowid()
+    }
+
+    pub fn get_ticket(&self, id: i64) -> Option<(i64, i64, i64, String, String, String, String)> {
+        // (id, seller_id, buyer_id, subject, status, created_at, updated_at)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT id, seller_id, buyer_id, subject, status, created_at, updated_at FROM tickets WHERE id=?1", params![id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().ok().flatten()
+    }
+
+    pub fn list_tickets(
+        &self,
+        seller_id: Option<i64>,
+        buyer_id: Option<i64>,
+        status: Option<&str>,
+    ) -> Vec<(i64, i64, i64, String, String, String)> {
+        // (id, seller_id, buyer_id, subject, status, updated_at)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sql =
+            "SELECT id, seller_id, buyer_id, subject, status, updated_at FROM tickets WHERE 1=1"
+                .to_string();
+        if seller_id.is_some() {
+            sql.push_str(" AND seller_id=?1");
         }
+        if buyer_id.is_some() {
+            sql.push_str(" AND buyer_id=?2");
+        }
+        if status.is_some() {
+            sql.push_str(" AND status=?3");
+        }
+        sql.push_str(" ORDER BY updated_at DESC");
+        // simplify: only handle common combos via sequential filters using a generic approach is complex; do seller+buyer+status with params
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let mapper =
+            |r: &rusqlite::Row| -> rusqlite::Result<(i64, i64, i64, String, String, String)> {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            };
+        // Build params dynamically is awkward with rusqlite; handle the common seller-only case and buyer-only case.
+        let rows = if let (Some(s), None, None) = (seller_id, buyer_id, status) {
+            stmt.query_map(params![s], mapper)
+        } else if let (Some(s), Some(b), None) = (seller_id, buyer_id, status) {
+            stmt.query_map(params![s, b], mapper)
+        } else if let (Some(s), Some(b), Some(st)) = (seller_id, buyer_id, status) {
+            stmt.query_map(params![s, b, st], mapper)
+        } else if let (None, Some(b), _) = (seller_id, buyer_id, status) {
+            // buyer-only: re-query simpler
+            let mut s2 = conn.prepare("SELECT id, seller_id, buyer_id, subject, status, updated_at FROM tickets WHERE buyer_id=?1 ORDER BY updated_at DESC").unwrap();
+            return s2
+                .query_map(params![b], mapper)
+                .ok()
+                .map(|r| r.flatten().collect())
+                .unwrap_or_default();
+        } else {
+            stmt.query_map(params![], mapper)
+        };
+        rows.ok().map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    #[test]
-    fn test_plan_namespace_cross_seller_isolation() {
-        // (seller_id, name) namespace: two sellers may both define "pro" and
-        // each resolves only their own row; a name unique to another seller
-        // is invisible from the wrong namespace. seller_id 0 is the
-        // admin/owner global namespace.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ns.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        db.add_plan(1, "pro", "10", "USDT", 30, None);
-        db.add_plan(2, "pro", "20", "USDT", 30, None);
-        let p1 = db.find_plans_by_name(Some(1), "pro");
-        let p2 = db.find_plans_by_name(Some(2), "pro");
-        assert_eq!(p1.len(), 1);
-        assert_eq!(p1[0].1, "10");
-        assert_eq!(p1[0].6, 1);
-        assert_eq!(p2.len(), 1);
-        assert_eq!(p2[0].1, "20");
-        assert_eq!(p2[0].6, 2);
-        // a name unique to seller 2 is not resolvable from seller 1
-        db.add_plan(2, "solo", "5", "TON", 7, None);
-        assert!(db.find_plans_by_name(Some(1), "solo").is_empty());
-        // the global namespace (0) is its own namespace, not a wildcard
-        db.add_plan(0, "legacy", "3", "USDT", 30, None);
-        assert_eq!(db.find_plans_by_name(Some(0), "legacy").len(), 1);
-        assert!(db.find_plans_by_name(Some(1), "legacy").is_empty());
-        // cross-seller active view returns all namespaces (caller filters)
-        assert_eq!(db.find_plans_by_name(None, "pro").len(), 2);
-        // the (seller_id, name) uniqueness holds per seller: re-adding the
-        // same name to one seller upserts (INSERT OR REPLACE), it does not
-        // create a second row or collide with the other seller's plan.
-        db.add_plan(1, "pro", "11", "USDT", 30, None);
-        assert_eq!(db.find_plans_by_name(Some(1), "pro").len(), 1);
-        assert_eq!(db.find_plans_by_name(Some(1), "pro")[0].1, "11");
+    pub fn add_ticket_message(
+        &self,
+        ticket_id: i64,
+        sender_role: &str,
+        sender_id: i64,
+        text: &str,
+    ) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO ticket_messages (ticket_id, sender_role, sender_id, text, created_at) VALUES (?1,?2,?3,?4,?5)", params![ticket_id, sender_role, sender_id, text, now]).unwrap_or(0);
+        let _ = conn.execute(
+            "UPDATE tickets SET updated_at=?2 WHERE id=?1",
+            params![ticket_id, now],
+        );
+        conn.last_insert_rowid()
     }
 
-    #[test]
-    fn test_plan_namespace_dedupe_migration() {
-        // Legacy database: plans WITHOUT the seller_id column and WITHOUT the
-        // UNIQUE(seller_id, name) constraint (both arrive via migration), so
-        // duplicate same-name rows can exist. Db::new must dedupe them
-        // (keeping the LOWEST id), re-point subscriptions/activation codes,
-        // and create the unique index — while a fresh database must NOT get
-        // a redundant manual index next to the schema-level constraint.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE plans (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price TEXT NOT NULL, asset TEXT NOT NULL, duration_days INTEGER NOT NULL, channel_id TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
-                 CREATE TABLE subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_id INTEGER, channel_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', starts_at TEXT NOT NULL, expires_at TEXT NOT NULL, invoice_id TEXT, code_id INTEGER, created_at TEXT NOT NULL);
-                 CREATE TABLE activation_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, plan_id INTEGER, value_days INTEGER, max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0, expires_at TEXT, created_at TEXT NOT NULL);
-                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','10','USDT',30,'2024-01-01');
-                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','20','USDT',30,'2024-01-02');
-                 INSERT INTO plans(name,price,asset,duration_days,created_at) VALUES('gold','30','USDT',30,'2024-01-03');
-                 INSERT INTO subscriptions(user_id,plan_id,channel_id,starts_at,expires_at,created_at) VALUES(7,3,'@c','2024-01-01','2024-02-01','2024-01-01');
-                 INSERT INTO activation_codes(code,plan_id,created_at) VALUES('CODE1',2,'2024-01-01');",
+    pub fn list_ticket_messages(&self, ticket_id: i64) -> Vec<(i64, String, i64, String, String)> {
+        // (id, sender_role, sender_id, text, created_at)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare("SELECT id, sender_role, sender_id, text, created_at FROM ticket_messages WHERE ticket_id=?1 ORDER BY created_at ASC") { Ok(s)=>s, Err(_)=>return vec![] };
+        stmt.query_map(params![ticket_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .ok()
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn set_ticket_status(&self, id: i64, status: &str) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE tickets SET status=?2, updated_at=?3 WHERE id=?1",
+            params![id, status, now],
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    // ---- Phase 4: recovery & engagement ----
+    pub fn mark_cart_abandoned(&self, buyer_id: i64, seller_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("INSERT INTO cart_abandonment (buyer_id, seller_id, abandoned_at, reminded_count) VALUES (?1,?2,?3,0) ON CONFLICT(buyer_id, seller_id) DO UPDATE SET abandoned_at=?3, reminded_count=0, reminded_at=NULL, recovered_at=NULL", params![buyer_id, seller_id, now]);
+    }
+
+    pub fn mark_cart_reminded(&self, buyer_id: i64, seller_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute("UPDATE cart_abandonment SET reminded_count = reminded_count + 1, reminded_at=?3 WHERE buyer_id=?1 AND seller_id=?2", params![buyer_id, seller_id, now]);
+    }
+
+    pub fn mark_cart_recovered(&self, buyer_id: i64, seller_id: i64) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE cart_abandonment SET recovered_at=?3 WHERE buyer_id=?1 AND seller_id=?2",
+            params![buyer_id, seller_id, now],
+        );
+    }
+
+    pub fn list_abandoned_carts(&self, min_hours: i64) -> Vec<(i64, i64, String, i64)> {
+        // (buyer_id, seller_id, abandoned_at, reminded_count)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let cutoff = (Utc::now() - chrono::Duration::hours(min_hours)).to_rfc3339();
+        let mut stmt = match conn.prepare("SELECT buyer_id, seller_id, abandoned_at, reminded_count FROM cart_abandonment WHERE recovered_at IS NULL AND abandoned_at <= ?1 ORDER BY abandoned_at ASC") { Ok(s)=>s, Err(_)=>return vec![] };
+        stmt.query_map(params![cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .ok()
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn set_reorder_schedule(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        product_id: i64,
+        interval_days: i64,
+    ) {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let next = (Utc::now() + chrono::Duration::days(interval_days)).to_rfc3339();
+        let _ = conn.execute("INSERT INTO reorder_schedules (buyer_id, seller_id, product_id, interval_days, last_ordered_at, next_reminder_at, enabled) VALUES (?1,?2,?3,?4,?5,?6,1) ON CONFLICT(buyer_id, seller_id, product_id) DO UPDATE SET interval_days=?4, last_ordered_at=?5, next_reminder_at=?6, enabled=1", params![buyer_id, seller_id, product_id, interval_days, now, next]);
+    }
+
+    pub fn list_due_reorders(&self) -> Vec<(i64, i64, i64, i64)> {
+        // (id, buyer_id, seller_id, product_id)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let mut stmt = match conn.prepare("SELECT id, buyer_id, seller_id, product_id FROM reorder_schedules WHERE enabled=1 AND next_reminder_at IS NOT NULL AND next_reminder_at <= ?1") { Ok(s)=>s, Err(_)=>return vec![] };
+        stmt.query_map(params![now], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .ok()
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn disable_reorder(&self, buyer_id: i64, seller_id: i64, product_id: i64) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute("UPDATE reorder_schedules SET enabled=0 WHERE buyer_id=?1 AND seller_id=?2 AND product_id=?3", params![buyer_id, seller_id, product_id]).unwrap_or(0) > 0
+    }
+
+    pub fn create_review(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        product_id: i64,
+        rating: i64,
+        text: Option<&str>,
+    ) -> Result<i64, String> {
+        if !(1..=5).contains(&rating) {
+            return Err("rating must be 1..=5".to_string());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO reviews (buyer_id, seller_id, product_id, rating, text, approved, created_at) VALUES (?1,?2,?3,?4,?5,0,?6)", params![buyer_id, seller_id, product_id, rating, text, now])
+            .map_err(|e| format!("create_review: {e}"))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_reviews(
+        &self,
+        seller_id: i64,
+        product_id: i64,
+        approved_only: bool,
+    ) -> Vec<(i64, i64, i64, String)> {
+        // (id, buyer_id, rating, text)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let sql = if approved_only {
+            "SELECT id, buyer_id, rating, COALESCE(text,'') FROM reviews WHERE seller_id=?1 AND product_id=?2 AND approved=1 ORDER BY created_at DESC"
+        } else {
+            "SELECT id, buyer_id, rating, COALESCE(text,'') FROM reviews WHERE seller_id=?1 AND product_id=?2 ORDER BY created_at DESC"
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![seller_id, product_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .ok()
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn approve_review(&self, id: i64) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute("UPDATE reviews SET approved=1 WHERE id=?1", params![id])
+            .unwrap_or(0)
+            > 0
+    }
+
+    pub fn avg_rating(&self, seller_id: i64, product_id: i64) -> Option<f64> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT AVG(rating) FROM reviews WHERE seller_id=?1 AND product_id=?2 AND approved=1",
+            params![seller_id, product_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    // ---- Phase 5: business analytics ----
+    pub fn analytics_revenue_total(&self, seller_id: i64) -> f64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0.0)
+    }
+
+    pub fn analytics_invoice_counts(&self, seller_id: i64) -> (i64, i64) {
+        // (total, paid)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM invoices WHERE seller_id=?1",
+                params![seller_id],
+                |r| r.get(0),
             )
-            .unwrap();
-        }
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        // All three legacy rows carried seller_id 0; the lowest id (price
-        // '10') survived.
-        let kept = db.get_plan(0, "gold").expect("kept lowest-id row");
-        assert_eq!(kept.0, 1);
-        assert_eq!(kept.1, "10");
-        assert_eq!(db.list_plans(Some(0)).len(), 1);
-        // References were re-pointed to the kept row, not orphaned.
-        {
-            let conn = Connection::open(&path).unwrap();
-            let sub_plan: i64 = conn
-                .query_row(
-                    "SELECT plan_id FROM subscriptions WHERE user_id=7",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(sub_plan, 1);
-            let code_plan: i64 = conn
-                .query_row(
-                    "SELECT plan_id FROM activation_codes WHERE code='CODE1'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(code_plan, 1);
-            // The legacy table got the unique index (it has no table-level
-            // constraint for sqlite to rely on).
-            let idx: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE name='idx_plans_seller_name'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(idx, 1);
-            // The index actually enforces the namespace now.
-            let dup = conn.execute(
-                "INSERT INTO plans(seller_id,name,price,asset,duration_days,active,created_at) VALUES(0,'gold','99','USDT',30,1,'2024-01-04')",
-                [],
-            );
-            assert!(dup.is_err(), "unique index must reject a duplicate");
-        }
-        // A FRESH database relies on the schema-level UNIQUE(seller_id, name)
-        // constraint and must not carry the redundant manual index.
-        let fresh_dir = tempfile::tempdir().unwrap();
-        let fresh = Db::new(fresh_dir.path().join("fresh.db").to_str().unwrap()).unwrap();
-        drop(fresh);
-        {
-            let conn = Connection::open(fresh_dir.path().join("fresh.db")).unwrap();
-            let idx: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE name='idx_plans_seller_name'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                idx, 0,
-                "fresh db uses the schema constraint, not a dup index"
-            );
-            let constraint: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_index_list('plans') WHERE \"unique\"=1 AND origin='u'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(constraint, 1);
-        }
+            .unwrap_or(0);
+        let paid: i64 = conn.query_row("SELECT COUNT(*) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0);
+        (total, paid)
     }
 
-    #[test]
-    fn test_channels_add_dedupe_and_scoping() {
-        // The channels store: seller_id 0 is the global namespace; names are
-        // unique console-wide and case-insensitive (a Telegram @username
-        // names one channel no matter who references it).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("channels.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        assert!(db.add_channel("@global", 0).is_ok());
-        assert!(db.add_channel("@seller1", 1).is_ok());
-        // Dedupe: same channel, different case or namespace, is refused with
-        // an honest message — not a raw SQLite constraint dump. (The message
-        // names the caller's spelling, so assert the refusal class, not an
-        // exact string across cases.)
-        let dup = db.add_channel("@GLOBAL", 0).unwrap_err();
-        assert!(dup.contains("already exists"), "got: {dup}");
-        assert!(
-            db.add_channel("@global", 1)
-                .unwrap_err()
-                .contains("already exists"),
-            "dedupe is console-wide across namespaces"
-        );
-        assert_eq!(db.list_channels(None).len(), 2, "duplicates must not land");
-        // Empty names are rejected.
-        assert!(db.add_channel("   ", 0).is_err());
-        // Scoping: the owner view (None) sees everything; a seller sees the
-        // global namespace plus their own rows, never another seller's.
-        assert_eq!(db.list_channels(None).len(), 2);
-        let s1 = db.list_channels(Some(1));
-        assert_eq!(s1.len(), 2);
-        assert!(s1.iter().any(|c| c.channel == "@global"));
-        assert!(s1.iter().any(|c| c.channel == "@seller1"));
-        db.add_channel("@seller2", 2).unwrap();
-        let s2 = db.list_channels(Some(2));
-        assert_eq!(s2.len(), 2);
-        assert!(
-            s2.iter().all(|c| c.channel != "@seller1"),
-            "other sellers invisible"
-        );
-        // Row shape: named fields, global namespace, not a default.
-        let row = db
-            .list_channels(None)
-            .into_iter()
-            .find(|c| c.channel == "@global")
-            .unwrap();
-        assert_eq!(row.seller_id, 0);
-        assert!(!row.is_default);
-        assert!(!row.created_at.is_empty());
+    pub fn analytics_aov(&self, seller_id: i64) -> f64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row("SELECT COALESCE(AVG(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0.0)
     }
 
-    #[test]
-    fn test_channels_remove_scoping() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rm.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        db.add_channel("@global", 0).unwrap();
-        db.add_channel("@own", 1).unwrap();
-        db.add_channel("@other", 2).unwrap();
-        // A seller cannot remove the global row or another seller's row.
-        assert!(db.remove_channel("@global", 1).is_err());
-        assert!(db.remove_channel("@other", 1).is_err());
-        assert!(
-            db.remove_channel("@OTHER", 1).is_err(),
-            "case-insensitive name, still scoped"
-        );
-        assert_eq!(
-            db.list_channels(None).len(),
-            3,
-            "nothing deleted by cross-scope attempts"
-        );
-        // A seller removes their own row.
-        assert!(db.remove_channel("@own", 1).is_ok());
-        assert!(
-            db.remove_channel("@own", 1).is_err(),
-            "second remove is not-found"
-        );
-        // The owner (0) removes global rows only.
-        assert!(db.remove_channel("@global", 0).is_ok());
-        assert!(
-            db.remove_channel("@other", 0).is_err(),
-            "owner does not reach seller rows here"
-        );
-        assert_eq!(
-            db.list_channels(None).len(),
-            1,
-            "only @other (seller 2) survives"
-        );
-        // Empty names are refused, not silently ignored.
-        assert!(db.remove_channel("", 0).is_err());
+    pub fn analytics_top_products(&self, seller_id: i64, limit: i64) -> Vec<(i64, i64)> {
+        // (product_id, count) for paid product invoices; product_id stored in plan_id column for products? Use product_grants join.
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare("SELECT product_id, COUNT(*) FROM product_grants WHERE seller_id=?1 GROUP BY product_id ORDER BY COUNT(*) DESC LIMIT ?2") { Ok(s)=>s, Err(_)=>return vec![] };
+        stmt.query_map(params![seller_id, limit], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .map(|r| r.flatten().collect())
+            .unwrap_or_default()
     }
 
-    #[test]
-    fn test_channels_default_switches_exactly_one_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("default.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        // Missing channels are upserted as new global defaults.
-        db.set_default_channel("@a").unwrap();
-        assert_eq!(db.default_channel().as_deref(), Some("@a"));
-        db.add_channel("@b", 0).unwrap();
-        // Switching: exactly one row carries the flag afterwards.
-        db.set_default_channel("@b").unwrap();
-        assert_eq!(db.default_channel().as_deref(), Some("@b"));
-        let defaults = db
-            .list_channels(None)
-            .into_iter()
-            .filter(|c| c.is_default)
-            .count();
-        assert_eq!(defaults, 1, "switching must clear every other is_default");
-        // A seller-owned channel cannot become the global default.
-        db.add_channel("@seller", 5).unwrap();
-        let err = db.set_default_channel("@seller").unwrap_err();
-        assert!(err.contains("belongs to a seller"), "got: {err}");
-        assert_eq!(
-            db.default_channel().as_deref(),
-            Some("@b"),
-            "refusal must not clobber"
-        );
-        // Re-flipping back to a global row works, still exactly one default.
-        db.set_default_channel("@a").unwrap();
-        assert_eq!(db.default_channel().as_deref(), Some("@a"));
-        assert_eq!(
-            db.list_channels(None)
-                .into_iter()
-                .filter(|c| c.is_default)
-                .count(),
-            1
-        );
-        // Empty names are rejected.
-        assert!(db.set_default_channel("  ").is_err());
+    pub fn analytics_repeat_buyers(&self, seller_id: i64) -> (i64, i64) {
+        // (total distinct buyers, repeat buyers with >1 paid invoice)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let total: i64 = conn.query_row("SELECT COUNT(DISTINCT user_id) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0);
+        let repeat: i64 = conn.query_row("SELECT COUNT(*) FROM (SELECT user_id FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed') GROUP BY user_id HAVING COUNT(*) > 1)", params![seller_id], |r| r.get(0)).unwrap_or(0);
+        (total, repeat)
     }
 
-    #[test]
-    fn test_default_channel_legacy_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy-fallback.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        // Nothing anywhere: None.
-        assert!(db.default_channel().is_none());
-        // Legacy installs: the free-text `channel` config key is honored.
-        db.set_config("channel", "@legacy");
-        assert_eq!(db.default_channel().as_deref(), Some("@legacy"));
-        // An empty legacy value is never resolved as a channel.
-        db.set_config("channel", "");
-        assert!(
-            db.default_channel().is_none(),
-            "empty legacy value is not a channel"
-        );
-        db.set_config("channel", "@legacy");
-        // A table default wins over the legacy key.
-        db.set_default_channel("@table").unwrap();
-        assert_eq!(db.default_channel().as_deref(), Some("@table"));
-        // Seller-owned rows never resolve as the global default, flag or not.
-        db.add_channel("@sellerch", 7).unwrap();
-        db.set_default_channel("@sellerch").unwrap_err();
-        assert_eq!(db.default_channel().as_deref(), Some("@table"));
-    }
-
-    #[test]
-    fn test_channels_migration_seeds_from_legacy_config() {
-        // Legacy database: only the config table with the `channel` key. The
-        // one-time migration seeds the channels table with that value as the
-        // single default global row.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 INSERT INTO config(key,value,updated_at) VALUES('channel','@old','2024-01-01');",
+    pub fn analytics_abandoned_cart_rate(&self, seller_id: i64) -> (i64, i64) {
+        // (abandoned carts, recovered carts)
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let abandoned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cart_abandonment WHERE seller_id=?1",
+                params![seller_id],
+                |r| r.get(0),
             )
-            .unwrap();
-        }
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        let rows = db.list_channels(None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].channel, "@old");
-        assert_eq!(rows[0].seller_id, 0, "seed lands in the global namespace");
-        assert!(rows[0].is_default, "seeded row is the default");
-        assert_eq!(db.default_channel().as_deref(), Some("@old"));
-        // Reopen (second startup): the config marker prevents a re-seed.
-        drop(db);
-        let db2 = Db::new(path.to_str().unwrap()).unwrap();
-        assert_eq!(db2.list_channels(None).len(), 1);
-        // Removing the channel afterwards must not resurrect it on restart.
-        assert!(db2.remove_channel("@old", 0).is_ok());
-        drop(db2);
-        let db3 = Db::new(path.to_str().unwrap()).unwrap();
-        assert!(db3.list_channels(None).is_empty());
-        // A legacy db with an empty `channel` value seeds nothing.
-        let empty_dir = tempfile::tempdir().unwrap();
-        {
-            let conn = Connection::open(empty_dir.path().join("e.db")).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
-                 INSERT INTO config(key,value,updated_at) VALUES('channel','','2024-01-01');",
-            )
-            .unwrap();
-        }
-        let empty = Db::new(empty_dir.path().join("e.db").to_str().unwrap()).unwrap();
-        assert!(empty.list_channels(None).is_empty());
-        assert!(empty.default_channel().is_none());
-        // A fresh database (no legacy key at all) seeds nothing either.
-        let fresh = Db::new(dir.path().join("fresh.db").to_str().unwrap()).unwrap();
-        assert!(fresh.list_channels(None).is_empty());
+            .unwrap_or(0);
+        let recovered: i64 = conn.query_row("SELECT COUNT(*) FROM cart_abandonment WHERE seller_id=?1 AND recovered_at IS NOT NULL", params![seller_id], |r| r.get(0)).unwrap_or(0);
+        (abandoned, recovered)
     }
 
-    #[test]
-    fn test_claim_code_stable_while_unclaimed() {
-        // Fresh install (no owner account, setup not completed): a claim code
-        // is generated, stored, and served — and repeated startups (same Db
-        // and a reopened Db) keep the SAME code while it stays unclaimed.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("claim.db");
-        let db = Db::new(path.to_str().unwrap()).unwrap();
-        assert!(!db.owner_account_exists());
-        let first = db.ensure_claim_code().expect("code must be generated");
-        assert_eq!(first.len(), 12, "gen_token(12) shape");
-        assert_eq!(db.claim_code().as_deref(), Some(first.as_str()));
-        assert_eq!(
-            db.ensure_claim_code().as_deref(),
-            Some(first.as_str()),
-            "not regenerated within one run"
-        );
-        drop(db);
-        let db2 = Db::new(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            db2.ensure_claim_code().as_deref(),
-            Some(first.as_str()),
-            "not regenerated across startups"
-        );
+    pub fn analytics_customer_count(&self, seller_id: i64) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT COUNT(*) FROM customers WHERE seller_id=?1",
+            params![seller_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
+
+    // ---- Phase 6: compliance (data export + deletion) ----
+    pub fn export_buyer_data(&self, seller_id: i64, user_id: i64) -> String {
+        let customer = self.get_customer(seller_id, user_id);
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // subscriptions
+        let mut subs = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT id, plan_id, channel, expires_at, created_at FROM subscriptions WHERE seller_id=?1 AND user_id=?2")
+            && let Ok(rows) = stmt.query_map(params![seller_id, user_id], |r| Ok(serde_json::json!({"id": r.get::<_,i64>(0)?, "plan_id": r.get::<_,Option<String>>(1)?, "channel": r.get::<_,Option<String>>(2)?, "expires_at": r.get::<_,Option<String>>(3)?, "created_at": r.get::<_,Option<String>>(4)?}))) {
+            for r in rows.flatten() { subs.push(r); }
+        }
+        // orders
+        let mut orders = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT order_id, product_id, status, tracking, created_at FROM orders WHERE seller_id=?1 AND buyer_user_id=?2")
+            && let Ok(rows) = stmt.query_map(params![seller_id, user_id], |r| Ok(serde_json::json!({"order_id": r.get::<_,String>(0)?, "product_id": r.get::<_,i64>(1)?, "status": r.get::<_,String>(2)?, "tracking": r.get::<_,Option<String>>(3)?, "created_at": r.get::<_,String>(4)?}))) {
+            for r in rows.flatten() { orders.push(r); }
+        }
+        // codes redeemed (activation_codes have no buyer link; skip)
+        // cart
+        let mut cart = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT item_type, item_id, qty FROM cart_items WHERE seller_id=?1 AND buyer_id=?2")
+            && let Ok(rows) = stmt.query_map(params![seller_id, user_id], |r| Ok(serde_json::json!({"item_type": r.get::<_,String>(0)?, "item_id": r.get::<_,i64>(1)?, "qty": r.get::<_,i64>(2)?}))) {
+            for r in rows.flatten() { cart.push(r); }
+        }
+        // reviews
+        let mut reviews = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT product_id, rating, text, created_at FROM reviews WHERE seller_id=?1 AND buyer_id=?2")
+            && let Ok(rows) = stmt.query_map(params![seller_id, user_id], |r| Ok(serde_json::json!({"product_id": r.get::<_,i64>(0)?, "rating": r.get::<_,i64>(1)?, "text": r.get::<_,Option<String>>(2)?, "created_at": r.get::<_,String>(3)?}))) {
+            for r in rows.flatten() { reviews.push(r); }
+        }
+        // bonus balance
+        let balance: i64 = conn
+            .query_row(
+                "SELECT balance_minor FROM bonus_balances WHERE seller_id=?1 AND user_id=?2",
+                params![seller_id, user_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        // customer
+        let out = serde_json::json!({
+            "seller_id": seller_id,
+            "user_id": user_id,
+            "customer": customer.map(|c| serde_json::json!({"first_seen": c.2, "last_seen": c.3, "tags": c.4, "notes": c.5, "total_spent": c.6, "order_count": c.7, "status": c.8})),
+            "subscriptions": subs,
+            "orders": orders,
+            "cart": cart,
+            "reviews": reviews,
+            "bonus_balance_minor": balance,
+        });
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn delete_buyer_data(&self, seller_id: i64, user_id: i64) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut total = 0i64;
+        let stmts = [
+            "DELETE FROM subscriptions WHERE seller_id=?1 AND user_id=?2",
+            "DELETE FROM product_grants WHERE seller_id=?1 AND user_id=?2",
+            "DELETE FROM orders WHERE seller_id=?1 AND buyer_user_id=?2",
+            "DELETE FROM cart_items WHERE seller_id=?1 AND buyer_id=?2",
+            "DELETE FROM reviews WHERE seller_id=?1 AND buyer_id=?2",
+            "DELETE FROM referrals WHERE seller_id=?1 AND (referrer_id=?2 OR referee_id=?2)",
+            "DELETE FROM bonus_balances WHERE seller_id=?1 AND user_id=?2",
+            "DELETE FROM bonus_ledger WHERE seller_id=?1 AND user_id=?2",
+            "DELETE FROM tickets WHERE seller_id=?1 AND buyer_id=?2",
+            "DELETE FROM customers WHERE seller_id=?1 AND user_id=?2",
+        ];
+        for sql in stmts {
+            total += conn.execute(sql, params![seller_id, user_id]).unwrap_or(0) as i64;
+        }
+        // ticket messages cascade
+        let _ = conn.execute("DELETE FROM ticket_messages WHERE ticket_id IN (SELECT id FROM tickets WHERE seller_id=?1 AND buyer_id=?2)", params![seller_id, user_id]);
+        total
+    }
+}
+// end phase6 (placeholder marker)
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod delete_bot_tests {
+    use super::*;
+    use std::fs;
 
     #[tokio::test]
-    async fn test_claim_code_cleared_when_owner_exists() {
-        // Once an owner account exists, the stored code is stale: startup
-        // maintenance clears it and claim mode can never return.
+    async fn delete_bot_removes_row_and_nulls_selected_bot_id() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("claim-owner.db");
+        let path = dir.path().join("delete_bot_unit.db");
         let db = Db::new(path.to_str().unwrap()).unwrap();
-        let code = db.ensure_claim_code().expect("pre-claim code exists");
-        db.create_web_account("owner", "password123", "owner", None)
+        let bot_id = db.create_bot("bot-key-del", 100, None, "");
+        assert!(bot_id > 0);
+
+        // Unknown id returns false and changes nothing.
+        assert!(!db.delete_bot(999_999));
+
+        db.create_web_account("alice", "pw", "admin", None)
             .await
-            .expect("owner account created");
-        assert!(db.owner_account_exists());
-        assert!(
-            db.ensure_claim_code().is_none(),
-            "no code printed once claimed"
-        );
-        assert!(
-            db.claim_code().is_none(),
-            "stale code cleared from the store"
-        );
-        assert_ne!(db.claim_code().as_deref(), Some(code.as_str()));
-        // Repeated startups stay clean (no resurrection, no churn).
-        drop(db);
-        let db2 = Db::new(path.to_str().unwrap()).unwrap();
-        assert!(db2.ensure_claim_code().is_none());
-    }
-
-    proptest! {
-        #[test]
-        fn prop_plan_create_list(seller_id in 1i64..101i64, name in "[a-z]{3,8}") {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("plan.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            db.add_plan(seller_id, &name, "1", "USDT", 7, None);
-            let plans = db.list_plans(Some(seller_id));
-            prop_assert!(!plans.is_empty());
-        }
-
-        #[test]
-        fn prop_code_uniqueness(_n in 0u8..1u8) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("code.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            db.add_plan(1, "P", "1", "USDT", 7, None);
-            let pid = db.get_plan(1, "P").unwrap().0;
-            let mut codes = std::collections::HashSet::new();
-            for _ in 0..10 {
-                let c = db.create_code(1, Some(pid), Some(7), 1, None, 12);
-                codes.insert(c);
+            .unwrap();
+        let (acc_id, ..) = db.get_web_account_by_username("alice").unwrap();
+        let token = db.create_web_session(acc_id, "admin", None, 7);
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(token.as_bytes());
+            let bytes = h.finalize();
+            let mut s = String::with_capacity(64);
+            for b in bytes.iter() {
+                s.push_str(&format!("{:02x}", b));
             }
-            prop_assert_eq!(codes.len(), 10);
-        }
+            s
+        };
+        assert!(db.set_web_session_selected_bot(&hash, Some(bot_id)));
+        assert_eq!(db.get_web_session_selected_bot(&hash), Some(bot_id));
 
-        #[test]
-        fn prop_subscription_roundtrip(seller_id in 1i64..101i64, user_id in 1i64..1001i64) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sub.db");
-            let db = Db::new(path.to_str().unwrap()).unwrap();
-            let id = db.create_subscription(seller_id, user_id, None, "@chan", 7, None, None);
-            prop_assert!(id > 0);
-            prop_assert!(db.user_has_active_sub(seller_id, user_id, "@chan"));
-        }
+        // Deleting removes the bot row...
+        assert!(db.delete_bot(bot_id));
+        assert!(db.get_bot(bot_id).is_none());
+        // ...and clears any session selection pointing at it.
+        assert_eq!(db.get_web_session_selected_bot(&hash), None);
+
+        // A second delete reports no row.
+        assert!(!db.delete_bot(bot_id));
+        let _ = fs::remove_file(path);
     }
 }

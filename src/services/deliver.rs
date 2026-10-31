@@ -7,7 +7,7 @@
 
 /// Deliver a purchased product to the buyer's private chat.
 ///
-/// - `digital_link` / `digital_file`: sends `🎁 {name}\n{delivery}` where
+/// - `digital_link` / `digital_file`: sends `Delivery: {name}\n{delivery}` where
 ///   `delivery` is the link, text, or Telegram `file_id` stored on the
 ///   product. The payload is required: a product without one is a seller
 ///   configuration error and surfaces as `Err` (never an empty delivery).
@@ -44,7 +44,7 @@ pub async fn deliver(
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric())
             {
-                bot.send_message(chat, format!("🎁 {name}\n{payload}"))
+                bot.send_message(chat, format!("Delivery: {name}\n{payload}"))
                     .await?;
             } else {
                 bot.send_document(
@@ -63,7 +63,7 @@ pub async fn deliver(
                     name, kind
                 )
             })?;
-            bot.send_message(chat, format!("🎁 {name}\n{payload}"))
+            bot.send_message(chat, format!("Delivery: {name}\n{payload}"))
                 .await?;
         }
         "physical" => {

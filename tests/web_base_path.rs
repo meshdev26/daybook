@@ -32,10 +32,8 @@ async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         .unwrap();
     db.set_config("setup_done", "1");
     let cfg = Config {
-        bot_token: "0:dummy".to_string(),
         owner_id: 1,
         db_path: db_path.to_str().unwrap().to_string(),
-        default_channel: None,
         crypto_token: None,
         ai_enabled: false,
         ai_provider: "openai".to_string(),
@@ -45,11 +43,21 @@ async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         ai_model: "gpt-4o-mini".to_string(),
         ai_daily_token_budget: None,
         mcp_owner_token: None,
+        telegram_api_id: None,
+        telegram_api_hash: None,
     };
+    let db = Arc::new(db);
+    let bots = Arc::new(telegram_agent::bots::BotManager::placeholder(
+        db.clone(),
+        Arc::new(cfg.clone()),
+        telegram_agent::identity::IdentityHandle::unconnected(),
+    ));
     let state = WebState {
-        db: Arc::new(db),
+        db: db.clone(),
         cfg,
         bot: teloxide::Bot::new("0:dummy"),
+        bots,
+        identity: telegram_agent::identity::IdentityHandle::unconnected(),
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
         base_path: base.to_string(),
@@ -212,7 +220,7 @@ async fn login_and_enroll(app: axum::Router, db: &Db, base: &str) -> String {
     //    compute the current 6-digit / 30s TOTP code.
     let pending_token = pending_pair.strip_prefix("mfa_pending=").unwrap();
     let (_account_id, purpose, secret, _expires) = db
-        .get_pending_mfa(&sha256_hex(pending_token))
+        .get_pending_mfa(sha256_hex(pending_token).as_str())
         .expect("pending MFA row for the mfa_pending cookie");
     assert_eq!(purpose, "enroll");
     let secret = secret.unwrap_or_default();
@@ -392,7 +400,9 @@ async fn invalid_plan_redirects_to_base_plans() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = location(&resp);
     assert_prefixed(&loc);
-    assert_eq!(loc, format!("{BASE}/plans"));
+    // The handler names the failure in the query so the page can render an
+    // honest error banner instead of a silent redirect.
+    assert_eq!(loc, format!("{BASE}/plans?error=invalid_duration"));
 }
 
 #[tokio::test]

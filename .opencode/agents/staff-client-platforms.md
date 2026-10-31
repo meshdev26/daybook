@@ -16,18 +16,21 @@ permission:
   read:
     "*": allow
     "*.env": deny
-  edit:
-    "src/web.rs": allow
-    "src/handlers/callbacks.rs": allow
-    "design-system/**": allow
-  write:
-    "src/web.rs": allow
-    "src/handlers/callbacks.rs": allow
-    "design-system/**": allow
+edit:
+  "src/web/**": allow
+  "src/handlers/callbacks.rs": allow
+  "design-system/**": allow
+  "assets/**": allow
+write:
+  "src/web/**": allow
+  "src/handlers/callbacks.rs": allow
+  "design-system/**": allow
+  "assets/**": allow
 territory:
-  - src/web.rs
+  - src/web/**
   - src/handlers/callbacks.rs
   - design-system/**
+  - assets/**
 ---
 
 # L7 -- Staff Client Platforms

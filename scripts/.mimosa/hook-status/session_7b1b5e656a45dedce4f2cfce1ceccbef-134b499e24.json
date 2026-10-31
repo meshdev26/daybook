@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-10-31T06:20:08.634Z",
+  "sessionId": "session_7b1b5e656a45dedce4f2cfce1ceccbef",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "/home/red/.zcode/cli/memories/projects/telegram-agent-c4331a1a197e68c4/memory/MEMORY.md",
+  "outcome": "clear",
+  "coverage": "complete",
+  "findingCount": 0,
+  "durationMs": 10,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}

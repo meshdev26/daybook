@@ -6,12 +6,16 @@
 
 pub mod ai;
 pub mod api;
+pub mod auth;
+pub mod bots;
 pub mod config;
+pub mod constants;
 pub mod crypto;
 pub mod db;
 pub mod dialogue;
 pub mod embed;
 pub mod handlers;
+pub mod identity;
 pub mod mcp;
 pub mod metrics;
 pub mod qr;
@@ -25,14 +29,22 @@ use teloxide::prelude::*;
 /// Revoke every expired subscription: kick the member out of the channel
 /// (ban + unban) and mark the row expired. Shared by the `/expirecheck`
 /// command and the periodic expiry sweeper so the behavior stays
-/// single-sourced. Returns one entry per expired subscription —
-/// (subscription id, buyer user_id, channel) — so callers can DM the buyer
-/// the revocation notice; the fields come straight from
-/// `expired_subscriptions()` (subscriptions.id / user_id / channel_id), no
-/// extra joins.
-pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> Vec<(i64, i64, String)> {
+/// single-sourced.
+///
+/// The kick goes through the bot that owns the row's seller
+/// (`BotManager::for_seller`), so one bot never moderates another bot's
+/// channels. Returns one entry per expired subscription —
+/// (subscription id, seller_id, buyer user_id, channel) — so callers can DM
+/// the buyer the revocation notice from that same bot; the fields come
+/// straight from `expired_subscriptions()` (subscriptions.id / seller_id /
+/// user_id / channel_id), no extra joins.
+pub async fn expire_subscriptions(
+    bots: &crate::bots::BotManager,
+    db: &db::Db,
+) -> Vec<(i64, i64, i64, String)> {
     let mut expired = Vec::new();
-    for (id, _seller, uid, ch) in db.expired_subscriptions() {
+    for (id, seller_id, uid, ch) in db.expired_subscriptions() {
+        let bot = bots.for_seller(seller_id).bot.clone();
         let cid = util::to_chat_id(&ch);
         let _ = bot
             .ban_chat_member(cid.clone(), teloxide::types::UserId(uid as u64))
@@ -41,7 +53,7 @@ pub async fn expire_subscriptions(bot: &Bot, db: &db::Db) -> Vec<(i64, i64, Stri
             .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
             .await;
         db.mark_subscription_expired(id);
-        expired.push((id, uid, ch));
+        expired.push((id, seller_id, uid, ch));
     }
     expired
 }
@@ -63,4 +75,105 @@ pub async fn broadcast_to_users(bot: &Bot, users: &[i64], text: &str) -> usize {
         }
     }
     sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_shared() -> crate::config::SharedConfig {
+        crate::config::SharedConfig {
+            db_path: String::new(),
+            crypto_token: None,
+            ai_enabled: false,
+            ai_provider: "openai".to_string(),
+            ai_api_style: "openai".to_string(),
+            ai_base_url: String::new(),
+            ai_api_key: None,
+            ai_model: String::new(),
+            ai_daily_token_budget: None,
+            mcp_owner_token: None,
+            telegram_api_id: None,
+            telegram_api_hash: None,
+            owner_id: 0,
+        }
+    }
+
+    /// The kick is performed by the bot that owns the row's seller, and the
+    /// returned tuple carries that seller_id so the caller can DM from the
+    /// same bot. Two wiremock Bot API servers stand in for two bots; the
+    /// primary must see nothing while the seller's bot serves ban + unban.
+    #[tokio::test]
+    async fn expire_subscriptions_kicks_through_the_sellers_bot() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let primary_api = MockServer::start().await;
+        let seller_api = MockServer::start().await;
+        for server in [&primary_api, &seller_api] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .mount(server)
+                .await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db").to_string_lossy().into_owned();
+        let db = Arc::new(db::Db::new(&db_path).unwrap());
+        let shared = Arc::new(test_shared());
+        let mk = |id: i64, key: &str, url: &str| {
+            let bot = teloxide::Bot::new(format!("{id}:placeholder"))
+                .set_api_url(url.parse::<reqwest::Url>().unwrap());
+            Arc::new(crate::bots::BotContext {
+                id,
+                key: key.to_string(),
+                bot,
+                owner_id: 0,
+                shared: shared.clone(),
+                db: db.clone(),
+            })
+        };
+        let primary = mk(1, "primary", &primary_api.uri());
+        let seller_bot = mk(7, "seller", &seller_api.uri());
+        let bots = crate::bots::BotManager {
+            bots: vec![primary.clone(), seller_bot],
+            primary,
+            db: db.clone(),
+            identity: crate::identity::IdentityHandle::unconnected(),
+        };
+
+        // Seller 5 is bound to bot 7 and its subscription lapsed yesterday.
+        db.upsert_seller_bot_id(5, Some(7));
+        let sub_id = db.create_subscription(5, 555, None, "123456", -1, None, None);
+
+        // Resolution really picks the seller's bot (not the primary).
+        assert_eq!(bots.for_seller(5).id, 7);
+
+        let expired = expire_subscriptions(&bots, &db).await;
+        assert_eq!(expired, vec![(sub_id, 5, 555, "123456".to_string())]);
+
+        let hits = seller_api.received_requests().await.unwrap();
+        let paths: Vec<String> = hits.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(paths.len(), 2, "ban + unban: {paths:?}");
+        assert!(
+            paths.iter().any(|p| p.ends_with("/BanChatMember")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("/UnbanChatMember")),
+            "{paths:?}"
+        );
+        assert!(
+            primary_api.received_requests().await.unwrap().is_empty(),
+            "the primary bot must never moderate another bot's channel"
+        );
+
+        // Exactly-once: the row is now 'expired', so a second sweep is a no-op.
+        assert!(db.expired_subscriptions().is_empty());
+        assert!(expire_subscriptions(&bots, &db).await.is_empty());
+    }
 }

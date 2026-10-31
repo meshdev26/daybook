@@ -1,7 +1,15 @@
 #![allow(clippy::too_many_arguments)]
+// Bot message formatting is intentional: plain-text labels (no emoji) keep
+// messages stable across clients and accessible to screen readers. Emoji
+// glyphs are avoided in bot output; status is conveyed via text.
 use crate::{
-    config::Config, crypto::CryptoPay, db::Db, dialogue::State,
-    handlers::registry::CommandRegistry, roles, util,
+    bots::{BotContext, BotManager},
+    config::SharedConfig,
+    crypto::CryptoPay,
+    db::Db,
+    dialogue::State,
+    handlers::registry::CommandRegistry,
+    roles, util,
 };
 use chrono::{Duration, Utc};
 use std::sync::Arc;
@@ -14,11 +22,9 @@ use teloxide::{
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// Maximum subscription length (in days) any flow may create — 10 years.
-/// Defined once here and referenced by the API layer and the binary
-/// (`crate::handlers::commands::MAX_PLAN_DAYS`) so bot and web limits stay
-/// identical. Public because the bin and fuzz targets are separate crates.
-pub const MAX_PLAN_DAYS: i64 = 3650;
+// Re-exports preserved after extraction (L11 refactor).
+pub use crate::constants::MAX_PLAN_DAYS;
+pub use crate::services::broadcast::filter_broadcast_users;
 
 /// Active (non-revoked) MCP tokens a seller may hold at once (D6). The
 /// per-seller cap is enforced HERE by counting `list_mcp_tokens` rows before
@@ -94,6 +100,16 @@ pub enum Command {
     Shop,
     /// Buy a plan or product: /buy name
     Buy(String),
+    /// Show shopping cart. /cart
+    Cart,
+    /// Add to cart: /cartadd <name> [qty]
+    CartAdd(String),
+    /// Remove from cart: /cartremove <name>
+    CartRemove(String),
+    /// Clear cart. /cartclear
+    CartClear,
+    /// Checkout cart. /checkout
+    Checkout,
     /// Claim payment: /paid invoice_id
     Paid(String),
     /// Redeem activation code: /redeem CODE
@@ -146,28 +162,92 @@ pub enum Command {
     RemoveAdmin(String),
     /// List platform admins (owner only): /admins.
     Admins,
-    /// List sellers (admin/owner): /sellers.
-    Sellers,
     /// List web accounts (owner only): /webusers.
     WebUsers,
+    /// List sellers (admin/owner): /sellers.
+    Sellers,
+    /// Export buyer data: /exportdata <user_id> [seller_id].
+    ExportData(String),
+    /// Delete buyer data: /deletedata <user_id> [confirm] [seller_id].
+    DeleteData(String),
     /// Approve a pending refund (admin/owner): /refundapprove [refund_id].
     RefundApprove(String),
     /// Approve a pending payout (admin/owner): /payoutapprove [payout_id].
     PayoutApprove(String),
+    /// Create promo code: /promocreate code | percent|fixed | value | [max_uses] | [min_purchase] | [days].
+    PromoCreate(String),
+    /// List promo codes (seller: own; admin: all). /promolist
+    PromoList,
+    /// Revoke promo code. /promodel code
+    PromoDel(String),
+    /// Apply/validate promo code at checkout. /promo code
+    Promo(String),
+    /// List customers (seller: own; admin: all). /customers
+    Customers,
+    /// View customer: /customer <id>
+    Customer(String),
+    /// Add note to customer: /customernote <id> | <text>
+    CustomerNote(String),
+    /// Tag customer: /customertag <id> | <tag>
+    CustomerTag(String),
+    /// Block customer: /blockcustomer <id>
+    BlockCustomer(String),
+    /// Open support ticket (buyer): /support <text>
+    Support(String),
+    /// List tickets (seller). /tickets
+    Tickets,
+    /// Reply to ticket: /reply <id> | <text>
+    Reply(String),
+    /// Close ticket: /closeticket <id>
+    CloseTicket(String),
+    /// Escalate ticket: /escalate <id>
+    Escalate(String),
+    /// Show referral code + stats + earnings. /referral
+    Referral,
+    /// Apply referral code: /redeemref <code>.
+    RedeemRef(String),
+    /// Show bonus balance. /balance
+    Balance,
+    /// Apply bonus at checkout: /redeembonus <amount>.
+    RedeemBonus(String),
+    /// Leave a review: /review <product> <rating> [text].
+    Review(String),
+    /// List reviews for a product. /reviews <product>
+    Reviews(String),
+    /// Set a reorder reminder: /reorder <product> <days>.
+    Reorder(String),
+    /// Disable reorder reminder. /reorderoff <product>
+    ReorderOff(String),
 }
 
-#[tracing::instrument(skip(bot, msg, dialogue, db, cfg, crypto, ai, reg, cmd))]
+#[tracing::instrument(skip(
+    _bot,
+    msg,
+    dialogue,
+    db,
+    cfg,
+    bot_ctx,
+    bot_manager,
+    crypto,
+    ai,
+    reg,
+    cmd
+))]
 pub async fn cmd_handler(
-    bot: Bot,
+    _bot: Bot,
     msg: Message,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     db: Arc<Db>,
-    cfg: Config,
+    cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
+    bot_manager: Arc<BotManager>,
+    owner_id: i64,
     crypto: Option<Arc<CryptoPay>>,
     ai: Option<Arc<crate::ai::AiService>>,
     reg: Arc<CommandRegistry>,
     cmd: Command,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     // register user for public mode / broadcasting
     if user_id != 0 {
@@ -178,7 +258,7 @@ pub async fn cmd_handler(
         // seller role — and the channels/privileges it unlocks — is always
         // opt-in.
     }
-    let role = roles::role_of(&db, user_id, cfg.owner_id);
+    let role = roles::role_of(&db, user_id, bot_ctx.owner_id);
     let is_admin = role >= roles::Role::Admin;
     let is_seller = role >= roles::Role::Seller;
     let user_cmd = matches!(
@@ -191,6 +271,11 @@ pub async fn cmd_handler(
             | Command::Buy(_)
             | Command::Paid(_)
             | Command::Redeem(_)
+            | Command::Cart
+            | Command::CartAdd(_)
+            | Command::CartRemove(_)
+            | Command::CartClear
+            | Command::Checkout
             | Command::Services
             | Command::Book(_)
             | Command::Bookings
@@ -198,6 +283,16 @@ pub async fn cmd_handler(
             | Command::CancelBooking(_)
             | Command::Setup(_)
             | Command::BecomeSeller
+            | Command::Promo(_)
+            | Command::Referral
+            | Command::RedeemRef(_)
+            | Command::Balance
+            | Command::RedeemBonus(_)
+            | Command::Support(_)
+            | Command::Review(_)
+            | Command::Reviews(_)
+            | Command::Reorder(_)
+            | Command::ReorderOff(_)
     );
     let seller_cmd = matches!(
         cmd,
@@ -219,6 +314,18 @@ pub async fn cmd_handler(
             | Command::Crypto(_)
             | Command::PlanAdd(_)
             | Command::PlanDel(_)
+            | Command::PromoCreate(_)
+            | Command::PromoList
+            | Command::PromoDel(_)
+            | Command::Customers
+            | Command::Customer(_)
+            | Command::CustomerNote(_)
+            | Command::CustomerTag(_)
+            | Command::BlockCustomer(_)
+            | Command::Tickets
+            | Command::Reply(_)
+            | Command::CloseTicket(_)
+            | Command::Escalate(_)
             | Command::ProductAdd(_)
             | Command::Products
             | Command::ProductDel(_)
@@ -252,7 +359,12 @@ pub async fn cmd_handler(
     );
     let owner_cmd = matches!(
         cmd,
-        Command::AddAdmin(_) | Command::RemoveAdmin(_) | Command::Admins | Command::WebUsers
+        Command::AddAdmin(_)
+            | Command::RemoveAdmin(_)
+            | Command::Admins
+            | Command::WebUsers
+            | Command::ExportData(_)
+            | Command::DeleteData(_)
     );
     let allowed = user_cmd
         || (is_seller && seller_cmd)
@@ -319,9 +431,6 @@ pub async fn cmd_handler(
             if let Some(c) = db.get_config("channel") {
                 set.insert(c);
             }
-            if let Some(c) = &cfg.default_channel {
-                set.insert(c.clone());
-            }
             for p in db.list_plans(None) {
                 if let Some(c) = p.4 {
                     set.insert(c);
@@ -379,7 +488,7 @@ pub async fn cmd_handler(
                 match bot.send_message(util::to_chat_id(&ch), text.clone()).await {
                     Ok(sent) => {
                         crate::metrics::bot_sent();
-                        let _ = db.log_post(user_id, &ch, sent.id.0, "text", Some(&text));
+                        let _ = db.log_post(user_id, &ch, sent.id.0, "text", Some(&text), "bot");
                         bot.send_message(
                             chat_id,
                             format!("Posted to {} (message_id={}).", ch, sent.id.0),
@@ -771,6 +880,781 @@ pub async fn cmd_handler(
             db.remove_plan(user_id, name.trim());
             bot.send_message(chat_id, "Plan removed.").await?;
         }
+        Command::PromoCreate(arg) => {
+            let parts: Vec<&str> = arg.split('|').map(|s| s.trim()).collect();
+            if parts.len() < 3 || parts[0].is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "Usage: /promocreate <code> | <percent|fixed> | <value> | [max_uses] | [min_purchase] | [days]",
+                )
+                .await?;
+                return Ok(());
+            }
+            let code = parts[0];
+            let promo_type = parts[1].to_lowercase();
+            if promo_type != "percent" && promo_type != "fixed" {
+                bot.send_message(chat_id, "Type must be 'percent' or 'fixed'.")
+                    .await?;
+                return Ok(());
+            }
+            let value: f64 = match parts[2].parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    bot.send_message(chat_id, "Invalid value.").await?;
+                    return Ok(());
+                }
+            };
+            if value <= 0.0 {
+                bot.send_message(chat_id, "Value must be > 0.").await?;
+                return Ok(());
+            }
+            if promo_type == "percent" && value > 100.0 {
+                bot.send_message(chat_id, "Percent value must be <= 100.")
+                    .await?;
+                return Ok(());
+            }
+            let max_uses = parts.get(3).and_then(|s| {
+                let s = s.trim();
+                if s.is_empty() || s == "-" {
+                    None
+                } else {
+                    s.parse::<i64>().ok()
+                }
+            });
+            let min_purchase = parts
+                .get(4)
+                .and_then(|s| {
+                    let s = s.trim();
+                    if s.is_empty() || s == "-" {
+                        None
+                    } else {
+                        s.parse::<f64>().ok()
+                    }
+                })
+                .unwrap_or(0.0);
+            let days = parts.get(5).and_then(|s| s.trim().parse::<i64>().ok());
+            let expires_at = days.map(|d| (Utc::now() + Duration::days(d)).to_rfc3339());
+            let seller_id = user_id;
+            match db.create_promo_code(
+                seller_id,
+                code,
+                &promo_type,
+                value,
+                None,
+                max_uses,
+                min_purchase,
+                "all",
+                None,
+                expires_at.as_deref(),
+            ) {
+                Ok(()) => {
+                    bot.send_message(
+                        chat_id,
+                        format!("Promo code '{}' created ({} {}).", code, promo_type, value),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                }
+            }
+        }
+        Command::PromoList => {
+            let promos = if is_admin {
+                db.list_all_promo_codes()
+            } else {
+                db.list_promo_codes(user_id)
+            };
+            if promos.is_empty() {
+                bot.send_message(chat_id, "No promo codes.").await?;
+            } else {
+                let mut out = String::from(
+                    "Promo codes (code | type | value | uses/max | min | expires | state):\n",
+                );
+                for (
+                    code,
+                    sid,
+                    promo_type,
+                    value,
+                    _currency,
+                    max_uses,
+                    uses,
+                    min_purchase,
+                    _scope,
+                    _scope_id,
+                    expires_at,
+                    active,
+                    _created,
+                ) in promos
+                {
+                    out.push_str(&format!(
+                        "{} (seller {}) | {} | {} | {}/{} | min {} | {} | {}\n",
+                        code,
+                        sid,
+                        promo_type,
+                        value,
+                        uses,
+                        max_uses
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "∞".to_string()),
+                        min_purchase,
+                        expires_at.unwrap_or_else(|| "-".to_string()),
+                        if active != 0 { "active" } else { "revoked" }
+                    ));
+                }
+                bot.send_message(chat_id, out).await?;
+            }
+        }
+        Command::PromoDel(code) => {
+            let code = code.trim();
+            if code.is_empty() {
+                bot.send_message(chat_id, "Usage: /promodel <code>").await?;
+                return Ok(());
+            }
+            let ok = if is_admin {
+                db.revoke_promo_code_all(code)
+            } else {
+                db.revoke_promo_code(user_id, code)
+            };
+            if ok {
+                bot.send_message(chat_id, "Promo code revoked.").await?;
+            } else {
+                bot.send_message(chat_id, "Promo code not found.").await?;
+            }
+        }
+        Command::Promo(code) => {
+            let code = code.trim();
+            if code.is_empty() {
+                bot.send_message(chat_id, "Usage: /promo <code>").await?;
+                return Ok(());
+            }
+            let promos = db.list_all_promo_codes();
+            let found = promos.into_iter().find(|p| p.0 == code && p.11 != 0);
+            match found {
+                Some(p) => {
+                    // p: code, seller, type, value, currency, max_uses, uses, min_purchase, scope, scope_id, expires, active, created
+                    let expired =
+                        p.10.as_ref()
+                            .map(|e| {
+                                chrono::DateTime::parse_from_rfc3339(e)
+                                    .map(|dt| dt < chrono::Utc::now())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    if expired {
+                        bot.send_message(chat_id, "Promo code expired.").await?;
+                        return Ok(());
+                    }
+                    if let Some(cap) = p.5
+                        && p.6 >= cap
+                    {
+                        bot.send_message(chat_id, "Promo code usage cap reached.")
+                            .await?;
+                        return Ok(());
+                    }
+                    let discount_desc = match p.2.as_str() {
+                        "percent" => format!("{}% off", p.3),
+                        "fixed" => format!("{} off", p.3),
+                        _ => p.2.clone(),
+                    };
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "Promo code '{}' valid: {} (min purchase {}). Apply at checkout with /buy; seller {}.",
+                            code,
+                            discount_desc,
+                            p.7,
+                            p.1
+                        ),
+                    )
+                    .await?;
+                }
+                None => {
+                    bot.send_message(chat_id, "Invalid or inactive promo code.")
+                        .await?;
+                }
+            }
+        }
+        Command::Referral => {
+            let seller_id = if is_seller { user_id } else { 0 };
+            let code = db.create_referral_code(seller_id, user_id);
+            let refs = db.list_referrals(seller_id, Some(user_id));
+            let total = refs.len();
+            let rewarded = refs.iter().filter(|r| r.4 == "rewarded").count();
+            let earnings: f64 = refs.iter().map(|r| r.5).sum();
+            let bal = db.bonus_balance(seller_id, user_id);
+            bot.send_message(
+                chat_id,
+                format!(
+                    "Your referral code: {}\nReferred: {} (rewarded: {})\nEarnings: {}\nBonus balance (minor): {}",
+                    code, total, rewarded, earnings, bal
+                ),
+            )
+            .await?;
+        }
+        Command::RedeemRef(code) => {
+            let code = code.trim();
+            if code.is_empty() {
+                bot.send_message(chat_id, "Usage: /redeemref <code>")
+                    .await?;
+                return Ok(());
+            }
+            // Resolve seller scope from the code.
+            let mut found: Option<(i64, i64)> = None;
+            let mut scopes = db.list_sellers();
+            scopes.push(0);
+            for sid in scopes {
+                if let Some(rid) = db.get_referrer_by_code(sid, code) {
+                    found = Some((sid, rid));
+                    break;
+                }
+            }
+            match found {
+                None => {
+                    bot.send_message(chat_id, "Invalid referral code.").await?;
+                }
+                Some((sid, rid)) => {
+                    if rid == user_id {
+                        bot.send_message(chat_id, "Self-referral is not allowed.")
+                            .await?;
+                        return Ok(());
+                    }
+                    match db.create_referral(sid, rid, user_id, code) {
+                        Ok(()) => {
+                            bot.send_message(
+                                chat_id,
+                                "Referral registered. Reward will be credited on first paid purchase.",
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            bot.send_message(chat_id, format!("Could not redeem referral: {}", e))
+                                .await?;
+                        }
+                    }
+                }
+            }
+        }
+        Command::Balance => {
+            // Show balances across known scopes.
+            let mut out = String::from("Bonus balances (minor units):\n");
+            let mut scopes = db.list_sellers();
+            scopes.push(0);
+            let mut any = false;
+            for sid in scopes {
+                let bal = db.bonus_balance(sid, user_id);
+                if bal != 0 {
+                    any = true;
+                    out.push_str(&format!("seller {}: {}\n", sid, bal));
+                }
+            }
+            if !any {
+                out.push_str("No bonus balance yet.");
+            }
+            bot.send_message(chat_id, out).await?;
+        }
+        Command::RedeemBonus(amount) => {
+            let amount: i64 = match amount.trim().parse() {
+                Ok(v) if v > 0 => v,
+                _ => {
+                    bot.send_message(chat_id, "Usage: /redeembonus <amount (minor units)>")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            // Debit from the first scope that has enough balance.
+            let mut scopes = db.list_sellers();
+            scopes.push(0);
+            let mut done = false;
+            for sid in scopes {
+                if db.bonus_balance(sid, user_id) >= amount {
+                    match db.bonus_debit(sid, user_id, amount, "redeembonus") {
+                        Ok(newbal) => {
+                            bot.send_message(
+                                chat_id,
+                                format!(
+                                    "Redeemed {} bonus. New balance: {} (seller {}).",
+                                    amount, newbal, sid
+                                ),
+                            )
+                            .await?;
+                            done = true;
+                            break;
+                        }
+                        Err(e) => {
+                            bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !done {
+                bot.send_message(chat_id, "Insufficient bonus balance.")
+                    .await?;
+            }
+        }
+        Command::Customers => {
+            let seller_ids: Vec<i64> = if is_admin {
+                let mut v = db.list_sellers();
+                v.push(0);
+                v
+            } else {
+                vec![user_id]
+            };
+            let mut out = String::from("Customers:\n");
+            let mut n = 0i64;
+            for sid in seller_ids {
+                for (uid, last_seen, tags, spent, orders, status) in
+                    db.list_customers(sid, None, None)
+                {
+                    out.push_str(&format!(
+                        "- {} (seller {}) | last {} | tags:{} | spent:{} orders:{} | {}\n",
+                        uid,
+                        sid,
+                        last_seen,
+                        tags.unwrap_or_default(),
+                        spent,
+                        orders,
+                        status
+                    ));
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                bot.send_message(chat_id, "No customers.").await?;
+            } else {
+                bot.send_message(chat_id, out).await?;
+            }
+        }
+        Command::Customer(arg) => {
+            let id: i64 = arg.trim().parse().unwrap_or(0);
+            if id == 0 {
+                bot.send_message(chat_id, "Usage: /customer <user_id>")
+                    .await?;
+                return Ok(());
+            }
+            let sellers: Vec<i64> = if is_admin {
+                let mut v = db.list_sellers();
+                v.push(0);
+                v
+            } else {
+                vec![user_id]
+            };
+            let mut found = false;
+            for sid in sellers {
+                if let Some(c) = db.get_customer(sid, id) {
+                    found = true;
+                    let (_u, _s, first, last, tags, notes, spent, orders, status) = c;
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "Customer {} (seller {})\nfirst:{} last:{}\ntags:{}\nnotes:{}\nspent:{} orders:{}\nstatus:{}",
+                            id,
+                            sid,
+                            first,
+                            last,
+                            tags.unwrap_or_default(),
+                            notes.unwrap_or_default(),
+                            spent,
+                            orders,
+                            status
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            if !found {
+                bot.send_message(chat_id, "Customer not found.").await?;
+            }
+        }
+        Command::CustomerNote(arg) => {
+            let parts: Vec<&str> = arg.splitn(2, '|').collect();
+            if parts.len() < 2 {
+                bot.send_message(chat_id, "Usage: /customernote <id> | <text>")
+                    .await?;
+                return Ok(());
+            }
+            let id: i64 = parts[0].trim().parse().unwrap_or(0);
+            let text = parts[1].trim();
+            if id == 0 || text.is_empty() {
+                bot.send_message(chat_id, "Usage: /customernote <id> | <text>")
+                    .await?;
+                return Ok(());
+            }
+            let sellers: Vec<i64> = if is_admin {
+                let mut v = db.list_sellers();
+                v.push(0);
+                v
+            } else {
+                vec![user_id]
+            };
+            let mut ok = false;
+            for sid in sellers {
+                if db.get_customer(sid, id).is_some() && db.update_customer_notes(sid, id, text) {
+                    ok = true;
+                }
+            }
+            if ok {
+                bot.send_message(chat_id, "Note updated.").await?;
+            } else {
+                bot.send_message(chat_id, "Customer not found.").await?;
+            }
+        }
+        Command::CustomerTag(arg) => {
+            let parts: Vec<&str> = arg.splitn(2, '|').collect();
+            if parts.len() < 2 {
+                bot.send_message(chat_id, "Usage: /customertag <id> | <tag>")
+                    .await?;
+                return Ok(());
+            }
+            let id: i64 = parts[0].trim().parse().unwrap_or(0);
+            let tag = parts[1].trim();
+            if id == 0 || tag.is_empty() {
+                bot.send_message(chat_id, "Usage: /customertag <id> | <tag>")
+                    .await?;
+                return Ok(());
+            }
+            let sellers: Vec<i64> = if is_admin {
+                let mut v = db.list_sellers();
+                v.push(0);
+                v
+            } else {
+                vec![user_id]
+            };
+            let mut ok = false;
+            for sid in sellers {
+                if let Some(c) = db.get_customer(sid, id) {
+                    let mut tags: Vec<String> =
+                        c.4.clone()
+                            .unwrap_or_default()
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    if !tags.iter().any(|t| t == tag) {
+                        tags.push(tag.to_string());
+                    }
+                    if db.update_customer_tags(sid, id, &tags.join(",")) {
+                        ok = true;
+                    }
+                }
+            }
+            if ok {
+                bot.send_message(chat_id, "Tag updated.").await?;
+            } else {
+                bot.send_message(chat_id, "Customer not found.").await?;
+            }
+        }
+        Command::BlockCustomer(arg) => {
+            let id: i64 = arg.trim().parse().unwrap_or(0);
+            if id == 0 {
+                bot.send_message(chat_id, "Usage: /blockcustomer <user_id>")
+                    .await?;
+                return Ok(());
+            }
+            let sellers: Vec<i64> = if is_admin {
+                let mut v = db.list_sellers();
+                v.push(0);
+                v
+            } else {
+                vec![user_id]
+            };
+            let mut ok = false;
+            for sid in sellers {
+                if db.get_customer(sid, id).is_some() && db.set_customer_status(sid, id, "blocked")
+                {
+                    ok = true;
+                }
+            }
+            if ok {
+                bot.send_message(chat_id, "Customer blocked.").await?;
+            } else {
+                bot.send_message(chat_id, "Customer not found.").await?;
+            }
+        }
+        Command::Support(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                bot.send_message(chat_id, "Usage: /support <text>").await?;
+                return Ok(());
+            }
+            let ticket_id = db.create_ticket(0, user_id, text);
+            db.add_ticket_message(ticket_id, "buyer", user_id, text);
+            bot.send_message(chat_id, format!("Ticket #{} created.", ticket_id))
+                .await?;
+        }
+        Command::Review(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                bot.send_message(chat_id, "Usage: /review <product> <rating> [text]")
+                    .await?;
+                return Ok(());
+            }
+            // Find the rating token (1..=5) to support multi-word product names.
+            let tokens: Vec<&str> = arg.split_whitespace().collect();
+            let mut rating_idx: Option<usize> = None;
+            for (i, t) in tokens.iter().enumerate() {
+                if let Ok(r) = t.parse::<i64>()
+                    && (1..=5).contains(&r)
+                {
+                    rating_idx = Some(i);
+                    break;
+                }
+            }
+            let (product, rating, text) = match rating_idx {
+                Some(i) if i > 0 => {
+                    let product = tokens[..i].join(" ");
+                    let rating: i64 = tokens[i].parse().unwrap_or(0);
+                    let text = if i + 1 < tokens.len() {
+                        Some(tokens[i + 1..].join(" "))
+                    } else {
+                        None
+                    };
+                    (product, rating, text)
+                }
+                _ => {
+                    bot.send_message(chat_id, "Usage: /review <product> <rating> [text]")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, &product);
+            let _ = plans;
+            if products.len() != 1 {
+                if products.is_empty() {
+                    bot.send_message(chat_id, "Product not found.").await?;
+                } else {
+                    bot.send_message(chat_id, "Multiple matches. Be more specific.")
+                        .await?;
+                }
+                return Ok(());
+            }
+            let p = products.into_iter().next().unwrap();
+            let (pid, seller_id, pname, ..) = p;
+            let _ = pname;
+            match db.create_review(user_id, seller_id, pid, rating, text.as_deref()) {
+                Ok(id) => {
+                    bot.send_message(
+                        chat_id,
+                        format!("Review #{} submitted (pending approval).", id),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                }
+            }
+        }
+        Command::Reviews(arg) => {
+            let name = arg.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Usage: /reviews <product>")
+                    .await?;
+                return Ok(());
+            }
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, name);
+            let _ = plans;
+            if products.len() != 1 {
+                if products.is_empty() {
+                    bot.send_message(chat_id, "Product not found.").await?;
+                } else {
+                    bot.send_message(chat_id, "Multiple matches. Be more specific.")
+                        .await?;
+                }
+                return Ok(());
+            }
+            let p = products.into_iter().next().unwrap();
+            let (pid, seller_id, pname, ..) = p;
+            let reviews = db.list_reviews(seller_id, pid, true);
+            if reviews.is_empty() {
+                bot.send_message(chat_id, format!("No reviews for '{}'.", pname))
+                    .await?;
+                return Ok(());
+            }
+            let mut out = format!(
+                "Reviews for {} (avg {:?}):\n",
+                pname,
+                db.avg_rating(seller_id, pid)
+            );
+            for (_id, buyer, rating, text) in reviews {
+                out.push_str(&format!("- {} (rating: {}) {}\n", buyer, rating, text));
+            }
+            bot.send_message(chat_id, out).await?;
+        }
+        Command::Reorder(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                bot.send_message(chat_id, "Usage: /reorder <product> <days>")
+                    .await?;
+                return Ok(());
+            }
+            let tokens: Vec<&str> = arg.split_whitespace().collect();
+            if tokens.len() < 2 {
+                bot.send_message(chat_id, "Usage: /reorder <product> <days>")
+                    .await?;
+                return Ok(());
+            }
+            let days: i64 = match tokens.last().unwrap().parse() {
+                Ok(d) if d > 0 => d,
+                _ => {
+                    bot.send_message(chat_id, "Days must be a positive number.")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let product = tokens[..tokens.len() - 1].join(" ");
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, &product);
+            let _ = plans;
+            if products.len() != 1 {
+                if products.is_empty() {
+                    bot.send_message(chat_id, "Product not found.").await?;
+                } else {
+                    bot.send_message(chat_id, "Multiple matches. Be more specific.")
+                        .await?;
+                }
+                return Ok(());
+            }
+            let p = products.into_iter().next().unwrap();
+            let (pid, seller_id, pname, ..) = p;
+            db.set_reorder_schedule(user_id, seller_id, pid, days);
+            db.set_config(
+                &format!("reorder_interval:{}:{}:{}", user_id, seller_id, pid),
+                &days.to_string(),
+            );
+            bot.send_message(
+                chat_id,
+                format!("Reorder reminder set for '{}' every {} days.", pname, days),
+            )
+            .await?;
+        }
+        Command::ReorderOff(arg) => {
+            let name = arg.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Usage: /reorderoff <product>")
+                    .await?;
+                return Ok(());
+            }
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, name);
+            let _ = plans;
+            if products.len() != 1 {
+                if products.is_empty() {
+                    bot.send_message(chat_id, "Product not found.").await?;
+                } else {
+                    bot.send_message(chat_id, "Multiple matches. Be more specific.")
+                        .await?;
+                }
+                return Ok(());
+            }
+            let p = products.into_iter().next().unwrap();
+            let (pid, seller_id, ..) = p;
+            if db.disable_reorder(user_id, seller_id, pid) {
+                bot.send_message(chat_id, "Reorder reminder disabled.")
+                    .await?;
+            } else {
+                bot.send_message(chat_id, "No active reorder reminder found.")
+                    .await?;
+            }
+        }
+        Command::Tickets => {
+            let tickets = if is_admin {
+                db.list_tickets(None, None, None)
+            } else {
+                db.list_tickets(Some(user_id), None, None)
+            };
+            if tickets.is_empty() {
+                bot.send_message(chat_id, "No tickets.").await?;
+            } else {
+                let mut out = String::from("Tickets:\n");
+                for (id, sid, buyer, subject, status, updated) in tickets {
+                    out.push_str(&format!(
+                        "#{} seller {} buyer {} | {} | {} | updated {}\n",
+                        id, sid, buyer, subject, status, updated
+                    ));
+                }
+                bot.send_message(chat_id, out).await?;
+            }
+        }
+        Command::Reply(arg) => {
+            let parts: Vec<&str> = arg.splitn(2, '|').collect();
+            if parts.len() < 2 {
+                bot.send_message(chat_id, "Usage: /reply <id> | <text>")
+                    .await?;
+                return Ok(());
+            }
+            let id: i64 = parts[0].trim().parse().unwrap_or(0);
+            let text = parts[1].trim();
+            if id == 0 || text.is_empty() {
+                bot.send_message(chat_id, "Usage: /reply <id> | <text>")
+                    .await?;
+                return Ok(());
+            }
+            let ticket = match db.get_ticket(id) {
+                Some(t) => t,
+                None => {
+                    bot.send_message(chat_id, "Ticket not found.").await?;
+                    return Ok(());
+                }
+            };
+            let (_id, seller_id, _buyer, _subj, _status, _c, _u) = ticket;
+            if !is_admin && seller_id != user_id {
+                bot.send_message(chat_id, "Ticket not found.").await?;
+                return Ok(());
+            }
+            let role_str = if is_admin { "admin" } else { "seller" };
+            db.add_ticket_message(id, role_str, user_id, text);
+            bot.send_message(chat_id, format!("Replied to ticket #{}.", id))
+                .await?;
+        }
+        Command::CloseTicket(arg) => {
+            let id: i64 = arg.trim().parse().unwrap_or(0);
+            if id == 0 {
+                bot.send_message(chat_id, "Usage: /closeticket <id>")
+                    .await?;
+                return Ok(());
+            }
+            let ticket = match db.get_ticket(id) {
+                Some(t) => t,
+                None => {
+                    bot.send_message(chat_id, "Ticket not found.").await?;
+                    return Ok(());
+                }
+            };
+            let (_id, seller_id, _buyer, _subj, _status, _c, _u) = ticket;
+            if !is_admin && seller_id != user_id {
+                bot.send_message(chat_id, "Ticket not found.").await?;
+                return Ok(());
+            }
+            if db.set_ticket_status(id, "closed") {
+                bot.send_message(chat_id, format!("Ticket #{} closed.", id))
+                    .await?;
+            } else {
+                bot.send_message(chat_id, "Ticket not found.").await?;
+            }
+        }
+        Command::Escalate(arg) => {
+            let id: i64 = arg.trim().parse().unwrap_or(0);
+            if id == 0 {
+                bot.send_message(chat_id, "Usage: /escalate <id>").await?;
+                return Ok(());
+            }
+            let ticket = match db.get_ticket(id) {
+                Some(t) => t,
+                None => {
+                    bot.send_message(chat_id, "Ticket not found.").await?;
+                    return Ok(());
+                }
+            };
+            let (_id, seller_id, _buyer, _subj, _status, _c, _u) = ticket;
+            if !is_admin && seller_id != user_id {
+                bot.send_message(chat_id, "Ticket not found.").await?;
+                return Ok(());
+            }
+            db.set_ticket_status(id, "escalated");
+            db.add_ticket_message(id, "seller", user_id, "Escalated.");
+            bot.send_message(chat_id, format!("Ticket #{} escalated.", id))
+                .await?;
+        }
         Command::ProductAdd(arg) => {
             // /productadd name | price | asset | kind | delivery | [stock]
             match parse_product_add(&arg) {
@@ -1143,6 +2027,302 @@ pub async fn cmd_handler(
                 }
             }
         }
+        Command::Cart => {
+            let items = db.cart_get_all_items(user_id);
+            if items.is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "Your cart is empty. Add items with /cartadd <name>.",
+                )
+                .await?;
+                return Ok(());
+            }
+            // Resolve each cart row to a display name + price.
+            let mut lines = Vec::new();
+            let mut total_by_asset: std::collections::BTreeMap<String, f64> =
+                std::collections::BTreeMap::new();
+            let mut ok = true;
+            for (seller_id, _row_id, item_type, item_id, qty) in &items {
+                let (name, price, asset) = if item_type == "plan" {
+                    match db.get_plan_by_id(*item_id) {
+                        Some((_, p, a, n, _, _)) => (n, p, a),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // product
+                    let prod = db
+                        .list_products(Some(*seller_id))
+                        .into_iter()
+                        .find(|p| p.0 == *item_id);
+                    match prod {
+                        Some(p) => (p.2, p.3, p.4),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                };
+                let q = *qty;
+                let p: f64 = price.parse().unwrap_or(0.0);
+                *total_by_asset.entry(asset.clone()).or_insert(0.0) += p * q as f64;
+                lines.push(format!("- {} x{} @ {} {}", name, q, price, asset));
+            }
+            if !ok {
+                bot.send_message(chat_id, "Cart contains an unknown item. Use /cartclear.")
+                    .await?;
+                return Ok(());
+            }
+            let mut out = String::from("Cart:\n");
+            for l in lines {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            for (asset, total) in &total_by_asset {
+                out.push_str(&format!("Total: {:.2} {}\n", total, asset));
+            }
+            bot.send_message(chat_id, out).await?;
+        }
+        Command::CartAdd(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                bot.send_message(chat_id, "Usage: /cartadd <name> [qty]")
+                    .await?;
+                return Ok(());
+            }
+            // Parse optional trailing qty.
+            let (name, qty) = parse_cart_add_arg(arg);
+            if qty <= 0 {
+                bot.send_message(chat_id, "Quantity must be > 0.").await?;
+                return Ok(());
+            }
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, name);
+            if plans.len() + products.len() != 1 {
+                if plans.is_empty() && products.is_empty() {
+                    bot.send_message(chat_id, "Not found. Use /shop or /plans.")
+                        .await?;
+                } else {
+                    bot.send_message(chat_id, "Multiple matches. Be more specific.")
+                        .await?;
+                }
+                return Ok(());
+            }
+            let (item_type, item_id, seller_id, stock) =
+                if let Some(product) = products.into_iter().next() {
+                    let (pid, pseller, pname, _price, _asset, _kind, _delivery, stock, _active) =
+                        product;
+                    let _ = pname;
+                    ("product", pid, pseller, stock)
+                } else if let Some(plan) = plans.into_iter().next() {
+                    let (pname, _price, _asset, _days, _ch, _active, pseller) = plan;
+                    // resolve plan id
+                    let (pid, ..) = match db.get_plan(pseller, &pname) {
+                        Some(x) => x,
+                        None => {
+                            bot.send_message(chat_id, "Plan not found.").await?;
+                            return Ok(());
+                        }
+                    };
+                    ("plan", pid, pseller, None)
+                } else {
+                    bot.send_message(chat_id, "Not found.").await?;
+                    return Ok(());
+                };
+            if stock == Some(0) {
+                bot.send_message(chat_id, "Item is out of stock.").await?;
+                return Ok(());
+            }
+            // Enforce single-seller cart.
+            let existing = db.cart_get_all_items(user_id);
+            let existing_sellers: std::collections::BTreeSet<i64> =
+                existing.iter().map(|i| i.0).collect();
+            if !existing_sellers.is_empty() && !existing_sellers.contains(&seller_id) {
+                bot.send_message(
+                    chat_id,
+                    "Cart contains items from another seller. /checkout or /cartclear first.",
+                )
+                .await?;
+                return Ok(());
+            }
+            match db.cart_add_item(user_id, seller_id, item_type, item_id, qty) {
+                Ok(()) => {
+                    db.mark_cart_abandoned(user_id, seller_id);
+                    bot.send_message(chat_id, format!("Added {} x{} to cart.", name, qty))
+                        .await?;
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("Error: {}", e)).await?;
+                }
+            }
+        }
+        Command::CartRemove(arg) => {
+            let name = arg.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Usage: /cartremove <name>")
+                    .await?;
+                return Ok(());
+            }
+            let (plans, products) = resolve_buy_candidates(&db, role, user_id, name);
+            if plans.len() + products.len() != 1 {
+                bot.send_message(chat_id, "Unknown item.").await?;
+                return Ok(());
+            }
+            let (item_type, item_id, seller_id) = if let Some(product) = products.into_iter().next()
+            {
+                let (pid, pseller, ..) = product;
+                ("product", pid, pseller)
+            } else if let Some(plan) = plans.into_iter().next() {
+                let (pname, .., pseller) = plan;
+                let (pid, ..) = match db.get_plan(pseller, &pname) {
+                    Some(x) => x,
+                    None => {
+                        bot.send_message(chat_id, "Plan not found.").await?;
+                        return Ok(());
+                    }
+                };
+                ("plan", pid, pseller)
+            } else {
+                bot.send_message(chat_id, "Unknown item.").await?;
+                return Ok(());
+            };
+            if db.cart_remove_item(user_id, seller_id, item_type, item_id) {
+                bot.send_message(chat_id, "Removed from cart.").await?;
+            } else {
+                bot.send_message(chat_id, "Item not in cart.").await?;
+            }
+        }
+        Command::CartClear => {
+            db.cart_clear_all(user_id);
+            bot.send_message(chat_id, "Cart cleared.").await?;
+        }
+        Command::Checkout => {
+            let items = db.cart_get_all_items(user_id);
+            if items.is_empty() {
+                bot.send_message(chat_id, "Your cart is empty.").await?;
+                return Ok(());
+            }
+            // Resolve all items.
+            let mut resolved2: Vec<(i64, &'static str, i64, String, String, String, i64)> =
+                Vec::new();
+            let mut assets = std::collections::BTreeSet::new();
+            let mut sellers = std::collections::BTreeSet::new();
+            let mut ok = true;
+            for (seller_id, _row_id, item_type, item_id, qty) in &items {
+                sellers.insert(*seller_id);
+                let (name, price, asset) = if item_type == "plan" {
+                    match db.get_plan_by_id(*item_id) {
+                        Some((_, p, a, n, _, _)) => (n, p, a),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    let prod = db
+                        .list_products(Some(*seller_id))
+                        .into_iter()
+                        .find(|p| p.0 == *item_id);
+                    match prod {
+                        Some(p) => (p.2, p.3, p.4),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                };
+                assets.insert(asset.clone());
+                resolved2.push((
+                    *seller_id,
+                    if item_type == "plan" {
+                        "plan"
+                    } else {
+                        "product"
+                    },
+                    *item_id,
+                    name,
+                    price,
+                    asset,
+                    *qty,
+                ));
+            }
+            if !ok {
+                bot.send_message(chat_id, "Cart contains an unknown item. Use /cartclear.")
+                    .await?;
+                return Ok(());
+            }
+            if sellers.len() != 1 {
+                bot.send_message(
+                    chat_id,
+                    "Cart contains items from multiple sellers. Checkout separately.",
+                )
+                .await?;
+                return Ok(());
+            }
+            if assets.len() != 1 {
+                bot.send_message(
+                    chat_id,
+                    "Cart contains mixed currencies. Checkout separately.",
+                )
+                .await?;
+                return Ok(());
+            }
+            let seller_id = *sellers.iter().next().unwrap();
+            let asset = assets.iter().next().unwrap().clone();
+            // total
+            let mut total: f64 = 0.0;
+            for r in &resolved2 {
+                let p: f64 = r.4.parse().unwrap_or(0.0);
+                total += p * r.6 as f64;
+            }
+            let amount = format!("{:.2}", total);
+            // crypto
+            let cp = crypto_or_load(&db, &cfg, crypto.clone());
+            match cp {
+                Some(c) => {
+                    let desc = "Cart checkout".to_string();
+                    match c
+                        .create_invoice(&amount, &asset, Some(&desc), Some("viewItem"), None)
+                        .await
+                    {
+                        Ok(v) => {
+                            let inv_id = v
+                                .get("invoice_id")
+                                .map(|x| x.to_string())
+                                .unwrap_or_default();
+                            let pay_url = v.get("pay_url").and_then(|x| x.as_str()).unwrap_or("");
+                            if !inv_id.is_empty() {
+                                db.save_invoice(
+                                    &inv_id,
+                                    seller_id,
+                                    &amount,
+                                    &asset,
+                                    Some(&desc),
+                                    "active",
+                                    Some(pay_url),
+                                    Some("cart"),
+                                    Some(user_id),
+                                    None,
+                                );
+                            }
+                            send_invoice_created(
+                                &bot, chat_id, "cart", &amount, &asset, pay_url, &inv_id,
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("cart checkout invoice failed: {}", e);
+                            bot.send_message(chat_id, "Something went wrong creating your invoice. Please try again in a minute.").await?;
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("cart checkout: no crypto token");
+                    bot.send_message(chat_id, "This shop can't take payments right now — the seller is finishing setup. Please contact the seller.").await?;
+                }
+            }
+        }
         Command::Paid(inv) => {
             let inv = inv.trim();
             let info = db.get_invoice(inv);
@@ -1322,6 +2502,140 @@ pub async fn cmd_handler(
                                     }
                                 }
                                 db.finalize_invoice_paid(inv);
+                                return Ok(());
+                            }
+                            // Cart invoices: grant every item in the buyer's cart.
+                            if plan_name.as_deref() == Some("cart") {
+                                let target_user = uid.unwrap_or(user_id);
+                                let cart_items = db.cart_get_all_items(target_user);
+                                if cart_items.is_empty() {
+                                    db.finalize_invoice_paid(inv);
+                                    bot.send_message(
+                                        chat_id,
+                                        "Payment confirmed (cart already cleared).",
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                // Idempotency: if already granted, finalize and return.
+                                // (v1 minimal: no per-invoice grant tracking for cart;
+                                //  we just grant and clear.)
+                                let mut granted_msgs: Vec<String> = Vec::new();
+                                for (seller_id, _row_id, item_type, item_id, qty) in &cart_items {
+                                    if item_type == "plan" {
+                                        if let Some((sid, _price, _asset, pname, days, ch)) =
+                                            db.get_plan_by_id(*item_id)
+                                        {
+                                            let ch = ch.unwrap_or_else(|| {
+                                                db.seller_channel(sid).unwrap_or_default()
+                                            });
+                                            let days = days.clamp(1, MAX_PLAN_DAYS);
+                                            if !ch.is_empty() {
+                                                let sub_id = db.create_subscription(
+                                                    sid,
+                                                    target_user,
+                                                    Some(*item_id),
+                                                    &ch,
+                                                    days,
+                                                    Some(inv),
+                                                    None,
+                                                );
+                                                let link =
+                                                    grant_access(&bot, &ch, target_user, days)
+                                                        .await;
+                                                match link {
+                                                    Ok(l) => granted_msgs.push(format!(
+                                                        "Plan '{}' x{}: access granted (sub #{}). Invite: {}",
+                                                        pname, qty, sub_id, l
+                                                    )),
+                                                    Err(e) => {
+                                                        tracing::warn!("cart plan grant invite failed: {}", e);
+                                                        granted_msgs.push(format!(
+                                                            "Plan '{}' x{}: access granted (sub #{}), invite link failed.",
+                                                            pname, qty, sub_id
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                tracing::warn!(
+                                                    "cart plan: seller {} has no channel",
+                                                    sid
+                                                );
+                                            }
+                                        }
+                                        let _ = seller_id;
+                                    } else {
+                                        // product
+                                        let prod = db
+                                            .list_products(Some(*seller_id))
+                                            .into_iter()
+                                            .find(|p| p.0 == *item_id);
+                                        if let Some(p) = prod {
+                                            let (
+                                                _pid,
+                                                pseller,
+                                                pname,
+                                                _price,
+                                                _asset,
+                                                kind,
+                                                delivery,
+                                                _stock,
+                                                _active,
+                                            ) = p;
+                                            // grant qty times
+                                            for _ in 0..*qty {
+                                                let _ = db.grant_product(
+                                                    pseller,
+                                                    target_user,
+                                                    *item_id,
+                                                    inv,
+                                                );
+                                            }
+                                            if kind == "physical" {
+                                                let _ = db.create_order(
+                                                    pseller,
+                                                    *item_id,
+                                                    target_user,
+                                                    inv,
+                                                );
+                                            }
+                                            match crate::services::deliver::deliver(
+                                                &bot,
+                                                target_user,
+                                                &kind,
+                                                &pname,
+                                                delivery.as_deref(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => granted_msgs.push(format!(
+                                                    "Product '{}' x{} delivered.",
+                                                    pname, qty
+                                                )),
+                                                Err(e) => {
+                                                    granted_msgs.push(format!(
+                                                        "Product '{}' x{}: delivery failed: {}.",
+                                                        pname, qty, e
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(first) = cart_items.first() {
+                                    db.mark_cart_recovered(target_user, first.0);
+                                }
+                                db.cart_clear_all(target_user);
+                                db.finalize_invoice_paid(inv);
+                                if granted_msgs.is_empty() {
+                                    bot.send_message(chat_id, "Payment confirmed.").await?;
+                                } else {
+                                    bot.send_message(
+                                        chat_id,
+                                        format!("Payment confirmed.\n{}", granted_msgs.join("\n")),
+                                    )
+                                    .await?;
+                                }
                                 return Ok(());
                             }
                             // Verified paid. Grant once (idempotent), then
@@ -1979,13 +3293,15 @@ pub async fn cmd_handler(
         }
         Command::ExpireCheck => {
             // Shared with the periodic expiry sweeper in main.rs so the
-            // kick+mark behavior stays single-sourced. Each expired buyer is
-            // DM'd the renewal notice; a failed DM is logged, never fatal to
-            // the sweep.
-            let expired = crate::expire_subscriptions(&bot, &db).await;
+            // kick+mark behavior stays single-sourced; the shared path
+            // resolves the moderating bot per row (`BotManager::for_seller`),
+            // so a seller bound to another bot is kicked/DM'd by that bot, not
+            // by whichever bot received the command.
+            let expired = crate::expire_subscriptions(&bot_manager, &db).await;
             let mut notified = 0usize;
-            for (_sub_id, uid, channel) in &expired {
-                match bot
+            for (_sub_id, seller_id, uid, channel) in &expired {
+                let row_bot = bot_manager.for_seller(*seller_id).bot.clone();
+                match row_bot
                     .send_message(
                         teloxide::types::ChatId(*uid),
                         format!(
@@ -2016,22 +3332,35 @@ pub async fn cmd_handler(
             }
             bot.send_message(chat_id, out).await?;
         }
-        Command::Broadcast(text) => {
+        Command::Broadcast(raw) => {
+            // Parse optional --segment flag: /broadcast --segment <seg> <text>
+            // or /broadcast --segment=<seg> <text>.
+            let mut segment = "all".to_string();
+            let mut parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.first() == Some(&"--segment") {
+                if parts.len() >= 2 {
+                    segment = parts[1].to_string();
+                    parts.drain(0..2);
+                }
+            } else if let Some(first) = parts.first().copied()
+                && let Some(seg) = first.strip_prefix("--segment=")
+            {
+                segment = seg.to_string();
+                parts.remove(0);
+            }
+            let text = parts.join(" ").trim().to_string();
             // Role-scoped audience: Admin/Owner reach all registered users,
             // sellers only their own customers (subscription holders). The
             // seller branch was previously unreachable behind an admin-only
             // early return; the docs (docs/COMMANDS.md, README) promise
             // seller-scoped broadcasts.
-            let text = text.trim().to_string();
             if text.is_empty() {
-                bot.send_message(chat_id, "Usage: /broadcast <text>")
+                bot.send_message(chat_id, "Usage: /broadcast [--segment <seg>] <text>")
                     .await?;
             } else {
-                let users = if is_admin {
-                    db.list_users()
-                } else {
-                    db.list_users_for_seller(user_id)
-                };
+                let seller_scope = if is_admin { None } else { Some(user_id) };
+                let users =
+                    crate::services::broadcast::filter_broadcast_users(&db, seller_scope, &segment);
                 if users.is_empty() {
                     bot.send_message(chat_id, "No users to broadcast to (no customers found).")
                         .await?;
@@ -2498,6 +3827,70 @@ pub async fn cmd_handler(
             }
             bot.send_message(chat_id, msg_text).await?;
         }
+        Command::ExportData(arg) => {
+            if role != roles::Role::Owner {
+                return Ok(());
+            }
+            let parts: Vec<&str> = arg.split_whitespace().collect();
+            let user_id_target: i64 = match parts.first().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => {
+                    bot.send_message(chat_id, "Usage: /exportdata <user_id> [seller_id]")
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let seller_id: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let data = db.export_buyer_data(seller_id, user_id_target);
+            // Telegram message limit: send truncated if needed.
+            let msg = if data.chars().count() > 3500 {
+                let head: String = data.chars().take(3500).collect();
+                format!("{}...\n(truncated; use web /privacy for full export)", head)
+            } else {
+                data
+            };
+            bot.send_message(chat_id, msg).await?;
+        }
+        Command::DeleteData(arg) => {
+            if role != roles::Role::Owner {
+                return Ok(());
+            }
+            let parts: Vec<&str> = arg.split_whitespace().collect();
+            let user_id_target: i64 = match parts.first().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => {
+                    bot.send_message(
+                        chat_id,
+                        "Usage: /deletedata <user_id> [confirm] [seller_id]",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let confirm = parts.get(1).map(|s| *s == "confirm").unwrap_or(false);
+            let seller_id: i64 = if confirm {
+                parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0)
+            } else {
+                0
+            };
+            if !confirm {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "This will delete ALL data for buyer {} (seller {}). To confirm, run: /deletedata {} confirm",
+                        user_id_target, seller_id, user_id_target
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let n = db.delete_buyer_data(seller_id, user_id_target);
+            bot.send_message(
+                chat_id,
+                format!("Deleted {} records for buyer {}.", n, user_id_target),
+            )
+            .await?;
+        }
         Command::RefundApprove(arg) => {
             if !is_admin {
                 return Ok(());
@@ -2667,7 +4060,7 @@ async fn check_seller_channel_target(bot: &Bot, channel: &str, sender_id: i64) -
 /// OWN channel (`seller_channel`); the global default fallback is reserved
 /// for Admin/Owner, so a seller can never post/grant into a channel they do
 /// not control via the default config.
-fn channel_of(db: &Db, cfg: &Config, seller_id: Option<i64>, is_admin: bool) -> String {
+fn channel_of(db: &Db, _cfg: &SharedConfig, seller_id: Option<i64>, is_admin: bool) -> String {
     if let Some(sid) = seller_id
         && let Some(c) = db.seller_channel(sid)
     {
@@ -2676,9 +4069,7 @@ fn channel_of(db: &Db, cfg: &Config, seller_id: Option<i64>, is_admin: bool) -> 
     if !is_admin {
         return String::new();
     }
-    db.get_config("channel")
-        .or_else(|| cfg.default_channel.clone())
-        .unwrap_or_default()
+    db.get_config("channel").unwrap_or_default()
 }
 
 /// Resolve the target channel for a channel-scoped command, enforcing seller
@@ -2690,7 +4081,7 @@ fn channel_of(db: &Db, cfg: &Config, seller_id: Option<i64>, is_admin: bool) -> 
 /// is a ready-to-send one-line reply for the caller.
 fn resolve_target_channel(
     db: &Db,
-    cfg: &Config,
+    cfg: &SharedConfig,
     user_id: i64,
     is_admin: bool,
     explicit: Option<String>,
@@ -2966,7 +4357,26 @@ pub(crate) fn parse_order_set(input: &str) -> Option<(&str, &str, Option<String>
     Some((parts[0], parts[1], tracking))
 }
 
-/// Parse `/gencodes plan | count | [days]`; count defaults to 1 and bad
+/// Parse `/cartadd name [qty]`: if the last whitespace token is an integer,
+/// treat it as qty; otherwise qty defaults to 1 and the whole input is the name.
+pub(crate) fn parse_cart_add_arg(input: &str) -> (&str, i64) {
+    let input = input.trim();
+    if input.is_empty() {
+        return ("", 1);
+    }
+    // Find last whitespace boundary.
+    if let Some(pos) = input.rfind(char::is_whitespace) {
+        let (head, tail) = input.split_at(pos);
+        let tail = tail.trim();
+        if let Ok(q) = tail.parse::<i64>() {
+            let head = head.trim();
+            if !head.is_empty() {
+                return (head, q);
+            }
+        }
+    }
+    (input, 1)
+}
 /// numbers fall back silently (count -> 1, days -> None).
 pub(crate) fn parse_gen_codes(input: &str) -> Option<(&str, usize, Option<i64>)> {
     let parts: Vec<&str> = input.split('|').map(|s| s.trim()).collect();
@@ -3089,7 +4499,7 @@ async fn handle_crypto(
     bot: &Bot,
     chat_id: teloxide::types::ChatId,
     db: &Db,
-    cfg: &Config,
+    cfg: &SharedConfig,
     crypto: Option<Arc<CryptoPay>>,
     user_id: i64,
     arg: &str,
@@ -3248,7 +4658,11 @@ async fn handle_crypto(
     Ok(())
 }
 
-fn crypto_or_load(db: &Db, cfg: &Config, crypto: Option<Arc<CryptoPay>>) -> Option<Arc<CryptoPay>> {
+fn crypto_or_load(
+    db: &Db,
+    cfg: &SharedConfig,
+    crypto: Option<Arc<CryptoPay>>,
+) -> Option<Arc<CryptoPay>> {
     if crypto.is_some() {
         return crypto;
     }
@@ -3505,7 +4919,7 @@ async fn handle_payout_approve(
 #[tracing::instrument(skip_all)]
 async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
     use teloxide::types::BotCommand;
-    let cmds = vec![
+    let _cmds = vec![
         BotCommand::new("help", "Show help"),
         BotCommand::new("menu", "Main menu"),
         BotCommand::new("channel", "Show target channel"),
@@ -3529,6 +4943,11 @@ async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
         BotCommand::new("productdel", "Deactivate a product"),
         BotCommand::new("shop", "Browse the shop"),
         BotCommand::new("buy", "Buy a plan or product"),
+        BotCommand::new("cart", "Show shopping cart"),
+        BotCommand::new("cartadd", "Add item to cart"),
+        BotCommand::new("cartremove", "Remove item from cart"),
+        BotCommand::new("cartclear", "Clear cart"),
+        BotCommand::new("checkout", "Checkout cart"),
         BotCommand::new("paid", "Claim payment"),
         BotCommand::new("redeem", "Redeem activation code"),
         BotCommand::new("gencodes", "Generate activation codes"),
@@ -3549,8 +4968,13 @@ async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
         BotCommand::new("aipost", "AI-assisted post"),
         BotCommand::new("refundapprove", "Approve a pending refund"),
         BotCommand::new("payoutapprove", "Approve a pending payout"),
+        BotCommand::new("promocreate", "Create a promo code (sellers)"),
+        BotCommand::new("promolist", "List promo codes"),
+        BotCommand::new("promodel", "Revoke a promo code"),
+        BotCommand::new("promo", "Apply a promo code"),
+        BotCommand::new("exportdata", "Export buyer data (owner)"),
+        BotCommand::new("deletedata", "Delete buyer data (owner)"),
     ];
-    bot.set_my_commands(cmds).await?;
     bot.set_my_description()
         .description(
             "Telegram shop: digital products, channel memberships, codes and bookings. Browse /shop — buy with /buy.",
@@ -3586,322 +5010,4 @@ async fn grant_access(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_add_parses() {
-        assert_eq!(
-            parse_plan_add("Gold | 9.9 | USDT | 30"),
-            Ok(("Gold", "9.9", "USDT", 30))
-        );
-        assert_eq!(parse_plan_add("p|1|USDT|1"), Ok(("p", "1", "USDT", 1)));
-        assert_eq!(
-            parse_plan_add("p | 1 | USDT | 3650"),
-            Ok(("p", "1", "USDT", MAX_PLAN_DAYS))
-        );
-    }
-
-    #[test]
-    fn plan_add_rejects() {
-        // bad numbers and boundary days: 0 and 3651 are outside 1..=3650
-        for bad in ["0", "3651", "abc", "", "-1"] {
-            assert_eq!(
-                parse_plan_add(&format!("p | 1 | USDT | {}", bad)),
-                Err(PlanAddError::Days(bad.to_string()))
-            );
-        }
-        assert_eq!(parse_plan_add("p | 1 | USDT"), Err(PlanAddError::Usage));
-        assert_eq!(parse_plan_add(""), Err(PlanAddError::Usage));
-    }
-
-    #[test]
-    fn product_add_valid() {
-        assert_eq!(
-            parse_product_add("VPN | 5 | USDT | digital_link | https://ex.co | 10"),
-            Ok((
-                "VPN",
-                "5",
-                "USDT",
-                "digital_link",
-                Some("https://ex.co"),
-                Some(10)
-            ))
-        );
-        // '-' delivery and '-' / blank / omitted stock all mean None
-        assert_eq!(
-            parse_product_add("Box | 3 | TON | physical | - | -"),
-            Ok(("Box", "3", "TON", "physical", None, None))
-        );
-        assert_eq!(
-            parse_product_add("Box | 3 | TON | physical | - |"),
-            Ok(("Box", "3", "TON", "physical", None, None))
-        );
-    }
-
-    #[test]
-    fn product_add_invalid() {
-        // missing delivery field / empty name
-        assert_eq!(
-            parse_product_add("VPN | 5 | USDT | digital_link"),
-            Err(ProductAddError::Usage)
-        );
-        assert_eq!(
-            parse_product_add(" | 5 | USDT | physical | d"),
-            Err(ProductAddError::Usage)
-        );
-        assert_eq!(
-            parse_product_add("n | 1 | USDT | ebook | d"),
-            Err(ProductAddError::Kind("ebook".into()))
-        );
-        assert_eq!(
-            parse_product_add("n | 1 | USDT | digital_file | -"),
-            Err(ProductAddError::Delivery)
-        );
-        assert_eq!(
-            parse_product_add("n | 1 | USDT | physical | d | x"),
-            Err(ProductAddError::Stock("x".into()))
-        );
-    }
-
-    #[test]
-    fn order_set_parses() {
-        assert_eq!(parse_order_set("A1 shipped"), Some(("A1", "shipped", None)));
-        assert_eq!(
-            parse_order_set("  A1   shipped  RR123 left depot "),
-            Some(("A1", "shipped", Some("RR123 left depot".to_string())))
-        );
-        assert_eq!(parse_order_set("A1"), None);
-        assert_eq!(parse_order_set(""), None);
-    }
-
-    #[test]
-    fn gen_codes_parses() {
-        assert_eq!(
-            parse_gen_codes("basic | 5 | 30"),
-            Some(("basic", 5, Some(30)))
-        );
-        assert_eq!(parse_gen_codes("basic"), Some(("basic", 1, None)));
-        assert_eq!(parse_gen_codes("basic | x | y"), Some(("basic", 1, None)));
-        assert_eq!(parse_gen_codes(" | 5 | 30"), None);
-    }
-
-    #[test]
-    fn split_channel_arg_variants() {
-        assert_eq!(
-            split_channel_arg("@chan rest here"),
-            (Some("@chan".into()), "rest here")
-        );
-        assert_eq!(
-            split_channel_arg("-100123 rest"),
-            (Some("-100123".into()), "rest")
-        );
-        assert_eq!(split_channel_arg("just text"), (None, "just text"));
-        assert_eq!(split_channel_arg(""), (None, ""));
-    }
-
-    #[test]
-    fn schedule_datetime_formats() {
-        assert_eq!(
-            parse_schedule_datetime("2026-01-02T03:04:05Z"),
-            Some("2026-01-02T03:04:05+00:00".into())
-        );
-        assert_eq!(
-            parse_schedule_datetime("2026-01-02 03:04"),
-            Some("2026-01-02T03:04:00+00:00".into())
-        );
-        assert_eq!(
-            parse_schedule_datetime("2026-01-02"),
-            Some("2026-01-02T00:00:00+00:00".into())
-        );
-        assert_eq!(parse_schedule_datetime("tomorrow"), None);
-    }
-
-    // ---- resolve_target_channel: seller tenancy on channel-scoped commands ----
-
-    fn chan_cfg() -> Config {
-        Config {
-            bot_token: "0:setup-placeholder".to_string(),
-            owner_id: 1,
-            db_path: String::new(),
-            default_channel: None,
-            crypto_token: None,
-            ai_enabled: false,
-            ai_provider: "openai".to_string(),
-            ai_api_style: "openai".to_string(),
-            ai_base_url: "https://api.openai.com/v1".to_string(),
-            ai_api_key: None,
-            ai_model: "gpt-4o-mini".to_string(),
-            ai_daily_token_budget: None,
-            mcp_owner_token: None,
-        }
-    }
-
-    fn chan_db() -> (tempfile::TempDir, Db) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::new(dir.path().join("chan.db").to_str().unwrap()).unwrap();
-        (dir, db)
-    }
-
-    #[test]
-    fn target_channel_seller_locked_to_own() {
-        // A seller may only target their own seller_channel: an explicit
-        // @channel matching their own is accepted, any other channel is
-        // rejected, and the no-channel case fails closed with the
-        // /setchannel hint — with or without an explicit argument.
-        let (_d, db) = chan_db();
-        let cfg = chan_cfg();
-        db.set_seller_channel(7, "@mine");
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 7, false, None),
-            Ok("@mine".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 7, false, Some("@mine".into())),
-            Ok("@mine".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 7, false, Some("@other".into())),
-            Err("You can only target your own channel. Set it with /setchannel.".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 8, false, None),
-            Err("No channel set. Use /setchannel @channel first.".to_string())
-        );
-        assert!(
-            resolve_target_channel(&db, &cfg, 8, false, Some("@other".into())).is_err(),
-            "an unconfigured seller may not pass an explicit channel"
-        );
-    }
-
-    #[test]
-    fn target_channel_admin_keeps_explicit_wins() {
-        // Admin/Owner: the explicit argument wins verbatim (any channel the
-        // bot is a member of), otherwise the channel_of fallback chain —
-        // with the caller's own seller channel still taking precedence over
-        // the global default. Sellers never inherit the global default.
-        let (_d, db) = chan_db();
-        let cfg = chan_cfg();
-        db.set_config("channel", "@global");
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 1, true, Some("@any".into())),
-            Ok("@any".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 1, true, None),
-            Ok("@global".to_string())
-        );
-        // An admin who also owns a seller channel: explicit still wins, and
-        // without an argument their own channel comes before the global.
-        db.set_seller_channel(1, "@mine");
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 1, true, Some("@any".into())),
-            Ok("@any".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 1, true, None),
-            Ok("@mine".to_string())
-        );
-        assert_eq!(
-            resolve_target_channel(&db, &cfg, 9, false, None),
-            Err("No channel set. Use /setchannel @channel first.".to_string())
-        );
-    }
-
-    // ---- /buy resolution over the (seller_id, name) plan namespace ----
-
-    fn buy_db() -> (tempfile::TempDir, Db) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::new(dir.path().join("buy.db").to_str().unwrap()).unwrap();
-        (dir, db)
-    }
-
-    #[test]
-    fn buy_resolution_is_seller_scoped() {
-        // Cross-seller plan isolation (2026-10-25 review HIGH): two sellers
-        // may both define "pro" and each resolves only their own; a name
-        // unique to another seller is invisible from the wrong namespace.
-        let (_d, db) = buy_db();
-        db.add_plan(1, "pro", "10", "USDT", 30, None);
-        db.add_plan(2, "pro", "20", "USDT", 30, None);
-        let (plans, products) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "pro");
-        assert!(products.is_empty());
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].1, "10");
-        assert_eq!(plans[0].6, 1);
-        let (plans2, _) = resolve_buy_candidates(&db, roles::Role::Seller, 2, "pro");
-        assert_eq!(plans2[0].1, "20");
-        db.add_plan(2, "solo", "5", "TON", 7, None);
-        let (solo, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "solo");
-        assert!(solo.is_empty(), "seller 1 must not resolve seller 2's plan");
-        // Same isolation for products (the /buy multiplex resolves both).
-        db.add_product(2, "widget", "3", "TON", "digital_link", Some("l"), None)
-            .unwrap();
-        let (p, w) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "widget");
-        assert!(p.is_empty() && w.is_empty());
-        let (_, w2) = resolve_buy_candidates(&db, roles::Role::Seller, 2, "widget");
-        assert_eq!(w2.len(), 1);
-    }
-
-    #[test]
-    fn buy_resolution_global_namespace_admin_owner_only() {
-        // The global (seller_id = 0) namespace — legacy rows and admin-created
-        // catalogue entries — is resolvable only by Admin/Owner (B5).
-        let (_d, db) = buy_db();
-        db.add_plan(0, "legacy", "3", "USDT", 30, None);
-        let (p_user, _) = resolve_buy_candidates(&db, roles::Role::User, 7, "legacy");
-        assert!(
-            p_user.is_empty(),
-            "plain users cannot resolve the global namespace"
-        );
-        let (p_seller, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "legacy");
-        assert!(
-            p_seller.is_empty(),
-            "sellers cannot resolve the global namespace"
-        );
-        let (p_admin, _) = resolve_buy_candidates(&db, roles::Role::Admin, 1, "legacy");
-        assert_eq!(p_admin.len(), 1);
-        assert_eq!(p_admin[0].6, 0);
-        let (p_owner, _) = resolve_buy_candidates(&db, roles::Role::Owner, 1, "legacy");
-        assert_eq!(p_owner.len(), 1);
-    }
-
-    #[test]
-    fn buy_resolution_plain_user_shop_fallback_excludes_global() {
-        // Public-mode /buy (README "Two modes"): a plain buyer falls back to
-        // the cross-seller active shop view, minus the global namespace,
-        // and the Owner may resolve any seller's entry by name.
-        let (_d, db) = buy_db();
-        db.add_plan(1, "vip", "9", "USDT", 30, None);
-        db.add_plan(0, "gplan", "1", "USDT", 7, None);
-        let (p, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "vip");
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[0].6, 1);
-        let (g, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "gplan");
-        assert!(
-            g.is_empty(),
-            "global namespace excluded from the shop fallback"
-        );
-        // Owner superuser ("owner can" in the review's test spec): any seller.
-        let (o, _) = resolve_buy_candidates(&db, roles::Role::Owner, 999, "vip");
-        assert_eq!(o.len(), 1);
-        assert_eq!(o[0].6, 1);
-    }
-
-    #[test]
-    fn buy_resolution_ambiguous_name_still_reports_both() {
-        // Seller-disambiguation syntax is deferred (v1.2 record): an
-        // ambiguous name for a plain buyer returns multiple candidates so the
-        // handler errors out instead of silently picking one.
-        let (_d, db) = buy_db();
-        db.add_plan(1, "dup", "1", "USDT", 7, None);
-        db.add_plan(2, "dup", "2", "TON", 7, None);
-        let (p, _) = resolve_buy_candidates(&db, roles::Role::User, 42, "dup");
-        assert_eq!(p.len(), 2);
-        // A seller with their own "dup" is never ambiguous: own namespace wins.
-        db.add_plan(1, "dup", "3", "USDT", 7, None);
-        let (p1, _) = resolve_buy_candidates(&db, roles::Role::Seller, 1, "dup");
-        assert_eq!(p1.len(), 1);
-        assert_eq!(p1[0].1, "3");
-    }
-}
+mod tests;

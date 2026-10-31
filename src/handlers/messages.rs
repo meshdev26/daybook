@@ -1,22 +1,25 @@
-use crate::{config::Config, db::Db, dialogue::State, roles, util};
+use crate::{bots::BotContext, config::SharedConfig, db::Db, dialogue::State, roles, util};
 use std::sync::Arc;
 use teloxide::{prelude::*, types::InputFile};
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn awaiting_photo_handler(
-    bot: Bot,
+    _bot: Bot,
     msg: Message,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     db: Arc<Db>,
-    cfg: Config,
+    _cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
+    _owner_id: i64,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     // /postphoto is a seller command, so this dialogue handler must accept
     // seller+ too. It previously required admin, silently dropping every
     // seller's photo. Plain users can never be in the AwaitingPhoto state
     // (the /postphoto gate excludes them) and are still ignored here.
-    let role = roles::role_of(&db, user_id, cfg.owner_id);
+    let role = roles::role_of(&db, user_id, bot_ctx.owner_id);
     if role < roles::Role::Seller {
         return Ok(());
     }
@@ -37,7 +40,6 @@ pub async fn awaiting_photo_handler(
     let ch = if role >= roles::Role::Admin {
         db.get_config("pending_channel")
             .or_else(|| db.get_config("channel"))
-            .or_else(|| cfg.default_channel.clone())
             .unwrap_or_default()
     } else {
         db.seller_channel(user_id).unwrap_or_default()
@@ -66,7 +68,8 @@ pub async fn awaiting_photo_handler(
             }
             match req.await {
                 Ok(sent) => {
-                    let _ = db.log_post(user_id, &ch, sent.id.0, "photo", caption.as_deref());
+                    let _ =
+                        db.log_post(user_id, &ch, sent.id.0, "photo", caption.as_deref(), "bot");
                     bot.send_message(
                         msg.chat.id,
                         format!("Photo posted. message_id={}", sent.id.0),
@@ -90,13 +93,15 @@ pub async fn awaiting_photo_handler(
 }
 
 pub async fn awaiting_ai_post_edit_handler(
-    bot: Bot,
+    _bot: Bot,
     msg: Message,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     db: Arc<Db>,
-    _cfg: Config,
+    _cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
     draft_id: i64,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     let _user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     if let Some(text) = msg.text()
         && text == "/cancel"
@@ -136,13 +141,15 @@ pub async fn awaiting_ai_post_edit_handler(
 }
 
 pub async fn awaiting_ai_post_confirm_handler(
-    bot: Bot,
+    _bot: Bot,
     msg: Message,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     db: Arc<Db>,
-    _cfg: Config,
+    _cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
     draft_id: i64,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     if let Some(text) = msg.text()
         && text == "/cancel"
     {
@@ -160,12 +167,14 @@ pub async fn awaiting_ai_post_confirm_handler(
 }
 
 pub async fn crypto_invoice_handler(
-    bot: Bot,
+    _bot: Bot,
     msg: Message,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     _db: Arc<Db>,
-    _cfg: Config,
+    _cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     // Minimal: cancel support; wizard optional. Exit on any input.
     if let Some(text) = msg.text()
         && text == "/cancel"

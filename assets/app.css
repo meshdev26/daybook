@@ -55,6 +55,8 @@
   --danger: #A6392F;        /* brick */
   --danger-ink: #FFFFFF;    /* text on --danger (6.46:1) */
   --danger-tint: #F7E9E7;
+  --accent: var(--brand);
+  --modal-shadow: 0 16px 40px rgba(10, 16, 12, 0.25);
   /* structure */
   --rail-w: 232px;
   --radius-ctl: 7px;        /* controls */
@@ -82,6 +84,8 @@
   --danger: #E07A6E;
   --danger-ink: #0D1511;    /* text on --danger (6.34:1) */
   --danger-tint: #33201D;
+  --accent: var(--brand);
+  --modal-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -92,6 +96,7 @@
     --brand-tint: #1C2B23;
     --ok: #4FBE8F; --warn: #D9A94F; --warn-tint: #2C2519;
     --danger: #E07A6E; --danger-ink: #0D1511; --danger-tint: #33201D;
+    --accent: var(--brand); --modal-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
   }
 }
 
@@ -137,6 +142,43 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail .brand b { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.2; }
 .rail .brand small { display: block; font-size: 11px; color: var(--ink-3); font-weight: 400; }
 .rail .group { font-size: 11.5px; font-weight: 600; color: var(--ink-3); padding: 14px 10px 6px; }
+/* ---- collapsible rail nav groups ---------------------------------------- */
+.nav-group { margin: 0; }
+.nav-group-toggle {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 14px 10px 6px; border: 0; background: transparent;
+  font: inherit; font-size: 11.5px; font-weight: 600; color: var(--ink-3);
+  cursor: pointer; text-align: left;
+}
+.nav-group-toggle:hover { background: var(--surface-2); border-radius: var(--radius-ctl); color: var(--ink); }
+.nav-group-toggle:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 2px; }
+.nav-chevron { width: 12px; height: 12px; flex: none; color: currentColor; transition: transform 180ms ease; }
+.nav-group.is-collapsed .nav-chevron { transform: rotate(-90deg); }
+.nav-group-panel {
+  max-height: 500px; overflow: hidden;
+  transition: max-height 180ms ease;
+  padding: 2px 0 6px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.nav-group.is-collapsed .nav-group-panel {
+  max-height: 0; overflow: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-chevron, .nav-group-panel { transition: none; }
+}
+/* bot scope control: selector for the global owner, pinned label otherwise */
+.rail .bot-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 10px 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.rail .bot-scope label { font-size: 11.5px; font-weight: 600; color: var(--ink-3); }
+.rail .bot-scope select { width: 100%; font-size: 13px; }
+.rail .bot-scope .btn { align-self: flex-start; }
+.rail .bot-scope-pinned span.mono { font-size: 13px; color: var(--ink); }
 .rail nav a {
   display: flex;
   align-items: center;
@@ -177,6 +219,8 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .door .brand b { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
 .door .panel { width: 100%; max-width: 560px; }
 .door .panel.narrow { max-width: 420px; }
+.door { position: relative; }
+.door .theme-toggle { position: absolute; top: 16px; right: 16px; }
 
 /* ---- panels -------------------------------------------------------------- */
 article, .panel {
@@ -189,12 +233,24 @@ article, .panel {
 .card, article, .panel { box-shadow: none; }
 .card h3, article h3, .panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
 .card p, article p, .panel p { color: var(--ink-2); }
+a.panel { color: inherit; text-decoration: none; }
+a.panel:hover { text-decoration: none; }
+a.panel:hover h3 { color: var(--brand); }
 
 /* section heading inside content */
 h1 { font-size: 21px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 4px; }
 h2 { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 10px; }
 h3 { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
 p { margin: 0 0 8px; }
+/* Standalone subtitle: inside an h1 it de-emphasizes the run-on title;
+ * bare (div.sub/h2.sub) it labels a fact line. h2.sub usages are being
+ * removed per-page (B4/B5/B11) — this rule is the safety net. */
+.sub {
+  color: var(--ink-2);
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
 code {
   font-family: var(--font-data);
   font-size: 0.92em;
@@ -227,6 +283,28 @@ code.copyable {
 }
 .qr svg { display: block; }
 
+/* ---- checkboxes ----------------------------------------------------------- */
+input[type="checkbox"] {
+  width: auto;
+  margin: 0 6px 0 0;
+  vertical-align: middle;
+}
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* checkbox nested inside its label (settings toggles, etc.): keep inline
+   control and label text aligned without the field-label block rhythm. */
+label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+label.check input[type="checkbox"],
+label:has(> input[type="checkbox"]) input[type="checkbox"] {
+  margin: 0;
+}
 /* ---- forms ---------------------------------------------------------------- */
 label {
   display: block;
@@ -256,7 +334,14 @@ input:focus, select:focus, textarea:focus {
 textarea { min-height: 96px; resize: vertical; }
 form button[type="submit"] { margin-top: 16px; }
 .help { font-size: 12px; color: var(--ink-3); margin: 2px 0 0; }
+
+/* Collapsed long-form help (MANAGEMENT_DISCLOSURE_SPEC §4) */
+.help-more { margin: 2px 0 0; }
+.help-more summary { padding: 2px 0; font-size: 12px; font-weight: 500; color: var(--ink-3); }
+.help-more[open] summary { margin-bottom: 4px; }
 .form-row { display: grid; gap: 0 16px; grid-template-columns: 1fr 1fr; }
+/* Compact numeric entry inside table rows and inline forms. */
+.input-num { width: 4.5em; min-width: 4.5em; margin-top: 0; }
 
 /* ---- secret fields: password/token inputs with a reveal toggle -------------
  * Wrapper follows the field's <label> as a sibling (the toggle button must
@@ -284,6 +369,7 @@ form button[type="submit"] { margin-top: 16px; }
 .secret-toggle:hover { background: var(--surface-2); color: var(--ink); }
 .secret-toggle:active { transform: none; } /* no press-lift inside the field */
 .secret-toggle svg { width: 18px; height: 18px; }
+.secret-toggle { min-width: 44px; }
 .secret-toggle .icon-eye-off { display: none; }
 .secret-toggle[aria-pressed="true"] { color: var(--ink); }
 .secret-toggle[aria-pressed="true"] .icon-eye { display: none; }
@@ -333,13 +419,24 @@ article ul li, .panel ul li, .rows li {
 }
 article ul li:last-child, .panel ul li:last-child, .rows li:last-child { border-bottom: none; }
 .rows li .row-action { margin-left: auto; }
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.row-actions .btn {
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
 .mono { font-family: var(--font-data); font-size: 13px; }
 /* ---- metric card (.stat) -------------------------------------------------- */
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat-value {
   font-family: var(--font-data);
   font-size: 24px;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
   color: var(--ink);
@@ -347,6 +444,7 @@ article ul li:last-child, .panel ul li:last-child, .rows li:last-child { border-
 .stat-label { font-size: 12px; color: var(--ink-2); font-weight: 500; }
 
 /* ---- tables ------------------------------------------------------------------ */
+.table-wrap:focus { outline: 2px solid var(--accent); }
 .table-wrap {
   overflow-x: auto;
   background: var(--surface);
@@ -431,12 +529,51 @@ details summary::before { content: "▸ "; color: var(--ink-3); }
 details[open] summary::before { content: "▾ "; }
 details ol { margin: 0; padding: 4px 14px 14px 34px; }
 details li { font-size: 13.5px; margin-bottom: 7px; }
+details { margin: 0 0 12px; }
+li details { margin-bottom: 0; }            /* AI recent-errors rows keep tight */
+/* Settings accordion body: the white card attaches flat to its summary. */
+details > article.panel {
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+}
 
 /* ---- misc ---------------------------------------------------------------------------- */
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 @media (max-width: 1100px) { .grid-2 { grid-template-columns: 1fr; } }
 .grid-2 .panel, .grid-2 article { margin-bottom: 0; }
-.inline-form { display: inline; }
+/* Metric-card rows: auto-fit keeps cards equal-width at any count. */
+.grid-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+  align-items: stretch;
+  margin-bottom: 16px;
+}
+.grid-stats .panel { margin-bottom: 0; }
+.inline-form { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; vertical-align: middle; }
+.inline-form input:not([type="hidden"]) { width: auto; min-width: 10rem; }
+/* ---- bot cards (Bot management v2) ---------------------------------------- */
+/* Collapsed accordion cards (MANAGEMENT_DISCLOSURE_SPEC §2): the summary is
+   the card header; form + actions live in the expanded body. */
+details.bot-card { display: block; padding: 0; } /* .panel surface, padding moves to summary/body */
+details.bot-card > summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 14px 18px;
+}
+details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.bot-card-owner, .bot-card-hint { color: var(--ink-3); font-size: 12px; }
+.bot-card-hint { margin-left: auto; }
+.bot-card-body {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px 18px 18px;
+  border-top: 1px solid var(--line);
+}
+.bot-card-form { display: grid; gap: 12px 16px; }
+.bot-card-form label { margin: 0; }
+.bot-card-form input { margin: 4px 0 0; }
+.bot-card-form button[type="submit"] { margin-top: 4px; justify-self: start; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 14px; font-size: 13.5px; }
 .kv dt { color: var(--ink-2); }
 .kv dd { margin: 0; }
@@ -452,7 +589,7 @@ details li { font-size: 13.5px; margin-bottom: 7px; }
   border-radius: var(--radius-panel);
   padding: 24px;
   max-width: 480px; width: 92%;
-  box-shadow: 0 16px 40px rgba(10, 16, 12, 0.25);
+  box-shadow: var(--modal-shadow);
 }
 .sr-only {
   position: absolute; width: 1px; height: 1px;
@@ -470,9 +607,14 @@ details li { font-size: 13.5px; margin-bottom: 7px; }
   z-index: 100;
 }
 
+/* Unsized onboarding SVG icons: keep them on the 16px grid so the
+ * checklist rows don't collapse vertically. */
+.icon-check, .icon-empty { width: 16px; height: 16px; flex-shrink: 0; }
+
 /* legacy wrapper kept so un-migrated fragments stay presentable */
 .container { max-width: var(--measure); margin: 0 auto; padding: 28px 24px 60px; }
 
+@media (max-width: 900px) { .btn-sm, .rail a, .secret-toggle { min-height: 44px; } }
 /* ---- responsive ------------------------------------------------------------------------ */
 @media (max-width: 900px) {
   .shell { flex-direction: column; }
@@ -484,12 +626,38 @@ details li { font-size: 13.5px; margin-bottom: 7px; }
   }
   .rail .brand { border: none; padding: 0 10px 0 0; margin: 0; }
   .rail .group { display: none; }
+  .nav-group-toggle { display: none; }
+  .nav-group, .nav-group-panel { display: contents; }
+  .nav-group-panel { max-height: none; opacity: 1; overflow: visible; }
   .rail nav { display: flex; flex-wrap: wrap; gap: 2px; }
   .rail .foot { margin: 0 0 0 auto; padding: 0; border: none; }
   .main { padding: 20px 16px 48px; }
   .form-row { grid-template-columns: 1fr; }
+  .rail .bot-scope {
+    flex-direction: row; align-items: center;
+    flex: 1 1 100%; gap: 8px;
+    padding: 4px 0 8px;
+  }
+  .rail .bot-scope select { flex: 1 1 auto; width: auto; min-width: 8rem; }
+  .rail .bot-scope .btn { align-self: center; }
 }
+@media (max-width: 900px) { .kv { grid-template-columns: 1fr; gap: 2px 0; } .kv dt { margin-top: 8px; } }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
   html { scroll-behavior: auto; }
 }
+
+/* ---- Identity: unlock-banner inline form (IDENTITY_UX_SPEC §9) -----------
+ * .alert is a flex row and the shipped `input { width: 100% }` breaks inside
+ * it; this keeps the banner's field row inline (wrap allowed, input flexes,
+ * 44px height). The only new CSS the Identity spec authorizes. */
+.alert-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; }
+.alert-form input { flex: 1 1 220px; width: auto; min-height: 44px; }
+
+/* ---- Identity Monitor: read-only timeline (IDENTITY_MONITOR_UX_SPEC §3.2) -
+ * Global CSS resets ul but not ol; without this block the timeline renders
+ * with browser-default numbering and no ledger dividers. */
+.timeline { margin: 4px 0 0; padding-left: 20px; }
+.timeline li { border-bottom: 1px solid var(--line); padding: 10px 0; }
+.timeline li:last-child { border-bottom: none; }
+.timeline .timeline, .timeline ol { margin-top: 6px; padding-left: 18px; }

@@ -20,21 +20,25 @@ permission:
   edit:
     "src/main.rs": allow
     "src/handlers/commands.rs": allow
+    "src/handlers/commands/**": allow
     "src/handlers/messages.rs": allow
     "src/handlers/mod.rs": allow
     "src/dialogue.rs": allow
     "src/roles.rs": allow
     "src/api.rs": allow
+    "src/api/**": allow
     "src/ai/**": allow
     "schema.sql": allow
   write:
     "src/main.rs": allow
     "src/handlers/commands.rs": allow
+    "src/handlers/commands/**": allow
     "src/handlers/messages.rs": allow
     "src/handlers/mod.rs": allow
     "src/dialogue.rs": allow
     "src/roles.rs": allow
     "src/api.rs": allow
+    "src/api/**": allow
     "src/ai/**": allow
     "schema.sql": allow
 territory:
@@ -43,6 +47,7 @@ territory:
   - src/dialogue.rs
   - src/roles.rs
   - src/api.rs
+  - src/api/**
   - src/ai/**
   - schema.sql
 ---

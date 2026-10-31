@@ -1,4 +1,4 @@
-use crate::{config::Config, db::Db, dialogue::State, roles, util};
+use crate::{bots::BotContext, config::SharedConfig, db::Db, dialogue::State, roles, util};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::CallbackQuery;
@@ -6,12 +6,15 @@ use teloxide::types::CallbackQuery;
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn callback_handler(
-    bot: Bot,
+    _bot: Bot,
     q: CallbackQuery,
     dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
     db: Arc<Db>,
-    cfg: Config,
+    _cfg: SharedConfig,
+    bot_ctx: Arc<BotContext>,
+    _owner_id: i64,
 ) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
     let Some(data) = q.data.as_deref() else {
         bot.answer_callback_query(q.id.clone()).await?;
         return Ok(());
@@ -50,7 +53,7 @@ pub async fn callback_handler(
         };
         // Only the draft's author or an admin/owner may act on it.
         let presser_id = q.from.id.0 as i64;
-        let role = roles::role_of(&db, presser_id, cfg.owner_id);
+        let role = roles::role_of(&db, presser_id, bot_ctx.owner_id);
         let is_admin = role >= roles::Role::Admin;
         if !is_admin && presser_id != seller_id {
             bot.answer_callback_query(q.id.clone())
@@ -78,7 +81,14 @@ pub async fn callback_handler(
                     .await
                 {
                     Ok(sent) => {
-                        let _ = db.log_post(seller_id, &channel, sent.id.0, "text", Some(&content));
+                        let _ = db.log_post(
+                            seller_id,
+                            &channel,
+                            sent.id.0,
+                            "text",
+                            Some(&content),
+                            "bot",
+                        );
                         let _ = db.mark_ai_post_draft_published(draft_id, sent.id.0 as i64);
                         let _ = dialogue.exit().await;
                         bot.send_message(
@@ -132,7 +142,7 @@ pub async fn callback_handler(
     // in their register instead of handing them seller instructions. The
     // buyer keyboard buttons (menu:shop / menu:plans / menu:help) are sent by
     // commands.rs buyer_menu_kb().
-    let role = roles::role_of(&db, q.from.id.0 as i64, cfg.owner_id);
+    let role = roles::role_of(&db, q.from.id.0 as i64, bot_ctx.owner_id);
     let buyer = role == roles::Role::User;
     let seller_only = "That action is for sellers. Browse /shop and /plans to buy.";
     let text = match data {

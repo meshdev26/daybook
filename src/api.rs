@@ -41,7 +41,7 @@ fn session_or_401(
     state: &WebState,
     headers: &HeaderMap,
 ) -> Result<crate::web::Session, (StatusCode, Json<ApiError>)> {
-    crate::web::session_from_headers(state, headers).ok_or_else(|| {
+    crate::auth::session_from_headers(state, headers).ok_or_else(|| {
         err(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -135,7 +135,7 @@ struct LoginResp {
 
 async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> impl IntoResponse {
     // Records this attempt up-front; a successful login clears it below.
-    if crate::web::login_throttle(&state.login_attempts, &f.username, 5, 900) {
+    if crate::auth::login_throttle(&state.login_attempts, &f.username, 5, 900) {
         return err(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_attempts",
@@ -145,7 +145,7 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
     }
     match state.db.verify_web_password(&f.username, &f.password).await {
         Some((account_id, role, seller_id)) => {
-            crate::web::login_ok(&state.login_attempts, &f.username);
+            crate::auth::login_ok(&state.login_attempts, &f.username);
             // MFA parity with the web login (web::login_submit): a correct
             // password alone never mints a session for a TOTP-enabled or
             // privileged account.
@@ -276,7 +276,7 @@ async fn auth_mfa_verify(
     // Throttle per pending token with the shared web map (5 failures / 900s),
     // same key shape as the web flow; a success clears the counter below.
     let throttle_key = format!("mfa:{}", f.pending_token);
-    if crate::web::login_throttle(&state.login_attempts, &throttle_key, 5, 900) {
+    if crate::auth::login_throttle(&state.login_attempts, &throttle_key, 5, 900) {
         return err(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_attempts",
@@ -289,14 +289,18 @@ async fn auth_mfa_verify(
     let mut ok = false;
     if enabled && code.chars().all(|c| c.is_ascii_digit()) && code.len() == 6 {
         let now_ts = chrono::Utc::now().timestamp() as u64;
-        let current_counter = (now_ts / 30) as i64;
-        let generated =
-            crate::util::totp_generate(&secret.clone().unwrap_or_default(), now_ts, 6usize, 30u64);
-        if crate::util::ct_eq(&generated, code)
-            && last_used.map(|l| current_counter > l).unwrap_or(true)
-        {
-            ok = true;
-            let _ = state.db.update_totp_last_used(account_id, current_counter);
+        for delta in [-30i64, 0i64, 30i64] {
+            let ts = (now_ts as i64 + delta).max(0) as u64;
+            let counter = (ts / 30) as i64;
+            let generated =
+                crate::util::totp_generate(&secret.clone().unwrap_or_default(), ts, 6usize, 30u64);
+            if crate::util::ct_eq(&generated, code)
+                && last_used.map(|l| counter > l).unwrap_or(true)
+            {
+                ok = true;
+                let _ = state.db.update_totp_last_used(account_id, counter);
+                break;
+            }
         }
     }
     if !ok && state.db.verify_recovery_code(account_id, code) {
@@ -310,7 +314,7 @@ async fn auth_mfa_verify(
         )
         .into_response();
     }
-    crate::web::login_ok(&state.login_attempts, &throttle_key);
+    crate::auth::login_ok(&state.login_attempts, &throttle_key);
     let _ = state.db.delete_pending_mfa(&hash);
     let (id, _u, _h, role, seller_id) = state.db.get_web_account_by_id(account_id).unwrap_or((
         account_id,
@@ -338,7 +342,7 @@ async fn auth_mfa_verify(
 }
 
 async fn auth_logout(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(token) = crate::web::get_cookie(&headers) {
+    if let Some(token) = crate::auth::get_cookie(&headers) {
         state.db.delete_web_session(&token);
     }
     // Bearer token support
@@ -382,7 +386,7 @@ struct PasswordReq {
 /// (cookie first, then Bearer) so the password change can keep the caller's
 /// session while evicting every other session of the account.
 fn caller_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(t) = crate::web::get_cookie(headers) {
+    if let Some(t) = crate::auth::get_cookie(headers) {
         return Some(t);
     }
     headers
@@ -665,8 +669,11 @@ async fn seller_set_channel(
             )
             .into_response();
         } else {
-            // @handle: the seller must be an administrator of that chat.
-            match channel_admin_proof(&state.bot, &channel, session.seller_id).await {
+            // @handle: the seller must be an administrator of that chat. The
+            // proof runs through the session's effective bot, so the seller is
+            // probed by the bot that will actually post to their channel.
+            let proof_bot = crate::web::effective_bot(&state, &session);
+            match channel_admin_proof(&proof_bot.bot, &channel, session.seller_id).await {
                 ChannelProof::Proven => {}
                 ChannelProof::NotAdmin => {
                     return err(
@@ -870,9 +877,7 @@ async fn plans_create(
     };
     // Same bound as the bot's /planadd; also guards Db's unchecked
     // expires_at arithmetic (Duration::days) against overflow panics.
-    let days = f
-        .duration_days
-        .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+    let days = f.duration_days.clamp(1, crate::constants::MAX_PLAN_DAYS);
     state.db.add_plan(
         seller_id,
         &f.name,
@@ -948,7 +953,7 @@ async fn plans_update(
     let new_days = f
         .duration_days
         .unwrap_or(days)
-        .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+        .clamp(1, crate::constants::MAX_PLAN_DAYS);
     let new_channel = f.channel_id.or(channel);
     if let Some(active) = f.active {
         if !active {
@@ -1081,7 +1086,7 @@ async fn subs_create(
     let ch = f.channel_id.unwrap_or_default();
     // Clamp to the shared plan-day bound so Db's unchecked expires_at
     // arithmetic can never overflow-panic on a hostile `days`.
-    let days = f.days.clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+    let days = f.days.clamp(1, crate::constants::MAX_PLAN_DAYS);
     let sub_id = state.db.create_subscription(
         seller_id,
         f.user_id,
@@ -1347,7 +1352,7 @@ async fn codes_create(
     // expiry arithmetic when the code is redeemed.
     let value_days = f
         .value_days
-        .map(|d| d.clamp(1, crate::handlers::commands::MAX_PLAN_DAYS));
+        .map(|d| d.clamp(1, crate::constants::MAX_PLAN_DAYS));
     let length = f.length.unwrap_or(12).clamp(1, 32) as usize;
     let mut codes = Vec::new();
     for _ in 0..count {
@@ -1497,7 +1502,7 @@ async fn codes_redeem(
             if let Some(days) = value_days {
                 // Clamp defensively (legacy codes may predate bounds) so the
                 // subscription expiry math cannot overflow.
-                let days = days.clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+                let days = days.clamp(1, crate::constants::MAX_PLAN_DAYS);
                 let ch = state.db.seller_channel(seller_id).unwrap_or_default();
                 state
                     .db
@@ -1593,7 +1598,10 @@ async fn posts_create(
         )
         .into_response();
     }
-    let msg_id = match state
+    // Sends go out as the session's effective bot (seller → their bot, owner →
+    // selected bot, admin → their bot with primary fallback).
+    let bot = crate::web::effective_bot(&state, &session);
+    let msg_id = match bot
         .bot
         .send_message(crate::util::to_chat_id(&ch), f.text.clone())
         .await
@@ -1604,7 +1612,7 @@ async fn posts_create(
     let seller_id = session.seller_id.unwrap_or(0);
     let _ = state
         .db
-        .log_post(seller_id, &ch, msg_id, "text", Some(&f.text));
+        .log_post(seller_id, &ch, msg_id, "text", Some(&f.text), "bot");
     state.db.log_action(
         session.account_id,
         &session.role,
@@ -1718,7 +1726,8 @@ async fn posts_update(
     let new_content = f.content.or(f.text);
     if let Some(c) = &new_content {
         if p.3 != 0 {
-            let _ = state
+            let bot = crate::web::effective_bot(&state, &session);
+            let _ = bot
                 .bot
                 .edit_message_text(crate::util::to_chat_id(&p.2), MessageId(p.3), c.clone())
                 .await;
@@ -1747,7 +1756,8 @@ async fn posts_delete(
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
-        let _ = state
+        let bot = crate::web::effective_bot(&state, &session);
+        let _ = bot
             .bot
             .delete_message(crate::util::to_chat_id(&p.2), MessageId(p.3))
             .await;
@@ -1783,7 +1793,8 @@ async fn posts_pin(
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
-        let _ = state
+        let bot = crate::web::effective_bot(&state, &session);
+        let _ = bot
             .bot
             .pin_chat_message(crate::util::to_chat_id(&p.2), MessageId(p.3))
             .await;
@@ -1810,7 +1821,8 @@ async fn posts_unpin(
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
-        let _ = state
+        let bot = crate::web::effective_bot(&state, &session);
+        let _ = bot
             .bot
             .unpin_chat_message(crate::util::to_chat_id(&p.2))
             .message_id(MessageId(p.3))
@@ -1849,8 +1861,10 @@ async fn broadcasts(
         state.db.list_users()
     };
     let mut sent = 0i64;
+    // Broadcasts go out as the session's effective bot.
+    let bot = crate::web::effective_bot(&state, &session);
     for uid in recipients {
-        if state
+        if bot
             .bot
             .send_message(teloxide::types::ChatId(uid), f.text.clone())
             .await
@@ -1900,11 +1914,14 @@ async fn channels_patch(
         Err(e) => return e.into_response(),
     };
     let chat = crate::util::to_chat_id(&id);
+    // Channel metadata edits run as the session's effective bot (the bot that
+    // owns the seller's channel).
+    let bot = crate::web::effective_bot(&state, &session);
     if let Some(title) = &f.title {
-        let _ = state.bot.set_chat_title(chat.clone(), title.clone()).await;
+        let _ = bot.bot.set_chat_title(chat.clone(), title.clone()).await;
     }
     if let Some(desc) = &f.description {
-        let _ = state
+        let _ = bot
             .bot
             .set_chat_description(chat.clone())
             .description(desc.clone())
@@ -2133,9 +2150,6 @@ async fn channels_list(State(state): State<WebState>, headers: HeaderMap) -> imp
     let mut set = std::collections::BTreeSet::new();
     if let Some(c) = state.db.get_config("channel") {
         set.insert(c);
-    }
-    if let Some(c) = &state.cfg.default_channel {
-        set.insert(c.clone());
     }
     for p in state.db.list_plans(seller_scope(&session)) {
         if let Some(c) = p.4 {
@@ -2883,14 +2897,18 @@ async fn finance_refunds_process(
         state.db.update_invoice_status(&inv, "refunded");
         // optionally revoke subscription access for subscriptions tied to this invoice
         let subs = state.db.subscriptions_for_invoice(&inv);
-        for (sub_id, _sid, uid, ch) in subs {
+        for (sub_id, sid, uid, ch) in subs {
             if !ch.is_empty() {
                 let cid = crate::util::to_chat_id(&ch);
-                let _ = state
+                // The channel belongs to the subscription's seller, so the
+                // kick must be issued by that seller's bot (primary when the
+                // seller has no dedicated bot).
+                let kick_bot = state.bots.for_seller(sid);
+                let _ = kick_bot
                     .bot
                     .ban_chat_member(cid.clone(), teloxide::types::UserId(uid as u64))
                     .await;
-                let _ = state
+                let _ = kick_bot
                     .bot
                     .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
                     .await;
@@ -3178,7 +3196,7 @@ async fn finance_refunds_execute(
     };
     let (
         _rid,
-        _seller,
+        refund_seller,
         invoice_id,
         refund_user,
         amount,
@@ -3282,16 +3300,19 @@ async fn finance_refunds_execute(
                     if !channel.is_empty() {
                         // Kick (ban+unban) so the refunded buyer loses channel
                         // access immediately. Best-effort: the status flip is
-                        // the source of truth.
+                        // the source of truth. The channel belongs to the
+                        // refund's seller, so that seller's bot does the kick
+                        // (primary when they have no dedicated bot).
                         let cid = crate::util::to_chat_id(&channel);
-                        let _ = state
+                        let kick_bot = state.bots.for_seller(refund_seller);
+                        let _ = kick_bot
                             .bot
                             .ban_chat_member(
                                 cid.clone(),
                                 teloxide::types::UserId(refund_user as u64),
                             )
                             .await;
-                        let _ = state
+                        let _ = kick_bot
                             .bot
                             .unban_chat_member(cid, teloxide::types::UserId(refund_user as u64))
                             .await;
@@ -4083,1296 +4104,7 @@ async fn api_keys_delete(
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-    use crate::{config::Config, db::Db};
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use proptest::prelude::*;
-    use std::sync::Arc;
-    use tower::ServiceExt;
-
-    /// Arbitrary JSON generator (depth-bounded) for parser property tests.
-    fn arb_json(depth: u32) -> BoxedStrategy<serde_json::Value> {
-        use serde_json::Value;
-        let leaf = prop_oneof![
-            Just(Value::Null),
-            any::<bool>().prop_map(Value::Bool),
-            any::<i64>().prop_map(Value::from),
-            any::<f64>()
-                .prop_filter("finite", |v| v.is_finite())
-                .prop_map(Value::from),
-            ".*".prop_map(Value::String),
-        ];
-        if depth == 0 {
-            return leaf.boxed();
-        }
-        prop_oneof![
-            leaf,
-            proptest::collection::vec(arb_json(depth - 1), 0..4).prop_map(Value::Array),
-            proptest::collection::hash_map(".*", arb_json(depth - 1), 0..4)
-                .prop_map(|m| Value::Object(m.into_iter().collect())),
-        ]
-        .boxed()
-    }
-
-    proptest! {
-        /// The invoice parser must never panic on arbitrary JSON.
-        #[test]
-        fn prop_extract_invoice_items_never_panics(v in arb_json(3)) {
-            let _ = extract_invoice_items(&v);
-        }
-
-        /// All three known Crypto Pay response shapes decode to the same items.
-        #[test]
-        fn prop_extract_invoice_items_shapes(
-            items in proptest::collection::vec(arb_json(1), 0..5)
-        ) {
-            let arr = serde_json::Value::Array(items.clone());
-            for wrapped in [
-                arr.clone(),
-                serde_json::json!({ "items": arr.clone() }),
-                serde_json::json!({ "result": { "items": arr } }),
-            ] {
-                prop_assert_eq!(extract_invoice_items(&wrapped), items.clone());
-            }
-        }
-
-        /// Signature checking: a correct HMAC hex digest passes ct_eq and any
-        /// single-character mutation fails — for every key/body pair.
-        #[test]
-        fn prop_signature_check(
-            key in proptest::collection::vec(any::<u8>(), 0..64),
-            body in proptest::collection::vec(any::<u8>(), 0..256),
-            idx in any::<usize>(),
-        ) {
-            let mac = crate::util::hmac_sha256(&key, &body);
-            let hex: String = mac.iter().map(|b| format!("{:02x}", b)).collect();
-            prop_assert!(crate::util::ct_eq(&hex, &hex));
-            let mut chars: Vec<char> = hex.chars().collect();
-            let i = idx % chars.len().max(1);
-            chars[i] = if chars[i] == '0' { '1' } else { '0' };
-            let bad: String = chars.into_iter().collect();
-            prop_assert!(!crate::util::ct_eq(&hex, &bad));
-        }
-    }
-
-    async fn make_state() -> (WebState, tempfile::TempDir) {
-        // reuse web test helper pattern
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
-        let db = Db::new(&db_path).unwrap();
-        db.create_web_account("owner", "secret", "owner", None)
-            .await
-            .unwrap();
-        let cfg = Config {
-            bot_token: "123:abc".to_string(),
-            owner_id: 1,
-            db_path: db_path.clone(),
-            default_channel: None,
-            crypto_token: None,
-            ai_enabled: false,
-            ai_provider: "openai".to_string(),
-            ai_api_style: "openai".to_string(),
-            ai_base_url: "https://api.openai.com/v1".to_string(),
-            ai_api_key: None,
-            ai_model: "gpt-4o-mini".to_string(),
-            ai_daily_token_budget: None,
-            mcp_owner_token: None,
-        };
-        let bot = teloxide::Bot::new(cfg.bot_token.clone());
-        let state = WebState {
-            db: Arc::new(db),
-            cfg,
-            bot,
-            login_attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
-            base_path: String::new(),
-        };
-        (state, dir)
-    }
-
-    #[tokio::test]
-    async fn health_ok() {
-        let (state, _dir) = make_state().await;
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_login_and_me() {
-        // Privileged accounts: a correct password is NOT enough — the web
-        // console forces TOTP enrollment before any session, so REST refuses
-        // (BLOCK-1 parity).
-        let (state, _dir) = make_state().await;
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"username":"owner","password":"secret"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["error"]["code"].as_str().unwrap(), "mfa_required");
-
-        // Non-privileged accounts without TOTP still get a session token.
-        let (state, _dir) = make_seller_state().await;
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"username":"seller","password":"secret"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let token = v["token"].as_str().unwrap().to_string();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_unauth_returns_401() {
-        let (state, _dir) = make_state().await;
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/dashboard/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    // ---- helpers ----
-    async fn make_seller_state() -> (WebState, tempfile::TempDir) {
-        let (state, dir) = make_state().await;
-        state
-            .db
-            .create_web_account("seller", "secret", "seller", Some(42))
-            .await
-            .unwrap();
-        state
-            .db
-            .upsert_seller(42, Some("seller42"), Some("@chan42"));
-        (state, dir)
-    }
-    fn owner_token(state: &WebState) -> String {
-        let (id, _, _, _, _) = state.db.get_web_account_by_username("owner").unwrap();
-        state.db.create_web_session(id, "owner", None, 7)
-    }
-    fn seller_token(state: &WebState) -> String {
-        let (id, _, _, _, _) = state.db.get_web_account_by_username("seller").unwrap();
-        state.db.create_web_session(id, "seller", Some(42), 7)
-    }
-
-    // ---- Auth ----
-    #[tokio::test]
-    async fn api_me_returns_role() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["role"].as_str().unwrap(), "owner");
-    }
-
-    #[tokio::test]
-    async fn api_logout_revokes() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/logout")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    // ---- Plans ----
-    #[tokio::test]
-    async fn api_plans_create_list_get() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let db = state.db.clone();
-        let app = router(state);
-        let resp = app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/plans")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", token))
-            .body(Body::from(r#"{"name":"Plan1","price":"10","asset":"USDT","duration_days":30,"channel_id":"@chan42"}"#)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/plans")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["total"].as_i64().unwrap(), 1);
-        let plan_id = db.get_plan(42, "Plan1").unwrap().0;
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/plans/{}", plan_id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["name"].as_str().unwrap(), "Plan1");
-    }
-
-    #[tokio::test]
-    async fn api_plans_update_delete() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let db = state.db.clone();
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/plans")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(
-                        r#"{"name":"PlanU","price":"10","asset":"USDT","duration_days":30}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let plan_id = db.get_plan(42, "PlanU").unwrap().0;
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri(format!("/api/v1/plans/{}", plan_id))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"price":"20"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let plan_id = db.get_plan(42, "PlanU").unwrap().0;
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/v1/plans/{}", plan_id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/plans")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["total"].as_i64().unwrap(), 0);
-    }
-
-    // ---- Subscriptions ----
-    #[tokio::test]
-    async fn api_subs_create_list_get_patch() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/subscriptions")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(
-                        r#"{"user_id":7,"channel_id":"@chan42","days":10}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let sub_id = v["id"].as_i64().unwrap();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/subscriptions")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/subscriptions/{}", sub_id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri(format!("/api/v1/subscriptions/{}", sub_id))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"status":"expired"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Invoices ----
-    #[tokio::test]
-    async fn api_invoices_create_list_get_status() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/invoices")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(
-                        r#"{"amount":"5","asset":"USDT","description":"test"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let inv_id = v["invoice_id"].as_str().unwrap().to_string();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/invoices")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/invoices/{}", inv_id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/invoices/{}/status", inv_id))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"status":"paid"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // Manual 'paid' transitions are rejected: paid is a verified state
-        // reachable only via the webhook or claim flow.
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/invoices/{}/status", inv_id))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"status":"expired"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/invoices/{}", inv_id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["status"].as_str().unwrap(), "expired");
-    }
-
-    // ---- Codes ----
-    #[tokio::test]
-    async fn api_codes_create_list_get_redeem() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/codes")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"value_days":7,"max_uses":1,"count":1}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let code = v["codes"][0].as_str().unwrap().to_string();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/codes")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/codes/{}", code))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/codes/{}/redeem", code))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"user_id":99}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Posts ----
-    #[tokio::test]
-    async fn api_posts_create_list() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/posts")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"text":"hello","channel":"@chan42"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/posts")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["total"].as_i64().unwrap() >= 1);
-    }
-
-    // ---- Users ----
-    #[tokio::test]
-    async fn api_users_list_upsert() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/users/upsert")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"user_id":555,"username":"foo"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/users")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let items = v["items"].as_array().unwrap();
-        assert!(items.iter().any(|x| x["user_id"].as_i64() == Some(555)));
-    }
-
-    // ---- Stats ----
-    #[tokio::test]
-    async fn api_dashboard_summary() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/dashboard/summary")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_revenue() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/revenue")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Channels ----
-    #[tokio::test]
-    async fn api_channels_list() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/channels")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Config ----
-    #[tokio::test]
-    async fn api_config_get_set() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/config/channel")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/config/channel")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"channel":"@cfg"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/config/channel")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["channel"].as_str().unwrap(), "@cfg");
-    }
-
-    // ---- AI ----
-    #[tokio::test]
-    async fn api_ai_templates_crud() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/ai/templates")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"name":"t1","user_prompt":"hello {{x}}"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/ai/templates")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let items = v["items"].as_array().unwrap();
-        assert!(items.iter().any(|x| x["name"].as_str() == Some("t1")));
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/ai/templates/t1")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/api/v1/ai/templates/t1")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(r#"{"description":"d"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/api/v1/ai/templates/t1")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Finance ----
-    #[tokio::test]
-    async fn api_finance_summary() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/finance/summary")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ---- Admin (owner) ----
-    #[tokio::test]
-    async fn api_admin_stats() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/admin/stats/global")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_admin_sellers() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/admin/sellers")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_admin_web_accounts_crud() {
-        let (state, _dir) = make_state().await;
-        let token = owner_token(&state);
-        let db = state.db.clone();
-        let app = router(state);
-        let resp = app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/admin/web-accounts")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", token))
-            .body(Body::from(r#"{"username":"ac1","password":"secret123","role":"seller","seller_id":42}"#)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/admin/web-accounts")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let items = v["items"].as_array().unwrap();
-        let acct = items
-            .iter()
-            .find(|x| x["username"].as_str() == Some("ac1"))
-            .unwrap();
-        let id = acct["id"].as_i64().unwrap();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/v1/admin/web-accounts/{}", id))
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let _ = db;
-    }
-
-    // ---- Role gating ----
-    #[tokio::test]
-    async fn api_seller_cannot_access_admin() {
-        let (state, _dir) = make_seller_state().await;
-        let token = seller_token(&state);
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/admin/stats/global")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn api_unauth_all_protected() {
-        let (state, _dir) = make_state().await;
-        let app = router(state);
-        for uri in [
-            "/api/v1/plans",
-            "/api/v1/users",
-            "/api/v1/dashboard/summary",
-        ] {
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "uri {}", uri);
-        }
-    }
-
-    // ---- L8 additions (2026-10-25): auth_password, codes_delete, /health,
-    // /metrics. Reuse the module's state helpers above.
-
-    async fn change_password(app: &Router, token: &str, body: &str) -> axum::response::Response {
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/password")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn delete_code(app: &Router, token: &str, code: &str) -> axum::response::Response {
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/v1/codes/{}", code).as_str())
-                    .header("authorization", format!("Bearer {}", token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn auth_password_non_owner_requires_current() {
-        let (state, _dir) = make_seller_state().await;
-        let app = router(state.clone());
-        let token = seller_token(&state);
-        // Missing current password -> rejected, nothing changes.
-        let resp = change_password(&app, &token, r#"{"new_password":"brandnewpw"}"#).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        // Wrong current password -> rejected.
-        let resp = change_password(
-            &app,
-            &token,
-            r#"{"new_password":"brandnewpw","current_password":"wrong"}"#,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            state
-                .db
-                .verify_web_password("seller", "secret")
-                .await
-                .is_some()
-        );
-        // Correct current password -> the hash rotates (same bcrypt path the
-        // login uses) and the old password stops verifying.
-        let resp = change_password(
-            &app,
-            &token,
-            r#"{"new_password":"brandnewpw","current_password":"secret"}"#,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            state
-                .db
-                .verify_web_password("seller", "brandnewpw")
-                .await
-                .is_some()
-        );
-        assert!(
-            state
-                .db
-                .verify_web_password("seller", "secret")
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn auth_password_invalidates_other_sessions() {
-        let (state, _dir) = make_seller_state().await;
-        let app = router(state.clone());
-        let token_a = seller_token(&state);
-        let token_b = seller_token(&state);
-        let resp = change_password(
-            &app,
-            &token_a,
-            r#"{"new_password":"brandnewpw","current_password":"secret"}"#,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        // The caller's session survives the rotation...
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {}", token_a))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // ...every OTHER session of the account is gone.
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/me")
-                    .header("authorization", format!("Bearer {}", token_b))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn auth_password_owner_changes_without_current() {
-        let (state, _dir) = make_state().await;
-        let app = router(state.clone());
-        let token = owner_token(&state);
-        let resp = change_password(&app, &token, r#"{"new_password":"newownerpw"}"#).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            state
-                .db
-                .verify_web_password("owner", "newownerpw")
-                .await
-                .is_some()
-        );
-        assert!(
-            state
-                .db
-                .verify_web_password("owner", "secret")
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn codes_delete_is_seller_scoped_and_real() {
-        let (state, _dir) = make_seller_state().await;
-        let own = state.db.create_code(42, None, Some(30), 1, None, 12);
-        let other = state.db.create_code(43, None, Some(30), 1, None, 12);
-        let app = router(state.clone());
-        let seller = seller_token(&state);
-
-        // Own code: the row is actually gone.
-        let resp = delete_code(&app, &seller, &own).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            state.db.get_code(&own).is_none(),
-            "code row must be deleted"
-        );
-
-        // Cross-seller: rejected, the row survives untouched.
-        let resp = delete_code(&app, &seller, &other).await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(
-            state.db.get_code(&other).is_some(),
-            "cross-seller delete must not touch the code"
-        );
-
-        // Admin/owner may delete any seller's code.
-        let owner = owner_token(&state);
-        let resp = delete_code(&app, &owner, &other).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(state.db.get_code(&other).is_none());
-    }
-
-    #[tokio::test]
-    async fn codes_delete_unknown_returns_404() {
-        let (state, _dir) = make_seller_state().await;
-        let app = router(state.clone());
-        let token = owner_token(&state);
-        let resp = delete_code(&app, &token, "NOPE_NOPE_NOPE").await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn health_reports_components() {
-        let (state, _dir) = make_state().await;
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["db"], "ok");
-        assert_eq!(v["bot"], "configured");
-        assert_eq!(v["mcp"], "disabled"); // make_state: mcp_owner_token = None
-        assert!(v["uptime_seconds"].is_u64());
-    }
-
-    #[tokio::test]
-    async fn metrics_scrape_ok_and_no_raw_path_labels() {
-        let (state, _dir) = make_seller_state().await;
-        // Mirror main.rs: metrics middleware over the API router.
-        let app = router(state).layer(axum::middleware::from_fn(crate::metrics::track_http));
-        let secret = "sub_tok_9f8e7d6c5b4a";
-        // Hit a real route, then an UNMATCHED route whose path AND query
-        // string carry a token-like secret — the house-lesson attack shape:
-        // a metrics endpoint that labels by raw path leaks it verbatim.
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/codes/{}/nope?token={}", secret, secret).as_str())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        assert!(ct.starts_with("text/plain"), "content-type {ct}");
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body).to_string();
-        assert!(!text.contains(secret), "metrics leaked raw path: {text}");
-        assert!(text.contains("http_requests_total{route=\"health\",status_class=\"2xx\"}"));
-        // The unmatched token-bearing route lands in the fixed catch-all
-        // category, never the raw path.
-        assert!(text.contains("http_requests_total{route=\"other\",status_class=\"4xx\"}"));
-        assert!(text.contains("# TYPE uptime_seconds gauge"));
-        assert!(text.contains("bot_messages_sent_total "));
-    }
-}
+mod tests;
 // ---------- Invoices (claim) ----------
 async fn invoices_claim(
     State(state): State<WebState>,
@@ -5484,6 +4216,11 @@ async fn invoices_claim(
         return err(StatusCode::BAD_REQUEST, "not_paid", "invoice not paid").into_response();
     }
     // Verified paid. Grant once (idempotent), then finalize.
+    // Every Telegram side-effect below (product delivery DM, plan invite link,
+    // grant DM) belongs to the invoice's seller, so it runs on that seller's
+    // bot — the same resolution the background granter uses. Seller 0
+    // (legacy/global invoices) resolves to the primary bot.
+    let invoice_bot = state.bots.for_seller(seller_id);
     let mut granted = false;
     let target_user = user_id.unwrap_or(0);
     // Product invoices take the delivery path; plan invoices the
@@ -5497,7 +4234,7 @@ async fn invoices_claim(
                 Ok(true) => {
                     granted = true;
                     if let Err(e) = crate::services::deliver::deliver(
-                        &state.bot,
+                        &invoice_bot.bot,
                         target_user,
                         &kind,
                         &pname,
@@ -5556,7 +4293,7 @@ async fn invoices_claim(
             .as_ref()
             .map(|p| p.4)
             .unwrap_or(30)
-            .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+            .clamp(1, crate::constants::MAX_PLAN_DAYS);
         let sid = seller_id;
         // The channel must belong to the invoice's seller (via its plan) —
         // the global default fallback stays reserved for Admin/Owner.
@@ -5599,7 +4336,7 @@ async fn invoices_claim(
             let expire = chrono::Duration::try_days(days)
                 .and_then(|d| chrono::Utc::now().checked_add_signed(d))
                 .unwrap_or_else(chrono::Utc::now);
-            let link = state
+            let link = invoice_bot
                 .bot
                 .create_chat_invite_link(crate::util::to_chat_id(&ch))
                 .member_limit(1)
@@ -5608,7 +4345,7 @@ async fn invoices_claim(
                 .ok()
                 .map(|l| l.invite_link);
             if let Some(l) = link {
-                let _ = state
+                let _ = invoice_bot
                     .bot
                     .send_message(
                         teloxide::types::ChatId(target_user),

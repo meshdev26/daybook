@@ -4,11 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
-pub struct Config {
-    pub bot_token: String,
-    pub owner_id: i64,
+pub struct SharedConfig {
     pub db_path: String,
-    pub default_channel: Option<String>,
     pub crypto_token: Option<String>,
     pub ai_enabled: bool,
     pub ai_provider: String,
@@ -20,7 +17,36 @@ pub struct Config {
     /// Static bearer token for the MCP endpoint. None/empty = endpoint fully
     /// disabled (secure default OFF) — see `mcp_enabled`.
     pub mcp_owner_token: Option<String>,
+    /// Personal-account (MTProto) identity credentials from
+    /// `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` (my.telegram.org). Both must be
+    /// present for the identity subsystem to offer login; the hash is a
+    /// secret and is never logged (L10 contract, user-identity design §5).
+    pub telegram_api_id: Option<i32>,
+    pub telegram_api_hash: Option<String>,
+    /// Transitional: primary bot's owner id (Telegram user id), 0 if none.
+    /// Bot-specific code should prefer BotContext.owner_id; this keeps legacy
+    /// call sites (web settings, embed) working during migration.
+    pub owner_id: i64,
 }
+
+#[derive(Clone, Debug)]
+pub struct BotConfig {
+    pub key: String,
+    pub name: String,
+    pub token: String,
+    pub owner_id: i64,
+    pub default_channel: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AppConfig {
+    pub shared: SharedConfig,
+    pub bots: Vec<BotConfig>,
+}
+
+/// Backward-compat alias: the shared portion is what most of the codebase
+/// historically called `Config`.
+pub type Config = SharedConfig;
 
 pub const APP_DIR_NAME: &str = "telegram-agent";
 
@@ -196,15 +222,76 @@ fn write_env_file_at(path: &Path, updates: &[(String, String)]) -> Result<PathBu
         content.push_str(&preserved.join("\n"));
         content.push('\n');
     }
-    // Atomic replace: stage the content in a sibling temp file, set 0600 on
-    // the temp BEFORE the rename (the target must never be briefly
-    // world-readable or half-written), then rename over the target —
-    // rename(2) within one directory is atomic. For the usual target `.env`
-    // this is the sibling `.env.tmp`. The temp is CREATED with mode 0600 via
-    // open(2), so there is no window where the file exists under umask-wide
-    // permissions before the chmod; the best-effort chmod below stays as
-    // belt-and-braces for a stale temp left by an earlier run (open(2) mode
-    // only applies at creation, never to an existing file).
+    write_env_atomically(path, &content)?;
+    Ok(path.to_path_buf())
+}
+
+/// `.env` writer with a PER-CALL managed-key set (L10 F6): every line whose
+/// key appears in `keys` is replaced — a `Some` value rewrites the line, a
+/// `None` value drops the line entirely — so re-saving never accumulates
+/// duplicate keys the way the fixed-`SETUP_ENV_KEYS` writer does for keys
+/// outside its set (the identity wizard prepending
+/// `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` kept stale copies behind). Lines
+/// with keys outside `keys` are preserved verbatim; comments and blank lines
+/// are dropped (same rules as [`write_env_file`]). Best-effort `0600`
+/// permissions on unix — secrets live here. Returns the path written.
+pub fn write_env_file_replacing(keys: &[(&str, Option<&str>)]) -> Result<PathBuf, io::Error> {
+    let explicit = env::var("ENV_FILE").ok();
+    let data_env = data_dir().join(".env");
+    let path = resolve_env_path(explicit.as_deref(), Path::new(".env"), &data_env);
+    write_env_file_replacing_at(&path, keys)
+}
+
+/// Core of [`write_env_file_replacing`] against an explicit path (no
+/// environment reads), so the replace rules are testable in isolation.
+fn write_env_file_replacing_at(
+    path: &Path,
+    keys: &[(&str, Option<&str>)],
+) -> Result<PathBuf, io::Error> {
+    let mut content = String::new();
+    for (k, v) in keys {
+        if let Some(v) = v {
+            content.push_str(&format!("{k}={v}\n"));
+        }
+    }
+    if path.exists() {
+        let existing = fs::read_to_string(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot read existing {}: {e}", path.display()),
+            )
+        })?;
+        let mut preserved: Vec<String> = Vec::new();
+        for line in existing.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            match line.split('=').next() {
+                // Managed keys are replaced/dropped by the updates above.
+                Some(key) if keys.iter().any(|(k, _)| *k == key) => continue,
+                _ => preserved.push(line.to_string()),
+            }
+        }
+        if !preserved.is_empty() {
+            content.push_str(&preserved.join("\n"));
+            content.push('\n');
+        }
+    }
+    write_env_atomically(path, &content)?;
+    Ok(path.to_path_buf())
+}
+
+/// Shared atomic tail of both `.env` writers: stage the content in a sibling
+/// temp file, set 0600 on the temp BEFORE the rename (the target must never
+/// be briefly world-readable or half-written), then rename over the target —
+/// rename(2) within one directory is atomic. For the usual target `.env`
+/// this is the sibling `.env.tmp`. The temp is CREATED with mode 0600 via
+/// open(2), so there is no window where the file exists under umask-wide
+/// permissions before the chmod; the best-effort chmod below stays as
+/// belt-and-braces for a stale temp left by an earlier run (open(2) mode
+/// only applies at creation, never to an existing file).
+fn write_env_atomically(path: &Path, content: &str) -> Result<(), io::Error> {
     let tmp_path = path.with_extension("tmp");
     #[cfg(unix)]
     {
@@ -247,7 +334,7 @@ fn write_env_file_at(path: &Path, updates: &[(String, String)]) -> Result<PathBu
             format!("cannot write {}: {e}", path.display()),
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(())
 }
 
 /// Normalize a `WEB_BASE_PATH` value: trim whitespace, strip trailing `/`s,
@@ -266,9 +353,11 @@ fn normalize_web_base_path(raw: &str) -> String {
     }
 }
 
-impl Config {
+impl SharedConfig {
     pub fn is_configured(&self) -> bool {
-        !self.bot_token.trim().is_empty() && self.owner_id != 0
+        // Transitional: a bot is "connected" when an owner id is present.
+        // Real configured check (token + owner) lives on AppConfig.
+        self.owner_id != 0
     }
 
     /// Whether the MCP endpoint accepts requests at all. Unset/empty token =
@@ -332,19 +421,22 @@ impl Config {
             self.web_base_path()
         )
     }
+}
+
+impl AppConfig {
+    pub fn is_configured(&self) -> bool {
+        self.bots
+            .iter()
+            .any(|b| !b.token.trim().is_empty() && b.owner_id != 0)
+    }
 
     pub fn from_env() -> Self {
         load_dotenv();
-        let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
-        let owner_id = env::var("OWNER_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Shared fields.
         let db_path = match env::var("DATABASE_URL") {
             Ok(url) => url.trim_start_matches("sqlite:").to_string(),
             Err(_) => data_dir().join("agent.db").to_string_lossy().into_owned(),
         };
-        let default_channel = env::var("DEFAULT_CHANNEL").ok().filter(|s| !s.is_empty());
         let crypto_token = env::var("CRYPTO_PAY_TOKEN").ok().filter(|s| !s.is_empty());
         let ai_enabled = env::var("AI_ENABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -365,11 +457,24 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok());
         let mcp_owner_token = env::var("MCP_OWNER_TOKEN").ok().filter(|s| !s.is_empty());
-        Self {
-            bot_token,
-            owner_id,
+        let telegram_api_id = env::var("TELEGRAM_API_ID")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|_| {
+                env::var("TELEGRAM_API_ID")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            });
+        let telegram_api_hash = env::var("TELEGRAM_API_HASH")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        // Bots resolution (needed for the primary bot's owner_id in shared).
+        let bots = resolve_bots();
+        let primary_owner_id = bots.first().map(|b| b.owner_id).unwrap_or(0);
+
+        let shared = SharedConfig {
             db_path,
-            default_channel,
             crypto_token,
             ai_enabled,
             ai_provider,
@@ -379,9 +484,161 @@ impl Config {
             ai_model,
             ai_daily_token_budget,
             mcp_owner_token,
-        }
+            telegram_api_id,
+            telegram_api_hash,
+            owner_id: primary_owner_id,
+        };
+
+        AppConfig { shared, bots }
     }
 }
+
+fn resolve_bots() -> Vec<BotConfig> {
+    // 1. BOTS_CONFIG (TOML path)
+    if let Ok(path) = env::var("BOTS_CONFIG")
+        && !path.trim().is_empty()
+        && let Ok(content) = fs::read_to_string(path.trim())
+        && let Ok(bots) = parse_bots_toml(&content)
+        && !bots.is_empty()
+    {
+        return bots;
+    }
+    // 2. BOTS_JSON
+    if let Ok(raw) = env::var("BOTS_JSON")
+        && !raw.trim().is_empty()
+        && let Ok(bots) = parse_bots_json(&raw)
+        && !bots.is_empty()
+    {
+        return bots;
+    }
+    // 3. Legacy single-bot env
+    let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let owner_id = env::var("OWNER_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if bot_token.trim().is_empty() && owner_id == 0 {
+        return vec![];
+    }
+    vec![BotConfig {
+        key: "primary".to_string(),
+        name: "Primary".to_string(),
+        token: bot_token,
+        owner_id,
+        default_channel: env::var("DEFAULT_CHANNEL").ok().filter(|s| !s.is_empty()),
+    }]
+}
+
+fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
+    let arr: serde_json::Value = serde_json::from_str(raw).map_err(|_| ())?;
+    let arr = arr.as_array().ok_or(())?;
+    let mut out = Vec::new();
+    for v in arr {
+        let key = v
+            .get("key")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&key)
+            .to_string();
+        let owner_id = v.get("owner_id").and_then(|x| x.as_i64()).unwrap_or(0);
+        let default_channel = v
+            .get("default_channel")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let token = if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
+            t.to_string()
+        } else if let Some(envname) = v.get("token_env").and_then(|x| x.as_str()) {
+            env::var(envname).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        out.push(BotConfig {
+            key,
+            name,
+            token,
+            owner_id,
+            default_channel,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_bots_toml(content: &str) -> Result<Vec<BotConfig>, ()> {
+    // Use toml crate if available.
+    // WHY toml::from_str::<Table>: in toml 1.x `Value::from_str`
+    // (`str::parse::<Value>()`) only parses bare values, never a full TOML
+    // document, so real bots.toml files always failed here and resolve_bots
+    // silently fell back to the legacy TELEGRAM_BOT_TOKEN/OWNER_ID pair.
+    // Same trap as the write-side fix in web/bots_config.rs
+    // `parse_toml_document` (2026-10-31); config.rs must not depend on web,
+    // so the document parser is repeated here instead of imported.
+    let value = toml::from_str::<toml::Table>(content).map_err(|_| ())?;
+    let bots = value.get("bots").and_then(|v| v.as_array()).ok_or(())?;
+    let mut out = Vec::new();
+    for b in bots {
+        let key = b
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = b
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&key)
+            .to_string();
+        let owner_id = b.get("owner_id").and_then(|v| v.as_integer()).unwrap_or(0);
+        let default_channel = b
+            .get("default_channel")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let token = if let Some(t) = b.get("token").and_then(|v| v.as_str()) {
+            t.to_string()
+        } else if let Some(envname) = b.get("token_env").and_then(|v| v.as_str()) {
+            env::var(envname).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        out.push(BotConfig {
+            key,
+            name,
+            token,
+            owner_id,
+            default_channel,
+        });
+    }
+    Ok(out)
+}
+
+// Keep Config::from_env for backward compat (returns shared? No—top-level).
+// Provide a shim so old callers that expect Config::from_env still compile.
+impl SharedConfig {
+    pub fn from_env() -> Self {
+        let mut s = AppConfig::from_env().shared;
+        // Legacy: ensure owner_id populated from OWNER_ID env if not already.
+        if s.owner_id == 0
+            && let Ok(v) = env::var("OWNER_ID")
+            && let Ok(n) = v.parse::<i64>()
+        {
+            s.owner_id = n;
+        }
+        s
+    }
+}
+
+// Also allow Config::from_env returning AppConfig? Config alias is SharedConfig,
+// so Config::from_env returns SharedConfig. Provide AppConfig::from_env above.
 
 #[cfg(test)]
 mod tests {
@@ -513,7 +770,6 @@ mod tests {
     }
 
     // ---- .env writer ----
-
     #[test]
     fn env_writer_preserves_foreign_keys_and_rewrites_owned_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -578,6 +834,84 @@ mod tests {
         assert!(env.is_dir(), "existing content must not be clobbered");
     }
 
+    /// The per-call managed-key writer (F6): re-saving replaces prior lines
+    /// for the keys it writes instead of accumulating duplicates, `None`
+    /// drops a key entirely, and keys outside the managed set survive.
+    #[test]
+    fn env_writer_replacing_replaces_managed_keys_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        // Simulate a second wizard save over a first one (plus deployment
+        // settings that must survive).
+        std::fs::write(
+            &env,
+            "TELEGRAM_API_ID=11111\nTELEGRAM_API_HASH=stale\nWEB_BIND=0.0.0.0\n",
+        )
+        .unwrap();
+        let written = write_env_file_replacing_at(
+            &env,
+            &[
+                ("TELEGRAM_API_ID", Some("22222")),
+                ("TELEGRAM_API_HASH", Some("fresh")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(written, env);
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(content.starts_with("TELEGRAM_API_ID=22222\nTELEGRAM_API_HASH=fresh\n"));
+        assert_eq!(
+            content.matches("TELEGRAM_API_ID=").count(),
+            1,
+            "no duplicate TELEGRAM_API_ID lines"
+        );
+        assert_eq!(content.matches("TELEGRAM_API_HASH=").count(), 1);
+        assert!(!content.contains("stale"), "old managed value must go");
+        assert!(
+            content.contains("WEB_BIND=0.0.0.0\n"),
+            "foreign keys survive"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets file must be owner-only");
+        }
+    }
+
+    /// A `None` value removes the managed key's line entirely (e.g. clearing
+    /// credentials), while foreign keys survive.
+    #[test]
+    fn env_writer_replacing_none_drops_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        std::fs::write(
+            &env,
+            "TELEGRAM_API_ID=11111\nTELEGRAM_API_HASH=h\nDEFAULT_CHANNEL=@c\n",
+        )
+        .unwrap();
+        write_env_file_replacing_at(
+            &env,
+            &[("TELEGRAM_API_ID", None), ("TELEGRAM_API_HASH", None)],
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(!content.contains("TELEGRAM_API_ID"));
+        assert!(!content.contains("TELEGRAM_API_HASH"));
+        assert!(content.contains("DEFAULT_CHANNEL=@c\n"));
+    }
+
+    /// The replacing writer creates a fresh file like the fixed one.
+    #[test]
+    fn env_writer_replacing_creates_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        write_env_file_replacing_at(&env, &[("TELEGRAM_API_ID", Some("1"))]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            "TELEGRAM_API_ID=1\n"
+        );
+    }
+
     #[test]
     fn env_path_resolution_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,5 +937,64 @@ mod tests {
         // Both exist: cwd wins.
         std::fs::write(&cwd_env, "Y=1\n").unwrap();
         assert_eq!(resolve_env_path(None, &cwd_env, &data_env), cwd_env);
+    }
+
+    // ---- bots.toml parsing ----
+    /// Regression: toml 1.x `Value::from_str` cannot parse documents, so
+    /// `parse_bots_toml` used to always fail for real bots.toml files (see
+    /// the comment on `parse_bots_toml`). Asserts keys, names, owner ids,
+    /// token_env resolution and default_channel for a two-bot document.
+    #[test]
+    fn bots_toml_parses_two_bot_document() {
+        const TOKEN_ENV_SET: &str = "BOTS_TOML_TEST_TOKEN_SET";
+        const TOKEN_ENV_UNSET: &str = "BOTS_TOML_TEST_TOKEN_UNSET";
+        // SAFETY: test-only variable names no other test touches; the set
+        // one is removed again below so the run leaves no state behind.
+        unsafe { std::env::set_var(TOKEN_ENV_SET, "tok-from-env") };
+        let doc = format!(
+            "\
+[[bots]]
+key = \"primary\"
+name = \"Primary\"
+token_env = \"{TOKEN_ENV_SET}\"
+owner_id = 111
+
+[[bots]]
+key = \"sales\"
+name = \"Sales\"
+token_env = \"{TOKEN_ENV_UNSET}\"
+owner_id = 222
+default_channel = \"@sales\"
+"
+        );
+        let bots = parse_bots_toml(&doc).expect("a real bots.toml document must parse");
+        assert_eq!(bots.len(), 2);
+        assert_eq!(bots[0].key, "primary");
+        assert_eq!(bots[0].name, "Primary");
+        assert_eq!(bots[0].owner_id, 111);
+        assert_eq!(bots[0].token, "tok-from-env");
+        assert_eq!(bots[0].default_channel, None);
+        assert_eq!(bots[1].key, "sales");
+        assert_eq!(bots[1].name, "Sales");
+        assert_eq!(bots[1].owner_id, 222);
+        // An unset token_env resolves to an empty token (existing rule).
+        assert_eq!(bots[1].token, "");
+        assert_eq!(bots[1].default_channel.as_deref(), Some("@sales"));
+        // SAFETY: restores the test-only variable.
+        unsafe { std::env::remove_var(TOKEN_ENV_SET) };
+    }
+
+    /// Malformed or bots-less documents fail closed: Err, never a silent
+    /// empty list (which resolve_bots would treat as "no config").
+    #[test]
+    fn bots_toml_malformed_document_fails_closed() {
+        assert!(
+            parse_bots_toml("bots = [").is_err(),
+            "truncated TOML must be Err"
+        );
+        assert!(
+            parse_bots_toml("[other]\nkey = \"x\"\n").is_err(),
+            "valid TOML without a [[bots]] array must be Err, not Ok(empty)"
+        );
     }
 }

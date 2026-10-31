@@ -77,10 +77,10 @@ whitespace, precise typography, subtle depth, single clear action per screen.
 - **Senior UX rationale**: Plex Sans/Mono are highly legible at small sizes; mono figures aid scanning amounts and ids.
 - **Type scale** (modular 1.25):
   - Display: 34px / 600 / 1.1
-  - H1: 28px / 600 / 1.2
-  - H2: 22px / 600 / 1.25
-  - H3: 18px / 600 / 1.3
-  - Body: 15px / 400 / 1.5
+  - H1: 21px / 600 / 1.2
+  - H2: 16px / 600 / 1.25
+  - H3: 14px / 600 / 1.3
+  - Body: 14.5px / 400 / 1.5
   - Small: 13px / 400 / 1.4
   - Caption: 11px / 500 / 1.3 (uppercase, tracked)
 - **Weights**: 400 (regular), 500 (medium), 600 (semibold). Avoid 700+ for calm feel.
@@ -92,10 +92,10 @@ Light:
 - Background (paper): `#F4F6F3` (`--bg`)
 - Surface: `#FFFFFF` (`--surface`); recessed `#FAFBF9` (`--surface-2`)
 - Text primary (ink): `#17201C` (`--ink`)
-- Text secondary: `#57645C` (`--ink-2`); faint `#7E8A82` (`--ink-3`)
+- Text secondary: `#57645C` (`--ink-2`); faint `#5F6B63` (`--ink-3`)
 - Brand (deep billiard green): `#1E6B52` (`--brand`); hover `#175542`; ink `#F1F7F3`
 - Status: ok `#1E6B52`; warn `#8A5A12`; danger (brick) `#A6392F`
-- Border (hairline): `#DEE3DC` (`--line`); strong `#C4CCC3`
+- Border (hairline): `#DEE3DC` (`--line`); strong `#8A958D` (`--line-strong`)
 Dark (`[data-theme="dark"]` / `prefers-color-scheme: dark`): background `#101512`, surface `#171D19`, ink `#E8EDE8`, brand `#4FBE8F`, warn `#D9A94F`, danger `#E07A6E`. All pairs WCAG 2.1 AA (checked in `app.css` header).
 
 ### Spacing (8px grid)
@@ -109,14 +109,14 @@ xs 4, sm 8, md 16, lg 24, xl 32, xxl 48.
 - **Nav**: minimal text links; active = brand tint.
 - **Table**: subtle dividers, generous padding.
 - **Badge/status**: dot before word; success/warn/danger tints.
-- **Stat (metric card)**: `.stat` column with `.stat-value` (24px Plex Mono, tabular figures, weight 600, ink) and `.stat-label` (12px ink-2). Container reuses `.panel`. Used for AI usage, subscription counts, dashboard metrics.
+- **Stat (metric card)**: `.stat` column with `.stat-value` (24px Plex Mono, tabular figures, weight 500, ink) and `.stat-label` (12px ink-2). Container reuses `.panel`. Used for AI usage, subscription counts, dashboard metrics.
 
 ## 6. Motion
 - 200ms ease transitions.
 - Respect `prefers-reduced-motion`.
 
 ## 7. Layout
-- Max width 980px, centered.
+- Max width 1040px, centered.
 - Single column mobile; two-column desktop.
 
 ## 8. Do / Don't

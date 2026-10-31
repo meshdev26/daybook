@@ -40,6 +40,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -52,3 +53,29 @@ sha2 = "0.10"
 async-trait = "0.1"
 bcrypt = "0.15"
 getrandom = "0.4"
+
+# ---- Personal-account MTProto identity (Phase 0a, user-identity design) ----
+# Exact pins (`=`) per the ratified design: grammers' raw-TL surfaces are not
+# semver-stable, so every bump is a deliberate act with a session re-pair
+# (src/identity/session.rs refuses blobs written by a different grammers
+# version). default-features = false drops grammers-client's `tokio/fs`
+# convenience feature; for grammers-session it keeps the optional `libsql`
+# dependency (SQLite-backed session storage, a large C-library build) OUT of
+# the graph — we store the serialized SessionData as one AES-256-GCM blob
+# instead. Verdict after integration (cargo tree -i libsql): libsql does NOT
+# enter the dependency graph; only `serde`/`serde_with` are activated on
+# grammers-session via the `serde` feature.
+grammers-client = { version = "=0.11.0", default-features = false }
+grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
+# Session-blob crypto: AES-256-GCM for the blob, PBKDF2-HMAC-SHA256 for
+# passphrase stretching — audited RustCrypto crates rather than hand-rolled
+# primitives. Our direct deps stay on the digest-0.10 line so the blob path
+# shares the `sha2` 0.10 already in the tree. Note: `grammers-crypto`
+# (grammers' own subtree) independently pulls the digest-0.11 / sha2-0.11
+# line, so two sha2 versions DO coexist in the lock — that is grammers'
+# cost, not the blob store's. `pbkdf2`'s default feature set includes its
+# own `hmac` dependency, so no separate direct `hmac` dep is needed.
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+# Wipe the derived AES key buffer from memory after each save/load.
+zeroize = "1"

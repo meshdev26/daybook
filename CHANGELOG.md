@@ -9,8 +9,9 @@ versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 ## [Unreleased]
 
 The 2026-10-27 hardening wave plus the v1.4 milestone
-(`docs/ARCHITECTURE-V1.4.md`: bookings, MCP per-seller tokens, setup links).
-Not yet tagged.
+(`docs/ARCHITECTURE-V1.4.md`: bookings, MCP per-seller tokens, setup links),
+and the setup & management UX polish
+(`design-system/telegram-agent/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
 - Bookings domain closed end-to-end: console `/bookings` page (seller-scope
@@ -42,8 +43,44 @@ Not yet tagged.
 - Mandatory TOTP enrollment with embedded QR (vendored `qrcodegen`, MIT) and a
   copyable `otpauth` URI.
 - Password show/hide toggles on all secret inputs.
+- Multi-bot console: a Bot selector in the sidebar rail for the global owner
+  (`POST /bot/select`, persisted per session, unknown/disabled bots rejected
+  server-side; sellers and admins get a pinned label instead) and an
+  owner-only `/bots` page editing bot metadata — owner, default channel,
+  enabled. Tokens stay in `BOTS_CONFIG`/`BOTS_JSON`/env; the page never reads
+  or edits them.
+- Bot-scoped console reads for a scoped owner: plans, products, orders,
+  channels, dashboard, codes, reviews, analytics and finance filter to the
+  selected bot's sellers (or channels); "All bots (primary)" is the unscoped
+  reset.
+- Owner-only `bot_key`/`bot_id` selectors on the MCP `publish_post`,
+  `broadcast` and `ai_publish_post` tools; per-seller MCP tokens ignore them
+  and act through their own seller's bot.
 
 ### Changed
+- Setup and management UX polish (per
+  `design-system/telegram-agent/SETUP_UX_POLISH_SPEC.md`): the `/setup`
+  wizard groups the form into "Your bot" and "Your console login" with the
+  optional fields collapsed under "Optional — add later in Settings",
+  validates locally before contacting Telegram, re-renders errors in place
+  with the typed values preserved (token and password are re-entered for
+  safety), asks before "Skip for now" ("This page won't come back."), and its
+  success page separates what works now (console login) from what needs the
+  restart (the bot), with per-platform restart commands. Settings copy is
+  plain language (no "0600 permissions" jargon) and gains a collapsed "How to
+  get a bot token" recipe, the renamed "Push commands & profile to Telegram"
+  action, and distinct labels on the two MFA code inputs. `/bots/add` becomes
+  a validate-then-configure two-step wizard whose fallback is a copy-paste
+  snippet panel instead of a raw file download; `/bots` save/disable/delete
+  confirm in plain language and every bot mutation flags "restart required",
+  so the dashboard restart banner actually appears after bot changes.
+- Bot-aware sends and background work: broadcasts, invite links, `/setupbot`
+  profile updates, console posts, REST sends, and the scheduled-post, expiry
+  and held-booking sweepers resolve the owning bot per seller (`for_seller`)
+  instead of always sending through the primary bot.
+- Docs: new `docs/MULTI_BOT.md` (operator guide); Bot Switching UX spec raised
+  to v1.1 with the scoping table extended to dashboard, codes, reviews,
+  analytics and finance.
 - `/book` tells the truth: the reply says the booking is **requested — not
   confirmed**, with a 60-minute seller-response window (the hold is the
   response window; an expired hold can still be confirmed while the slot is
@@ -73,6 +110,10 @@ Not yet tagged.
   no-channel states release the held claim.
 - Setup/Settings `.env` writes are atomic (temp file 0600 + rename) and
   preserve unknown keys.
+- Bot add wizard: on `toml` 1.x the config-file write's parse check used a
+  parser that only accepts bare values, so it always failed and validated
+  setups silently fell back to the manual copy-paste snippet. TOML writes now
+  validate with the document parser and land in `bots.toml` directly.
 - Crypto Pay client requests time out after 15s.
 
 ### Security

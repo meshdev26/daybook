@@ -19,6 +19,7 @@ permission:
     "*.env": deny
   edit:
     "src/db.rs": allow
+    "src/db/**": allow
     "src/crypto.rs": allow
     "src/config.rs": allow
     "src/util.rs": allow
@@ -37,6 +38,7 @@ permission:
     ".github/workflows/**": allow
   write:
     "src/db.rs": allow
+    "src/db/**": allow
     "src/crypto.rs": allow
     "src/config.rs": allow
     "src/util.rs": allow
@@ -55,6 +57,7 @@ permission:
     ".github/workflows/**": allow
 territory:
   - src/db.rs
+  - src/db/**
   - src/crypto.rs
   - src/config.rs
   - src/util.rs

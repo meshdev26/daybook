@@ -291,13 +291,96 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status_time ON scheduled_posts(st
 -- unique console-wide and case-insensitive: a Telegram @username names one
 -- channel no matter who references it. Exactly one row may carry is_default.
 CREATE TABLE IF NOT EXISTS channels (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel    TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    seller_id  INTEGER NOT NULL DEFAULT 0,
-    is_default INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    title           TEXT,
+    seller_id       INTEGER NOT NULL DEFAULT 0,
+    is_default      INTEGER NOT NULL DEFAULT 0,
+    sender_identity TEXT NOT NULL DEFAULT 'bot',
+    created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_channels_seller ON channels(seller_id);
+
+-- Phase 1: promo codes + shopping cart
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code        TEXT NOT NULL,
+    seller_id   INTEGER NOT NULL DEFAULT 0,
+    promo_type  TEXT NOT NULL CHECK (promo_type IN ('percent','fixed')),
+    value       REAL NOT NULL,
+    currency    TEXT,
+    max_uses    INTEGER,
+    uses        INTEGER NOT NULL DEFAULT 0,
+    min_purchase REAL NOT NULL DEFAULT 0,
+    scope       TEXT NOT NULL DEFAULT 'all',
+    scope_id    INTEGER,
+    expires_at  TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (code, seller_id)
+);
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    code           TEXT NOT NULL,
+    seller_id      INTEGER NOT NULL,
+    buyer_id       INTEGER NOT NULL,
+    invoice_id     TEXT,
+    discount_amount REAL NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_promo_redemptions_seller ON promo_redemptions(seller_id);
+CREATE TABLE IF NOT EXISTS cart_items (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id   INTEGER NOT NULL,
+    seller_id  INTEGER NOT NULL DEFAULT 0,
+    item_type  TEXT NOT NULL CHECK (item_type IN ('plan','product')),
+    item_id    INTEGER NOT NULL,
+    qty        INTEGER NOT NULL DEFAULT 1,
+    added_at   TEXT NOT NULL,
+    UNIQUE (buyer_id, seller_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cart_items_buyer ON cart_items(buyer_id, seller_id);
+
+-- Phase 2: referrals + bonus/loyalty balance
+CREATE TABLE IF NOT EXISTS referrals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL DEFAULT 0,
+    referrer_id  INTEGER NOT NULL,
+    referee_id   INTEGER NOT NULL,
+    code         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    reward_type  TEXT,
+    reward_value REAL NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    rewarded_at  TEXT,
+    UNIQUE (seller_id, referee_id)
+);
+CREATE INDEX IF NOT EXISTS idx_referrals_seller ON referrals(seller_id);
+CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(seller_id, referrer_id);
+CREATE TABLE IF NOT EXISTS referral_codes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id  INTEGER NOT NULL DEFAULT 0,
+    user_id    INTEGER NOT NULL,
+    code       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (seller_id, user_id),
+    UNIQUE (seller_id, code)
+);
+CREATE TABLE IF NOT EXISTS bonus_balances (
+    user_id      INTEGER NOT NULL,
+    seller_id    INTEGER NOT NULL DEFAULT 0,
+    balance_minor INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (user_id, seller_id)
+);
+CREATE TABLE IF NOT EXISTS bonus_ledger (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL,
+    seller_id    INTEGER NOT NULL DEFAULT 0,
+    amount_minor INTEGER NOT NULL,
+    reason       TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bonus_ledger_user ON bonus_ledger(user_id, seller_id);
 
 -- MCP approvals: sensitive tool calls park here until the owner decides via
 -- the bot; args_json is replayed verbatim on approval.
@@ -343,6 +426,21 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_seller ON mcp_tokens(seller_id);
+
+-- Multi-bot (v1.6): one row per configured bot. `name` is the console
+-- display name (v1.7); '' falls back to the key. Declared last so legacy
+-- (ALTERed) and fresh layouts match.
+CREATE TABLE IF NOT EXISTS bots (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    key               TEXT NOT NULL UNIQUE,
+    username          TEXT,
+    owner_user_id     INTEGER NOT NULL,
+    default_channel_id INTEGER,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT NOT NULL,
+    name              TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_user_id);
 
 -- AI-assisted post drafts
 CREATE TABLE IF NOT EXISTS ai_post_drafts (
@@ -415,3 +513,72 @@ CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_api_keys_account ON api_keys(account_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+-- Phase 3: CRM + support tickets
+CREATE TABLE IF NOT EXISTS customers (
+    user_id     INTEGER NOT NULL,
+    seller_id   INTEGER NOT NULL DEFAULT 0,
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL,
+    tags        TEXT,
+    notes       TEXT,
+    total_spent REAL NOT NULL DEFAULT 0,
+    order_count INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'active',
+    PRIMARY KEY (user_id, seller_id)
+);
+CREATE INDEX IF NOT EXISTS idx_customers_seller ON customers(seller_id);
+CREATE TABLE IF NOT EXISTS tickets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id  INTEGER NOT NULL DEFAULT 0,
+    buyer_id   INTEGER NOT NULL,
+    subject    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_seller ON tickets(seller_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_buyer ON tickets(buyer_id);
+CREATE TABLE IF NOT EXISTS ticket_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id   INTEGER NOT NULL,
+    sender_role TEXT NOT NULL,
+    sender_id   INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket ON ticket_messages(ticket_id);
+
+-- Phase 4: recovery & engagement
+CREATE TABLE IF NOT EXISTS cart_abandonment (
+    buyer_id       INTEGER NOT NULL,
+    seller_id      INTEGER NOT NULL DEFAULT 0,
+    abandoned_at   TEXT NOT NULL,
+    reminded_count INTEGER NOT NULL DEFAULT 0,
+    reminded_at    TEXT,
+    recovered_at   TEXT,
+    PRIMARY KEY (buyer_id, seller_id)
+);
+CREATE TABLE IF NOT EXISTS reorder_schedules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id        INTEGER NOT NULL,
+    seller_id       INTEGER NOT NULL DEFAULT 0,
+    product_id      INTEGER NOT NULL,
+    interval_days   INTEGER NOT NULL,
+    last_ordered_at TEXT,
+    next_reminder_at TEXT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (buyer_id, seller_id, product_id)
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id   INTEGER NOT NULL,
+    seller_id  INTEGER NOT NULL DEFAULT 0,
+    product_id INTEGER NOT NULL,
+    rating     INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    text       TEXT,
+    approved   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE (buyer_id, product_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id);

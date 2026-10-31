@@ -14,6 +14,9 @@
 //! - **Tiered tools** (see [`tools`]): Read / Write execute; Sensitive park a
 //!   pending approval and return `requires_approval` — owner callers only: a
 //!   non-owner principal is refused before anything parks (see `dispatch`).
+//!   Identity reads (`tools::IDENTITY_TOOLS`, the operator's personal
+//!   account) are owner-principal only too: any principal carrying a seller
+//!   id is refused before validation.
 //! - **Audited**: every `tools/call` outcome — ok or err, every tier — lands
 //!   in `mcp_audit`.
 
@@ -376,6 +379,30 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                     "sensitive tools require the owner credential",
                 );
             }
+            // Identity reads are owner-principal ONLY (user-identity design,
+            // L10 decision 6). They operate the operator's personal Telegram
+            // account, and no per-seller token may drive it — so every
+            // principal carrying a seller_id is refused here, mirroring the
+            // Sensitive gate above: no execution, not even an arg-validation
+            // oracle, one audited failure row. (tools/list still advertises
+            // the names — capability discovery is fine; calling is what is
+            // gated.) The handlers repeat the check as defense in depth.
+            if tools::is_identity_tool(spec.name) && principal.seller_id.is_some() {
+                st.web.db.mcp_audit(
+                    spec.name,
+                    tools::role_name(principal.role),
+                    principal.seller_id,
+                    false,
+                    Some("forbidden: identity tools require the owner credential"),
+                );
+                crate::metrics::mcp_tool(Some(spec.name), tier_label(spec.tier), false);
+                return rpc_error(
+                    StatusCode::OK,
+                    id,
+                    CODE_FORBIDDEN,
+                    "identity tools require the owner credential",
+                );
+            }
             // Validate BEFORE anything runs: bad args are -32602 with zero
             // side effects — a sensitive tool must not even park an approval.
             if let Err(msg) = (spec.validate)(&args) {
@@ -650,10 +677,8 @@ mod tests {
         let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
         let db = Db::new(&db_path).unwrap();
         let cfg = Config {
-            bot_token: "0:setup-placeholder".to_string(),
             owner_id: 1,
             db_path,
-            default_channel: None,
             crypto_token: None,
             ai_enabled: false,
             ai_provider: "openai".to_string(),
@@ -663,11 +688,21 @@ mod tests {
             ai_model: "gpt-4o-mini".to_string(),
             ai_daily_token_budget: None,
             mcp_owner_token: token.map(str::to_string),
+            telegram_api_id: None,
+            telegram_api_hash: None,
         };
+        let db = Arc::new(db);
+        let bots = Arc::new(crate::bots::BotManager::placeholder(
+            db.clone(),
+            Arc::new(cfg.clone()),
+            crate::identity::IdentityHandle::unconnected(),
+        ));
         let state = WebState {
-            db: Arc::new(db),
+            db: db.clone(),
             cfg,
             bot: teloxide::Bot::new("0:setup-placeholder"),
+            bots,
+            identity: crate::identity::IdentityHandle::unconnected(),
             login_attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
             base_path: String::new(),
@@ -870,13 +905,17 @@ mod tests {
             names.insert(t["name"].as_str().unwrap().to_string());
             let annotations = &t["annotations"];
             match t["name"].as_str().unwrap() {
-                "list_channels" | "list_plans" | "list_posts" | "subs_report" | "list_codes" => {
+                "list_channels" | "list_plans" | "list_posts" | "subs_report" | "list_codes"
+                | "list_promos" | "analytics_summary" | "list_customers" | "list_referrals"
+                | "referral_stats" | "read_channel" | "read_thread" | "search_messages"
+                | "unread_digest" => {
                     assert_eq!(annotations["readOnlyHint"], true, "{}", t["name"]);
                 }
-                "publish_post" | "edit_post" => {
+                "publish_post" | "edit_post" | "customer_note" => {
                     assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
                 }
-                "gen_codes" | "delete_post" | "broadcast" | "ai_publish_post" => {
+                "gen_codes" | "create_promo" | "delete_post" | "broadcast" | "ai_publish_post"
+                | "export_buyer_data" | "delete_buyer_data" | "publish_as_user" => {
                     assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
                     assert_eq!(annotations["destructiveHint"], true, "{}", t["name"]);
                     assert_eq!(annotations["x-approval-required"], true, "{}", t["name"]);
@@ -890,12 +929,26 @@ mod tests {
             "list_posts",
             "subs_report",
             "list_codes",
+            "list_promos",
+            "analytics_summary",
+            "list_referrals",
+            "referral_stats",
+            "list_customers",
+            "read_channel",
+            "read_thread",
+            "search_messages",
+            "unread_digest",
             "publish_post",
             "edit_post",
+            "customer_note",
             "gen_codes",
+            "create_promo",
             "delete_post",
             "broadcast",
             "ai_publish_post",
+            "export_buyer_data",
+            "delete_buyer_data",
+            "publish_as_user",
         ] {
             assert!(names.contains(expected), "missing tool {expected}");
         }
@@ -1022,6 +1075,128 @@ mod tests {
         assert_eq!(result["items"][0]["active"], true);
     }
 
+    // ---- Identity reads: owner-principal only ----
+
+    /// L10 floor: identity tools drive the operator's personal Telegram
+    /// account, so a per-seller token is refused before validation — the
+    /// same forbidden envelope for valid and invalid args alike (no
+    /// arg-validation oracle), and nothing but the audit rows as traces.
+    #[tokio::test]
+    async fn seller_token_cannot_call_identity_tools_and_leaves_no_traces() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        // A real per-seller token row: the request authenticates as a seller
+        // principal, exactly the caller class the owner-only floor exists
+        // for. The handle is unconnected, so any accidental execution would
+        // surface as an isError tool result instead — the forbidden envelope
+        // proves the gate fired first.
+        let (_, raw) = state.db.create_mcp_token(7, Some("ci"));
+        let app = router(state.clone());
+        for (i, (name, args)) in [
+            ("read_channel", json!({"channel": "@chan"})),
+            ("read_thread", json!({"channel": "@chan", "msg_id": 1})),
+            (
+                "search_messages",
+                json!({"query": "hi", "channel": "@chan"}),
+            ),
+            ("unread_digest", json!({})),
+            // Invalid args on purpose: still the gate refusal, not -32602.
+            ("read_channel", json!({})),
+            ("search_messages", json!({"query": ""})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, v) = send(
+                &app,
+                Some(&raw),
+                rpc(
+                    i as i64 + 1,
+                    "tools/call",
+                    json!({"name": name, "arguments": args}),
+                )
+                .to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name} #{i}");
+            assert_eq!(err_code(&v), CODE_FORBIDDEN, "{name} #{i}");
+            assert_eq!(
+                v["error"]["message"], "identity tools require the owner credential",
+                "{name} #{i}"
+            );
+        }
+        // Six refusals, six seller-role failure rows, nothing else.
+        let audit = state.db.mcp_list_audit(10);
+        assert_eq!(audit.len(), 6);
+        assert!(audit.iter().all(|a| a.2 == "seller" && !a.3));
+    }
+
+    /// The owner path works: over `IdentityHandle::unconnected()` every read
+    /// fails closed with NotConnected, and the tools answer with the honest
+    /// state string as an isError tool result — never a panic or a
+    /// protocol-level fault.
+    #[tokio::test]
+    async fn identity_reads_over_the_unconnected_handle_answer_honest_state_errors() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        let app = router(state.clone());
+        for (i, (name, args)) in [
+            ("read_channel", json!({"channel": "@chan"})),
+            ("read_thread", json!({"channel": "@chan", "msg_id": 1})),
+            (
+                "search_messages",
+                json!({"query": "hi", "channel": "@chan"}),
+            ),
+            ("unread_digest", json!({})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_, v) = call(
+                &app,
+                rpc(
+                    i as i64 + 1,
+                    "tools/call",
+                    json!({"name": name, "arguments": args}),
+                ),
+            )
+            .await;
+            assert_eq!(v["result"]["isError"], true, "{name}");
+            assert_eq!(
+                result_text(&v)["error"],
+                "personal identity subsystem is not running",
+                "{name}"
+            );
+        }
+    }
+
+    /// With the owner gate passed, argument validation still applies: bad
+    /// args are -32602 with zero side effects (nothing reached the actor).
+    #[tokio::test]
+    async fn identity_read_args_are_validated_for_the_owner() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        let app = router(state.clone());
+        for (i, (name, args)) in [
+            ("read_channel", json!({})),
+            ("read_thread", json!({"channel": "@chan"})),
+            ("search_messages", json!({"query": "x".repeat(201)})),
+            ("read_channel", json!({"channel": "@chan", "limit": 101})),
+            ("read_thread", json!({"channel": "@chan", "msg_id": 0})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_, v) = call(
+                &app,
+                rpc(
+                    i as i64 + 1,
+                    "tools/call",
+                    json!({"name": name, "arguments": args}),
+                ),
+            )
+            .await;
+            assert_eq!(err_code(&v), CODE_PARAMS, "{name} #{i}");
+        }
+    }
+
     // ---- Write tools ----
 
     #[tokio::test]
@@ -1057,7 +1232,9 @@ mod tests {
     #[tokio::test]
     async fn edit_post_updates_the_stored_record() {
         let (state, _dir) = mcp_state(Some(TOKEN));
-        let _ = state.db.log_post(0, "@chan", 11, "text", Some("before"));
+        let _ = state
+            .db
+            .log_post(0, "@chan", 11, "text", Some("before"), "bot");
         let app = router(state.clone());
         let (_, v) = call(
             &app,
@@ -1082,8 +1259,12 @@ mod tests {
         let (state, _dir) = mcp_state(Some(TOKEN));
         // Seller 7 owns one post, seller 8 another; a real per-seller token
         // authenticates the request as the seller-7 principal.
-        let _ = state.db.log_post(7, "@chan", 11, "text", Some("mine"));
-        let _ = state.db.log_post(8, "@chan", 22, "text", Some("theirs"));
+        let _ = state
+            .db
+            .log_post(7, "@chan", 11, "text", Some("mine"), "bot");
+        let _ = state
+            .db
+            .log_post(8, "@chan", 22, "text", Some("theirs"), "bot");
         let (_, raw) = state.db.create_mcp_token(7, Some("ci"));
         let posts = state.db.list_posts(None, 10);
         let own_id = posts.iter().find(|p| p.1 == 7).unwrap().0;
@@ -1210,6 +1391,7 @@ mod tests {
             ("delete_post", json!({"post_id": 1})),
             ("broadcast", json!({"text": "hi"})),
             ("ai_publish_post", json!({"draft_id": 1})),
+            ("publish_as_user", json!({"channel": "@chan", "text": "hi"})),
         ] {
             let (status, v) = send(
                 &app,
@@ -1229,7 +1411,7 @@ mod tests {
         assert_eq!(state.db.count_codes(None), before_codes);
         // The refusals are audited as seller-role failures.
         let audit = state.db.mcp_list_audit(10);
-        assert_eq!(audit.len(), 4);
+        assert_eq!(audit.len(), 5);
         assert!(audit.iter().all(|a| a.2 == "seller" && !a.3));
     }
 
@@ -1336,6 +1518,148 @@ mod tests {
         );
     }
 
+    // ---- publish_as_user: the Sensitive identity-write ----
+
+    #[tokio::test]
+    async fn publish_as_user_parks_an_approval_without_side_effects() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        state.db.add_channel("@chan", 0).unwrap();
+        let app = router(state.clone());
+        let (_, v) = call(
+            &app,
+            rpc(
+                1,
+                "tools/call",
+                json!({"name": "publish_as_user",
+                       "arguments": {"channel": "@chan", "text": "hello"}}),
+            ),
+        )
+        .await;
+        let result = result_text(&v);
+        assert_eq!(result["requires_approval"], true);
+        let id = result["approval_id"].as_i64().unwrap();
+        // Nothing was sent, nothing recorded.
+        assert_eq!(state.db.count_posts(None), 0);
+        let row = state.db.mcp_get_approval(id).unwrap();
+        assert_eq!(row.1, "publish_as_user");
+        assert_eq!(row.3, "pending");
+    }
+
+    /// An unbound (or unknown) channel is refused at execution with an error
+    /// that names the fix; no post is ever recorded.
+    #[tokio::test]
+    async fn publish_as_user_refuses_unbound_channels_with_the_fix() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        state.db.add_channel("@chan", 0).unwrap(); // exists, still 'bot'-bound
+        let app = router(state.clone());
+        let (_, v) = call(
+            &app,
+            rpc(
+                1,
+                "tools/call",
+                json!({"name": "publish_as_user",
+                       "arguments": {"channel": "@chan", "text": "hello"}}),
+            ),
+        )
+        .await;
+        let id = result_text(&v)["approval_id"].as_i64().unwrap();
+        let reply = cmd_approve(&state, &id.to_string()).await;
+        assert!(
+            reply.contains("not bound to the personal identity"),
+            "error must name the problem: {reply}"
+        );
+        assert!(
+            reply.contains("Post as user"),
+            "error must name the fix: {reply}"
+        );
+        assert_eq!(state.db.count_posts(None), 0);
+        // A channel that does not exist at all gets the same class of error
+        // (the binding check covers 'configured AND bound').
+        let (_, v) = call(
+            &app,
+            rpc(
+                2,
+                "tools/call",
+                json!({"name": "publish_as_user",
+                       "arguments": {"channel": "@missing", "text": "hello"}}),
+            ),
+        )
+        .await;
+        let id = result_text(&v)["approval_id"].as_i64().unwrap();
+        let reply = cmd_approve(&state, &id.to_string()).await;
+        assert!(
+            reply.contains("not bound to the personal identity"),
+            "{reply}"
+        );
+        assert_eq!(state.db.count_posts(None), 0);
+    }
+
+    /// A bound channel still needs the L10 T2 "Enable posting" gate; once it
+    /// is confirmed, the send goes through the identity actor — which, over
+    /// an unconnected handle, answers with the honest not-authorized error.
+    /// The audit trail records channel + text length, never the text.
+    #[tokio::test]
+    async fn publish_as_user_bound_channel_requires_writes_enabled() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        state.db.add_channel("@chan", 0).unwrap();
+        assert!(state.db.set_channel_sender_identity("@chan", "user"));
+        let app = router(state.clone());
+        // Park + approve with posting disabled: honest gate error.
+        let (_, v) = call(
+            &app,
+            rpc(
+                1,
+                "tools/call",
+                json!({"name": "publish_as_user",
+                       "arguments": {"channel": "@chan", "text": "hello"}}),
+            ),
+        )
+        .await;
+        let id = result_text(&v)["approval_id"].as_i64().unwrap();
+        let reply = cmd_approve(&state, &id.to_string()).await;
+        assert!(
+            reply.contains("posting as the personal account is disabled"),
+            "gate error must be honest: {reply}"
+        );
+        assert_eq!(state.db.count_posts(None), 0);
+
+        // Enable posting: the gate passes, the actor refuses (unconnected).
+        state.db.set_config("identity_writes_enabled", "1");
+        let (_, v) = call(
+            &app,
+            rpc(
+                2,
+                "tools/call",
+                json!({"name": "publish_as_user",
+                       "arguments": {"channel": "@chan", "text": "hello"}}),
+            ),
+        )
+        .await;
+        let id = result_text(&v)["approval_id"].as_i64().unwrap();
+        let reply = cmd_approve(&state, &id.to_string()).await;
+        assert!(
+            reply.contains("not authorized to post"),
+            "unconnected identity must fail loudly: {reply}"
+        );
+        assert_eq!(state.db.count_posts(None), 0);
+        // The execution attempt is audited with the channel and the text
+        // length — never the text itself.
+        let audit = state.db.mcp_list_audit(20);
+        let detail_row = audit
+            .iter()
+            .find(|a| {
+                a.1 == "publish_as_user" && a.4.as_deref().is_some_and(|d| d.contains("text_len="))
+            })
+            .expect("execution attempt must carry channel + text_len detail");
+        let detail = detail_row.4.as_deref().unwrap();
+        assert!(detail.contains("channel=@chan"), "detail: {detail}");
+        assert!(detail.contains("text_len=5"), "detail: {detail}");
+        assert!(
+            !detail.contains("hello"),
+            "the text itself must never be audited"
+        );
+    }
+
     #[tokio::test]
     async fn approvals_listing_shows_pending_rows() {
         let (state, _dir) = mcp_state(Some(TOKEN));
@@ -1424,5 +1748,259 @@ mod tests {
             }
         }
         assert!(limited > 0, "expected the burst to trip the rate limiter");
+    }
+
+    // ---- Multi-bot selectors (`bot` / `bot_key` / `bot_id`, N3) ----
+
+    /// Replace the placeholder manager with a two-bot one (ids 0 "primary" and
+    /// 7 "secondary"), each bot pointed at the given Bot API base URL.
+    fn with_bot_manager(mut state: WebState, primary_url: &str, secondary_url: &str) -> WebState {
+        let db = state.db.clone();
+        let shared = Arc::new(state.cfg.clone());
+        let mk = |id: i64, key: &str, url: &str| {
+            let bot = teloxide::Bot::new(format!("{id}:placeholder"))
+                .set_api_url(url.parse::<reqwest::Url>().unwrap());
+            Arc::new(crate::bots::BotContext {
+                id,
+                key: key.to_string(),
+                bot,
+                owner_id: 0,
+                shared: shared.clone(),
+                db: db.clone(),
+            })
+        };
+        let primary = mk(0, "primary", primary_url);
+        let secondary = mk(7, "secondary", secondary_url);
+        state.bots = Arc::new(crate::bots::BotManager {
+            bots: vec![primary.clone(), secondary],
+            primary,
+            db: db.clone(),
+            identity: state.identity.clone(),
+        });
+        state
+    }
+
+    /// Resolve via the real resolver, panicking (with the message) on error.
+    fn key_of(state: &WebState, principal: &tools::Principal, args: &Value) -> String {
+        match tools::resolve_tool_bot(state, principal, args) {
+            Ok(ctx) => ctx.key.clone(),
+            Err(e) => panic!("expected a bot context, got error '{e}'"),
+        }
+    }
+
+    /// Resolve via the real resolver, expecting a failure.
+    fn key_err(state: &WebState, principal: &tools::Principal, args: &Value) -> String {
+        match tools::resolve_tool_bot(state, principal, args) {
+            Ok(ctx) => panic!("expected a resolver error, got bot '{}'", ctx.key),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn resolve_tool_bot_honors_owner_selectors_and_ignores_seller_spoofs() {
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        let state = with_bot_manager(state, "http://127.0.0.1:1/", "http://127.0.0.1:1/");
+        let seller = |sid: Option<i64>| tools::Principal {
+            role: crate::roles::Role::Seller,
+            seller_id: sid,
+        };
+
+        // Seller mapped to bot 7: every spoof attempt (valid, unknown or
+        // malformed selectors alike) is ignored and the mapped bot wins.
+        state.db.upsert_seller_bot_id(7, Some(7));
+        let mapped = seller(Some(7));
+        for args in [
+            json!({}),
+            json!({"bot_key": "primary"}),
+            json!({"bot": "primary"}),
+            json!({"bot_id": 0}),
+            json!({"bot_id": 7, "bot_key": "primary"}),
+            json!({"bot_id": 999}),
+            json!({"bot_key": 5}),
+        ] {
+            assert_eq!(
+                key_of(&state, &mapped, &args),
+                "secondary",
+                "seller spoof must be ignored: {args}"
+            );
+        }
+        // Seller with no mapping → primary, even when it names "secondary".
+        let unmapped = seller(Some(99));
+        let args = json!({"bot_key": "secondary"});
+        assert_eq!(key_of(&state, &unmapped, &args), "primary");
+        // A non-owner principal without a seller id fails closed.
+        let broken = seller(None);
+        assert_eq!(
+            key_err(&state, &broken, &json!({})),
+            "seller principal missing seller_id"
+        );
+
+        // Owner: no selector → primary.
+        let owner = tools::Principal::OWNER;
+        assert_eq!(key_of(&state, &owner, &json!({})), "primary");
+        // Owner: every accepted selector form (and agreeing combinations).
+        for args in [
+            json!({"bot_key": "secondary"}),
+            json!({"bot": "secondary"}),
+            json!({"bot_id": 7}),
+            json!({"bot_id": 7, "bot_key": "secondary"}),
+            json!({"bot_key": "secondary", "bot": "secondary"}),
+        ] {
+            assert_eq!(key_of(&state, &owner, &args), "secondary", "{args}");
+        }
+        let agree = json!({"bot_id": 0, "bot": "primary"});
+        assert_eq!(key_of(&state, &owner, &agree), "primary");
+        // Owner: unknown/disabled selectors never fall back to primary.
+        for args in [
+            json!({"bot_key": "nope"}),
+            json!({"bot": "nope"}),
+            json!({"bot_id": 999}),
+            json!({"bot_id": 99_999}),
+        ] {
+            assert_eq!(
+                key_err(&state, &owner, &args),
+                "unknown or disabled bot",
+                "{args}"
+            );
+        }
+        let wrong_type = json!({"bot_id": "7"});
+        assert_eq!(
+            key_err(&state, &owner, &wrong_type),
+            "bot_id must be an integer"
+        );
+        // Owner: distinct selectors naming different bots are an error.
+        for args in [
+            json!({"bot_key": "primary", "bot": "secondary"}),
+            json!({"bot_id": 0, "bot_key": "secondary"}),
+            json!({"bot_id": 7, "bot": "primary"}),
+        ] {
+            assert_eq!(
+                key_err(&state, &owner, &args),
+                "conflicting bot selectors",
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn publishing_tools_advertise_owner_only_bot_selectors() {
+        for name in ["publish_post", "broadcast", "ai_publish_post"] {
+            let Some(spec) = tools::find_tool(name) else {
+                panic!("{name} must be registered");
+            };
+            let props = &spec.input_schema["properties"];
+            assert_eq!(props["bot_key"]["type"], "string", "{name}");
+            assert_eq!(props["bot_id"]["type"], "integer", "{name}");
+            for field in ["bot_key", "bot_id"] {
+                assert_eq!(
+                    props[field]["description"],
+                    "Owner-only; seller credentials ignore it and act through their own bot.",
+                    "{name}.{field}"
+                );
+            }
+            // Advertised, never required: both keys stay optional.
+            let required = spec.input_schema["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(!required.contains(&json!("bot_key")), "{name}");
+            assert!(!required.contains(&json!("bot_id")), "{name}");
+        }
+    }
+
+    /// End to end over the real teloxide send path: two wiremock Bot API
+    /// servers, each mounted as one bot of the manager. The owner's `bot_key`
+    /// selector picks the secondary server, and a seller's spoofed selector is
+    /// ignored in favor of its mapped bot — the primary server sees NOTHING.
+    #[tokio::test]
+    async fn publish_post_sends_through_the_selected_or_mapped_bot() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        // Minimal Bot API Message: id, date, chat and a text media kind.
+        let reply = json!({
+            "ok": true,
+            "result": {
+                "message_id": 4242,
+                "date": 1_700_000_000,
+                "chat": {"id": 123, "type": "private", "first_name": "T"},
+                "text": "hi"
+            }
+        });
+        for server in [&primary, &secondary] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(reply.clone()))
+                .mount(server)
+                .await;
+        }
+
+        let (state, _dir) = mcp_state(Some(TOKEN));
+        let state = with_bot_manager(state, &primary.uri(), &secondary.uri());
+        let app = router(state.clone());
+
+        // Owner, bot_key "secondary" → the secondary server only.
+        let (status, v) = call(
+            &app,
+            rpc(
+                1,
+                "tools/call",
+                json!({
+                    "name": "publish_post",
+                    "arguments": {"channel": "123", "text": "hi", "bot_key": "secondary"}
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        assert_eq!(result_text(&v)["message_id"], 4242);
+        let secondary_hits = secondary.received_requests().await.unwrap();
+        assert_eq!(secondary_hits.len(), 1, "secondary must serve the send");
+        let path = secondary_hits[0].url.path().to_string();
+        assert!(path.ends_with("/SendMessage"), "unexpected path {path}");
+        let primary_hits = primary.received_requests().await.unwrap();
+        assert!(
+            primary_hits.is_empty(),
+            "primary must not be contacted for an explicit selector"
+        );
+
+        // Seller mapped to bot 7 (secondary) spoofs "primary" and id 0: the
+        // selector is ignored, the mapped bot still serves the send.
+        let (_, raw) = state.db.create_mcp_token(5, Some("ci"));
+        state.db.upsert_seller_bot_id(5, Some(7));
+        let (status, v) = send(
+            &app,
+            Some(&raw),
+            rpc(
+                2,
+                "tools/call",
+                json!({
+                    "name": "publish_post",
+                    "arguments": {
+                        "channel": "123",
+                        "text": "hi",
+                        "bot_key": "primary",
+                        "bot_id": 0
+                    }
+                }),
+            )
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        let seller_hits = secondary.received_requests().await.unwrap();
+        assert_eq!(
+            seller_hits.len(),
+            2,
+            "the seller's mapped bot must serve the second send"
+        );
+        let primary_hits = primary.received_requests().await.unwrap();
+        assert!(
+            primary_hits.is_empty(),
+            "a seller selector must never reach the primary bot"
+        );
     }
 }

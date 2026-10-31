@@ -73,6 +73,22 @@ CRYPTO_PAY_TOKEN=...
 RUST_LOG=info
 ```
 
+## Multiple bots
+
+One process, one database, one console — several bot tokens. Describe them in a
+TOML file (`BOTS_CONFIG`) or a `BOTS_JSON` array; tokens stay in the environment
+via `token_env`, never in the database. The legacy
+`TELEGRAM_BOT_TOKEN`/`OWNER_ID` pair keeps working unchanged as one bot keyed
+`primary`. Business data stays seller-scoped and carries the bot through
+`sellers.bot_id`.
+
+Inside the console, the sidebar Bot selector lets the global owner read the
+pages scoped to a single bot; sellers and admins see a pinned label instead
+(their bot is resolved server-side and cannot be switched).
+
+Adding or retokenizing a bot needs a restart. Full guide:
+[docs/MULTI_BOT.md](docs/MULTI_BOT.md).
+
 ## Build & run
 ```bash
 cargo build --release
@@ -113,7 +129,7 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 
 ## Architecture
 - `src/main.rs` — dispatcher, dialogue storage; merges the routers with the request-timeout and metrics layers.
-- `src/web.rs` — server-rendered web dashboard (axum pages, sessions, static assets).
+- `src/web/` — server-rendered web dashboard (axum pages, sessions, static assets), split per surface: `mod.rs` routing/auth/sessions, `dashboard.rs`, `channel_ops.rs` (first-run setup + channel ops), `settings.rs`, `bots_admin.rs` (multi-bot pages and add wizard), `bots_config.rs` (bots.toml writer/validator), `admin_console.rs` (grant/broadcast/admins/sellers), `wizard.rs`/`identity.rs`, `bookings.rs`, `finance.rs`, etc.
 - `src/api.rs` — REST API under `/api/v1/...` (JSON), plus `/health` and `/metrics`.
 - `src/mcp/` — MCP JSON-RPC 2.0 endpoint at `/api/v1/mcp` (tiered tools, audited).
 - `src/db.rs` — SQLite persistence (plans, subscriptions, codes, invoices, config).
@@ -154,6 +170,7 @@ See `docs/` and root MD files:
 - `AGENT.md` — AI agent instructions.
 - `docs/COMMANDS.md` — command reference.
 - `docs/SETUP.md` — setup guide.
+- `docs/MULTI_BOT.md` — running several bot tokens in one instance.
 - `docs/ARCHITECTURE.md` — code structure.
 - `docs/CRYPTO_PAY.md` — Crypto Pay integration.
 - `docs/SECURITY.md` — security model.

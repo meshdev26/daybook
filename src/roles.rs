@@ -12,7 +12,7 @@ pub fn role_of(db: &Db, user_id: i64, owner_id: i64) -> Role {
     if user_id == owner_id {
         return Role::Owner;
     }
-    if db.is_admin(user_id, owner_id) {
+    if db.is_admin(user_id, None) {
         return Role::Admin;
     }
     if db.get_seller(user_id).is_some() {

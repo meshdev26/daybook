@@ -1,5 +1,14 @@
 # Design System Master File
 
+Non-authoritative; DESIGN.md and assets/app.css are the source of truth.
+
+> **DEPRECATED (2026-10-31):** This file documents a superseded direction. The
+> ONLY sources of truth are `DESIGN.md` and `assets/app.css` (bundled Plex
+> fonts, ledger-green tokens, no CDN); the palette/typography tables below are
+> historical and must not be used for new work. See
+> `design-system/telegram-agent/VISUAL_POLISH_SPEC.md` §D3 for the finding.
+> Pages under `design-system/telegram-agent/pages/` inherit the same caveat.
+
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
 > If not, strictly follow the rules below.

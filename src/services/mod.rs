@@ -4,4 +4,5 @@
 //! v1.2 introduces the first service (`deliver`); the remaining grant/expiry
 //! absorptions are §3 seam work and are built only on their scale trigger.
 
+pub mod broadcast;
 pub mod deliver;

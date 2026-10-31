@@ -12,6 +12,7 @@
 .env
 .env.*
 !.env.example
+/docs/plans
 
 # Local agent tooling — internal workflow, not published. EXCEPTION: the
 # agent charters under agents/ ARE published — verify-agent-tiers.py (part

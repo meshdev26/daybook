@@ -88,7 +88,7 @@ impl AgentAppBuilder {
 
         // Seed owner web account (idempotent) only when configured — mirrors
         // main.rs, including the generated-password-once-on-stderr behavior.
-        if cfg.is_configured() {
+        if cfg.owner_id != 0 {
             let uname = cfg.web_username();
             let pw = std::env::var("WEB_PASSWORD")
                 .ok()
@@ -105,10 +105,13 @@ impl AgentAppBuilder {
             }
         }
 
-        let bot = if cfg.is_configured() {
-            Bot::new(cfg.bot_token.clone())
-        } else {
-            Bot::new("0:setup-placeholder".to_string())
+        let bot = {
+            let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+            if token.trim().is_empty() {
+                Bot::new("0:setup-placeholder".to_string())
+            } else {
+                Bot::new(token)
+            }
         };
 
         let mut registry = CommandRegistry::new();
@@ -120,10 +123,17 @@ impl AgentAppBuilder {
         let registry = Arc::new(registry);
 
         let base = self.base_override.unwrap_or_else(|| cfg.web_base_path());
+        let bots = Arc::new(crate::bots::BotManager::placeholder(
+            db.clone(),
+            Arc::new(cfg.clone()),
+            crate::identity::IdentityHandle::unconnected(),
+        ));
         let state = WebState {
             db,
             cfg,
             bot,
+            bots,
+            identity: crate::identity::IdentityHandle::unconnected(),
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
             ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
             base_path: base,
