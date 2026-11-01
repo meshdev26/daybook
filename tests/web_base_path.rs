@@ -45,6 +45,8 @@ async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         mcp_owner_token: None,
         telegram_api_id: None,
         telegram_api_hash: None,
+        bots: Vec::new(),
+        bots_legacy: true,
     };
     let db = Arc::new(db);
     let bots = Arc::new(telegram_agent::bots::BotManager::placeholder(

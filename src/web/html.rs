@@ -222,7 +222,7 @@ pub(super) fn html_page(
   <div class="brand">{plane}<b>Telegram Business<small>operator console</small></b></div>
   {bot_scope}
   <nav>{nav}</nav>
-  <div class="foot"><a href="{base}/settings">Settings</a> <a href="{base}/logout">Log out</a> <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button></div>
+  <div class="foot"><a href="{base}/settings">Settings</a> <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button></div>
 </aside>
 <main class="main" id="main"><div class="measure">{unlock_banner}{identity_flash}
 {b}

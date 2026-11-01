@@ -50,6 +50,7 @@ mod monitor;
 mod promos;
 mod referrals;
 mod settings;
+mod settings_tokens;
 mod subs;
 mod wizard;
 
@@ -96,6 +97,7 @@ use monitor::*;
 use promos::*;
 use referrals::*;
 use settings::*;
+use settings_tokens::*;
 use subs::*;
 use wizard::*;
 
@@ -237,7 +239,10 @@ fn routes_core(r: Router<WebState>) -> Router<WebState> {
             get(setup_claim_page).post(setup_claim_submit),
         )
         .route("/login", get(login_page).post(login_submit))
-        .route("/logout", get(logout))
+        // SETTINGS_PER_BOT_TOKEN_SPEC §7: the Management panel posts its
+        // "Sign out" form here; the GET arm stays for bookmarks and the
+        // existing route test. Same method-agnostic handler both ways.
+        .route("/logout", get(logout).post(logout))
         .route("/dashboard", get(dashboard))
         .route("/settings", get(settings_page))
         .route("/settings/save", post(settings_save))

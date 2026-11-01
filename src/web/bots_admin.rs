@@ -315,6 +315,23 @@ fn bot_card_form(
     enabled_attr: &str,
     js_key: &str,
 ) -> String {
+    // SETTINGS_PER_BOT_TOKEN_SPEC §6: the old "never shows or edits a token"
+    // clause was already false (Settings edits TELEGRAM_BOT_TOKEN in legacy
+    // mode, and writes per-bot tokens in multi-bot mode) — say what is true
+    // for THIS page and point at the Settings section that edits the token.
+    let settings_url = state.url("/settings?section=connection");
+    let token_line = if multi_bot_mode(state) {
+        format!(
+            r#"Token: set it in Settings → <a href="{}">{}</a>."#,
+            esc(&settings_url),
+            esc(bot_display_name(b))
+        )
+    } else {
+        format!(
+            r#"Token: set it in Settings → <a href="{}">Connection</a>."#,
+            esc(&settings_url)
+        )
+    };
     format!(
         r#"  <div class="bot-card-body">
     <form method="post" action="{bots_url}" class="bot-card-form">
@@ -340,7 +357,7 @@ fn bot_card_form(
         <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('Delete {js_key}? Its settings are removed from the console. Bots that come from your config file will reappear on restart unless you remove them from the file.')">Delete</button>
       </form>
     </div>
-    <p class="help">Tokens are stored only in your config file (.env / bots.toml) and are read once at startup — this console never shows or edits a token. Owner and channel changes here apply on restart.</p>
+    <p class="help">Tokens are stored only in your config file (.env / bots.toml) and are read once at startup — this page never shows a token. Owner and channel changes here apply on restart. {token_line}</p>
   </div>
 </details>"#,
         id = b.id,
@@ -352,6 +369,7 @@ fn bot_card_form(
         js_key = js_key,
         disable_url = state.url(&format!("/bots/{}/disable", b.id)),
         delete_url = state.url(&format!("/bots/{}/delete", b.id)),
+        token_line = token_line,
     )
 }
 

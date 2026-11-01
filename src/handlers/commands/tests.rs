@@ -145,6 +145,8 @@ fn chan_cfg() -> SharedConfig {
         mcp_owner_token: None,
         telegram_api_id: None,
         telegram_api_hash: None,
+        bots: Vec::new(),
+        bots_legacy: true,
     }
 }
 

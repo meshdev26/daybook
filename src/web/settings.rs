@@ -225,9 +225,13 @@ fn settings_tabs(state: &WebState, sec: &str) -> String {
 }
 
 /// The BotFather recipe, duplicated from channel_ops.rs by design (F2.2).
-const BOTFATHER_RECIPE_SETTINGS: &str = r#"<details><summary>How to get a bot token (2 minutes)</summary><ol><li>Open Telegram and message <a href="https://t.me/BotFather" rel="noopener">@BotFather</a>.</li><li>Send <code>/newbot</code>, choose a display name, then a username ending in <code>bot</code>.</li><li>Copy the token it replies with (<code>123456:ABC-…</code>) and paste it below.</li><li>For your owner ID, message <a href="https://t.me/userinfobot" rel="noopener">@userinfobot</a> — it replies with your numeric ID.</li><li>Keep the bot's privacy mode ON; add it as <b>admin</b> to your channel when you sell access.</li></ol></details>"#;
+/// `pub(super)`: the multi-bot panel (settings_tokens.rs) renders it too.
+pub(super) const BOTFATHER_RECIPE_SETTINGS: &str = r#"<details><summary>How to get a bot token (2 minutes)</summary><ol><li>Open Telegram and message <a href="https://t.me/BotFather" rel="noopener">@BotFather</a>.</li><li>Send <code>/newbot</code>, choose a display name, then a username ending in <code>bot</code>.</li><li>Copy the token it replies with (<code>123456:ABC-…</code>) and paste it below.</li><li>For your owner ID, message <a href="https://t.me/userinfobot" rel="noopener">@userinfobot</a> — it replies with your numeric ID.</li><li>Keep the bot's privacy mode ON; add it as <b>admin</b> to your channel when you sell access.</li></ol></details>"#;
 
 fn connection_panel(state: &WebState) -> String {
+    if multi_bot_mode(state) {
+        return multi_bot_connection_panel(state);
+    }
     let token_badge = if state.cfg.owner_id == 0 {
         r#"<span class="badge badge-warning">not connected</span>"#.to_string()
     } else {
@@ -238,27 +242,13 @@ fn connection_panel(state: &WebState) -> String {
     } else {
         "Leave blank to keep the token you already saved — the console never shows it. To replace it, get a new token from @BotFather and paste it here."
     };
-    let crypto_badge = if state
-        .cfg
-        .crypto_token
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .is_empty()
-    {
-        r#"<span class="badge badge-warning">not set</span>"#.to_string()
-    } else {
-        r#"<span class="badge badge-success">configured</span>"#.to_string()
-    };
-    let owner_id_value = if state.cfg.owner_id != 0 {
-        state.cfg.owner_id.to_string()
-    } else {
-        String::new()
-    };
+    let crypto_badge = crypto_badge_of(state);
+    let owner_id_value = owner_id_value_of(state);
     let default_channel_value = state.db.default_channel().unwrap_or_default();
     format!(
         r#"<details open id="connection"><summary>Bot connection</summary>
 <article class="panel">
+<p class="help" id="connection-mode">This console is in single-bot mode. The fields below configure that one bot.</p>
 <form method="post" action="{}">
 <input type="hidden" name="section" value="connection">
 <label for="settings-bot-token">Bot token {token_badge}</label>
@@ -285,6 +275,33 @@ fn connection_panel(state: &WebState) -> String {
         token_badge = token_badge,
         crypto_badge = crypto_badge,
     )
+}
+
+/// Crypto Pay token presence badge — shared by both connection panels so the
+/// markup cannot drift between them.
+pub(super) fn crypto_badge_of(state: &WebState) -> String {
+    if state
+        .cfg
+        .crypto_token
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        r#"<span class="badge badge-warning">not set</span>"#.to_string()
+    } else {
+        r#"<span class="badge badge-success">configured</span>"#.to_string()
+    }
+}
+
+/// The owner-id field's pre-filled value: the boot-resolved primary owner,
+/// blank when unset. Shared by both connection panels.
+pub(super) fn owner_id_value_of(state: &WebState) -> String {
+    if state.cfg.owner_id != 0 {
+        state.cfg.owner_id.to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn password_panel(state: &WebState) -> String {
@@ -359,6 +376,9 @@ fn management_panel(state: &WebState, session: &Session) -> String {
 </div>
 <form method="post" action="{}"><button type="submit" class="btn btn-secondary btn-sm">Push commands &amp; profile to Telegram</button></form>
 <p class="help">Updates your bot's command list and description on Telegram. Use this after changing the bot's profile.</p>
+<h3>Console session</h3>
+<form method="post" action="{}"><button type="submit" class="btn btn-secondary btn-sm">Sign out</button></form>
+<p class="help">Sign out of this console. You will need your dashboard password to sign back in.</p>
 </article></details>"#,
         state.url("/settings/sidebar"),
         checked(prefs.ai),
@@ -372,6 +392,7 @@ fn management_panel(state: &WebState, session: &Session) -> String {
         state.url("/sellers"),
         state.url("/webusers"),
         state.url("/settings/setupbot"),
+        state.url("/logout"),
     )
 }
 
@@ -428,26 +449,34 @@ pub(super) fn settings_error(
     settings_response(state, session, section, focused_error_alert(msg))
 }
 
-#[derive(Deserialize)]
-pub(super) struct SettingsForm {
-    pub(super) bot_token: Option<String>,
-    pub(super) owner_id: Option<String>,
-    pub(super) default_channel: Option<String>,
-    pub(super) crypto_token: Option<String>,
-    pub(super) section: Option<String>,
-}
-
 /// Trimmed, non-empty view of an optional form field: the single definition
 /// of "blank = keep current" for settings saves.
 pub(super) fn non_blank(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Map-flavored form access for the HashMap-extracted save (§3.4): known
+/// keys only — a posted key that names no rendered field is ignored, so a
+/// crafted `bot_nosuchbot` can never select a bot that is not listed.
+pub(super) fn form_value<'a>(form: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    form.get(key).map(String::as_str)
+}
+
+/// `non_blank` for a map lookup: the same trim + drop-empty steps (the
+/// "blank = keep current" contract), expressed on the borrowed value
+/// because the owned clone cannot outlive this function.
+pub(super) fn non_blank_in<'a>(form: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    form.get(key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn settings_save(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
-    Form(f): Form<SettingsForm>,
+    Form(f): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -456,12 +485,18 @@ pub(super) async fn settings_save(
     if session.role != "owner" {
         return forbidden_page(&state, "Settings", "Settings");
     }
-    let section = normalize_section(f.section.clone());
+    let section = normalize_section(form_value(&f, "section").map(str::to_string));
+    // Multi-bot mode answers from the per-bot panel contract (§5). The
+    // legacy TELEGRAM_BOT_TOKEN write below is unreachable there by design —
+    // that shadowed key is exactly what made the old banner lie (§0).
+    if multi_bot_mode(&state) {
+        return settings_save_multi_bot(&state, &session, section, &f).await;
+    }
     // Build updates ONLY for non-blank fields: a blank field means "keep the
     // current value", so the secrets already in .env can never be clobbered
     // by an empty form field.
     let mut updates: Vec<(String, String)> = Vec::new();
-    if let Some(t) = non_blank(&f.bot_token) {
+    if let Some(t) = non_blank_in(&f, "bot_token") {
         // A changed token is validated before anything is written: a typo
         // must never take down the bot's connection on the next restart;
         // the verdict (rejected vs unreachable) decides the copy (F2.5).
@@ -470,7 +505,7 @@ pub(super) async fn settings_save(
         }
         updates.push(("TELEGRAM_BOT_TOKEN".to_string(), t.to_string()));
     }
-    if let Some(o) = non_blank(&f.owner_id) {
+    if let Some(o) = non_blank_in(&f, "owner_id") {
         match o.parse::<i64>() {
             Ok(v) if v > 0 => updates.push(("OWNER_ID".to_string(), v.to_string())),
             _ => {
@@ -483,10 +518,10 @@ pub(super) async fn settings_save(
             }
         }
     }
-    if let Some(c) = non_blank(&f.default_channel) {
+    if let Some(c) = non_blank_in(&f, "default_channel") {
         updates.push(("DEFAULT_CHANNEL".to_string(), c.to_string()));
     }
-    if let Some(c) = non_blank(&f.crypto_token) {
+    if let Some(c) = non_blank_in(&f, "crypto_token") {
         updates.push(("CRYPTO_PAY_TOKEN".to_string(), c.to_string()));
     }
     if updates.is_empty() {

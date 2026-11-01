@@ -139,6 +139,335 @@ async fn settings_save_owner_error_names_the_fix() {
     clear_env_file_var();
 }
 
+// ---- SETTINGS_PER_BOT_TOKEN_SPEC §8.2: multi-bot settings (additive) ----
+
+/// A multi-bot test state: the legacy `make_state()` with the boot snapshot
+/// pointed at two config-file bots — `primary` resolves a token through the
+/// named `BOT_PRIMARY` setting (configured), `proxy26_bot` has the named
+/// `BOT_PROXY26_BOT` setting but no token (not set). `cfg` is a plain field,
+/// so tests mutate the snapshot directly (§8.2 preamble); every token here
+/// is the house fake, never a real-shaped literal.
+#[tracing::instrument(skip_all)]
+async fn make_state_multi_bot() -> (WebState, TempDir) {
+    let (mut state, dir) = make_state().await;
+    state.cfg.bots = vec![
+        crate::config::BotConfig {
+            key: "primary".to_string(),
+            name: "Primary".to_string(),
+            token: "test-token-placeholder".to_string(),
+            owner_id: 1,
+            default_channel: None,
+            token_env: Some("BOT_PRIMARY".to_string()),
+        },
+        crate::config::BotConfig {
+            key: "proxy26_bot".to_string(),
+            name: "Proxy26_Bot".to_string(),
+            token: String::new(),
+            owner_id: 0,
+            default_channel: None,
+            token_env: Some("BOT_PROXY26_BOT".to_string()),
+        },
+    ];
+    state.cfg.bots_legacy = false;
+    (state, dir)
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_renders_one_field_per_bot() {
+    let (state, _dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    state.db.create_bot("proxy26_bot", 0, None, "Proxy26_Bot");
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/settings", &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    // One write-only field per DB bot, addressed by key — and no legacy
+    // shadow field at all (mode exclusivity, §2).
+    assert_eq!(body.matches(r#"name="bot_primary""#).count(), 1, "{body}");
+    assert_eq!(
+        body.matches(r#"name="bot_proxy26_bot""#).count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains(r#"name="bot_token""#), "{body}");
+    // House shape: the secret-field wrapper with the shared reveal toggle,
+    // and the write-target var named in each row's help.
+    assert!(
+        body.contains(r#"id="settings-bot-token-primary""#),
+        "{body}"
+    );
+    assert!(body.contains("secret-toggle"), "{body}");
+    assert!(body.contains("<code>BOT_PRIMARY</code>"), "{body}");
+    assert!(body.contains("<code>BOT_PROXY26_BOT</code>"), "{body}");
+    // Badges read the boot-resolved tokens: configured vs not set (§3.3).
+    assert!(
+        body.contains(
+            r#"<label for="settings-bot-token-primary">Bot token — Primary <span class="badge badge-success">configured</span></label>"#
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            r#"<label for="settings-bot-token-proxy26_bot">Bot token — Proxy26_Bot <span class="badge badge-warning">not set</span></label>"#
+        ),
+        "{body}"
+    );
+    // The §3.2 mode line, and the scoped honesty note for the two
+    // legacy-env fields the file branch never reads.
+    assert!(body.contains("Multi-bot mode."), "{body}");
+    assert!(
+        body.contains("these two fields only apply in single-bot mode."),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_inline_token_row_has_no_input() {
+    let (mut state, _dir) = make_state_multi_bot().await;
+    // An inline token in the config file has no setting name to write to
+    // (token_env: None) — the row must offer no input at all.
+    state.cfg.bots[0].token_env = None;
+    state.db.create_bot("primary", 1, None, "Primary");
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/settings", &token)).await.unwrap();
+    let body = body_string(resp).await;
+    assert!(!body.contains(r#"name="bot_primary""#), "{body}");
+    assert!(
+        body.contains("set directly in your bot config file — edit it there"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_blank_save_writes_nothing() {
+    let (state, dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    state.db.create_bot("proxy26_bot", 0, None, "Proxy26_Bot");
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let _env = ENV_LOCK.lock().await;
+    let env_path = dir.path().join(".env");
+    set_env_file_var(&env_path);
+    let resp = app
+        .oneshot(post_authed_req(
+            "/settings/save",
+            "section=connection&bot_primary=&bot_proxy26_bot=&owner_id=&default_channel=&crypto_token=",
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    assert!(body.contains("Nothing to save"), "{body}");
+    assert!(!env_path.exists(), "all-blank save must not create .env");
+    clear_env_file_var();
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_composes_right_vars() {
+    let (mut state, _dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    state.db.create_bot("proxy26_bot", 0, None, "Proxy26_Bot");
+    let mut form = HashMap::new();
+    form.insert(
+        "bot_primary".to_string(),
+        "test-token-placeholder".to_string(),
+    );
+    form.insert("bot_proxy26_bot".to_string(), String::new());
+    // Pure composition: exactly the non-blank state-A row becomes a write;
+    // the blank row writes nothing and names no bot.
+    let writes = token_env_updates(&state, &form).expect("compose succeeds");
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].var, "BOT_PRIMARY");
+    assert_eq!(writes[0].value, "test-token-placeholder");
+    assert_eq!(writes[0].bot_name, "Primary");
+    // §5.2 guard: two rows resolving to the SAME var with different values
+    // are rejected (dotenvy is first-wins; a duplicate line would lie).
+    state.cfg.bots[1].token_env = Some("BOT_PRIMARY".to_string());
+    let mut shared = HashMap::new();
+    shared.insert(
+        "bot_primary".to_string(),
+        "test-token-placeholder".to_string(),
+    );
+    shared.insert("bot_proxy26_bot".to_string(), "another-fake".to_string());
+    let err = token_env_updates(&state, &shared).expect_err("shared var rejected");
+    assert!(err.contains("share the setting"), "{err}");
+    assert!(err.contains("BOT_PRIMARY"), "{err}");
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_token_debug_redacts_value() {
+    let (state, _dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    let mut form = HashMap::new();
+    form.insert(
+        "bot_primary".to_string(),
+        "test-token-placeholder".to_string(),
+    );
+    let writes = token_env_updates(&state, &form).expect("compose succeeds");
+    // L3 P3-1: the Debug render is a redaction surface — a future
+    // `tracing::debug!(?writes)` can never leak the token value.
+    let dbg = format!("{:?}", writes);
+    assert!(dbg.contains("<redacted>"), "{dbg}");
+    assert!(!dbg.contains("test-token-placeholder"), "{dbg}");
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_writer_replaces_and_preserves() {
+    let (state, dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    let mut form = HashMap::new();
+    form.insert(
+        "bot_primary".to_string(),
+        "test-token-placeholder".to_string(),
+    );
+    // The handler's managed set: exactly the composed writes (legacy keys
+    // are blank here, so the set is just the one bot var).
+    let writes = token_env_updates(&state, &form).expect("compose succeeds");
+    let updates: Vec<(String, Option<String>)> = writes
+        .iter()
+        .map(|w| (w.var.clone(), Some(w.value.clone())))
+        .collect();
+    let _env = ENV_LOCK.lock().await;
+    let env_path = dir.path().join(".env");
+    std::fs::write(&env_path, "BOT_PRIMARY=stale-value\nWEB_BIND=0.0.0.0\n").unwrap();
+    set_env_file_var(&env_path);
+    let managed: Vec<(&str, Option<&str>)> = updates
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_deref()))
+        .collect();
+    crate::config::write_env_file_replacing(&managed).expect("write succeeds");
+    // The managed key is REPLACED (exactly one line, stale value gone); the
+    // foreign key survives verbatim.
+    let env = std::fs::read_to_string(&env_path).unwrap();
+    assert_eq!(env.matches("BOT_PRIMARY=").count(), 1, "{env}");
+    assert!(env.contains("WEB_BIND=0.0.0.0"), "{env}");
+    assert!(!env.contains("stale-value"), "{env}");
+    clear_env_file_var();
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_invalid_token_writes_nothing() {
+    let (state, dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    state.db.create_bot("proxy26_bot", 0, None, "Proxy26_Bot");
+    let db = state.db.clone();
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let _env = ENV_LOCK.lock().await;
+    let env_path = dir.path().join(".env");
+    set_env_file_var(&env_path);
+    let resp = app
+        .oneshot(post_authed_req(
+            "/settings/save",
+            "section=connection&bot_primary=123456:definitely-not-a-token",
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    // The banner names the failing bot and keeps the shared nothing-saved
+    // tail; which verdict (rejected vs unreachable) depends on the network.
+    assert!(body.contains("Primary — "), "{body}");
+    assert!(body.contains("Nothing was saved."), "{body}");
+    assert!(!env_path.exists(), "a rejected token must never reach .env");
+    assert!(
+        db.get_config("restart_required").is_none(),
+        "a rejected save must not set the restart flag"
+    );
+    clear_env_file_var();
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_multi_bot_rejects_shadowed_legacy_field() {
+    let (state, dir) = make_state_multi_bot().await;
+    state.db.create_bot("primary", 1, None, "Primary");
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let _env = ENV_LOCK.lock().await;
+    let env_path = dir.path().join(".env");
+    set_env_file_var(&env_path);
+    // A stale bookmark or crafted POST must not resurrect the shadowed
+    // legacy write (§5.6) — even alongside otherwise-valid fields.
+    let resp = app
+        .oneshot(post_authed_req(
+            "/settings/save",
+            "section=connection&bot_token=nonblank&owner_id=42",
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("Single-bot token fields are not used in multi-bot mode"),
+        "{body}"
+    );
+    assert!(body.contains("Nothing was saved."), "{body}");
+    assert!(!env_path.exists(), "the shadow write must stay dead");
+    clear_env_file_var();
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_legacy_mode_renders_single_field_and_mode_line() {
+    let (state, _dir) = make_state().await; // bots_legacy: true
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/settings", &token)).await.unwrap();
+    let body = body_string(resp).await;
+    // §4 byte-guard: the single legacy field plus exactly one mode line.
+    assert!(
+        body.contains("This console is in single-bot mode."),
+        "{body}"
+    );
+    assert!(body.contains(r#"name="bot_token""#), "{body}");
+    assert!(!body.contains("Multi-bot mode."), "{body}");
+    // No per-bot rows: only the legacy field (the per-row ids carry a
+    // `-` key suffix the single field never has; `name="bot_id"` is the
+    // unrelated bot-scope select).
+    assert!(!body.contains(r#"id="settings-bot-token-""#), "{body}");
+    assert_eq!(body.matches(r#"name="bot_token""#).count(), 1, "{body}");
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_logout_link_lives_in_management_not_rail() {
+    let (state, _dir) = make_state().await;
+    let db = state.db.clone();
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(authed_req("/settings", &token))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    // §7: the rail foot lost its logout anchor; the Management section
+    // carries the sign-out form instead.
+    assert!(!body.contains(r#"href="/logout""#), "{body}");
+    assert!(body.contains(r#"action="/logout""#), "{body}");
+    assert!(body.contains("Sign out"), "{body}");
+    assert!(body.contains("Sign out of this console."), "{body}");
+    // The new POST arm clears the session exactly like the GET arm.
+    let resp = app
+        .oneshot(post_authed_req("/logout", "", &token))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
+    assert!(db.get_web_session(&token).is_none());
+}
+
 #[tokio::test]
 #[tracing::instrument(skip_all)]
 async fn settings_password_changes_and_invalidates_other_sessions() {

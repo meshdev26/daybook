@@ -97,6 +97,8 @@ mod tests {
             telegram_api_id: None,
             telegram_api_hash: None,
             owner_id: 0,
+            bots: Vec::new(),
+            bots_legacy: true,
         }
     }
 

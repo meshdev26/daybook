@@ -36,6 +36,8 @@ pub(super) async fn make_unclaimed_state() -> (WebState, TempDir) {
         mcp_owner_token: None,
         telegram_api_id: None,
         telegram_api_hash: None,
+        bots: Vec::new(),
+        bots_legacy: true,
     };
     let db = Arc::new(db);
     let bots = Arc::new(crate::bots::BotManager::placeholder(

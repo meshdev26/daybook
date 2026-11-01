@@ -3052,6 +3052,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             token: String::new(),
             owner_id: 100,
             default_channel: None,
+            token_env: None,
         },
         crate::config::BotConfig {
             key: "shop_bot".to_string(),
@@ -3059,6 +3060,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             token: String::new(),
             owner_id: 101,
             default_channel: None,
+            token_env: None,
         },
     ];
     db.backfill_bots_at_startup(&bots);

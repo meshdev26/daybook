@@ -690,6 +690,8 @@ mod tests {
             mcp_owner_token: token.map(str::to_string),
             telegram_api_id: None,
             telegram_api_hash: None,
+            bots: Vec::new(),
+            bots_legacy: true,
         };
         let db = Arc::new(db);
         let bots = Arc::new(crate::bots::BotManager::placeholder(

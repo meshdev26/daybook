@@ -93,6 +93,8 @@ async fn make_state() -> (WebState, tempfile::TempDir) {
         mcp_owner_token: None,
         telegram_api_id: None,
         telegram_api_hash: None,
+        bots: Vec::new(),
+        bots_legacy: true,
     };
     let bot = teloxide::Bot::new("0:setup-placeholder".to_string());
     let db = Arc::new(db);

@@ -27,6 +27,19 @@ pub struct SharedConfig {
     /// Bot-specific code should prefer BotContext.owner_id; this keeps legacy
     /// call sites (web settings, embed) working during migration.
     pub owner_id: i64,
+    /// Boot snapshot of the resolved bots — a mirror of `AppConfig.bots` so
+    /// the web layer can address per-bot `token_env` (and resolved-token
+    /// presence) through the state it already has. Populated only by
+    /// `AppConfig::from_env`; test literals leave it empty (legacy mode).
+    pub bots: Vec<BotConfig>,
+    /// True when bot resolution fell through to the legacy
+    /// `TELEGRAM_BOT_TOKEN`/`OWNER_ID` pair — i.e. no `BOTS_CONFIG`/
+    /// `BOTS_JSON` source parsed to at least one bot. Decides which
+    /// connection panel the Settings page renders
+    /// (SETTINGS_PER_BOT_TOKEN_SPEC §2 mode matrix). Source-tracked at
+    /// resolution time so a *set-but-broken* BOTS_CONFIG honestly renders
+    /// as legacy (that is what the running process actually uses).
+    pub bots_legacy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +49,13 @@ pub struct BotConfig {
     pub token: String,
     pub owner_id: i64,
     pub default_channel: Option<String>,
+    /// NAME of the env var the token was resolved from (`token_env` in
+    /// bots.toml / BOTS_JSON), retained so the web settings layer can write
+    /// an updated token back to the right variable. None for inline `token`
+    /// entries (legacy convenience; nothing to write back to — see
+    /// docs/MULTI_BOT.md). The variable name is non-secret config metadata
+    /// (it already appears in bots.toml); the token value stays in `token`.
+    pub token_env: Option<String>,
 }
 
 #[derive(Clone)]
@@ -470,7 +490,7 @@ impl AppConfig {
             .filter(|s| !s.trim().is_empty());
 
         // Bots resolution (needed for the primary bot's owner_id in shared).
-        let bots = resolve_bots();
+        let (bots, bots_legacy) = resolve_bots();
         let primary_owner_id = bots.first().map(|b| b.owner_id).unwrap_or(0);
 
         let shared = SharedConfig {
@@ -487,13 +507,22 @@ impl AppConfig {
             telegram_api_id,
             telegram_api_hash,
             owner_id: primary_owner_id,
+            bots: bots.clone(),
+            bots_legacy,
         };
 
         AppConfig { shared, bots }
     }
 }
 
-fn resolve_bots() -> Vec<BotConfig> {
+/// Resolves the boot bot list plus the source that served it: the bool is
+/// the legacy flag — true only for the `TELEGRAM_BOT_TOKEN`/`OWNER_ID`
+/// fallback arm (including its empty early return), false when
+/// `BOTS_CONFIG`/`BOTS_JSON` parsed to at least one bot. Tracked at the
+/// decision point (no drift) so the web layer can render the honest
+/// connection mode: a set-but-broken bot config file yields `([], true)`,
+/// because the process really runs legacy in that case.
+fn resolve_bots() -> (Vec<BotConfig>, bool) {
     // 1. BOTS_CONFIG (TOML path)
     if let Ok(path) = env::var("BOTS_CONFIG")
         && !path.trim().is_empty()
@@ -501,7 +530,7 @@ fn resolve_bots() -> Vec<BotConfig> {
         && let Ok(bots) = parse_bots_toml(&content)
         && !bots.is_empty()
     {
-        return bots;
+        return (bots, false);
     }
     // 2. BOTS_JSON
     if let Ok(raw) = env::var("BOTS_JSON")
@@ -509,7 +538,7 @@ fn resolve_bots() -> Vec<BotConfig> {
         && let Ok(bots) = parse_bots_json(&raw)
         && !bots.is_empty()
     {
-        return bots;
+        return (bots, false);
     }
     // 3. Legacy single-bot env
     let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
@@ -518,15 +547,34 @@ fn resolve_bots() -> Vec<BotConfig> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if bot_token.trim().is_empty() && owner_id == 0 {
-        return vec![];
+        return (vec![], true);
     }
-    vec![BotConfig {
+    (
+        vec![legacy_primary_bot(
+            bot_token,
+            owner_id,
+            env::var("DEFAULT_CHANNEL").ok().filter(|s| !s.is_empty()),
+        )],
+        true,
+    )
+}
+
+/// The synthesized legacy primary bot. Its token comes from
+/// `TELEGRAM_BOT_TOKEN`, so the retained env name is exactly that variable —
+/// that is what the settings layer must write back to.
+fn legacy_primary_bot(
+    bot_token: String,
+    owner_id: i64,
+    default_channel: Option<String>,
+) -> BotConfig {
+    BotConfig {
         key: "primary".to_string(),
         name: "Primary".to_string(),
         token: bot_token,
         owner_id,
-        default_channel: env::var("DEFAULT_CHANNEL").ok().filter(|s| !s.is_empty()),
-    }]
+        default_channel,
+        token_env: Some("TELEGRAM_BOT_TOKEN".to_string()),
+    }
 }
 
 fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
@@ -550,9 +598,11 @@ fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
+        let mut token_env = None;
         let token = if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
             t.to_string()
         } else if let Some(envname) = v.get("token_env").and_then(|x| x.as_str()) {
+            token_env = Some(envname.to_string());
             env::var(envname).unwrap_or_default()
         } else {
             String::new()
@@ -566,6 +616,7 @@ fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
             token,
             owner_id,
             default_channel,
+            token_env,
         });
     }
     Ok(out)
@@ -600,9 +651,11 @@ fn parse_bots_toml(content: &str) -> Result<Vec<BotConfig>, ()> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
+        let mut token_env = None;
         let token = if let Some(t) = b.get("token").and_then(|v| v.as_str()) {
             t.to_string()
         } else if let Some(envname) = b.get("token_env").and_then(|v| v.as_str()) {
+            token_env = Some(envname.to_string());
             env::var(envname).unwrap_or_default()
         } else {
             String::new()
@@ -616,6 +669,7 @@ fn parse_bots_toml(content: &str) -> Result<Vec<BotConfig>, ()> {
             token,
             owner_id,
             default_channel,
+            token_env,
         });
     }
     Ok(out)
@@ -973,12 +1027,14 @@ default_channel = \"@sales\"
         assert_eq!(bots[0].name, "Primary");
         assert_eq!(bots[0].owner_id, 111);
         assert_eq!(bots[0].token, "tok-from-env");
+        assert_eq!(bots[0].token_env.as_deref(), Some(TOKEN_ENV_SET));
         assert_eq!(bots[0].default_channel, None);
         assert_eq!(bots[1].key, "sales");
         assert_eq!(bots[1].name, "Sales");
         assert_eq!(bots[1].owner_id, 222);
         // An unset token_env resolves to an empty token (existing rule).
         assert_eq!(bots[1].token, "");
+        assert_eq!(bots[1].token_env.as_deref(), Some(TOKEN_ENV_UNSET));
         assert_eq!(bots[1].default_channel.as_deref(), Some("@sales"));
         // SAFETY: restores the test-only variable.
         unsafe { std::env::remove_var(TOKEN_ENV_SET) };
@@ -996,5 +1052,135 @@ default_channel = \"@sales\"
             parse_bots_toml("[other]\nkey = \"x\"\n").is_err(),
             "valid TOML without a [[bots]] array must be Err, not Ok(empty)"
         );
+    }
+
+    /// `token_env` names are retained per bot: Some(var name) for entries
+    /// that reference an env variable, None for inline `token` entries.
+    /// Inline tokens still resolve (legacy convenience — docs/MULTI_BOT.md
+    /// warns against them) but there is no variable to write back to.
+    #[test]
+    fn bots_toml_token_env_name_some_for_env_none_for_inline() {
+        const TOKEN_ENV_SET: &str = "BOTS_TOML_TEST_TOKEN_MIXED_SET";
+        // SAFETY: test-only variable name no other test touches; removed
+        // again below so the run leaves no state behind.
+        unsafe { std::env::set_var(TOKEN_ENV_SET, "test-token-placeholder") };
+        let doc = format!(
+            "\
+[[bots]]
+key = \"primary\"
+name = \"Primary\"
+token_env = \"{TOKEN_ENV_SET}\"
+owner_id = 111
+
+[[bots]]
+key = \"shop\"
+name = \"Shop\"
+token = \"test-token-placeholder\"
+owner_id = 222
+"
+        );
+        let bots = parse_bots_toml(&doc).expect("a two-bot document must parse");
+        assert_eq!(bots.len(), 2);
+        assert_eq!(bots[0].token, "test-token-placeholder");
+        assert_eq!(bots[0].token_env.as_deref(), Some(TOKEN_ENV_SET));
+        // Inline token resolves but records no env name.
+        assert_eq!(bots[1].token, "test-token-placeholder");
+        assert_eq!(bots[1].token_env, None);
+        // SAFETY: restores the test-only variable.
+        unsafe { std::env::remove_var(TOKEN_ENV_SET) };
+    }
+
+    /// Same retention contract for the BOTS_JSON parser.
+    #[test]
+    fn bots_json_token_env_name_some_for_env_none_for_inline() {
+        const TOKEN_ENV_SET: &str = "BOTS_JSON_TEST_TOKEN_MIXED_SET";
+        // SAFETY: test-only variable name no other test touches; removed
+        // again below so the run leaves no state behind.
+        unsafe { std::env::set_var(TOKEN_ENV_SET, "test-token-placeholder") };
+        let raw = serde_json::json!([
+            {
+                "key": "primary",
+                "name": "Primary",
+                "token_env": TOKEN_ENV_SET,
+                "owner_id": 111
+            },
+            {
+                "key": "shop",
+                "name": "Shop",
+                "token": "test-token-placeholder",
+                "owner_id": 222
+            }
+        ])
+        .to_string();
+        let bots = parse_bots_json(&raw).expect("a two-bot JSON array must parse");
+        assert_eq!(bots.len(), 2);
+        assert_eq!(bots[0].token, "test-token-placeholder");
+        assert_eq!(bots[0].token_env.as_deref(), Some(TOKEN_ENV_SET));
+        // Inline token resolves but records no env name.
+        assert_eq!(bots[1].token, "test-token-placeholder");
+        assert_eq!(bots[1].token_env, None);
+        // SAFETY: restores the test-only variable.
+        unsafe { std::env::remove_var(TOKEN_ENV_SET) };
+    }
+
+    /// The legacy fallback bot's token comes from `TELEGRAM_BOT_TOKEN`, so
+    /// the retained env name must be exactly that variable. Asserted on the
+    /// `legacy_primary_bot` constructor rather than end-to-end through
+    /// `resolve_bots`, which reads shared process env (`BOTS_CONFIG`) that
+    /// other test modules also touch.
+    #[test]
+    fn legacy_fallback_bot_carries_telegram_bot_token_env() {
+        let bot = legacy_primary_bot("test-token-placeholder".to_string(), 42, None);
+        assert_eq!(bot.key, "primary");
+        assert_eq!(bot.name, "Primary");
+        assert_eq!(bot.token, "test-token-placeholder");
+        assert_eq!(bot.owner_id, 42);
+        assert_eq!(bot.default_channel, None);
+        assert_eq!(bot.token_env.as_deref(), Some("TELEGRAM_BOT_TOKEN"));
+        // Passthrough fields stay intact.
+        let bot = legacy_primary_bot(String::new(), 0, Some("@shop".to_string()));
+        assert_eq!(bot.token, "");
+        assert_eq!(bot.default_channel.as_deref(), Some("@shop"));
+        assert_eq!(bot.token_env.as_deref(), Some("TELEGRAM_BOT_TOKEN"));
+    }
+
+    /// End-to-end source tracking for `resolve_bots` (the flag is decided
+    /// exactly where the source decision happens): a parseable
+    /// `BOTS_CONFIG` reports legacy=false and retains the per-bot
+    /// `token_env` name, while a cleared environment falls through to the
+    /// legacy `TELEGRAM_BOT_TOKEN`/`OWNER_ID` arm and reports legacy=true.
+    #[tokio::test]
+    async fn resolve_bots_reports_file_vs_legacy_source() {
+        // BOTS_CONFIG is shared process env that web tests also set
+        // (web/tests/bots.rs); ENV_LOCK is the house seam serializing
+        // env-mutating tests in this binary.
+        let _env = crate::web::test_support::ENV_LOCK.lock().await;
+        const TOKEN_ENV: &str = "BOTS_RESOLVE_TEST_TOKEN_ENV";
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("bots.toml");
+        let doc = format!(
+            "[[bots]]\nkey = \"primary\"\nname = \"Primary\"\ntoken_env = \"{TOKEN_ENV}\"\nowner_id = 42\n"
+        );
+        std::fs::write(&cfg_path, doc).unwrap();
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("BOTS_CONFIG", &cfg_path) };
+        // SAFETY: serialized by ENV_LOCK; no test sets BOTS_JSON.
+        unsafe { std::env::remove_var("BOTS_JSON") };
+        let (bots, legacy) = resolve_bots();
+        assert!(!legacy, "a parseable BOTS_CONFIG must resolve file mode");
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].key, "primary");
+        assert_eq!(bots[0].token_env.as_deref(), Some(TOKEN_ENV));
+
+        // Cleared environment: the legacy fallback arm, flagged as such.
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::remove_var("BOTS_CONFIG") };
+        // SAFETY: serialized by ENV_LOCK; no other test sets these legacy
+        // vars, so clearing them makes the empty-legacy case deterministic.
+        unsafe { std::env::remove_var("TELEGRAM_BOT_TOKEN") };
+        unsafe { std::env::remove_var("OWNER_ID") };
+        let (bots, legacy) = resolve_bots();
+        assert!(legacy, "no file source parsed must resolve legacy mode");
+        assert!(bots.is_empty());
     }
 }
