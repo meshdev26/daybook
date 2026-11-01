@@ -1,6 +1,41 @@
 use super::*;
 // ---------- Promos ----------
 
+/// Promos flash keys (EDIT_FLOW_SPEC E6/E7): create outcome (naming the code
+/// — the object key), revoke outcome, and mapped validation errors.
+#[derive(Deserialize)]
+pub(super) struct PromosQuery {
+    pub(super) created: Option<String>,
+    pub(super) code: Option<String>,
+    pub(super) revoked: Option<String>,
+    pub(super) error: Option<String>,
+}
+
+fn promos_banner(q: &PromosQuery) -> String {
+    if q.created.as_deref() == Some("1") {
+        return match q.code.as_deref().filter(|s| !s.is_empty()) {
+            Some(code) => format!(
+                r#"<div class="alert alert-success" role="status" aria-live="polite">Promo code {} created.</div>"#,
+                esc(code)
+            ),
+            None => r#"<div class="alert alert-success" role="status" aria-live="polite">Promo code created.</div>"#.to_string(),
+        };
+    }
+    if q.revoked.as_deref() == Some("1") {
+        return r#"<div class="alert alert-success" role="status" aria-live="polite">Promo code revoked.</div>"#.to_string();
+    }
+    if let Some(e) = q.error.as_ref() {
+        let msg = match e.as_str() {
+            "code" => "Enter a code.",
+            "type" => "Choose percent or fixed.",
+            "value" => "Value must be a number greater than 0.",
+            _ => return String::new(),
+        };
+        return format!(r#"<div class="alert alert-error" role="alert">{msg}</div>"#);
+    }
+    String::new()
+}
+
 #[derive(Deserialize)]
 pub(super) struct PromosCreateForm {
     pub(super) code: Option<String>,
@@ -17,6 +52,7 @@ pub(super) struct PromosCreateForm {
 pub(super) async fn promos_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<PromosQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -86,19 +122,22 @@ pub(super) async fn promos_page(
         r#"<article class="panel"><h3>Create promo code</h3>
 <form method="post" action="{}">
 <label for="code">Code</label><input id="code" name="code" required>
-<label for="promo_type">Type</label><select id="promo_type" name="promo_type"><option value="percent">percent</option><option value="fixed">fixed</option></select>
+<label for="promo_type">Type</label><select id="promo_type" name="promo_type"><option value="percent">percent (% off)</option><option value="fixed">fixed (amount off)</option></select>
 <label for="value">Value</label><input id="value" name="value" type="number" step="any" required>
 <label for="max_uses">Max uses</label><input id="max_uses" name="max_uses" type="number" min="0" placeholder="unlimited">
 <label for="min_purchase">Min purchase</label><input id="min_purchase" name="min_purchase" type="number" step="any" value="0">
-<label for="days">Days</label><input id="days" name="days" type="number" min="0" value="30">
+<label for="days">Expires after (days)</label><input id="days" name="days" type="number" min="0" value="30"><span class="help">0 = never expires.</span>
 <button type="submit">Create</button>
 </form></article>"#,
         state.url("/promos")
     );
+    let banner = promos_banner(&q);
     let body = format!(
         r#"<h1>Promos <span class="sub">promo codes &amp; discounts</span></h1>
+{banner}
 {form}
 {table}"#,
+        banner = banner,
         form = form,
         table = table
     );
@@ -124,8 +163,10 @@ pub(super) async fn promos_create(
         }
     };
     let code = f.code.as_deref().map(str::trim).unwrap_or("").to_string();
+    // E6: every validation failure used to plain-redirect, silently
+    // discarding the whole form — fixed keys with mapped copy now report.
     if code.is_empty() {
-        return Redirect::to(&state.url("/promos")).into_response();
+        return Redirect::to(&state.url("/promos?error=code")).into_response();
     }
     let promo_type = f
         .promo_type
@@ -135,11 +176,11 @@ pub(super) async fn promos_create(
         .unwrap_or("")
         .to_string();
     if promo_type != "percent" && promo_type != "fixed" {
-        return Redirect::to(&state.url("/promos")).into_response();
+        return Redirect::to(&state.url("/promos?error=type")).into_response();
     }
     let value: f64 = match f.value.as_deref().map(str::trim).unwrap_or("").parse() {
         Ok(v) if v > 0.0 => v,
-        _ => return Redirect::to(&state.url("/promos")).into_response(),
+        _ => return Redirect::to(&state.url("/promos?error=value")).into_response(),
     };
     let max_uses = f
         .max_uses
@@ -180,7 +221,7 @@ pub(super) async fn promos_create(
         None,
         expires_ref,
     );
-    Redirect::to(&state.url("/promos")).into_response()
+    Redirect::to(&state.url(&format!("/promos?created=1&code={}", qenc(&code)))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -209,5 +250,6 @@ pub(super) async fn promos_revoke(
     } else {
         state.db.revoke_promo_code_all(&code);
     }
-    Redirect::to(&state.url("/promos")).into_response()
+    // E7: the confirm names the code, but the outcome used to be silent.
+    Redirect::to(&state.url("/promos?revoked=1")).into_response()
 }

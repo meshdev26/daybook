@@ -78,17 +78,8 @@ pub(super) async fn dashboard(
 {onboarding}
 <article class="panel"><div class="stat"><span class="stat-label">Default channel</span><span class="stat-value">{}</span></div></article>
 <div class="grid-2">
-<article class="panel"><h3>Plans ({})</h3><ul>{}</ul></article>
+<article class="panel"><h3>Plans ({})</h3><ul>{}</ul><a class="btn btn-ghost btn-sm" href="{}">Create on the Plans page</a></article>
 <article class="panel"><h3>Recent subscriptions ({})</h3><ul>{}</ul></article>
-</div>
-<div class="grid-2">
-<article class="panel"><h3>Create plan</h3><form method="post" action="{}">
-<label for="name">Name</label><input id="name" name="name" required>
-<label for="price">Price</label><input id="price" name="price" required>
-<label for="asset">Asset</label><input id="asset" name="asset" required>
-<label for="duration_days">Duration days</label><input id="duration_days" name="duration_days" type="number" required>
-<label for="channel">Channel</label><input id="channel" name="channel" placeholder="@channel (optional)">
-<button type="submit">Create plan</button></form></article>
 <article class="panel"><h3>Post</h3><form method="post" action="{}">
 <label>Channel<select name="channel">{}</select>{composer_note}</label>
 <label>Text<textarea name="text" required></textarea></label>
@@ -101,9 +92,9 @@ pub(super) async fn dashboard(
         ),
         lists.plans_len,
         lists.plans_list,
+        state.url("/plans"),
         lists.subs_len,
         lists.subs_list,
-        state.url("/plan"),
         state.url("/post"),
         channel_options,
     );
@@ -140,7 +131,10 @@ fn dashboard_lists(
         None => state.db.list_subscriptions(seller_scope, 10),
     };
     let plans_list = if plans.is_empty() {
-        "<li class=\"empty\"><b>No plans yet.</b>Create your first plan below — buyers see it in the shop.</li>"
+        // C10b: the dashboard no longer duplicates the Plans create form —
+        // the ghost link above is the one pointer, so the empty state points
+        // there too.
+        "<li class=\"empty\"><b>No plans yet.</b>Create your first plan on the Plans page — buyers see it in the shop.</li>"
             .to_string()
     } else {
         plans

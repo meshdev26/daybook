@@ -34,6 +34,9 @@ pub(super) struct SubsQuery {
     /// /orders outcome flag: the status/tracking handlers redirect with
     /// ?saved=1 (the query struct is shared with /subs, which ignores it).
     pub(super) saved: Option<String>,
+    /// /codes delete flag (EDIT_FLOW_SPEC E5): the codes page shares this
+    /// struct and renders "Code deleted." from it; /subs ignores it.
+    pub(super) deleted: Option<String>,
 }
 
 pub(super) fn normalize_sub_status(s: Option<String>) -> String {
@@ -281,9 +284,12 @@ fn subs_table_html(
                         r.0,
                         r.0
                     );
-                    // Extend: the handler takes sub_id + days (clamped 1..=3650).
+                    // Extend: the handler takes sub_id + days (clamped
+                    // 1..=3650). C4: secondary weight — the row's primary
+                    // action space belongs to nothing here; Extend mutates
+                    // access like finance Approve, not like a fresh grant.
                     let extend_form = format!(
-                        r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="sub_id" value="{}"><input type="number" name="days" value="30" min="1" max="3650" aria-label="Days to extend subscription {}" class="input-num"><button type="submit" class="btn btn-sm" onclick="return confirm('Extend subscription #{} by the given days?')">Extend</button></form>"#,
+                        r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="sub_id" value="{}"><input type="number" name="days" value="30" min="1" max="3650" aria-label="Days to extend subscription {}" class="input-num"><button type="submit" class="btn btn-secondary btn-sm" onclick="return confirm('Extend subscription #{} by the given days?')">Extend</button></form>"#,
                         state.url("/subs/extend"),
                         r.0,
                         r.0,
@@ -380,12 +386,14 @@ fn subs_pagination(
 }
 
 fn subs_grant_form(state: &WebState) -> String {
+    // C3 (EDIT_FLOW_SPEC): visible <label for> like every other create form
+    // on the console — the aria-label-only inputs are gone.
     format!(
         r#"<article class="panel"><h3>Grant subscription</h3>
 <form method="post" action="{}" class="inline-form">
-<input type="number" name="user_id" placeholder="user id" required aria-label="Telegram user id to grant">
-<input type="number" name="days" placeholder="days" value="30" required aria-label="Days to grant">
-<input type="text" name="channel" placeholder="@channel" required aria-label="Channel to grant access to">
+<label for="g-user">Telegram user id</label><input id="g-user" type="number" name="user_id" placeholder="user id" required>
+<label for="g-days">Days</label><input id="g-days" type="number" name="days" placeholder="days" value="30" required>
+<label for="g-channel">Channel</label><input id="g-channel" type="text" name="channel" placeholder="@channel" required>
 <button type="submit">Grant</button>
 </form></article>"#,
         state.url("/subs/grant")

@@ -44,27 +44,62 @@ pub(super) async fn subs_grant(
 
 // ---------- Broadcast ----------
 
-/// Query for the broadcast page: the send handler's outcome flag (?sent={n}).
-#[derive(Deserialize)]
-pub(super) struct BroadcastQuery {
-    pub(super) sent: Option<String>,
-    pub(super) segment: Option<String>,
+/// One segment value from the GET form's repeated `segment` params (EDIT_FLOW_SPEC
+/// E17: the preset select and the custom `<details>` input share the name on
+/// purpose — the extraction is `Query<Vec<(String, String)>>` because
+/// serde_urlencoded rejects repeated keys into any struct field). DOM order
+/// makes the select first and the custom text input second, so an explicit
+/// select choice (anything but the `custom` sentinel) wins; the sentinel
+/// defers to the typed expression; a bare `custom` with nothing typed stays
+/// `custom` (matches nobody — the honest zero audience the preview count
+/// then reports).
+fn resolve_segment(values: &[String]) -> String {
+    let select = values.first().map(|s| s.trim()).unwrap_or("");
+    let custom = values
+        .iter()
+        .skip(1)
+        .rev()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    if select == "custom" {
+        if custom.is_empty() {
+            "custom".to_string()
+        } else {
+            custom.to_string()
+        }
+    } else if !select.is_empty() {
+        select.to_string()
+    } else if !custom.is_empty() {
+        custom.to_string()
+    } else {
+        "all".to_string()
+    }
 }
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn broadcast_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
-    Query(q): Query<BroadcastQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    let sent = pairs
+        .iter()
+        .find(|(k, _)| k == "sent")
+        .map(|(_, v)| v.clone());
+    let segments: Vec<String> = pairs
+        .iter()
+        .filter(|(k, _)| k == "segment")
+        .map(|(_, v)| v.clone())
+        .collect();
     // Outcome banner from the ?sent={n} redirect (PRG). The count is what the
     // send actually delivered; 0 is a failure, not a success — nothing went
     // out.
-    let banner = match q.sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
+    let banner = match sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
         Some(0) => Some(
             r#"<div class="alert alert-error" role="alert">No users matched — nothing was sent.</div>"#
                 .to_string(),
@@ -75,7 +110,7 @@ pub(super) async fn broadcast_page(
         )),
         None => None,
     };
-    let segment = q.segment.clone().unwrap_or_else(|| "all".to_string());
+    let segment = resolve_segment(&segments);
     // Recipient scope (review P1-1, fail closed): owner → global (None);
     // a non-owner carries their seller_id; a non-owner with NO seller scope
     // must see and reach zero recipients — passing None from here would
@@ -107,26 +142,12 @@ pub(super) async fn broadcast_page(
         r#"onclick="return confirm('Broadcast to {} users? This cannot be unsent.')""#,
         audience
     );
-    let segment_options = ["all", "product:", "tag:", "active:30", "minspend:0"]
-        .iter()
-        .map(|s| {
-            // Render a few presets; selected if segment starts with s prefix
-            let val = *s;
-            let sel = if segment == val || (val.ends_with(':') && segment.starts_with(val)) {
-                " selected"
-            } else {
-                ""
-            };
-            format!(r#"<option value="{}"{}>{}</option>"#, val, sel, val)
-        })
-        .collect::<String>();
-    // Provide free-text segment input for custom values.
+    let segment_fields = broadcast_segment_fields(&segment);
     let body = format!(
         r#"{banner}<h1>Broadcast <span class="sub">send to customers</span></h1>
 <article class="panel"><h3>Compose</h3>
 <form method="get" action="{}" class="inline-form">
-<label>Segment <select name="segment">{segment_options}</select></label>
-<label>Custom <input type="text" name="segment" placeholder="product:1 / tag:vip / active:7 / minspend:10"></label>
+{segment_fields}
 <button type="submit">Preview count</button>
 </form>
 <form method="post" action="{}" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}">
@@ -140,12 +161,59 @@ pub(super) async fn broadcast_page(
         state.url("/broadcast"),
         state.url("/broadcast/send"),
         banner = banner.as_deref().unwrap_or(""),
-        segment_options = segment_options,
+        segment_fields = segment_fields,
         segment = esc(&segment),
         confirm = confirm,
         audience_note = audience_note,
     );
     Html(html_page(&state, Some(&session), "Broadcast", &body)).into_response()
+}
+
+/// The GET preview form's segment controls (EDIT_FLOW_SPEC E17): one preset
+/// select carrying the `custom` sentinel as its last option, plus the ONE
+/// custom text input inside a native `<details>` (closed unless the segment
+/// is non-preset — server-rendered, no JS). The shared `name="segment"` is
+/// deliberate: `resolve_segment` gives the explicit select choice
+/// precedence, so both submitting can no longer produce an unpredictable
+/// audience.
+fn broadcast_segment_fields(segment: &str) -> String {
+    let presets = ["all", "product:", "tag:", "active:30", "minspend:0"];
+    let preset_selected = presets
+        .iter()
+        .any(|val| segment == *val || (val.ends_with(':') && segment.starts_with(val)));
+    let mut segment_options = presets
+        .iter()
+        .map(|s| {
+            // Render a few presets; selected if segment starts with s prefix
+            let val = *s;
+            let sel = if segment == val || (val.ends_with(':') && segment.starts_with(val)) {
+                " selected"
+            } else {
+                ""
+            };
+            format!(r#"<option value="{}"{}>{}</option>"#, val, sel, val)
+        })
+        .collect::<String>();
+    if preset_selected {
+        segment_options.push_str(r#"<option value="custom">Custom segment…</option>"#);
+    } else {
+        segment_options.push_str(r#"<option value="custom" selected>Custom segment…</option>"#);
+    }
+    let custom_input = if preset_selected {
+        String::new()
+    } else {
+        format!(r#" value="{}""#, esc(segment))
+    };
+    let details_open = if preset_selected { "" } else { " open" };
+    format!(
+        r#"<label>Segment <select name="segment">{segment_options}</select></label>
+<details{details_open}><summary>Custom segment</summary>
+<label>Custom segment expression <input type="text" name="segment"{custom_input} placeholder="product:1 / tag:vip / active:7 / minspend:10"></label>
+</details>"#,
+        segment_options = segment_options,
+        details_open = details_open,
+        custom_input = custom_input,
+    )
 }
 
 #[derive(Deserialize)]
@@ -188,10 +256,18 @@ pub(super) async fn broadcast_send(
 
 // ---------- Crypto ----------
 
+/// The crypto page's save flash (EDIT_FLOW_SPEC E18) and the "Show me"
+/// result slot (E16): both render through one banner parameter.
+#[derive(Deserialize)]
+pub(super) struct CryptoQuery {
+    pub(super) saved: Option<String>,
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn crypto_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<CryptoQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -200,6 +276,20 @@ pub(super) async fn crypto_page(
     if session.role != "owner" {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
+    let banner = if q.saved.as_deref() == Some("1") {
+        r#"<div class="alert alert-success" role="status" aria-live="polite">Token saved.</div>"#
+            .to_string()
+    } else {
+        String::new()
+    };
+    let body = crypto_body(&state, &banner);
+    Html(html_page(&state, Some(&session), "Crypto", &body)).into_response()
+}
+
+/// The crypto page body, parameterized on the banner slot so `crypto_me` can
+/// render its check result in place (keys_setup.rs:149-155 direct-Html
+/// precedent — no PRG, no free text in URLs).
+fn crypto_body(state: &WebState, banner: &str) -> String {
     let token = state.db.get_config("crypto_token");
     let badge = if token
         .as_deref()
@@ -212,10 +302,9 @@ pub(super) async fn crypto_page(
         r#"<span class="badge badge-warning" aria-label="Crypto token not set">not set</span>"#
             .to_string()
     };
-    let result = ""; // placeholder
-    let _ = result;
-    let body = format!(
+    format!(
         r#"<h1>Crypto <span class="sub">Crypto Pay</span></h1>
+{banner}
 <article class="panel"><h3>Token {}</h3>
 <form method="post" action="{}" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}">
 <label for="crypto-token">Token</label>
@@ -228,9 +317,9 @@ pub(super) async fn crypto_page(
         badge,
         state.url("/crypto/setup"),
         state.url("/crypto/me"),
+        banner = banner,
         toggle = SECRET_TOGGLE,
-    );
-    Html(html_page(&state, Some(&session), "Crypto", &body)).into_response()
+    )
 }
 
 #[derive(Deserialize)]
@@ -253,8 +342,24 @@ pub(super) async fn crypto_setup(
     }
     if let Some(t) = f.token.as_deref().filter(|s| !s.trim().is_empty()) {
         state.db.set_config("crypto_token", t.trim());
+        Redirect::to(&state.url("/crypto?saved=1")).into_response()
+    } else {
+        // Blank submit changed nothing — no success flash (honest no-op).
+        Redirect::to(&state.url("/crypto")).into_response()
     }
-    Redirect::to(&state.url("/crypto")).into_response()
+}
+
+/// Char-boundary-safe truncation for the getMe snippet shown in the banner.
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// The error NAME only (EDIT_FLOW_SPEC E16): Crypto Pay errors are
+/// `HTTP <status> - <body>` or an API error word — the response body never
+/// reaches the banner.
+fn crypto_error_name(e: &str) -> String {
+    let head = e.split(" - ").next().unwrap_or(e);
+    truncate_chars(head, 120)
 }
 
 #[tracing::instrument(skip_all)]
@@ -274,22 +379,58 @@ pub(super) async fn crypto_me(
         return Redirect::to(&state.url("/crypto")).into_response();
     }
     let cp = crate::crypto::CryptoPay::new(token);
-    let res = cp.get_me().await;
-    let msg = match res {
-        Ok(v) => format!("Me: {}", v),
-        Err(e) => format!("Error: {}", e),
+    let banner = match cp.get_me().await {
+        Ok(v) => {
+            // EDIT_FLOW_SPEC E16: the computed result actually displays now —
+            // truncated to 200 chars and escaped, rendered here only.
+            let me = truncate_chars(&format!("Me: {}", v), 200);
+            format!(
+                r#"<div class="alert alert-success" role="status" aria-live="polite"><p><strong>Crypto Pay reachable.</strong></p><p class="mono">{}</p></div>"#,
+                esc(&me)
+            )
+        }
+        Err(e) => {
+            tracing::warn!("crypto get_me failed: {}", e);
+            format!(
+                r#"<div class="alert alert-error" role="alert">Crypto Pay check failed: {}</div>"#,
+                esc(&crypto_error_name(&e))
+            )
+        }
     };
-    // store in a query param (best effort, truncated)
-    let _ = msg;
-    Redirect::to(&state.url("/crypto")).into_response()
+    let body = crypto_body(&state, &banner);
+    Html(html_page(&state, Some(&session), "Crypto", &body)).into_response()
 }
 
 // ---------- Admins ----------
+
+/// Admins-page flash keys (EDIT_FLOW_SPEC E14): added/removed outcomes and
+/// the uid parse-fail error that used to drop silently.
+#[derive(Deserialize)]
+pub(super) struct AdminsQuery {
+    pub(super) added: Option<String>,
+    pub(super) removed: Option<String>,
+    pub(super) error: Option<String>,
+}
+
+fn admins_banner(q: &AdminsQuery) -> String {
+    if q.added.as_deref() == Some("1") {
+        return r#"<div class="alert alert-success" role="status" aria-live="polite">Admin added.</div>"#.to_string();
+    }
+    if q.removed.as_deref() == Some("1") {
+        return r#"<div class="alert alert-success" role="status" aria-live="polite">Admin removed.</div>"#.to_string();
+    }
+    if q.error.as_deref() == Some("uid") {
+        return r#"<div class="alert alert-error" role="alert">User ID must be a number.</div>"#
+            .to_string();
+    }
+    String::new()
+}
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn admins_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<AdminsQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -302,17 +443,18 @@ pub(super) async fn admins_page(
     let rows = admins
         .iter()
         .map(|(uid, uname)| {
+            // Username comes from the add-admin form's free-text field —
+            // escaped on render like every other user-supplied cell.
+            let name = esc(uname.as_deref().unwrap_or("—"));
             format!(
                 r#"<tr><td class="mono">{}</td><td>{}</td><td>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="user_id" value="{}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Remove admin {}?')">Remove</button></form>
+<form method="post" action="{}" class="inline-form"><input type="hidden" name="user_id" value="{}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Remove admin {}? They lose console admin powers.')">Remove</button></form>
 </td></tr>"#,
                 uid,
-                // Username comes from the add-admin form's free-text field —
-                // escaped on render like every other user-supplied cell.
-                esc(uname.as_deref().unwrap_or("—")),
+                name,
                 state.url("/admins/remove"),
                 uid,
-                uid
+                name
             )
         })
         .collect::<Vec<_>>()
@@ -325,8 +467,10 @@ pub(super) async fn admins_page(
             rows
         }
     );
+    let banner = admins_banner(&q);
     let body = format!(
         r#"<h1>Admins <span class="sub">admin management</span></h1>
+{banner}
 <article class="panel"><h3>Add admin</h3>
 <form method="post" action="{}" class="inline-form">
 <label for="user_id">User ID</label><input id="user_id" type="number" name="user_id" placeholder="user id" required>
@@ -335,6 +479,7 @@ pub(super) async fn admins_page(
 </form></article>
 {table}"#,
         state.url("/admins/add"),
+        banner = banner,
         table = table
     );
     Html(html_page(&state, Some(&session), "Admins", &body)).into_response()
@@ -364,10 +509,13 @@ pub(super) async fn admins_add(
     if session.role != "owner" {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
-    if let Ok(uid) = f.user_id.trim().parse::<i64>() {
-        state.db.add_admin(uid, f.username.as_deref());
+    match f.user_id.trim().parse::<i64>() {
+        Ok(uid) => {
+            state.db.add_admin(uid, f.username.as_deref());
+            Redirect::to(&state.url("/admins?added=1")).into_response()
+        }
+        Err(_) => Redirect::to(&state.url("/admins?error=uid")).into_response(),
     }
-    Redirect::to(&state.url("/admins")).into_response()
 }
 
 #[tracing::instrument(skip_all)]
@@ -383,18 +531,41 @@ pub(super) async fn admins_remove(
     if session.role != "owner" {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
-    if let Ok(uid) = f.user_id.trim().parse::<i64>() {
-        state.db.remove_admin(uid);
+    match f.user_id.trim().parse::<i64>() {
+        Ok(uid) => {
+            state.db.remove_admin(uid);
+            Redirect::to(&state.url("/admins?removed=1")).into_response()
+        }
+        Err(_) => Redirect::to(&state.url("/admins?error=uid")).into_response(),
     }
-    Redirect::to(&state.url("/admins")).into_response()
 }
 
 // ---------- Sellers ----------
+
+/// Sellers-page flash keys (EDIT_FLOW_SPEC E15): the save outcome and the
+/// uid parse-fail error that used to drop silently.
+#[derive(Deserialize)]
+pub(super) struct SellersQuery {
+    pub(super) saved: Option<String>,
+    pub(super) error: Option<String>,
+}
+
+fn sellers_banner(q: &SellersQuery) -> String {
+    if q.saved.as_deref() == Some("1") {
+        return r#"<div class="alert alert-success" role="status" aria-live="polite">Seller saved.</div>"#.to_string();
+    }
+    if q.error.as_deref() == Some("uid") {
+        return r#"<div class="alert alert-error" role="alert">Seller id must be a number.</div>"#
+            .to_string();
+    }
+    String::new()
+}
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn sellers_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<SellersQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -428,24 +599,34 @@ pub(super) async fn sellers_page(
             rows
         }
     );
+    // EDIT_FLOW_SPEC E15: same verb ("Save") for both forms, one help line
+    // each so the ownership of the channel field is unambiguous; "Upsert"
+    // (developer vocabulary) is gone.
+    let banner = sellers_banner(&q);
     let body = format!(
         r#"<h1>Sellers <span class="sub">seller management</span></h1>
-<article class="panel"><h3>Upsert seller</h3>
+{banner}
+<article class="panel"><h3>Add or update seller</h3>
 <form method="post" action="{}" class="inline-form">
 <label for="upsert-user-id">Seller ID</label><input id="upsert-user-id" type="number" name="user_id" placeholder="user id" required>
 <label for="upsert-username">Username</label><input id="upsert-username" type="text" name="username" placeholder="username">
 <label for="upsert-channel">Channel</label><input id="upsert-channel" type="text" name="channel" placeholder="@channel">
 <button type="submit">Save</button>
-</form></article>
+</form>
+<p class="help">Creates the seller if the id is new, otherwise updates name and channel.</p>
+</article>
 <article class="panel"><h3>Set seller channel</h3>
 <form method="post" action="{}" class="inline-form">
 <label for="setchan-user-id">Seller ID</label><input id="setchan-user-id" type="number" name="user_id" placeholder="seller id" required>
 <label for="setchan-channel">Channel</label><input id="setchan-channel" type="text" name="channel" placeholder="@channel" required>
-<button type="submit">Set</button>
-</form></article>
+<button type="submit">Save</button>
+</form>
+<p class="help">Updates only the channel.</p>
+</article>
 {table}"#,
         state.url("/sellers/upsert"),
         state.url("/sellers/channel"),
+        banner = banner,
         table = table
     );
     Html(html_page(&state, Some(&session), "Sellers", &body)).into_response()
@@ -477,12 +658,15 @@ pub(super) async fn sellers_upsert(
     if session.role != "owner" {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
-    if let Ok(uid) = f.user_id.trim().parse::<i64>() {
-        state
-            .db
-            .upsert_seller(uid, f.username.as_deref(), f.channel.as_deref());
+    match f.user_id.trim().parse::<i64>() {
+        Ok(uid) => {
+            state
+                .db
+                .upsert_seller(uid, f.username.as_deref(), f.channel.as_deref());
+            Redirect::to(&state.url("/sellers?saved=1")).into_response()
+        }
+        Err(_) => Redirect::to(&state.url("/sellers?error=uid")).into_response(),
     }
-    Redirect::to(&state.url("/sellers")).into_response()
 }
 
 #[tracing::instrument(skip_all)]
@@ -498,8 +682,11 @@ pub(super) async fn sellers_channel(
     if session.role != "owner" {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
-    if let Ok(uid) = f.user_id.trim().parse::<i64>() {
-        state.db.set_seller_channel(uid, &f.channel);
+    match f.user_id.trim().parse::<i64>() {
+        Ok(uid) => {
+            state.db.set_seller_channel(uid, &f.channel);
+            Redirect::to(&state.url("/sellers?saved=1")).into_response()
+        }
+        Err(_) => Redirect::to(&state.url("/sellers?error=uid")).into_response(),
     }
-    Redirect::to(&state.url("/sellers")).into_response()
 }

@@ -20,12 +20,21 @@ pub(super) async fn codes_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    let banner = codes_banner(&q);
+    let body = codes_body(&state, &session, &banner);
+    Html(html_page(&state, Some(&session), "Codes", &body)).into_response()
+}
+
+/// The codes page body, parameterized on the banner slot so the reclaim
+/// handler can render its one-time replacement code in place (EDIT_FLOW_SPEC
+/// E4 — no PRG: the code must not ride a URL).
+fn codes_body(state: &WebState, session: &Session, banner: &str) -> String {
     let scope = if session.role == "seller" {
         session.seller_id
     } else {
         None
     };
-    let bot_scope = bot_scope_sellers(&state, &session);
+    let bot_scope = bot_scope_sellers(state, session);
     let codes = match &bot_scope {
         Some(set) => state.db.list_codes_for_sellers(set, 200),
         None => state.db.list_codes(scope, 200),
@@ -37,7 +46,7 @@ pub(super) async fn codes_page(
         .map(|p| format!(r#"<option value="{}">{}</option>"#, esc(&p.1), esc(&p.1)))
         .collect::<Vec<_>>()
         .join("");
-    let rows_html = codes_rows_html(&state, &session, &codes);
+    let rows_html = codes_rows_html(state, session, &codes);
     let table = format!(
         r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Codes"><table aria-label="Codes"><thead><tr><th scope="col">Code</th><th scope="col">Plan</th><th scope="col">Days</th><th scope="col">Uses</th><th scope="col">Max</th><th scope="col">Actions</th></tr></thead><tbody>{}</tbody></table></div>"#,
         rows_html
@@ -55,16 +64,14 @@ pub(super) async fn codes_page(
         state.url("/codes/generate"),
         plan_options
     );
-    let banner = codes_banner(&q);
-    let body = format!(
+    format!(
         r#"{banner}<h1>Codes <span class="sub">activation codes</span></h1>
 {form}
 {table}"#,
         banner = banner,
         form = form,
         table = table
-    );
-    Html(html_page(&state, Some(&session), "Codes", &body)).into_response()
+    )
 }
 
 type CodeRow = (String, Option<i64>, Option<i64>, i64, i64, i64, bool);
@@ -92,9 +99,14 @@ fn codes_rows_html(state: &WebState, session: &Session, codes: &[CodeRow]) -> St
             } else {
                 String::new()
             };
+            // EDIT_FLOW_SPEC E4: reclaim revokes the old code and mints a
+            // replacement — keys-revoke-weight destructive, so danger + a
+            // confirm naming the code and the consequence. The per-row
+            // "New length" field is gone (the 12 default stays server-side).
             let reclaim = format!(
-                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><input type="number" name="length" min="1" max="32" value="12" class="input-num" aria-label="New length for code {}"><button type="submit" class="btn btn-secondary btn-sm">Reclaim</button></form>"#,
+                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Reclaim code {}" onclick="return confirm('Reclaim code {}? The old code stops working and a new one is issued.')">Reclaim</button></form>"#,
                 state.url("/codes/reclaim"),
+                esc(&c.0),
                 esc(&c.0),
                 esc(&c.0)
             );
@@ -114,17 +126,18 @@ fn codes_rows_html(state: &WebState, session: &Session, codes: &[CodeRow]) -> St
         .join("")
 }
 
+/// Codes-page flash keys (EDIT_FLOW_SPEC E4/E5): the generate count and the
+/// delete outcome. The former raw `?error=` arm is gone — it had no
+/// producer and only invited rendering a raw URL key (the Plans bug).
 fn codes_banner(q: &SubsQuery) -> String {
     if let Some(nstr) = q.id.as_ref() {
         format!(
             r#"<div class="alert alert-success" role="status" aria-live="polite">Generated {} code(s).</div>"#,
             esc(nstr)
         )
-    } else if let Some(e) = q.error.as_ref() {
-        format!(
-            r#"<div class="alert alert-error" role="alert">{}</div>"#,
-            esc(e)
-        )
+    } else if q.deleted.as_deref() == Some("1") {
+        r#"<div class="alert alert-success" role="status" aria-live="polite">Code deleted.</div>"#
+            .to_string()
     } else {
         String::new()
     }
@@ -209,7 +222,7 @@ pub(super) async fn codes_delete(
         None
     };
     state.db.delete_code_seller_scoped(&f.code, scope);
-    Redirect::to(&state.url("/codes")).into_response()
+    Redirect::to(&state.url("/codes?deleted=1")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -233,6 +246,7 @@ pub(super) async fn codes_reclaim(
     } else {
         None
     };
+    // The inline length field is gone (E4); the 12 default stays here.
     let length: usize = f
         .length
         .as_deref()
@@ -240,6 +254,22 @@ pub(super) async fn codes_reclaim(
         .parse()
         .unwrap_or(12)
         .clamp(1, 32) as usize;
-    let _ = state.db.reclaim_code(&f.code, scope, length);
-    Redirect::to(&state.url("/codes")).into_response()
+    let banner = match state.db.reclaim_code(&f.code, scope, length) {
+        Some(new) => {
+            // One-time secret display (keys_setup.rs:145-148 idiom): the
+            // replacement code renders here and nowhere else — never logged,
+            // never stored in the URL, never re-shown by a later redirect.
+            format!(
+                r#"<div class="alert alert-success" role="status" aria-live="polite"><p><strong>Code reclaimed.</strong> The old code stops working. New code (shown once): <code class="copyable">{}</code></p><p class="help">You won't see this code again. Hand it out now.</p></div>"#,
+                esc(&new)
+            )
+        }
+        None => {
+            // Honest nothing-happened: unknown code or another seller's code.
+            r#"<div class="alert alert-error" role="alert">Reclaim failed — that code was not found.</div>"#
+                .to_string()
+        }
+    };
+    let body = codes_body(&state, &session, &banner);
+    Html(html_page(&state, Some(&session), "Codes", &body)).into_response()
 }

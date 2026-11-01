@@ -2,6 +2,37 @@ use super::*;
 #[derive(Deserialize)]
 pub(super) struct PlansQuery {
     pub(super) error: Option<String>,
+    pub(super) created: Option<String>,
+    pub(super) deleted: Option<String>,
+}
+
+/// Plans-page flash banners (EDIT_FLOW_SPEC E1): success keys render the
+/// house "{Object} {verb}." copy; error keys map to human sentences — the
+/// raw URL key never reaches the screen. The URL keys stay byte-identical
+/// (tests/web_base_path.rs pins `{BASE}/plans?error=invalid_duration`); only
+/// the rendered copy is mapped. Unknown keys render nothing.
+fn plans_banner(q: &PlansQuery) -> String {
+    if q.created.as_deref() == Some("1") {
+        return flash_success("Plan created.");
+    }
+    if q.deleted.as_deref() == Some("1") {
+        return flash_success("Plan deleted.");
+    }
+    if let Some(e) = q.error.as_ref() {
+        let msg = match e.as_str() {
+            "invalid_duration" => "Duration must be a positive number of days.",
+            "missing_fields" => "Fill in name, price and asset.",
+            _ => return String::new(),
+        };
+        return format!(r#"<div class="alert alert-error" role="alert">{msg}</div>"#);
+    }
+    String::new()
+}
+
+/// The one PRG success banner shape (subs.rs:63-66 idiom), shared by the
+/// console surfaces this pass touched (content, codes, promos, mfa_users).
+pub(super) fn flash_success(msg: &str) -> String {
+    format!(r#"<div class="alert alert-success" role="status" aria-live="polite">{msg}</div>"#)
 }
 
 #[tracing::instrument(skip_all)]
@@ -34,12 +65,13 @@ pub(super) async fn plans_page(
             .iter()
             .map(|p| {
                 format!(
-                    "<li><b>{}</b><span class=\"mono\">{} {}</span><span class=\"help\">/ {} days</span><span class=\"row-action\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\" aria-label=\"Delete plan {}\">Delete</button></form></span></li>",
+                    "<li><b>{}</b><span class=\"mono\">{} {}</span><span class=\"help\">/ {} days</span><span class=\"row-action\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\" aria-label=\"Delete plan {}\" onclick=\"return confirm('Delete plan {}? Buyers can no longer buy it.')\">Delete</button></form></span></li>",
                     esc(&p.0),
                     esc(&p.1),
                     esc(&p.2),
                     p.3,
                     state.url("/plandel"),
+                    esc(&p.0),
                     esc(&p.0),
                     esc(&p.0)
                 )
@@ -47,14 +79,7 @@ pub(super) async fn plans_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    let banner = if let Some(e) = q.error.as_ref() {
-        format!(
-            r#"<div class="alert alert-error" role="alert">{}</div>"#,
-            esc(e)
-        )
-    } else {
-        String::new()
-    };
+    let banner = plans_banner(&q);
     let body = format!(
         r#"{}<h1>Plans <span class="sub">what buyers can purchase</span></h1>
 <article class="panel"><h3>Create plan</h3><form method="post" action="{}">
@@ -179,7 +204,10 @@ pub(super) fn tme_link_path(input: &str) -> Option<String> {
 /// - t.me/<handle> -> @handle
 /// - t.me/+hash or t.me/joinchat/<hash> -> the invite link (returned as-is
 ///   for a best-effort `get_chat`, which is expected to fail)
-#[allow(dead_code)]
+///
+/// Used by the channels-add Public path (CHANNEL_ADD_REDESIGN_SPEC §3.4.3):
+/// the public visibility stores the normalized `@handle`, so the shape-
+/// derived badge stays truthful (§6).
 pub(super) fn normalize_channel_input(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -400,7 +428,7 @@ pub(super) async fn create_plan(
     state
         .db
         .add_plan(seller_id, &name, &price, &asset, days, channel.as_deref());
-    Redirect::to(&state.url("/plans")).into_response()
+    Redirect::to(&state.url("/plans?created=1")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -444,7 +472,7 @@ pub(super) async fn delete_plan_by_name(
             .unwrap_or(0);
         state.db.remove_plan(sid, &name);
     }
-    Redirect::to(&state.url("/plans")).into_response()
+    Redirect::to(&state.url("/plans?deleted=1")).into_response()
 }
 
 #[tracing::instrument(skip_all)]
@@ -463,25 +491,68 @@ pub(super) async fn delete_plan_by_id(
         }
         let _ = (price, asset, days, channel);
         state.db.remove_plan(sid, &name);
+        return Redirect::to(&state.url("/plans?deleted=1")).into_response();
     }
     Redirect::to(&state.url("/plans")).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct ProductsQuery {
+    pub(super) created: Option<String>,
+    pub(super) activated: Option<String>,
+    pub(super) deactivated: Option<String>,
+    pub(super) error: Option<String>,
+}
+
+/// Products-page flash banners (EDIT_FLOW_SPEC E2/E3): fixed keys mapped to
+/// house copy; an unknown key renders nothing rather than leaking a raw code.
+fn products_banner(q: &ProductsQuery) -> String {
+    if q.created.as_deref() == Some("1") {
+        return flash_success("Product created.");
+    }
+    if q.activated.as_deref() == Some("1") {
+        return flash_success("Product activated.");
+    }
+    if q.deactivated.as_deref() == Some("1") {
+        return flash_success("Product deactivated.");
+    }
+    if let Some(e) = q.error.as_ref() {
+        let msg = match e.as_str() {
+            "missing_fields" => "Fill in name, price and asset.",
+            "bad_kind" => "Choose a valid product kind.",
+            "bad_stock" => "Stock must be a number, 0 or more.",
+            _ => return String::new(),
+        };
+        return format!(r#"<div class="alert alert-error" role="alert">{msg}</div>"#);
+    }
+    String::new()
 }
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn products_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<ProductsQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    let banner = products_banner(&q);
+    let body = products_body(&state, &session, &banner);
+    Html(html_page(&state, Some(&session), "Products", &body)).into_response()
+}
+
+/// The products page body, parameterized on the banner slot so the
+/// create-product DB-error path can re-render in place (EDIT_FLOW_SPEC E3 —
+/// the typed form's context stays instead of a bare dead-end page).
+fn products_body(state: &WebState, session: &Session, banner: &str) -> String {
     let seller_scope = if session.role == "seller" {
         session.seller_id
     } else {
         None
     };
-    let bot_scope = bot_scope_sellers(&state, &session);
+    let bot_scope = bot_scope_sellers(state, session);
     let products = state
         .db
         .list_products(seller_scope)
@@ -505,17 +576,35 @@ pub(super) async fn products_page(
                 } else {
                     "<span class=\"badge badge-danger\">inactive</span>"
                 };
+                // EDIT_FLOW_SPEC E2: an inactive product is no longer a dead
+                // end — the row gets Activate (set_product_active(true)'s
+                // first caller anywhere); an active row keeps Deactivate,
+                // now confirmed because it is a sell-stop, not a delete.
+                let row_action = if p.8 != 0 {
+                    format!(
+                        r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="name" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Deactivate {}" onclick="return confirm('Deactivate {}? Buyers can no longer buy it in /shop.')">Deactivate</button></form>"#,
+                        state.url("/productdel"),
+                        esc(&p.2),
+                        esc(&p.2),
+                        esc(&p.2)
+                    )
+                } else {
+                    format!(
+                        r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="name" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Activate {}">Activate</button></form>"#,
+                        state.url("/product/activate"),
+                        esc(&p.2),
+                        esc(&p.2)
+                    )
+                };
                 format!(
-                    "<tr><td><b>{}</b></td><td class=\"num\">{}</td><td class=\"mono\">{}</td><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"actions\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\" aria-label=\"Deactivate {}\">Deactivate</button></form></td></tr>",
+                    "<tr><td><b>{}</b></td><td class=\"num\">{}</td><td class=\"mono\">{}</td><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"actions\">{}</td></tr>",
                     esc(&p.2),
                     esc(&p.3),
                     esc(&p.4),
                     esc(&p.5),
                     stock,
                     active,
-                    state.url("/productdel"),
-                    esc(&p.2),
-                    esc(&p.2)
+                    row_action
                 )
             })
             .collect::<Vec<_>>()
@@ -525,21 +614,22 @@ pub(super) async fn products_page(
             rows
         )
     };
-    let body = format!(
+    format!(
         r#"<h1>Products <span class="sub">digital delivery</span></h1>
-{}
+{banner}
+{listing}
 <article class="panel"><h3>Create product</h3><form method="post" action="{}">
 <label for="name">Name</label><input id="name" name="name" required>
 <label for="price">Price</label><input id="price" name="price" required>
 <label for="asset">Asset</label><input id="asset" name="asset" required>
-<label for="kind">Kind</label><select id="kind" name="kind"><option value="digital_link">digital_link</option><option value="digital_file">digital_file</option><option value="physical">physical</option></select>
+<label for="kind">Kind</label><select id="kind" name="kind"><option value="digital_link">Link</option><option value="digital_file">File</option><option value="physical">Physical item (shipped)</option></select>
 <label for="delivery">Delivery (link, text or Telegram file_id, optional)</label><input id="delivery" name="delivery">
 <label for="stock">Stock (blank = unlimited)</label><input id="stock" name="stock" type="number" min="0">
 <button type="submit">Create product</button></form></article>"#,
-        listing,
-        state.url("/product")
-    );
-    Html(html_page(&state, Some(&session), "Products", &body)).into_response()
+        state.url("/product"),
+        banner = banner,
+        listing = listing
+    )
 }
 
 #[derive(Deserialize)]
@@ -567,11 +657,14 @@ pub(super) async fn create_product(
     let price = f.price.trim().to_string();
     let asset = f.asset.trim().to_string();
     let kind = f.kind.trim().to_string();
+    // Failures are flash keys with mapped copy (EDIT_FLOW_SPEC E3) — the
+    // URL keys are fixed words, never free text; the page renders the
+    // honest sentence.
     if name.is_empty() || price.is_empty() || asset.is_empty() {
-        return Redirect::to(&state.url("/products")).into_response();
+        return Redirect::to(&state.url("/products?error=missing_fields")).into_response();
     }
     if !matches!(kind.as_str(), "digital_link" | "digital_file" | "physical") {
-        return Redirect::to(&state.url("/products")).into_response();
+        return Redirect::to(&state.url("/products?error=bad_kind")).into_response();
     }
     let delivery = f
         .delivery
@@ -580,7 +673,7 @@ pub(super) async fn create_product(
     let stock: Option<i64> = match f.stock.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => match s.parse() {
             Ok(v) if v >= 0 => Some(v),
-            _ => return Redirect::to(&state.url("/products")).into_response(),
+            _ => return Redirect::to(&state.url("/products?error=bad_stock")).into_response(),
         },
         None => None,
     };
@@ -593,19 +686,15 @@ pub(super) async fn create_product(
         delivery.as_deref(),
         stock,
     ) {
-        return Html(html_page(
-            &state,
-            Some(&session),
-            "Products",
-            &format!(
-                r#"<div class="alert alert-error" role="alert">{}</div><p><a href="{}">Back to products</a></p>"#,
-                esc(&e.to_string()),
-                state.url("/products")
-            ),
-        ))
-        .into_response();
+        // DB failure re-renders the products page in place with the reason
+        // in a focused alert (identity.rs:241-244 idiom) instead of the
+        // former bare dead-end page.
+        tracing::warn!("product create failed: {}", e);
+        let alert = focused_error_alert(&esc(&e.to_string()));
+        let body = products_body(&state, &session, &alert);
+        return Html(html_page(&state, Some(&session), "Products", &body)).into_response();
     }
-    Redirect::to(&state.url("/products")).into_response()
+    Redirect::to(&state.url("/products?created=1")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -628,5 +717,30 @@ pub(super) async fn delete_product(
     if !name.is_empty() {
         state.db.set_product_active(seller, &name, false);
     }
-    Redirect::to(&state.url("/products")).into_response()
+    Redirect::to(&state.url("/products?deactivated=1")).into_response()
+}
+
+/// The one new route this pass adds (EDIT_FLOW_SPEC E2, `POST
+/// /product/activate`): reactivation removes the one-way dead end where a
+/// mis-clicked Deactivate made a product unsellable forever. Reuses the
+/// existing [`Db::set_product_active`] `true` arm — its first caller — with
+/// the same seller-namespace scope rule as `delete_product`: a seller flips
+/// rows in their own seller_id namespace, an owner the global one. No DB
+/// change.
+#[tracing::instrument(skip_all)]
+pub(super) async fn product_activate(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    Form(f): Form<ProductDeleteForm>,
+) -> impl IntoResponse {
+    let session = match session_from_headers(&state, &headers) {
+        Some(s) => s,
+        None => return Redirect::to(&state.url("/login")).into_response(),
+    };
+    let seller = session.seller_id.unwrap_or(0);
+    let name = f.name.trim().to_string();
+    if !name.is_empty() {
+        state.db.set_product_active(seller, &name, true);
+    }
+    Redirect::to(&state.url("/products?activated=1")).into_response()
 }

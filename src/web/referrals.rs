@@ -27,17 +27,18 @@ pub(super) async fn referrals_page(
         }
     }
     let rows_html = if all.is_empty() {
-        r#"<tr><td colspan="7" class="empty"><b>No referrals yet.</b> Buyers join with your referral code — rewards appear here.</td></tr>"#.to_string()
+        r#"<tr><td colspan="6" class="empty"><b>No referrals yet.</b> Buyers join with your referral code — rewards appear here.</td></tr>"#.to_string()
     } else {
         all.iter()
             .map(|r| {
+                // C2 (EDIT_FLOW_SPEC): the badge IS the status fact — the
+                // raw word column printed the same thing twice.
                 format!(
-                    r#"<tr><td>{}</td><td class="mono">{}</td><td>{}</td><td>{}</td><td class="mono">{}</td><td>{}</td><td class="num">{}</td></tr>"#,
+                    r#"<tr><td>{}</td><td class="mono">{}</td><td>{}</td><td>{}</td><td class="mono">{}</td><td class="num">{}</td></tr>"#,
                     r.0,
                     r.2,
                     r.3,
                     esc(&r.4),
-                    esc(&r.5),
                     if r.5 == "rewarded" {
                         r#"<span class="badge badge-success">rewarded</span>"#
                     } else {
@@ -50,7 +51,7 @@ pub(super) async fn referrals_page(
             .join("")
     };
     let table = format!(
-        r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Referrals"><table aria-label="Referrals"><thead><tr><th scope="col">Seller</th><th scope="col">Referrer</th><th scope="col">Referee</th><th scope="col">Code</th><th scope="col">Status</th><th scope="col">State</th><th scope="col">Reward</th></tr></thead><tbody>{}</tbody></table></div>"#,
+        r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Referrals"><table aria-label="Referrals"><thead><tr><th scope="col">Seller</th><th scope="col">Referrer</th><th scope="col">Referee</th><th scope="col">Code</th><th scope="col">Status</th><th scope="col">Reward</th></tr></thead><tbody>{}</tbody></table></div>"#,
         rows_html
     );
     // Bonus balance display for the session user/seller.
@@ -96,6 +97,9 @@ fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
             // refund-create form. Orders never carry a "paid" status
             // (pending/shipped/delivered do); Finance enforces the
             // paid-invoice rule when the refund is submitted.
+            // The inline status select therefore offers no "refunded"
+            // option (EDIT_FLOW_SPEC E8): one path, one word. The handler
+            // still accepts `refunded` for REST/bot parity.
             let refund_link = if o.3 != "refunded" && o.3 != "cancelled" {
                 format!(
                     r#"<a class="btn btn-ghost btn-sm" href="{}" aria-label="Request refund for order {}">Refund</a>"#,
@@ -107,8 +111,8 @@ fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
             };
             format!(
                 r#"<tr><td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="mono">{}</td><td>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><select name="status" aria-label="New status for order {}"><option value="pending">pending</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="refunded">refunded</option><option value="cancelled">cancelled</select><button type="submit" class="btn btn-secondary btn-sm">Set</button></form>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><input type="text" name="tracking" placeholder="tracking" aria-label="Tracking number for order {}"><button type="submit" class="btn btn-secondary btn-sm">Track</button></form>
+<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><select name="status" aria-label="New status for order {}"><option value="pending">pending</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</select><button type="submit" class="btn btn-secondary btn-sm">Save</button></form>
+<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><input type="text" name="tracking" placeholder="Tracking number" aria-label="Tracking number for order {}"><button type="submit" class="btn btn-secondary btn-sm">Save</button></form>
 {}</td></tr>"#,
                 esc(&o.0),
                 o.1,
@@ -233,6 +237,7 @@ pub(super) struct ReviewApproveForm {
 pub(super) async fn reviews_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<SubsQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -256,26 +261,38 @@ pub(super) async fn reviews_page(
         let pname = &p.2;
         let reviews = state.db.list_reviews(seller_id, pid, false);
         for (rid, buyer, rating, text) in reviews {
+            // N2: the approve control names the review by product + buyer,
+            // not the internal row id.
             rows.push(format!(
-                r#"<tr><td>{}</td><td class="mono">{}</td><td class="num">{}</td><td>{}</td><td class="actions"><form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Approve review {rid}">Approve</button></form></td></tr>"#,
+                r#"<tr><td>{}</td><td class="mono">{}</td><td class="num">{}</td><td>{}</td><td class="actions"><form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Approve review from {buyer} on {}">Approve</button></form></td></tr>"#,
                 esc(pname),
                 buyer,
                 rating,
                 esc(&text),
                 state.url("/reviews/approve"),
-                rid
+                rid,
+                esc(pname)
             ));
         }
     }
     let table = if rows.is_empty() {
-        "<p class=\"empty\">No reviews.</p>".to_string()
+        // N2: the bold-lead + help empty-state idiom (content.rs:30).
+        r#"<p class="empty"><b>No reviews to moderate.</b> Buyer reviews appear here after delivery.</p>"#.to_string()
     } else {
         format!(
             "<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Reviews\"><table aria-label=\"Reviews\"><thead><tr><th scope=\"col\">Product</th><th scope=\"col\">Buyer</th><th scope=\"col\">Rating</th><th scope=\"col\">Text</th><th scope=\"col\"><span class=\"sr-only\">Actions</span></th></tr></thead><tbody>{}</tbody></table></div>",
             rows.join("")
         )
     };
-    let body = format!(r#"<h1>Reviews <span class="sub">moderation</span></h1>{table}"#);
+    // E9: the approve POST redirects ?saved=1 — the row vanishing with zero
+    // acknowledgment used to be indistinguishable from a failed click.
+    let saved_banner = if q.saved.as_deref() == Some("1") {
+        r#"<div class="alert alert-success" role="status" aria-live="polite">Review approved.</div>"#
+    } else {
+        ""
+    };
+    let body =
+        format!(r#"<h1>Reviews <span class="sub">moderation</span></h1>{saved_banner}{table}"#);
     Html(html_page(&state, Some(&session), "Reviews", &body)).into_response()
 }
 
@@ -310,7 +327,7 @@ pub(super) async fn reviews_approve(
         return Redirect::to(&state.url("/reviews")).into_response();
     }
     state.db.approve_review(f.id);
-    Redirect::to(&state.url("/reviews")).into_response()
+    Redirect::to(&state.url("/reviews?saved=1")).into_response()
 }
 
 #[derive(Deserialize)]

@@ -978,8 +978,8 @@ async fn bind_sender_route_is_owner_only() {
         .unwrap();
     assert!(resp.status().is_redirection());
     assert_eq!(resp.headers().get("location").unwrap(), "/login");
-    // Owner → PRG back to /channels with the §3 success flash, and
-    // the write landed.
+    // Owner → PRG back to the channel's detail view (CHANNELS_MASTER_DETAIL_SPEC
+    // §6) with the §3 success flash, and the write landed.
     let resp = app
         .oneshot(post_authed_req(
             "/channels/bind-sender",
@@ -991,7 +991,7 @@ async fn bind_sender_route_is_owner_only() {
     assert!(resp.status().is_redirection());
     assert_eq!(
         resp.headers().get("location").unwrap(),
-        "/channels?bound-bot=1&channel=@chan"
+        "/channels/manage?channel=@chan&bound-bot=1"
     );
     assert_eq!(
         db.get_channel_sender_identity("@chan").as_deref(),
@@ -1020,7 +1020,7 @@ async fn bind_sender_user_requires_gate_then_ready() {
     assert!(resp.status().is_redirection());
     assert_eq!(
         resp.headers().get("location").unwrap(),
-        "/channels?error=posting"
+        "/channels/manage?channel=@chan&error=posting"
     );
     assert_ne!(
         db.get_channel_sender_identity("@chan").as_deref(),
@@ -1041,7 +1041,7 @@ async fn bind_sender_user_requires_gate_then_ready() {
     assert!(resp.status().is_redirection());
     assert_eq!(
         resp.headers().get("location").unwrap(),
-        "/channels?error=identity"
+        "/channels/manage?channel=@chan&error=identity"
     );
     assert_ne!(
         db.get_channel_sender_identity("@chan").as_deref(),
@@ -1058,7 +1058,7 @@ async fn bind_sender_user_requires_gate_then_ready() {
         .unwrap();
     assert_eq!(
         resp.headers().get("location").unwrap(),
-        "/channels?bound-bot=1&channel=@chan"
+        "/channels/manage?channel=@chan&bound-bot=1"
     );
     assert_eq!(
         db.get_channel_sender_identity("@chan").as_deref(),
@@ -1137,12 +1137,26 @@ async fn channels_rows_show_binding_state() {
     state.db.add_channel("@userbound", 0).unwrap();
     state.db.set_channel_sender_identity("@userbound", "user");
     let app = router(state);
-    let body = body_string(app.oneshot(authed_req("/channels", &owner)).await.unwrap()).await;
-    // Exception-only marking: exactly one "as user" badge, on the
-    // user-bound row (spec §0.2).
+    let body = body_string(
+        app.clone()
+            .oneshot(authed_req("/channels", &owner))
+            .await
+            .unwrap(),
+    )
+    .await;
+    // Exception-only marking on the master list: exactly one "as user"
+    // badge, on the user-bound row (spec §0.2 — badges are STATE and stay).
     assert_eq!(body.matches(">as user</span>").count(), 1, "{body}");
-    // The user-bound row offers the safe revert with a channel-named
-    // aria-label and no confirm.
+    // The binding controls moved to the per-channel detail view
+    // (CHANNELS_MASTER_DETAIL_SPEC §5.6). The user-bound row offers the
+    // safe revert with a channel-named aria-label and no confirm.
+    let body = body_string(
+        app.clone()
+            .oneshot(authed_req("/channels/manage?channel=@userbound", &owner))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(body.contains("Post as bot"), "{body}");
     assert!(
         body.contains(r#"aria-label="Post to @userbound as the bot""#),
@@ -1151,6 +1165,12 @@ async fn channels_rows_show_binding_state() {
     // The bot-bound row offers the risky direction behind a confirm
     // that names the channel and the risk (§2.1), with a
     // channel-named aria-label (§2.2).
+    let body = body_string(
+        app.oneshot(authed_req("/channels/manage?channel=@botbound", &owner))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(body.contains("Post as user…"), "{body}");
     assert!(
         body.contains(r#"aria-label="Post to @botbound as your personal account""#),

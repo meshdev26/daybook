@@ -593,6 +593,51 @@ pub(super) async fn settings_mfa_recovery(
     Html(html_page(&state, Some(&session), "Settings", &body)).into_response()
 }
 
+/// Web-users flash keys (EDIT_FLOW_SPEC E11): every mutation lands on a
+/// banner; `u` carries the non-sensitive username the created / MFA banners
+/// name (the bookings `b` object-key precedent).
+#[derive(Deserialize)]
+pub(super) struct WebUsersQuery {
+    pub(super) created: Option<String>,
+    pub(super) deleted: Option<String>,
+    pub(super) password: Option<String>,
+    pub(super) mfa: Option<String>,
+    pub(super) error: Option<String>,
+    pub(super) u: Option<String>,
+}
+
+fn webusers_banner(q: &WebUsersQuery) -> String {
+    let who = esc(q.u.as_deref().unwrap_or(""));
+    let err = match q.error.as_deref() {
+        Some("taken") => Some("That username is taken."),
+        Some("create") => Some("Account could not be created — check the values and try again."),
+        Some("password") => Some("Password reset failed — try again."),
+        _ => None,
+    };
+    if let Some(msg) = err {
+        return format!(r#"<div class="alert alert-error" role="alert">{msg}</div>"#);
+    }
+    if q.created.as_deref() == Some("1") && !who.is_empty() {
+        return flash_success(&format!("Account {who} created."));
+    }
+    if q.created.as_deref() == Some("1") {
+        return flash_success("Account created.");
+    }
+    if q.deleted.as_deref() == Some("1") {
+        return flash_success("Account deleted.");
+    }
+    if q.password.as_deref() == Some("1") {
+        return flash_success("Password reset.");
+    }
+    if q.mfa.as_deref() == Some("1") && !who.is_empty() {
+        return flash_success(&format!("MFA disabled for {who}."));
+    }
+    if q.mfa.as_deref() == Some("1") {
+        return flash_success("MFA disabled.");
+    }
+    String::new()
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn webusers_resetmfa(
     State(state): State<WebState>,
@@ -607,15 +652,46 @@ pub(super) async fn webusers_resetmfa(
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
+        // Resolve the username BEFORE the disable so the banner can name
+        // the account (E11); an empty name falls back to the who-less
+        // banner via `u=`.
+        let uname = state
+            .db
+            .get_web_account_by_id(id)
+            .map(|r| r.1)
+            .unwrap_or_default();
         let _ = state.db.disable_totp(id);
+        return Redirect::to(&state.url(&format!("/webusers?mfa=1&u={}", qenc(uname.trim()))))
+            .into_response();
     }
     Redirect::to(&state.url("/webusers")).into_response()
+}
+
+/// E13 (EDIT_FLOW_SPEC): the create form's seller picker — the real seller
+/// list with channels (the sellers_page idiom), never a typed raw id the
+/// owner cannot know. The empty option is platform-level (None).
+fn webusers_seller_options(state: &WebState) -> String {
+    let mut options = String::from(r#"<option value="">No seller (platform-level)</option>"#);
+    for sid in state.db.list_sellers() {
+        let ch = state.db.seller_channel(sid).unwrap_or_default();
+        let label = if ch.is_empty() {
+            "no channel"
+        } else {
+            ch.as_str()
+        };
+        options.push_str(&format!(
+            r#"<option value="{sid}">{sid} — {}</option>"#,
+            esc(label)
+        ));
+    }
+    options
 }
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn webusers_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<WebUsersQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -636,56 +712,54 @@ pub(super) async fn webusers_page(
             } else {
                 r#"<span class="badge badge-warning">disabled</span>"#
             };
+            // E12: disabling a second factor is keys-revoke-class (danger
+            // weight + confirm naming the account); C9: the delete confirm
+            // names the username, not the row id.
+            let u = esc(uname);
+            let role = esc(role);
+            let seller_cell = seller.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+            let pw = state.url("/webusers/password");
+            let del = state.url("/webusers/delete");
+            let rmf = state.url("/webusers/resetmfa");
+            let toggle = SECRET_TOGGLE;
             format!(
-                r#"<tr><td class="mono">{}</td><td>{}</td><td>{}</td><td class="mono">{}</td><td>{}</td><td>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><span class="secret-field"><input type="password" name="password" placeholder="new password" aria-label="New password for {}">{toggle}</span><button type="submit" class="btn btn-sm">Reset</button></form>
-<form method="post" action="{}" class="inline-form" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Delete account {}?')">Delete</button></form>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-sm">Reset MFA</button></form>
-</td></tr>"#,
-                id,
-                esc(uname),
-                esc(role),
-                seller.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string()),
-                mfa,
-                state.url("/webusers/password"),
-                id,
-                esc(uname),
-                state.url("/webusers/delete"),
-                id,
-                id,
-                state.url("/webusers/resetmfa"),
-                id,
-                toggle = SECRET_TOGGLE,
+                r#"<tr><td class="mono">{id}</td><td>{u}</td><td>{role}</td><td class="mono">{seller_cell}</td><td>{mfa}</td><td>
+<form method="post" action="{pw}" class="inline-form"><input type="hidden" name="id" value="{id}"><span class="secret-field"><input type="password" name="password" placeholder="new password" aria-label="New password for {u}">{toggle}</span><button type="submit" class="btn btn-sm">Reset</button></form>
+<form method="post" action="{del}" class="inline-form" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Delete account {u}" onclick="return confirm('Delete account {u}? Their sessions end immediately.')">Delete</button></form>
+<form method="post" action="{rmf}" class="inline-form"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Reset MFA for {u}? They will sign in with password only until they enroll again.')">Reset MFA</button></form>
+</td></tr>"#
             )
         })
         .collect::<Vec<_>>()
         .join("");
+    let tbody = if rows.is_empty() {
+        r#"<tr><td colspan="6" class="empty"><b>No web users.</b></td></tr>"#.to_string()
+    } else {
+        rows
+    };
     let table = format!(
-        r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Web users"><table aria-label="Web users"><thead><tr><th scope="col">ID</th><th scope="col">Username</th><th scope="col">Role</th><th scope="col">Seller</th><th scope="col">MFA</th><th scope="col">Actions</th></tr></thead><tbody>{}</tbody></table></div>"#,
-        if rows.is_empty() {
-            r#"<tr><td colspan="6" class="empty"><b>No web users.</b></td></tr>"#.to_string()
-        } else {
-            rows
-        }
+        r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Web users"><table aria-label="Web users"><thead><tr><th scope="col">ID</th><th scope="col">Username</th><th scope="col">Role</th><th scope="col">Seller</th><th scope="col">MFA</th><th scope="col">Actions</th></tr></thead><tbody>{tbody}</tbody></table></div>"#
     );
+    let banner = webusers_banner(&q);
+    let seller_options = webusers_seller_options(&state);
+    let create_url = state.url("/webusers/create");
+    let toggle = SECRET_TOGGLE;
     let body = format!(
         r#"<h1>Web users <span class="sub">console accounts</span></h1>
+{banner}
 <article class="panel"><h3>Create account</h3>
-<form method="post" action="{}" class="inline-form">
+<form method="post" action="{create_url}" class="inline-form">
 <label for="wu-username">Username</label>
 <input type="text" id="wu-username" name="username" placeholder="username" required>
 <label for="wu-password">Password</label>
 <span class="secret-field"><input type="password" id="wu-password" name="password" placeholder="password" required>{toggle}</span>
 <label for="wu-role">Role</label>
 <select id="wu-role" name="role"><option value="seller">seller</option><option value="owner">owner</option></select>
-<label for="wu-seller-id">Seller id</label>
-<input type="number" id="wu-seller-id" name="seller_id" placeholder="seller id (optional)">
+<label for="wu-seller-id">Seller</label>
+<select id="wu-seller-id" name="seller_id">{seller_options}</select>
 <button type="submit">Create</button>
 </form></article>
-{table}"#,
-        state.url("/webusers/create"),
-        table = table,
-        toggle = SECRET_TOGGLE,
+{table}"#
     );
     Html(html_page(&state, Some(&session), "Web users", &body)).into_response()
 }
@@ -723,15 +797,24 @@ pub(super) async fn webusers_create(
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     let role = if f.role == "owner" { "owner" } else { "seller" };
+    // E13: empty seller_id stays None (platform-level) — the select's first
+    // option submits "" and the parse here already maps that to None.
     let seller_id = f
         .seller_id
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok());
-    let _ = state
+    let res = state
         .db
         .create_web_account(&f.username, &f.password, role, seller_id)
         .await;
-    Redirect::to(&state.url("/webusers")).into_response()
+    // E11: a duplicate username used to vanish (`let _ =`) — the honest
+    // failure renders now. Other Db failures get their own key.
+    let dest = match res {
+        Ok(()) => format!("/webusers?created=1&u={}", qenc(f.username.trim())),
+        Err(e) if e.contains("UNIQUE") => "/webusers?error=taken".to_string(),
+        Err(_) => "/webusers?error=create".to_string(),
+    };
+    Redirect::to(&state.url(&dest)).into_response()
 }
 
 #[tracing::instrument(skip_all)]
@@ -749,6 +832,7 @@ pub(super) async fn webusers_delete(
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
         state.db.delete_web_account(id);
+        return Redirect::to(&state.url("/webusers?deleted=1")).into_response();
     }
     Redirect::to(&state.url("/webusers")).into_response()
 }
@@ -767,7 +851,13 @@ pub(super) async fn webusers_password(
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
-        let _ = state.db.update_web_password_by_id(id, &f.password).await;
+        // Honest failure (E11 sibling): the reset can fail (the
+        // deleted-account edge) — never banner success for a swallowed Db
+        // error.
+        return match state.db.update_web_password_by_id(id, &f.password).await {
+            Ok(()) => Redirect::to(&state.url("/webusers?password=1")).into_response(),
+            Err(_) => Redirect::to(&state.url("/webusers?error=password")).into_response(),
+        };
     }
     Redirect::to(&state.url("/webusers")).into_response()
 }

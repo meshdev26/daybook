@@ -28,6 +28,26 @@ const APP_JS: &str = r#"(function () {
         this.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
       });
     }
+    // Visibility-aware add form (CHANNEL_ADD_REDESIGN_SPEC §3.3): the radio
+    // swaps the identifier placeholder, the visible help line, and the
+    // aria-describedby target. Enhancement only — without JS the public help
+    // shows by default and the omnibus details still carries both rules.
+    var vform = document.querySelector('[data-visibility-form]');
+    if (vform && !vform.dataset.visBound) {
+      vform.dataset.visBound = '1';
+      var id = vform.querySelector('input[name="channel"]');
+      var vpub = vform.querySelector('#ch-id-help-public');
+      var vpriv = vform.querySelector('#ch-id-help-private');
+      vform.querySelectorAll('input[name="visibility"]').forEach(function (r) {
+        r.addEventListener('change', function () {
+          var priv = this.value === 'private';
+          id.placeholder = priv ? id.dataset.phPrivate : id.dataset.phPublic;
+          vpriv.hidden = !priv;
+          vpub.hidden = priv;
+          id.setAttribute('aria-describedby', priv ? 'ch-id-help-private' : 'ch-id-help-public');
+        });
+      });
+    }
     // Focus-on-render for the standing unlock banner and for error alerts
     // that re-render after a failed POST (IDENTITY_UX_SPEC §3.8/§4.2). The
     // containers carry tabindex="-1"; without JS the page still works.

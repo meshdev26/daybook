@@ -1,4 +1,6 @@
-use super::tests::{authed_req, make_state, owner_session, post_authed_req, seller_session};
+use super::tests::{
+    authed_req, body_string, make_state, owner_session, post_authed_req, seller_session,
+};
 use super::*;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -243,7 +245,11 @@ async fn smoke_codes_reclaim_authed() {
         .oneshot(post_authed_req("/codes/reclaim", "code=x", &token))
         .await
         .unwrap();
-    assert!(resp.status().is_redirection());
+    // EDIT_FLOW_SPEC E4: reclaim renders in place — an unknown code is the
+    // honest failure page (200 + banner), not the old silent redirect.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("Reclaim failed"), "{body}");
 }
 
 #[tokio::test]
@@ -276,6 +282,55 @@ async fn smoke_channels_add_unauth_redirect() {
     let app = router(state);
     let resp = app
         .oneshot(post_req("/channels/add", "channel=@x"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    assert_eq!(resp.headers().get("location").unwrap(), "/login");
+}
+
+// CHANNELS_MASTER_DETAIL_SPEC §10.4.6: the dedicated add page and the
+// per-channel manage view smoke-level 200/redirect pins.
+
+#[tokio::test]
+async fn smoke_channels_add_page_authed_200() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .oneshot(authed_req("/channels/add", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn smoke_channels_add_page_unauth_redirect() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/channels/add")).await.unwrap();
+    assert!(resp.status().is_redirection());
+    assert_eq!(resp.headers().get("location").unwrap(), "/login");
+}
+
+#[tokio::test]
+async fn smoke_channels_manage_authed_200() {
+    let (state, _dir) = make_state().await;
+    state.db.add_channel("@x", 0).unwrap();
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .oneshot(authed_req("/channels/manage?channel=@x", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn smoke_channels_manage_unauth_redirect() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app
+        .oneshot(get_req("/channels/manage?channel=@x"))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());

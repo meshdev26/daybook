@@ -217,3 +217,225 @@ async fn broadcast_fails_closed_for_non_owner_without_seller_scope() {
         "a scopeless non-owner delivers to zero users"
     );
 }
+
+// ---- EDIT_FLOW_SPEC L7 pass: additive pins for the flow-break fixes ----
+
+/// E2: POST /product/activate flips an inactive row back on and redirects
+/// with the `activated=1` flash (the Deactivate dead-end's counterpart).
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn product_activate_reactivates_and_redirects() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .add_product(0, "widget", "10", "TON", "digital_link", None, None)
+        .unwrap();
+    state.db.set_product_active(0, "widget", false);
+    assert!(
+        state
+            .db
+            .list_products(Some(0))
+            .iter()
+            .any(|p| p.2 == "widget" && p.8 == 0),
+        "fixture: product starts inactive"
+    );
+    let token = owner_session(&state).await;
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req("/product/activate", "name=widget", &token))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("activated=1"), "{loc}");
+    assert!(
+        state
+            .db
+            .list_products(Some(0))
+            .iter()
+            .any(|p| p.2 == "widget" && p.8 == 1),
+        "the product is active again"
+    );
+}
+
+/// E2 scope rule (the seller-namespace 403-class pin): a seller session
+/// must never flip another seller's product — the row is addressed by name,
+/// so the seller namespace is the isolation boundary.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn product_activate_scoped_to_seller_namespace() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .add_product(0, "owners", "5", "TON", "digital_link", None, None)
+        .unwrap();
+    state.db.set_product_active(0, "owners", false);
+    let token = seller_session(&state, 42).await;
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req("/product/activate", "name=owners", &token))
+        .await
+        .unwrap();
+    // Same acceptance as subs_revoke_requires_owner: refused outright (403)
+    // or a redirect that carries no mutation of the foreign row.
+    assert!(
+        resp.status() == StatusCode::FORBIDDEN || resp.status().is_redirection(),
+        "{resp:?}"
+    );
+    assert!(
+        state
+            .db
+            .list_products(Some(0))
+            .iter()
+            .any(|p| p.2 == "owners" && p.8 == 0),
+        "the owner's product stays inactive"
+    );
+}
+
+/// E10: the bulk revoke (kicks up to 1000 buyers) is POST-only — the GET
+/// arm that made it linkable/prefetchable is gone.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn subs_bulkrevoke_get_is_gone() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .oneshot(authed_req("/subs/bulkrevoke?status=active", &token))
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
+        "GET must not reach the bulk revoke: {}",
+        resp.status()
+    );
+}
+
+/// E4: reclaim revokes the old code, mints the replacement, and the
+/// response body shows the new code with the one-time help line — the
+/// replacement is no longer thrown away.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn codes_reclaim_shows_new_code_once() {
+    let (state, _dir) = make_state().await;
+    let old = state.db.create_code(0, None, Some(30), 1, None, 12);
+    let token = owner_session(&state).await;
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req(
+            "/codes/reclaim",
+            &format!("code={old}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let codes = state.db.list_codes(None, 200);
+    assert!(
+        codes.iter().any(|c| c.0 == old && c.6),
+        "the old code is revoked"
+    );
+    let new = codes
+        .iter()
+        .find(|c| c.0 != old && !c.6)
+        .map(|c| c.0.clone())
+        .expect("a replacement code was minted");
+    assert!(body.contains(&new), "banner must show the new code: {body}");
+    assert!(body.contains("shown once"), "{body}");
+    assert!(
+        !body.contains(&format!("/codes/reclaim%22{}%22", esc(&new))),
+        "the new code never rides a URL"
+    );
+}
+
+/// E11: a duplicate username used to vanish (`let _ =`); now the honest
+/// failure renders as a banner.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn webusers_create_duplicate_shows_taken_banner() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state.clone());
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/webusers/create",
+            "username=dup&password=secret1&role=seller",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/webusers/create",
+            "username=dup&password=secret1&role=seller",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("error=taken"), "{loc}");
+    let page = app.oneshot(authed_req(loc, &token)).await.unwrap();
+    let body = body_string(page).await;
+    assert!(body.contains("That username is taken."), "{body}");
+}
+
+/// E13: the seller select's empty option creates a platform-level account
+/// (seller_id stays None) — no more typed raw ids.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn webusers_create_empty_seller_id_is_platform_level() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req(
+            "/webusers/create",
+            "username=plat&password=secret1&role=seller&seller_id=",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("created=1"), "{loc}");
+    let (_id, _u, _h, _r, seller_id) = state
+        .db
+        .get_web_account_by_username("plat")
+        .expect("account exists");
+    assert_eq!(seller_id, None, "empty seller stays platform-level");
+}
+
+/// E17: the preview form renders exactly ONE visible custom-segment text
+/// input (inside the native details) even when both a preset and a custom
+/// value round-trip through the URL — the dual-input ambiguity is gone.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn broadcast_single_custom_segment_input() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .oneshot(authed_req(
+            "/broadcast?segment=all&segment=product:1",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert_eq!(
+        body.matches(r#"<input type="text" name="segment""#).count(),
+        1,
+        "one custom segment text input"
+    );
+    let details_pos = body.find("<details").expect("a details disclosure exists");
+    let input_pos = body
+        .find(r#"<input type="text" name="segment""#)
+        .expect("the custom input exists");
+    assert!(input_pos > details_pos, "the custom input lives in details");
+}

@@ -305,6 +305,15 @@ label.check input[type="checkbox"],
 label:has(> input[type="checkbox"]) input[type="checkbox"] {
   margin: 0;
 }
+/* Visibility radio group (channels add form): mirror the checkbox block so
+   the 100%-wide input rule does not balloon the radios. */
+fieldset.visibility { border: 0; padding: 0; margin: 12px 0 0; }
+fieldset.visibility legend { font-size: 12.5px; font-weight: 600; color: var(--ink-2); padding: 0; }
+fieldset.visibility label { margin-top: 8px; }
+input[type="radio"] { width: auto; margin: 0 6px 0 0; vertical-align: middle; }
+
+/* Post-add reveal: the just-added row (token comment: "selected rows"). */
+.panel ul li.row-added { background: var(--brand-tint); }
 /* ---- forms ---------------------------------------------------------------- */
 label {
   display: block;
@@ -503,6 +512,10 @@ td.actions { text-align: right; }
 .alert-success { border-left-color: var(--brand); background: var(--brand-tint); color: var(--ink); }
 .alert-info { border-left-color: var(--brand); background: var(--surface); }
 .alert-warn { border-left-color: var(--warn); background: var(--warn-tint); color: var(--ink); }
+
+/* Channels manage view: the danger zone panel leads with the danger
+   hairline — same left-border idiom as .alert (above). */
+.danger-zone { border-left: 3px solid var(--danger); }
 
 /* ---- empty states ------------------------------------------------------------------ */
 .empty {

@@ -20,6 +20,65 @@ struct Row {
     pub(super) notes: String,
 }
 
+/// The statuses the system actually writes (db default `active`, /block's
+/// `blocked`) — chip filters that exist only here would lie with empty
+/// tables. Extend when the product writes more statuses (EDIT_FLOW_SPEC C6).
+const CUSTOMER_STATUSES: [&str; 2] = ["active", "blocked"];
+
+/// Status chips nav (the orders/bookings idiom): real links, the active one
+/// marked aria-current="page". Non-empty tag/search filters ride along so
+/// clicking a chip never silently resets them. The all-chip is the bare URL
+/// — `list_customers` has no "all" row value, so `?status=all` would filter
+/// literally and show an empty table (the orders page guards the same way,
+/// referrals.rs:161).
+fn customers_filter_nav(
+    state: &WebState,
+    status_filter: &Option<String>,
+    tag: &Option<String>,
+    search: &Option<String>,
+) -> String {
+    let mut extra = String::new();
+    if let Some(t) = tag {
+        extra.push_str(&format!("&tag={}", qenc(t)));
+    }
+    if let Some(s) = search {
+        extra.push_str(&format!("&q={}", qenc(s)));
+    }
+    let base = state.url("/customers");
+    let all_href = if extra.is_empty() {
+        base.clone()
+    } else {
+        format!("{}?{}", base, extra.trim_start_matches('&'))
+    };
+    let current = status_filter.clone().unwrap_or_else(|| "all".to_string());
+    let links = std::iter::once("all")
+        .chain(CUSTOMER_STATUSES.iter().copied())
+        .map(|s| {
+            let cls = if s == current {
+                "btn btn-secondary btn-sm"
+            } else {
+                "btn btn-ghost btn-sm"
+            };
+            let aria = if s == current {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            let href = if s == "all" {
+                all_href.clone()
+            } else {
+                format!("{}?status={}{}", base, s, extra)
+            };
+            format!(r#"<a class="{}" href="{}"{}>{}</a>"#, cls, href, aria, s)
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<nav aria-label="Filter customers by status" class="inline-form">{}</nav>"#,
+        links
+    )
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn customers_page(
     State(state): State<WebState>,
@@ -36,25 +95,32 @@ pub(super) async fn customers_page(
         None
     };
     let tag_filter = q.tag.clone().filter(|s| !s.trim().is_empty());
-    let status_filter = q.status.clone().filter(|s| !s.trim().is_empty());
+    // "all" is the no-filter choice (the orders guard, referrals.rs:161):
+    // list_customers has no "all" row value — passing it through would
+    // filter literally and show an empty table.
+    let status_filter = q
+        .status
+        .clone()
+        .filter(|s| !s.trim().is_empty() && s != "all");
     let search = q.q.clone().filter(|s| !s.trim().is_empty());
 
     let rows = load_customers(&state, seller_scope, &tag_filter, &status_filter, &search);
 
     let tag_val = tag_filter.clone().unwrap_or_default();
-    let status_val = status_filter.clone().unwrap_or_default();
     let q_val = search.clone().unwrap_or_default();
+    // C6: status is chip-filtered; Tag and Search stay free-form inputs.
+    // Enter still submits the form (implicit submission) — the old ghost
+    // Filter button is gone because the chips are the links.
     let filter_form = format!(
         r#"<form method="get" action="{}" class="inline-form">
 <label>Tag <input name="tag" value="{}"></label>
-<label>Status <input name="status" value="{}"></label>
 <label>Search <input name="q" value="{}"></label>
-<button type="submit" class="btn btn-ghost btn-sm">Filter</button>
-</form>"#,
+</form>
+{}"#,
         state.url("/customers"),
         esc(&tag_val),
-        esc(&status_val),
-        esc(&q_val)
+        esc(&q_val),
+        customers_filter_nav(&state, &status_filter, &tag_filter, &search)
     );
 
     let rows_html = customers_rows_html(&rows);
@@ -164,6 +230,9 @@ fn ticket_badge(status: &str) -> &'static str {
 pub(super) struct TicketsQuery {
     pub(super) status: Option<String>,
     pub(super) id: Option<i64>,
+    /// C5 (EDIT_FLOW_SPEC): both ticket mutations redirect ?saved=1 — the
+    /// status change and the reply used to re-render with no feedback.
+    pub(super) saved: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +245,42 @@ pub(super) struct TicketReplyForm {
 pub(super) struct TicketStatusForm {
     pub(super) ticket_id: i64,
     pub(super) status: String,
+}
+
+/// Ticket chips nav (the bookings/orders idiom, EDIT_FLOW_SPEC C5): the
+/// known status vocabulary as real links instead of a free-text input. The
+/// all-chip is the bare URL — `list_tickets` has no "all" row value, so
+/// `?status=all` would filter literally and show an empty table (the orders
+/// page guards the same way, referrals.rs:161).
+fn tickets_filter_nav(state: &WebState, status_filter: &Option<String>) -> String {
+    let statuses = ["all", "open", "pending", "resolved", "closed", "escalated"];
+    let current = status_filter.clone().unwrap_or_else(|| "all".to_string());
+    let links = statuses
+        .iter()
+        .map(|s| {
+            let cls = if *s == current {
+                "btn btn-secondary btn-sm"
+            } else {
+                "btn btn-ghost btn-sm"
+            };
+            let aria = if *s == current {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            let href = if *s == "all" {
+                state.url("/tickets")
+            } else {
+                format!("{}?status={}", state.url("/tickets"), s)
+            };
+            format!(r#"<a class="{}" href="{}"{}>{}</a>"#, cls, href, aria, s)
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<nav aria-label="Filter tickets by status" class="inline-form">{}</nav>"#,
+        links
+    )
 }
 
 #[tracing::instrument(skip_all)]
@@ -195,10 +300,16 @@ pub(super) async fn tickets_page(
     };
 
     if let Some(id) = q.id {
-        return ticket_detail_response(&state, &session, seller_scope, id);
+        return ticket_detail_response(&state, &session, seller_scope, id, &q);
     }
 
-    let status_filter = q.status.clone().filter(|s| !s.trim().is_empty());
+    // "all" is the no-filter choice (the orders guard, referrals.rs:161):
+    // list_tickets has no "all" row value — passing it through would filter
+    // literally and show an empty table.
+    let status_filter = q
+        .status
+        .clone()
+        .filter(|s| !s.trim().is_empty() && s != "all");
     let tickets = if let Some(ss) = seller_scope {
         state
             .db
@@ -228,14 +339,7 @@ pub(super) async fn tickets_page(
             .collect::<Vec<_>>()
             .join("")
     };
-    let filter_form = format!(
-        r#"<form method="get" action="{}" class="inline-form">
-<label>Status <input name="status" value="{}"></label>
-<button type="submit" class="btn btn-ghost btn-sm">Filter</button>
-</form>"#,
-        state.url("/tickets"),
-        esc(status_filter.as_deref().unwrap_or(""))
-    );
+    let filter_form = tickets_filter_nav(&state, &status_filter);
     let table = format!(
         r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Tickets"><table aria-label="Tickets"><thead><tr><th scope="col">ID</th><th scope="col">Seller</th><th scope="col">Buyer</th><th scope="col">Subject</th><th scope="col">Status</th><th scope="col">Updated</th></tr></thead><tbody>{}</tbody></table></div>"#,
         rows_html
@@ -255,6 +359,7 @@ fn ticket_detail_response(
     session: &Session,
     seller_scope: Option<i64>,
     id: i64,
+    q: &TicketsQuery,
 ) -> Response {
     let ticket = match state.db.get_ticket(id) {
         Some(t) => t,
@@ -287,7 +392,7 @@ fn ticket_detail_response(
 <option value="closed" {}>closed</option>
 <option value="escalated" {}>escalated</option>
 </select>
-<button type="submit" class="btn btn-ghost btn-sm">Set status</button>
+<button type="submit" class="btn btn-ghost btn-sm">Save</button>
 </form>"#,
         state.url("/tickets/status"),
         id,
@@ -311,8 +416,16 @@ fn ticket_detail_response(
         state.url("/tickets/reply"),
         id
     );
+    // C5: the reply/status POSTs land here with ?saved=1 — both used to
+    // re-render with zero acknowledgment.
+    let saved_banner = if q.saved.as_deref() == Some("1") {
+        r#"<div class="alert alert-success" role="status" aria-live="polite">Ticket updated.</div>"#
+    } else {
+        ""
+    };
     let body = format!(
         r#"<h1>Ticket #{} <span class="sub">{}</span></h1>
+{saved_banner}
 <p>Seller {} · Buyer {} · Status <b>{}</b> · Created {} · Updated {}</p>
 {status_form}
 {thread}
@@ -358,7 +471,7 @@ pub(super) async fn tickets_reply(
                 .add_ticket_message(f.ticket_id, role_str, session.account_id, &f.text);
         }
     }
-    Redirect::to(&state.url(&format!("/tickets?id={}", f.ticket_id))).into_response()
+    Redirect::to(&state.url(&format!("/tickets?id={}&saved=1", f.ticket_id))).into_response()
 }
 
 #[tracing::instrument(skip_all)]
@@ -382,5 +495,5 @@ pub(super) async fn tickets_status(
             let _ = state.db.set_ticket_status(f.ticket_id, &f.status);
         }
     }
-    Redirect::to(&state.url(&format!("/tickets?id={}", f.ticket_id))).into_response()
+    Redirect::to(&state.url(&format!("/tickets?id={}&saved=1", f.ticket_id))).into_response()
 }

@@ -58,7 +58,8 @@ sibling `tests.rs`/`tests/` files per Phase A).
 | `src/db.rs` | L9 | 7,512 | over hard cap — Phase B domain split pending |
 | `src/handlers/commands.rs` | L8 | 5,013 | over hard cap — Phase B domain split pending |
 | `src/api.rs` | L8 | 4,638 | over hard cap — Phase B domain split pending |
-| `src/web/bots_admin.rs` | L7 | 1,094 | over 800 target, under cap — boy-scout split on next touch |
+| `src/web/mfa_users.rs` | L7 | 863 | over 800 target, under cap — split `web_users.rs`/`mfa_claim.rs` on next touch (2026-10-31 edit-flow wave; function bodies all ≤100) |
+| `src/web/bots_admin.rs` | L7 | 568 | over 800 target resolved 2026-10-31 (bots_add.rs split); now under target |
 | `src/web.rs` | L7 | — | RESOLVED: split into `src/web/`; every other surface ≤ 800 target |
 
 None of these grow further; each is reduced when next touched (boy-scout rule).

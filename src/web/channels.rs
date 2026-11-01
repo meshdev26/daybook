@@ -19,15 +19,15 @@ pub(super) async fn channels_page(
         &state,
         Some(&session),
         "Channels",
-        &channels_body(&state, &session, None, success_banner.as_deref()),
+        &channels_body(&state, &session, None, success_banner.as_deref(), Some(&q)),
     ))
     .into_response()
 }
 
 /// One console banner line (MANAGEMENT_DISCLOSURE_SPEC §5e): fixed wrapper,
 /// caller-owned copy. info/success/warn announce politely; error is
-/// assertive — output is byte-identical to the previous inline blocks.
-fn channels_banner(kind: &str, msg: &str) -> String {
+/// assertive — shared by the list, the add page, and the manage detail.
+pub(super) fn channels_banner(kind: &str, msg: &str) -> String {
     let (class, attrs) = if kind == "error" {
         ("alert-error", "role=\"alert\"")
     } else {
@@ -36,25 +36,82 @@ fn channels_banner(kind: &str, msg: &str) -> String {
     format!("<div class=\"alert {class}\" {attrs}>{msg}</div>")
 }
 
-/// The channels page's PRG outcome banners, one per redirect flag — every
-/// line wraps through `channels_banner` (MANAGEMENT_DISCLOSURE_SPEC §5e).
-fn channels_banners(q: &ChannelsQuery, state: &WebState, session: &Session) -> Vec<String> {
+/// Fixed copy for the channels pages' `?error=` keys (kept out of
+/// `channels_banners` for the 100-line body budget): fixed keys render fixed
+/// copy; unknown values stay escaped — a query string never injects markup.
+/// Refusals link the Identity gate.
+pub(super) fn channels_error_copy(e: &str, state: &WebState, session: &Session) -> String {
+    match e {
+        "empty" => "Type a channel name first.".to_string(),
+        // §3.4 fixed refusal keys — shape-branched add validation (§3.4.2/3).
+        "private-id" => {
+            "Private channels are addressed by their numeric -100 ID only — paste the ID, or switch Visibility to Public if the channel has an @handle."
+                .to_string()
+        }
+        "public-shape" => {
+            "Public channels are addressed by an @handle or a t.me link — or switch Visibility to Private and paste the channel's numeric -100 ID."
+                .to_string()
+        }
+        "posting" => {
+            if session.role == "owner" {
+                format!(
+                    "Posting as your personal account isn't enabled yet. Enable it on the <a href=\"{}\">Identity page</a> first.",
+                    state.url("/identity")
+                )
+            } else {
+                "Posting as your personal account isn't enabled yet — the console owner enables it on the Identity page first.".to_string()
+            }
+        }
+        "locked" => "Your identity is locked — unlock it in the banner above.".to_string(),
+        "identity" => {
+            if session.role == "owner" {
+                format!(
+                    "The personal identity isn't connected — finish connecting it on the <a href=\"{}\">Identity page</a> first.",
+                    state.url("/identity")
+                )
+            } else {
+                "The personal identity isn't connected — the console owner connects it on the Identity page first.".to_string()
+            }
+        }
+        other => esc(other),
+    }
+}
+
+/// The channels pages' PRG outcome banners, one per redirect flag — every
+/// line wraps through `channels_banner`. Called by BOTH the list and the
+/// manage detail (spec §6): old `/channels?flag=1` bookmarks keep working.
+pub(super) fn channels_banners(
+    q: &ChannelsQuery,
+    state: &WebState,
+    session: &Session,
+) -> Vec<String> {
     // The same query-param idiom /subs and /finance use. ?notitle=1 means
     // the add succeeded but the Telegram title could not be resolved.
     let mut banners: Vec<String> = Vec::new();
     if q.added.as_deref() == Some("1") {
-        if q.notitle.as_deref() == Some("1") {
-            // Honest add (CHANNELS_TITLE_UX_SPEC §3): resolution failed, say so.
-            let tail = match session.role.as_str() {
-                "owner" => " Use Rename to name it.",
-                _ => "",
-            };
-            banners.push(channels_banner(
-                "info",
-                &format!("Channel added — I couldn't fetch its name from Telegram (the bot may not be an admin there yet).{tail}"),
-            ));
-        } else {
-            banners.push(channels_banner("success", "Channel added."));
+        // One outcome, one banner (CHANNEL_ADD_REDESIGN_SPEC §4.4): when the
+        // add redirect anchors the new row (?channel=), the in-panel callout
+        // owns the message — no top banner. Legacy redirects without
+        // `channel` keep today's banners byte-identical.
+        let anchored = q
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|c| !c.is_empty());
+        if !anchored {
+            if q.notitle.as_deref() == Some("1") {
+                // Honest add (CHANNELS_TITLE_UX_SPEC §3): resolution failed, say so.
+                let tail = match session.role.as_str() {
+                    "owner" => " Open Manage to name it.",
+                    _ => "",
+                };
+                banners.push(channels_banner(
+                    "info",
+                    &format!("Channel added — I couldn't fetch its name from Telegram (the bot may not be an admin there yet).{tail}"),
+                ));
+            } else {
+                banners.push(channels_banner("success", "Channel added."));
+            }
         }
     }
     if q.default.as_deref() == Some("1") {
@@ -64,7 +121,7 @@ fn channels_banners(q: &ChannelsQuery, state: &WebState, session: &Session) -> V
         banners.push(channels_banner("success", "Channel removed."));
     }
     if q.renamed.as_deref() == Some("1") && q.same.as_deref() == Some("1") {
-        let msg = "Nothing changed — that's still the channel's ID. Clear the box and type a name to label it.";
+        let msg = "Nothing changed — that's still the channel's address. Use Save name in the Identity section to change its label.";
         banners.push(channels_banner("info", msg));
     } else if q.renamed.as_deref() == Some("1") {
         let name = q.channel.as_deref().unwrap_or("the channel");
@@ -88,34 +145,12 @@ fn channels_banners(q: &ChannelsQuery, state: &WebState, session: &Session) -> V
             &format!("Posts to {} are sent by the bot again.", esc(name)),
         ));
     }
+    // §5a: the Edit-name PRG flag — the label changed, the identifier did not.
+    if q.named.as_deref() == Some("1") {
+        banners.push(channels_banner("success", "Channel name saved."));
+    }
     if let Some(e) = q.error.as_ref() {
-        // Fixed keys render fixed copy; unknown values stay escaped — a
-        // query string never injects markup. Refusals link the Identity gate.
-        let msg = match e.as_str() {
-            "empty" => "Type a channel name first.".to_string(),
-            "posting" => {
-                if session.role == "owner" {
-                    format!(
-                        "Posting as your personal account isn't enabled yet. Enable it on the <a href=\"{}\">Identity page</a> first.",
-                        state.url("/identity")
-                    )
-                } else {
-                    "Posting as your personal account isn't enabled yet — the console owner enables it on the Identity page first.".to_string()
-                }
-            }
-            "locked" => "Your identity is locked — unlock it in the banner above.".to_string(),
-            "identity" => {
-                if session.role == "owner" {
-                    format!(
-                        "The personal identity isn't connected — finish connecting it on the <a href=\"{}\">Identity page</a> first.",
-                        state.url("/identity")
-                    )
-                } else {
-                    "The personal identity isn't connected — the console owner connects it on the Identity page first.".to_string()
-                }
-            }
-            other => esc(other),
-        };
+        let msg = channels_error_copy(e, state, session);
         banners.push(channels_banner("error", &msg));
     }
     banners
@@ -123,9 +158,11 @@ fn channels_banners(q: &ChannelsQuery, state: &WebState, session: &Session) -> V
 
 /// Query shared by the channels GET page: the success flags its mutation
 /// handlers redirect with — `notitle` marks the add that succeeded without a
-/// Telegram title, `same` marks the NOCASE self-rename guard (spec §5) —
-/// plus the sender-binding flashes (IDENTITY_SENDER_UX_SPEC §8.4) and
-/// `channel`, the binding's channel name for the success copy (§7.5).
+/// Telegram title, `same` marks the NOCASE self-rename guard (spec §5),
+/// `named` marks the Edit-name save (CHANNEL_ADD_REDESIGN_SPEC §5a) — plus
+/// the sender-binding flashes (IDENTITY_SENDER_UX_SPEC §8.4) and `channel`,
+/// the binding's/add's channel name (§7.5; with `added=1` it anchors the
+/// post-add reveal, §4).
 #[derive(Deserialize)]
 pub(super) struct ChannelsQuery {
     pub(super) added: Option<String>,
@@ -134,6 +171,7 @@ pub(super) struct ChannelsQuery {
     pub(super) removed: Option<String>,
     pub(super) renamed: Option<String>,
     pub(super) same: Option<String>,
+    pub(super) named: Option<String>,
     pub(super) error: Option<String>,
     #[serde(rename = "bound-user")]
     pub(super) bound_user: Option<String>,
@@ -145,84 +183,37 @@ pub(super) struct ChannelsQuery {
 /// The channels manager body (PLAN v1.3.x): the owner manages the global
 /// set; a seller sees only their own bot-managed channel. `alert` renders an
 /// inline error (no redirect); `success` carries the pre-rendered PRG banner
-/// HTML (?added=1 / ?default=1 / ?removed=1).
+/// HTML (?added=1 / ?default=1 / ?removed=1). `q` (absent on the inline-error
+/// path) drives the post-add reveal: the highlighted row and the in-panel
+/// callout (CHANNEL_ADD_REDESIGN_SPEC §4).
 pub(super) fn channels_body(
     state: &WebState,
     session: &Session,
     alert: Option<&str>,
     success: Option<&str>,
+    q: Option<&ChannelsQuery>,
 ) -> String {
     let alert = alert
         .map(|a| channels_banner("error", a))
         .unwrap_or_default();
     let success = success.unwrap_or_default().to_string();
     if session.role == "seller" {
-        return render_seller_channels(state, session, &alert, &success);
+        return render_seller_channels(state, session, &alert, &success, q);
     }
-    render_global_channels(state, session, &alert, &success)
+    render_global_channels(state, session, &alert, &success, q)
 }
 
-fn render_seller_channels(
-    state: &WebState,
-    session: &Session,
-    alert: &String,
-    success: &String,
-) -> String {
-    let sid = session.seller_id.unwrap_or(0);
-    let list = match state.db.seller_channel(sid) {
-        Some(ch) => {
-            // Same label contract as the owner rows (CHANNELS_TITLE_UX_SPEC
-            // §2): the title is read from the channels table, case-insensitively.
-            let title = state
-                .db
-                .list_channels(Some(sid))
-                .into_iter()
-                .find(|row| row.channel.eq_ignore_ascii_case(&ch))
-                .and_then(|row| row.title);
-            let label = channel_label(title.as_deref(), &ch);
-            let notitle_hint = if title.as_deref().is_none_or(|t| t.trim().is_empty()) {
-                r#"<span class="help">no title stored for this channel yet</span>"#
-            } else {
-                ""
-            };
-            let type_badge = channel_type_badge(&ch);
-            let confirm_msg = esc(&format!(
-                "Remove {}? This cannot be undone.",
-                js_arg(&ch)
-            ));
-            format!(
-                "<li><span class=\"mono\">{}</span> {}<span class=\"badge badge-success\">bot-managed</span>{} <div class=\"row-actions\"><form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\" aria-label=\"Remove {}\" onclick=\"return confirm('{}')\">Delete</button></form></div></li>",
-                label,
-                type_badge,
-                notitle_hint,
-                state.url("/channels/remove"),
-                esc(&ch),
-                esc(&ch),
-                confirm_msg
-            )
-        }
-        None => "<li class=\"empty\"><b>No channel yet.</b>Add one below, or use /setchannel in the bot.</li>"
-            .to_string(),
-    };
-    format!(
-        r#"{alert}{success}<h1>Channels <span class="sub">your posting target</span></h1>
-<article class="panel"><h3>Your channel</h3><ul>{list}</ul>
-<form method="post" action="{}">
-<label for="channel">Channel</label><input id="channel" name="channel" required placeholder="@yourchannel"><span class="help">@handle, t.me link, or -100 ID — the bot must be admin in the channel.</span><details class="help-more"><summary>Which forms are accepted?</summary><span class="help">Accepted: @handle, t.me link, or numeric -100 ID. Recommended: the channel's @handle (memorable) or its t.me link. Private channel without a public @handle: paste the numeric chat ID (starts with -100) — forward any message from it to @userinfobot to get it. The bot must be an admin in the channel. Adding one replaces the previous.</span></details>
-<button type="submit">Set channel</button>
-</form></article>"#,
-        state.url("/channels/add"),
-        alert = alert,
-        success = success,
-        list = list,
-    )
-}
-
+/// The owner/admin master list (CHANNELS_MASTER_DETAIL_SPEC §4): a page-head
+/// with the one `Add channel` primary affordance (owner only — admins have no
+/// add permission and get no button, the same honesty as the old missing
+/// form) and read-first rows. Every edit control moved to
+/// `GET /channels/manage`.
 fn render_global_channels(
     state: &WebState,
     session: &Session,
     alert: &String,
     success: &String,
+    q: Option<&ChannelsQuery>,
 ) -> String {
     let is_owner = session.role == "owner";
     let scope_bot = if is_owner {
@@ -230,6 +221,7 @@ fn render_global_channels(
     } else {
         None
     };
+    let focus = added_focus(q);
     let fetched = state.db.list_channels(None);
     // An empty SCOPED list with rows present is a scoping artifact, not an
     // empty set (MANAGEMENT_DISCLOSURE_SPEC §3) — count the unscoped rows.
@@ -238,220 +230,116 @@ fn render_global_channels(
         .into_iter()
         .filter(|row| row.seller_id == 0)
         .filter(|row| scope_bot.is_none_or(|bid| state.bots.for_channel(&row.channel).id == bid))
-        .map(|row| render_global_channel_row(state, is_owner, row))
+        .map(|row| render_global_channel_row(state, is_owner, row, focus))
         .collect::<Vec<_>>()
         .join("");
     let list = if rows.is_empty() && scope_bot.is_some() && total_global > 0 {
         "<li class=\"empty\"><b>No channels resolve to this bot yet.</b> The bot may not be connected (no token) or these channels belong to another bot — switch the Bot selector above to All bots.</li>".to_string()
     } else if rows.is_empty() {
-        "<li class=\"empty\"><b>No global channels yet.</b> Add one below — it becomes a posting target for plans and posts.</li>".to_string()
+        "<li class=\"empty\"><b>No global channels yet.</b> Add one — it becomes a posting target for plans and posts.</li>".to_string()
     } else {
         rows
     };
-    let add_form = if is_owner {
+    // §4.1: one primary affordance in the page head — `a.btn` with no
+    // modifier IS the primary button (house CSS, first `.page-head` consumer).
+    let add_button = if is_owner {
         format!(
-            r#"<form method="post" action="{}">
-<label for="channel">Channel</label><input id="channel" name="channel" required placeholder="@yourchannel"><span class="help">@handle, t.me link, or -100 ID — the bot must be admin in the channel.</span><details class="help-more"><summary>Which forms are accepted?</summary><span class="help">Accepted: @handle, t.me link, or numeric -100 ID. Recommended: the channel's @handle (memorable) or its t.me link. Private channel without a public @handle: paste the numeric chat ID (starts with -100) — forward any message from it to @userinfobot to get it. The bot must be an admin in the channel. Adding one does not change the default — use Set default.</span></details>
-<button type="submit">Add channel</button>
-</form>"#,
+            r#"<div class="actions"><a class="btn" href="{}">Add channel</a></div>"#,
             state.url("/channels/add")
         )
     } else {
         String::new()
     };
+    // §4.3: the callout sits immediately after the <ul>, adjacent to the
+    // highlighted last row.
+    let callout = q
+        .map(|q| channels_added_callout(state, session, q))
+        .unwrap_or_default();
     format!(
-        r#"{alert}{success}<h1>Channels <span class="sub">the global posting targets</span></h1>
+        r#"{alert}{success}<div class="page-head"><h1>Channels <span class="sub">the global posting targets</span></h1>{add_button}</div>
 <article class="panel"><h3>Global channels</h3><ul>{list}</ul>
-{add_form}
+{callout}
 <p class="help">Sellers manage their own channel via /setchannel in the bot.</p>
 </article>"#,
         alert = alert,
         success = success,
+        add_button = add_button,
         list = list,
-        add_form = add_form,
+        callout = callout,
     )
 }
 
-fn render_global_channel_row(
-    state: &WebState,
-    is_owner: bool,
-    row: crate::db::ChannelRow,
-) -> String {
-    let type_badge = channel_type_badge(&row.channel);
-    let badge = if row.is_default {
-        "<span class=\"badge badge-success\">default</span>".to_string()
-    } else {
-        String::new()
-    };
-    let user_bound = state
-        .db
-        .get_channel_sender_identity(&row.channel)
-        .as_deref()
-        == Some("user");
-    let user_badge = if user_bound {
-        "<span class=\"badge badge-warning\">as user</span>"
-    } else {
-        ""
-    };
-    let bind_action = if is_owner {
-        if user_bound {
-            format!(
-                "<form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><input type=\"hidden\" name=\"identity\" value=\"bot\"><button type=\"submit\" class=\"btn btn-secondary btn-sm\" aria-label=\"Post to {} as the bot\">Post as bot</button></form>",
-                state.url("/channels/bind-sender"),
-                esc(&row.channel),
-                esc(&row.channel)
-            )
-        } else {
-            let confirm_msg = esc(&format!(
-                "Bind {} to your personal account? Posts to this channel will be sent as you — not as the bot — and every member sees them as yours.",
-                js_arg(&row.channel)
-            ));
-            format!(
-                "<form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><input type=\"hidden\" name=\"identity\" value=\"user\"><button type=\"submit\" class=\"btn btn-ghost btn-sm\" aria-label=\"Post to {} as your personal account\" onclick=\"return confirm('{}')\">Post as user…</button></form>",
-                state.url("/channels/bind-sender"),
-                esc(&row.channel),
-                esc(&row.channel),
-                confirm_msg
-            )
-        }
-    } else {
-        String::new()
-    };
-    let set_default_action = if is_owner && !row.is_default {
-        format!(
-            "<form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><button type=\"submit\" class=\"btn btn-ghost btn-sm\" aria-label=\"Set {} as default\">Set default</button></form>",
-            state.url("/channels/default"),
-            esc(&row.channel),
-            esc(&row.channel)
-        )
-    } else {
-        String::new()
-    };
-    let delete_action = if is_owner {
-        // Owners can remove (delete) non-default rows only. The default
-        // channel is protected: show a hint instead of a Delete button.
-        if row.is_default {
-            String::new()
-        } else {
-            let confirm_msg = esc(&format!(
-                "Remove {}? This cannot be undone.",
-                js_arg(&row.channel)
-            ));
-            format!(
-                "<form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger btn-sm\" aria-label=\"Delete {}\" onclick=\"return confirm('{}')\">Delete</button></form>",
-                state.url("/channels/remove"),
-                esc(&row.channel),
-                esc(&row.channel),
-                confirm_msg
-            )
-        }
-    } else {
-        String::new()
-    };
-    // Sellers can remove their own channel; handled in seller view, not here.
-    let rename_id = esc(&format!("rename-{}", row.channel));
-    // MANAGEMENT_DISCLOSURE_SPEC §5: pre-fill the stored title when one
-    // exists; else EMPTY with a plain placeholder — the identifier rides the
-    // hidden `channel` field, never the visible box.
-    let current = row.title.as_deref().map(str::trim);
-    let current = current.filter(|t| !t.is_empty());
-    let (rename_value, rename_ph) = match current {
-        Some(t) => (esc(t), ""),
-        None => (String::new(), "Friendly name, e.g. Tech Tips"),
-    };
-    let rename_details = if is_owner {
-        format!(
-            r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="channel" value="{}"><label class="sr-only" for="{}">New name for {}</label><input id="{}" name="new" value="{}" placeholder="{rename_ph}" required><button type="submit" class="btn btn-secondary btn-sm" aria-label="Rename {}">Rename</button></form>"#,
-            state.url("/channels/rename"),
-            esc(&row.channel),
-            rename_id,
-            esc(&row.channel),
-            rename_id,
-            rename_value,
-            esc(&row.channel)
-        )
-    } else {
-        String::new()
-    };
-    let default_hint = if is_owner && row.is_default {
-        r#"<span class="help">Set another channel as default to remove</span>"#.to_string()
-    } else {
-        String::new()
-    };
-    let actions =
-        format!("{bind_action}{set_default_action}{rename_details}{delete_action}{default_hint}");
-    // Show the human title (when known) alongside the canonical id so a title
-    // and its id are never mistaken for two different channels (CHANNELS_TITLE_UX_SPEC §2).
-    let label = channel_label(row.title.as_deref(), &row.channel);
-    // The hint names the Rename action, which is owner-only (F-2): an admin
-    // reading a titleless global row sees the bare id, not a dead pointer.
-    let notitle_hint = if is_owner && row.title.as_deref().is_none_or(|t| t.trim().is_empty()) {
-        r#"<span class="help">no title yet — use Rename to name it</span>"#
-    } else {
-        ""
-    };
-    format!(
-        "<li><span class=\"mono\">{}</span> {}{badge}{user_badge}{notitle_hint}<div class=\"row-actions\">{actions}</div></li>",
-        label,
-        type_badge,
-        badge = badge,
-        user_badge = user_badge,
-        notitle_hint = notitle_hint,
-        actions = actions
-    )
-}
-
-/// Re-render the channels page with an inline error (no redirect: the failed
-/// action's message belongs on the page it failed from).
+/// Re-render the channels LIST page with an inline error (no redirect: the
+/// failed action's message belongs on the page it failed from). The remaining
+/// inline paths are scripted-only (spec §6) — every UI-reachable failure now
+/// PRGs to the add page or the manage detail.
 pub(super) fn channels_error(state: &WebState, session: &Session, msg: &str) -> Response {
     Html(html_page(
         state,
         Some(session),
         "Channels",
-        &channels_body(state, session, Some(msg), None),
+        &channels_body(state, session, Some(msg), None, None),
     ))
     .into_response()
-}
-
-fn channel_type_badge(ch: &str) -> &'static str {
-    if ch.starts_with('@') {
-        r#"<span class="badge">public</span>"#
-    } else {
-        r#"<span class="badge">private</span>"#
-    }
-}
-
-/// The house channel label: "Title (id)" when a human title is stored, the
-/// bare identifier otherwise. Every console surface that shows a channel
-/// renders through this, so a channel never reads two different ways
-/// (CHANNELS_TITLE_UX_SPEC §4). Both fields are escaped here.
-pub(super) fn channel_label(title: Option<&str>, channel: &str) -> String {
-    match title.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => format!("{} ({})", esc(t), esc(channel)),
-        None => esc(channel),
-    }
-}
-
-/// One `list_channels` scan → lowercase-keyed title map for pages that show
-/// channel identifiers (dashboard readout, Posts, Subs, Sellers, Monitor).
-/// Keys are `to_ascii_lowercase()` to mirror the column's NOCASE collation.
-/// No new SQL — the existing read, shaped for lookup.
-pub(super) fn channel_titles(state: &WebState) -> std::collections::HashMap<String, String> {
-    state
-        .db
-        .list_channels(None)
-        .into_iter()
-        .filter_map(|row| {
-            row.title
-                .filter(|t| !t.trim().is_empty())
-                .map(|t| (row.channel.to_ascii_lowercase(), t))
-        })
-        .collect()
 }
 
 #[derive(Deserialize)]
 pub(super) struct ChannelForm {
     pub(super) channel: String,
+    /// §3.1: the visibility radio (`public` | `private`). Absent (or
+    /// unrecognized) keeps the legacy omnibus path (§3.4.1).
+    pub(super) visibility: Option<String>,
+    /// §3.1: the user-typed label — wins over getChat (§3.4.5).
+    pub(super) title: Option<String>,
+}
+
+/// §3.4: visibility validation + best-effort resolution for `channels_add` —
+/// the radio is the truth, the server is the enforcement. Returns the
+/// canonical identifier to store plus the getChat title (best-effort), or a
+/// fixed banner key to redirect with:
+/// - private: the trimmed input must parse as `i64` AND start with `-100`
+///   (else `private-id`);
+/// - public: `normalize_channel_input` yields `@handle` from
+///   `@handle`/`t.me/<handle>` — a numeric paste (a private ID) or junk under
+///   Public is one honest refusal (`public-shape`);
+/// - absent/unrecognized: the legacy omnibus path, today's behavior verbatim
+///   — no shape enforcement, so scripted and legacy posters keep working.
+///   Fail-open is correct here: getChat resolution stays best-effort and this
+///   is a UX gate, not a security boundary.
+async fn resolve_channel_add(
+    bot: &Bot,
+    ch: &str,
+    visibility: Option<&str>,
+) -> Result<(String, Option<String>), &'static str> {
+    match visibility {
+        Some("private") => {
+            if !(ch.parse::<i64>().is_ok() && ch.starts_with("-100")) {
+                return Err("private-id");
+            }
+            Ok(match channel_chat_info(bot, ch).await {
+                Some((id, title)) => (id.to_string(), title),
+                None => (ch.to_string(), None),
+            })
+        }
+        Some("public") => match normalize_channel_input(ch) {
+            // §3.4.4: public rows store @handle; getChat still runs for the
+            // TITLE only — its numeric id is discarded, so the stored shape
+            // matches the radio and the shape-derived badge stays truthful
+            // (§6). Dialing @handle is fully supported (util.rs to_chat_id).
+            Some(canonical) if canonical.parse::<i64>().is_err() => {
+                let title = channel_chat_info(bot, &canonical)
+                    .await
+                    .and_then(|(_, t)| t);
+                Ok((canonical, title))
+            }
+            _ => Err("public-shape"),
+        },
+        // Legacy omnibus path (§3.4.1).
+        _ => Ok(match channel_chat_info(bot, ch).await {
+            Some((id, title)) => (id.to_string(), title),
+            None => (ch.to_string(), None),
+        }),
+    }
 }
 
 #[tracing::instrument(skip_all)]
@@ -466,15 +354,21 @@ pub(super) async fn channels_add(
     };
     let ch = f.channel.trim();
     if ch.is_empty() {
-        return Redirect::to(&state.url("/channels?error=empty")).into_response();
+        return Redirect::to(&state.url("/channels/add?error=empty")).into_response();
     }
     // Resolve the input (an @handle, a t.me link, or a numeric id) to a
-    // canonical numeric chat id via Telegram when the bot can answer
+    // canonical chat identifier via Telegram when the bot can answer
     // get_chat: a channel with both a title and an id is identified by its
     // id, and the title is display-only. Resolution is BEST-EFFORT — when
     // the bot cannot answer (placeholder token, offline, chat not visible
     // yet) the input is stored as-is so adding still succeeds; the title
     // simply stays unknown.
+    let vis = f
+        .visibility
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let user_title = f.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let bot = if session.role == "seller" {
         session
             .seller_id
@@ -483,17 +377,31 @@ pub(super) async fn channels_add(
     } else {
         effective_bot(&state, &session)
     };
-    let (canonical, title) = match channel_chat_info(&bot.bot, ch).await {
-        Some((id, title)) => (id.to_string(), title),
-        None => (ch.to_string(), None),
+    let (canonical, resolved_title) = match resolve_channel_add(&bot.bot, ch, vis).await {
+        Ok(res) => res,
+        Err(key) => {
+            return Redirect::to(&state.url(&format!("/channels/add?error={key}"))).into_response();
+        }
     };
-    // PRG honesty (CHANNELS_TITLE_UX_SPEC §3): when getChat couldn't answer,
-    // the redirect carries ?notitle=1 so the page says so instead of a bare
-    // "Channel added."
-    let added_q = if title.is_none() {
-        "/channels?added=1&notitle=1"
+    // §3.4.5: user-typed title > getChat title > none. notitle rides the
+    // redirect only when BOTH are absent — a typed title means nothing is
+    // unresolved.
+    let chosen_title = user_title.map(str::to_string).or(resolved_title);
+    let notitle_q = if chosen_title.is_none() {
+        "&notitle=1"
     } else {
-        "/channels?added=1"
+        ""
+    };
+    // §3.4.6: visibility-aware adds anchor the redirect at the new row so the
+    // page can reveal it (§4); legacy adds (no visibility field) keep today's
+    // bare flags byte-identical.
+    let added_q = match vis {
+        None => format!("/channels?added=1{notitle_q}"),
+        Some(_) => format!(
+            "/channels?added=1&channel={}{}",
+            urlencode_query(&canonical),
+            notitle_q
+        ),
     };
     // Sellers adding = setting their own channel (the bot's /setchannel
     // semantics); owners add to the global set (seller_id 0).
@@ -501,17 +409,21 @@ pub(super) async fn channels_add(
         match session.seller_id {
             Some(sid) => {
                 state.db.set_seller_channel(sid, &canonical);
-                Redirect::to(&state.url(added_q)).into_response()
+                Redirect::to(&state.url(&added_q)).into_response()
             }
             None => forbidden_page(&state, "Channels", "Your session has no seller profile."),
         }
     } else if session.role == "owner" {
         match state.db.add_channel(&canonical, 0) {
             Ok(()) => {
-                state.db.set_channel_title(&canonical, title.as_deref());
-                Redirect::to(&state.url(added_q)).into_response()
+                state
+                    .db
+                    .set_channel_title(&canonical, chosen_title.as_deref());
+                Redirect::to(&state.url(&added_q)).into_response()
             }
-            Err(e) => channels_error(&state, &session, &esc(&e)),
+            // The DB-Err inline path (duplicate NOCASE add) re-renders the
+            // ADD page with the focused alert (spec §3.3).
+            Err(e) => channels_add_error(&state, &session, &esc(&e)),
         }
     } else {
         forbidden_page(&state, "Channels", "Global channels")
@@ -538,7 +450,12 @@ pub(super) async fn channels_default(
     // set_default_channel refuses seller-owned rows and unknown names —
     // surface that honestly instead of redirecting as if it worked.
     match state.db.set_default_channel(ch) {
-        Ok(()) => Redirect::to(&state.url("/channels?default=1")).into_response(),
+        // PRG to the detail view (spec §2): the flagged row is the managed one.
+        Ok(()) => Redirect::to(&state.url(&format!(
+            "/channels/manage?channel={}&default=1",
+            urlencode_query(ch)
+        )))
+        .into_response(),
         Err(e) => channels_error(&state, &session, &esc(&e)),
     }
 }
@@ -675,22 +592,90 @@ pub(super) async fn channels_rename(
     }
     // Self-rename guard (MANAGEMENT_DISCLOSURE_SPEC §5): a NOCASE match of
     // the box against the identifier changed nothing — say so (mirrors
-    // ?notitle=1) instead of a false "renamed" banner.
+    // ?notitle=1) instead of a false "renamed" banner. PRGs land on the
+    // detail view (spec §2); the DB-Err target carries the OLD identifier.
     if old.eq_ignore_ascii_case(&new) {
-        return Redirect::to(&state.url("/channels?renamed=1&same=1")).into_response();
+        return Redirect::to(&state.url(&format!(
+            "/channels/manage?channel={}&renamed=1&same=1",
+            urlencode_query(&old)
+        )))
+        .into_response();
     }
     match state
         .db
         .rename_channel(sid, &old, &new, session.role == "owner")
     {
         Ok(()) => Redirect::to(&state.url(&format!(
-            "/channels?renamed=1&channel={}",
+            "/channels/manage?channel={}&renamed=1",
             urlencode_query(&new)
         )))
         .into_response(),
-        Err(e) => Redirect::to(&state.url(&format!("/channels?error={}", urlencode_query(&e))))
-            .into_response(),
+        Err(e) => Redirect::to(&state.url(&format!(
+            "/channels/manage?channel={}&error={}",
+            urlencode_query(&old),
+            urlencode_query(&e)
+        )))
+        .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChannelNameForm {
+    pub(super) channel: String,
+    pub(super) name: Option<String>,
+}
+
+/// POST /channels/name sets a global channel's display label
+/// (`channels.title`) via the existing Db::set_channel_title (db.rs:2031) —
+/// the human label, never the dialed identifier (CHANNEL_ADD_REDESIGN_SPEC
+/// §5a). Owner-only: global rows are owner data. The identifier is rewritten
+/// only by POST /channels/rename (§5b), which is why this is a separate
+/// route and not a rename-handler field (`POST /channels/title` is occupied
+/// by the Bot API set_chat_title handler).
+#[tracing::instrument(skip_all)]
+pub(super) async fn channels_name(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    Form(f): Form<ChannelNameForm>,
+) -> impl IntoResponse {
+    let session = match session_from_headers(&state, &headers) {
+        Some(s) => s,
+        None => return Redirect::to(&state.url("/login")).into_response(),
+    };
+    if session.role != "owner" {
+        return forbidden_page(&state, "Channels", "Channel names");
+    }
+    let ch = f.channel.trim();
+    if ch.is_empty() {
+        return Redirect::to(&state.url("/channels?error=empty")).into_response();
+    }
+    // set_channel_title no-ops on a missing row — say so instead of a false
+    // success (existence probe precedent: bind-sender, channels.rs:743).
+    if state.db.get_channel_seller_id(ch) != Some(0) {
+        return channels_error(
+            &state,
+            &session,
+            "That channel isn't in the global list — add it first.",
+        );
+    }
+    let name = f.name.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    state.db.set_channel_title(ch, name);
+    // Audit parity with bind-sender (§5c): a label edit writes a log_action row.
+    let channel_id = state.db.get_channel_id(ch).unwrap_or(0);
+    state.db.log_action(
+        session.account_id,
+        &session.role,
+        "channel_name",
+        "channel",
+        channel_id,
+        None,
+    );
+    // PRG to the detail view (spec §2): the named row is the managed one.
+    Redirect::to(&state.url(&format!(
+        "/channels/manage?channel={}&named=1",
+        urlencode_query(ch)
+    )))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -754,7 +739,11 @@ pub(super) async fn channels_bind_sender(
         // Gate first (spec §3): the Enable-posting acceptance is the one ToS
         // surface; this page links to it, never re-asks it.
         if !crate::identity::user_writes_enabled(&state.db) {
-            return Redirect::to(&state.url("/channels?error=posting")).into_response();
+            return Redirect::to(&state.url(&format!(
+                "/channels/manage?channel={}&error=posting",
+                urlencode_query(ch)
+            )))
+            .into_response();
         }
         // Then readiness: binding 'user' while the identity is locked (or not
         // connected) would brick every send on the channel. Refuse the
@@ -762,10 +751,18 @@ pub(super) async fn channels_bind_sender(
         match state.identity.status().await.state {
             IdentityState::Ready => {}
             IdentityState::Locked => {
-                return Redirect::to(&state.url("/channels?error=locked")).into_response();
+                return Redirect::to(&state.url(&format!(
+                    "/channels/manage?channel={}&error=locked",
+                    urlencode_query(ch)
+                )))
+                .into_response();
             }
             _ => {
-                return Redirect::to(&state.url("/channels?error=identity")).into_response();
+                return Redirect::to(&state.url(&format!(
+                    "/channels/manage?channel={}&error=identity",
+                    urlencode_query(ch)
+                )))
+                .into_response();
             }
         }
     }
@@ -793,7 +790,7 @@ pub(super) async fn channels_bind_sender(
     // PRG (spec §3): the channel name rides the redirect for the success
     // copy — an identifier, not PII (§7.5), escaped again at render.
     Redirect::to(&state.url(&format!(
-        "/channels?{flash}&channel={}",
+        "/channels/manage?channel={}&{flash}",
         urlencode_query(ch)
     )))
     .into_response()

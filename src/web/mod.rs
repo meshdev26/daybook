@@ -33,6 +33,8 @@ mod bots_config;
 mod cart;
 mod channel_ops;
 mod channels;
+mod channels_manage;
+mod channels_rows;
 mod codes;
 mod common_pages;
 mod content;
@@ -77,6 +79,8 @@ use bots_config::*;
 use cart::*;
 use channel_ops::*;
 use channels::*;
+use channels_manage::*;
+use channels_rows::*;
 use codes::*;
 use common_pages::*;
 use content::*;
@@ -241,7 +245,7 @@ fn routes_core(r: Router<WebState>) -> Router<WebState> {
         .route("/settings/sidebar", post(settings_sidebar))
         .route("/settings/restart", post(settings_restart))
         .route("/channels", get(channels_page))
-        .route("/channels/add", post(channels_add))
+        .route("/channels/add", get(channels_add_page).post(channels_add))
         .route("/ai", get(ai_page))
         .route("/ai/save", post(ai_save))
         .route("/ai/test", post(ai_test))
@@ -250,6 +254,8 @@ fn routes_core(r: Router<WebState>) -> Router<WebState> {
 
 fn routes_channels(r: Router<WebState>) -> Router<WebState> {
     r.route("/channels/default", post(channels_default))
+        .route("/channels/manage", get(channels_manage_page))
+        .route("/channels/name", post(channels_name))
         .route("/channels/remove", post(channels_remove))
         .route("/channels/rename", post(channels_rename))
         .route("/channels/bind-sender", post(channels_bind_sender))
@@ -264,6 +270,9 @@ fn routes_content(r: Router<WebState>) -> Router<WebState> {
         .route("/plans/{id}/delete", post(delete_plan_by_id))
         .route("/products", get(products_page))
         .route("/product", post(create_product))
+        // The pass's one new route (EDIT_FLOW_SPEC E2): reactivation removes
+        // the one-way dead end; reuses Db::set_product_active(true).
+        .route("/product/activate", post(product_activate))
         .route("/analytics", get(analytics_page))
         .route("/analytics/export", get(analytics_export))
         .route("/subs", get(subs_page))
@@ -275,10 +284,9 @@ fn routes_commerce(r: Router<WebState>) -> Router<WebState> {
         .route("/subs/expirecheck", post(subs_expirecheck))
         .route("/subs/grant", post(subs_grant))
         .route("/subs/extend", post(subs_extend))
-        .route(
-            "/subs/bulkrevoke",
-            get(subs_bulkrevoke).post(subs_bulkrevoke),
-        )
+        // EDIT_FLOW_SPEC E10: POST-only — the GET arm let a linkable,
+        // prefetchable URL kick up to 1000 buyers out of their channels.
+        .route("/subs/bulkrevoke", post(subs_bulkrevoke))
         .route("/codes", get(codes_page))
         .route("/codes/generate", post(codes_generate))
         .route("/codes/delete", post(codes_delete))
