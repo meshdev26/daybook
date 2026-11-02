@@ -7,7 +7,7 @@ single index ("Tech Tips") that links to them, without duplicate posts.
 ## Channels
 | Channel (handle or ID) | Role | Audience |
 |---|---|---|
-| Tech Tips (`-1003876818154`) | Hub / index | Everyone — short summaries + links |
+| Tech Tips (`<hub-chat-id>`) | Hub / index | Everyone — short summaries + links |
 | (per-topic channels) | Spoke / detail | People interested in that topic |
 
 ## Roadmap (topics in order)

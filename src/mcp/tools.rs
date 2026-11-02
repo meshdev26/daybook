@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
+use teloxide::payloads::SendMessageSetters;
 use teloxide::prelude::Requester;
 
 use crate::roles;
@@ -348,7 +349,8 @@ pub fn registry() -> &'static [ToolSpec] {
             ToolSpec {
                 name: "publish_post",
                 description: "Publish a text post to a channel (default channel unless \
-                              `channel` is given). Executes immediately.",
+                              `channel` is given). Executes immediately. Optional parse_mode: \
+                              'html' enables Telegram HTML formatting (b/i/code/pre/a).",
                 tier: Tier::Write,
                 input_schema: json!({
                     "type": "object",
@@ -356,6 +358,8 @@ pub fn registry() -> &'static [ToolSpec] {
                         "channel": {"type": "string",
                                     "description": "Target channel (@name or id); defaults to the configured default channel."},
                         "text": {"type": "string", "minLength": 1},
+                        "parse_mode": {"type": "string",
+                                       "description": "Optional parse_mode: 'html' enables Telegram HTML formatting (b/i/code/pre/a)."},
                         "bot_key": {"type": "string",
                                     "description": "Owner-only; seller credentials ignore it and act through their own bot."},
                         "bot_id": {"type": "integer",
@@ -370,13 +374,17 @@ pub fn registry() -> &'static [ToolSpec] {
             ToolSpec {
                 name: "edit_post",
                 description: "Edit the stored content of a logged post. Edits the stored \
-                              record only; the already-sent Telegram message is not rewritten.",
+                              record only; the already-sent Telegram message is not rewritten. \
+                              Optional parse_mode: 'html' enables Telegram HTML formatting \
+                              (b/i/code/pre/a).",
                 tier: Tier::Write,
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "post_id": {"type": "integer"},
-                        "text": {"type": "string", "minLength": 1}
+                        "text": {"type": "string", "minLength": 1},
+                        "parse_mode": {"type": "string",
+                                       "description": "Optional parse_mode: 'html' enables Telegram HTML formatting (b/i/code/pre/a)."}
                     },
                     "required": ["post_id", "text"]
                 }),
@@ -630,13 +638,33 @@ fn validate_text_field(args: &Value, key: &str) -> Result<(), String> {
     }
 }
 
+/// Map the optional `parse_mode` argument of the post tools to a teloxide
+/// parse mode. Absent (or null) keeps the historical plain-text send — zero
+/// drift for scripted callers; `"html"` passes the caller's text as-is so
+/// the caller crafts the entities (`<b>`, `<i>`, `<code>`, `<pre>`,
+/// `<a href>`). Any other value is rejected with an error naming the one
+/// valid value. In html mode no escaping is added (the caller owns the
+/// entities); Telegram itself rejects malformed HTML and that error flows
+/// back to the caller as the tool error.
+fn resolve_parse_mode(args: &Value) -> Result<Option<teloxide::types::ParseMode>, String> {
+    match args.get("parse_mode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "html" => Ok(Some(teloxide::types::ParseMode::Html)),
+        Some(_) => Err(
+            "'parse_mode' must be \"html\" (Telegram HTML formatting) or omitted for plain text"
+                .into(),
+        ),
+    }
+}
+
 fn validate_publish_post(args: &Value) -> Result<(), String> {
     validate_text_field(args, "text")?;
     match args.get("channel") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) if !s.trim().is_empty() => Ok(()),
-        Some(_) => Err("'channel' must be a non-empty string".into()),
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if !s.trim().is_empty() => {}
+        Some(_) => return Err("'channel' must be a non-empty string".into()),
     }
+    resolve_parse_mode(args).map(|_| ())
 }
 
 fn validate_ai_publish_post(args: &Value) -> Result<(), String> {
@@ -654,7 +682,8 @@ fn validate_edit_post(args: &Value) -> Result<(), String> {
     if get_int(args, "post_id")?.is_none() {
         return Err("missing required integer argument 'post_id'".into());
     }
-    validate_text_field(args, "text")
+    validate_text_field(args, "text")?;
+    resolve_parse_mode(args).map(|_| ())
 }
 
 fn validate_gen_codes(args: &Value) -> Result<(), String> {
@@ -1522,16 +1551,22 @@ async fn publish_post(state: WebState, principal: Principal, args: Value) -> Res
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // Absent parse_mode keeps the historical plain-text send; "html" sends
+    // the caller's text as-is under Telegram's HTML mode. The stored record
+    // keeps the raw text either way.
+    let parse_mode = resolve_parse_mode(&args)?;
     // Unlike the web API (which logs a 0 message id), a bot failure is
     // reported as a tool error so an AI caller knows nothing was posted.
     // Multi-bot: the send goes through the principal's effective bot (owner
     // selector or the seller's mapped bot), never blindly through primary.
     let bot_ctx = resolve_tool_bot(&state, &principal, &args)?;
-    match bot_ctx
+    let mut send = bot_ctx
         .bot
-        .send_message(crate::util::to_chat_id(&ch), text.clone())
-        .await
-    {
+        .send_message(crate::util::to_chat_id(&ch), text.clone());
+    if let Some(pm) = parse_mode {
+        send = send.parse_mode(pm);
+    }
+    match send.await {
         Ok(sent) => {
             crate::metrics::bot_sent();
             let seller_id = principal.seller_id.unwrap_or(0);
@@ -1553,6 +1588,12 @@ async fn edit_post(state: WebState, principal: Principal, args: Value) -> Result
         .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    // Arg-shape parity with publish_post: parse_mode is accepted and
+    // validated the same way, but this tool edits the STORED RECORD ONLY
+    // (no edit_message_text — the sent Telegram message is never rewritten
+    // by design), so there is no send to decorate and the raw text is
+    // stored verbatim either way.
+    let _parse_mode = resolve_parse_mode(&args)?;
     // Tenancy: the update itself is by-id and unscoped, so a seller principal
     // must first prove the target is one of their own posts. The check re-uses
     // the read tool's exact scoped query (`list_posts(Some(seller_id), …)`,
@@ -2065,5 +2106,174 @@ mod tests {
             validate_publish_as_user(&json!({"channel": "@c", "text": "x".repeat(4096)})).is_ok()
         );
         assert!(validate_publish_as_user(&json!({"channel": "@c", "text": "hi"})).is_ok());
+    }
+
+    // ---- parse_mode (publish_post / edit_post) ----
+
+    #[test]
+    fn resolve_parse_mode_maps_absent_null_and_html_only() {
+        use teloxide::types::ParseMode;
+        // Absent or null: the historical plain-text path, zero drift.
+        assert_eq!(resolve_parse_mode(&json!({"text": "hi"})), Ok(None));
+        assert_eq!(
+            resolve_parse_mode(&json!({"text": "hi", "parse_mode": null})),
+            Ok(None)
+        );
+        // The one accepted value maps to teloxide's HTML mode.
+        assert_eq!(
+            resolve_parse_mode(&json!({"text": "hi", "parse_mode": "html"})),
+            Ok(Some(ParseMode::Html))
+        );
+        // Anything else is rejected with an error naming the valid value.
+        for bad in ["markdown", "HTML", "MarkdownV2", ""] {
+            let err = resolve_parse_mode(&json!({"parse_mode": bad})).unwrap_err();
+            assert!(err.contains("\"html\""), "{bad}: {err}");
+        }
+        assert!(resolve_parse_mode(&json!({"parse_mode": 5})).is_err());
+    }
+
+    #[test]
+    fn post_tool_validators_enforce_parse_mode_values() {
+        // Absent stays accepted on both tools (existing behavior untouched).
+        assert!(validate_publish_post(&json!({"text": "hi"})).is_ok());
+        assert!(validate_edit_post(&json!({"post_id": 1, "text": "hi"})).is_ok());
+        // "html" accepted on both tools.
+        assert!(validate_publish_post(&json!({"text": "hi", "parse_mode": "html"})).is_ok());
+        assert!(
+            validate_edit_post(&json!({"post_id": 1, "text": "hi", "parse_mode": "html"})).is_ok()
+        );
+        // Anything else is rejected with the same valid-value error on both.
+        for bad in [json!("markdown"), json!("HTML"), json!(5)] {
+            let pub_args = json!({"text": "hi", "parse_mode": bad});
+            let edit_args = json!({"post_id": 1, "text": "hi", "parse_mode": bad});
+            let err = validate_publish_post(&pub_args).unwrap_err();
+            assert!(err.contains("\"html\""), "{bad}: {err}");
+            assert_eq!(err, resolve_parse_mode(&pub_args).unwrap_err());
+            assert_eq!(err, validate_edit_post(&edit_args).unwrap_err());
+        }
+    }
+
+    /// Minimal WebState whose primary bot points its Bot API at `api_url`
+    /// (wiremock) — the direct-handler mirror of the mcp tests' mcp_state +
+    /// with_bot_manager seam, for exercising the real teloxide send path.
+    fn send_test_state(api_url: &str) -> (WebState, tempfile::TempDir) {
+        use crate::config::Config;
+        use crate::db::Db;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
+        let db = Db::new(&db_path).unwrap();
+        let cfg = Config {
+            owner_id: 1,
+            db_path,
+            crypto_token: None,
+            ai_enabled: false,
+            ai_provider: "openai".to_string(),
+            ai_api_style: "openai".to_string(),
+            ai_base_url: "https://api.openai.com/v1".to_string(),
+            ai_api_key: None,
+            ai_model: "gpt-4o-mini".to_string(),
+            ai_daily_token_budget: None,
+            mcp_owner_token: None,
+            telegram_api_id: None,
+            telegram_api_hash: None,
+            bots: Vec::new(),
+            bots_legacy: true,
+        };
+        let db = Arc::new(db);
+        let shared = Arc::new(cfg.clone());
+        let bot = teloxide::Bot::new("0:placeholder")
+            .set_api_url(api_url.parse::<reqwest::Url>().unwrap());
+        let primary = Arc::new(crate::bots::BotContext {
+            id: 0,
+            key: "primary".to_string(),
+            bot,
+            owner_id: 1,
+            shared,
+            db: db.clone(),
+        });
+        let bots = Arc::new(crate::bots::BotManager {
+            bots: vec![primary.clone()],
+            primary,
+            db: db.clone(),
+            identity: crate::identity::IdentityHandle::unconnected(),
+        });
+        let state = WebState {
+            db: db.clone(),
+            cfg,
+            bot: teloxide::Bot::new("0:setup-placeholder"),
+            bots,
+            identity: crate::identity::IdentityHandle::unconnected(),
+            login_attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
+            base_path: String::new(),
+        };
+        (state, dir)
+    }
+
+    /// End to end over the real teloxide send path (wiremock Bot API):
+    /// parse_mode "html" serializes Telegram's `"parse_mode": "HTML"` on the
+    /// wire, the absent-arg send carries NO parse_mode key at all (zero
+    /// drift), and the stored record keeps the raw text either way.
+    #[tokio::test]
+    async fn publish_post_parse_mode_reaches_the_send_call() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let reply = json!({
+            "ok": true,
+            "result": {
+                "message_id": 42,
+                "date": 1_700_000_000,
+                "chat": {"id": 123, "type": "private", "first_name": "T"},
+                "text": "hi"
+            }
+        });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = send_test_state(&server.uri());
+
+        let out = publish_post(
+            state.clone(),
+            Principal::OWNER,
+            json!({"channel": "123", "text": "<b>hi</b>", "parse_mode": "html"}),
+        )
+        .await
+        .expect("html send must succeed");
+        assert_eq!(out["message_id"], 42);
+        let out = publish_post(
+            state.clone(),
+            Principal::OWNER,
+            json!({"channel": "123", "text": "hi"}),
+        )
+        .await
+        .expect("plain send must succeed");
+        assert_eq!(out["message_id"], 42);
+
+        let hits = server.received_requests().await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[0].url.path().ends_with("/SendMessage"),
+            "{:?}",
+            hits[0].url
+        );
+        // html mode reaches the wire as Telegram's HTML parse mode.
+        let first: Value = serde_json::from_slice(&hits[0].body).unwrap();
+        assert_eq!(first["parse_mode"], "HTML", "{first}");
+        assert_eq!(first["text"], "<b>hi</b>");
+        // Absent parse_mode: exactly the historical body, no parse_mode key.
+        let second: Value = serde_json::from_slice(&hits[1].body).unwrap();
+        assert!(second.get("parse_mode").is_none(), "{second}");
+        assert_eq!(second["text"], "hi");
+        // The stored record keeps the raw text either way (kind "text").
+        let posts = state.db.list_posts(None, 10);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1].4, "text");
+        assert_eq!(posts[1].5.as_deref(), Some("<b>hi</b>"));
+        assert_eq!(posts[0].4, "text");
+        assert_eq!(posts[0].5.as_deref(), Some("hi"));
     }
 }

@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::{ErasedStorage, SqliteStorage, Storage, serializer::Json},
+    error_handlers::LoggingErrorHandler,
     payloads::CreateChatInviteLinkSetters,
     prelude::*,
+    update_listeners::Polling,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -89,8 +91,32 @@ async fn security_headers(
     resp
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // P1 stack-overflow mitigation (2026-11-01): the binary aborted twice in
+    // production with `thread 'tokio-rt-worker' has overflowed its stack /
+    // fatal runtime error: stack overflow` while LIVE bot pollers dispatched
+    // real Telegram updates (crash #1 minutes after the first live boot,
+    // crash #2 after ~1h; tokenless setup boots ran for days with no crash).
+    // A bare `#[tokio::main]` leaves worker threads on tokio's default 2 MiB
+    // stack — far below the process `ulimit -s` (8 MiB) — and the live-update
+    // dispatch path is the deepest frame chain in the process: every update
+    // (including MyChatMember fall-throughs, which traverse the entire dptree
+    // branch tree without reaching an endpoint) walks a chain of nested
+    // matcher frames while teloxide moves the large Update/Message enums by
+    // value. 16 MiB per worker (and per blocking-pool thread, which also
+    // inherits this knob) is the standard, documented fix for dptree dispatch
+    // depth. Worker-thread COUNT and all runtime semantics are unchanged from
+    // the previous #[tokio::main] (multi_thread flavor, enable_all, default
+    // worker_threads = num_cpus); only the per-thread stack grows.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime"); // allowed: startup path
+    runtime.block_on(run());
+}
+
+async fn run() {
     config::load_dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -324,7 +350,11 @@ async fn main() {
         None
     };
 
-    // Build BotContexts from app_cfg (enabled bots only).
+    // Build BotContexts from app_cfg (enabled bots only). One hardened HTTP
+    // client is shared by every bot (`Bot::new` would otherwise give each its
+    // own client with teloxide's 17s default total timeout — under the 30s
+    // long poll below it must be our 45s budget, see bots::bot_http_client).
+    let bot_http = bots::bot_http_client();
     let mut bot_contexts: Vec<Arc<bots::BotContext>> = Vec::new();
     for bc in &app_cfg.bots {
         if bc.token.trim().is_empty() || bc.owner_id == 0 {
@@ -339,7 +369,7 @@ async fn main() {
         let ctx = Arc::new(bots::BotContext {
             id: bot_id,
             key: bc.key.clone(),
-            bot: Bot::new(bc.token.clone()),
+            bot: Bot::with_client(bc.token.clone(), bot_http.clone()),
             owner_id: bc.owner_id,
             shared: Arc::new(cfg.clone()),
             db: db.clone(),
@@ -353,7 +383,7 @@ async fn main() {
         Arc::new(bots::BotContext {
             id: 0,
             key: "primary".to_string(),
-            bot: Bot::new("0:setup-placeholder".to_string()),
+            bot: Bot::with_client("0:setup-placeholder".to_string(), bot_http),
             owner_id: 0,
             shared: Arc::new(cfg.clone()),
             db: db.clone(),
@@ -1094,11 +1124,42 @@ async fn main() {
                 first = false;
             }
             let mut dispatcher = builder.build();
-            tasks.push(tokio::spawn(async move { dispatcher.dispatch().await }));
+            // Explicit long-poll listener instead of `dispatch()` (whose
+            // internal `polling_default` hardcodes 10s): a 30s poll costs one
+            // round trip per cycle on this network. A poll wedged past
+            // bots::BOT_HTTP_TOTAL_TIMEOUT is cut off by the client and
+            // resurfaces as a Network error, which teloxide's polling backoff
+            // retries indefinitely — the loop recovers on its own.
+            tasks.push((
+                ctx.key.clone(),
+                tokio::spawn(async move {
+                    let listener = Polling::builder(ctx.bot.clone())
+                        .timeout(bots::LONG_POLL_TIMEOUT)
+                        .delete_webhook()
+                        .await
+                        .build();
+                    dispatcher
+                        .dispatch_with_listener(
+                            listener,
+                            LoggingErrorHandler::with_custom_text(
+                                "An error from the update listener",
+                            ),
+                        )
+                        .await;
+                }),
+            ));
         }
         Some(tokio::spawn(async move {
-            for t in tasks {
-                let _ = t.await;
+            // A dispatcher task must never die silently: that is the deaf-bot
+            // state (process alive, web serving, no poller) that restart
+            // supervision cannot see. Panics here include teloxide's own
+            // startup `get_me` failure (`dispatch_with_listener` expects the
+            // initial call) — log loudly and keep the other bots serving.
+            for (key, t) in tasks {
+                match t.await {
+                    Ok(()) => tracing::info!(bot = %key, "bot dispatcher finished"),
+                    Err(e) => tracing::error!(bot = %key, "bot dispatcher task died: {e}"),
+                }
             }
         }))
     } else {

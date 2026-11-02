@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use teloxide::Bot;
 use teloxide::requests::Requester;
@@ -6,6 +7,57 @@ use teloxide::requests::Requester;
 use crate::config::SharedConfig;
 use crate::db::Db;
 use crate::identity::{ContentSender, SendError, SenderIdentity, SentMessage};
+
+/// Long-poll budget sent as the `getUpdates` `timeout` parameter: the server
+/// holds each request up to this long before answering. 30s keeps one poll
+/// cycle per round trip on this deployment's high-latency route to
+/// api.telegram.org (~3s per trivial call), instead of cycling three times
+/// as often with teloxide's 10s default. Must stay below
+/// [`BOT_HTTP_TOTAL_TIMEOUT`] (teloxide: the client timeout must exceed the
+/// polling timeout).
+pub const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total per-request budget for every Telegram API call the bots make —
+/// long polls and sends alike: connect ([`BOT_HTTP_CONNECT_TIMEOUT`]) +
+/// [`LONG_POLL_TIMEOUT`] hold + response transfer, with headroom for the
+/// ~3s-per-call baseline latency. The load-bearing half of the polling fix:
+/// without a total cap a black-holed `getUpdates` never errors, teloxide's
+/// retry loop never runs, and the bot goes deaf while the process (and the
+/// web UI) stay alive — invisible to systemd-style restart. With it, a wedged
+/// request is cut off at 45s and surfaces as `RequestError::Network`,
+/// which the polling backoff retries indefinitely until the network returns.
+pub const BOT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Connect budget for the same client: ~3x the observed 2.4-2.9s per-call
+/// baseline, so slow-but-alive TLS handshakes survive while connects that
+/// will never complete are abandoned early (a dropped SYN otherwise burns
+/// the whole 45s total budget per attempt).
+pub const BOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reqwest client every bot shares for Telegram API traffic.
+///
+/// Applied via `Bot::with_client` (teloxide's own default client has a 17s
+/// total timeout, which would chronically cut a 30s long poll mid-flight).
+/// Built once and cloned into each bot — `reqwest::Client` is an internal
+/// Arc, so sharing is free and connection pooling is common across bots.
+/// Keeps teloxide's `tcp_nodelay` (their long-duration hygiene, issue 223);
+/// like `Bot::new`, no proxy is configured.
+pub fn bot_http_client() -> reqwest::Client {
+    bot_http_client_with(BOT_HTTP_TOTAL_TIMEOUT, BOT_HTTP_CONNECT_TIMEOUT)
+}
+
+/// Test seam: the same builder shape with explicit budgets. reqwest offers
+/// no post-build introspection, so the timeout contract is pinned by the
+/// loopback black-hole test below against this constructor; the production
+/// client differs only in the constants it passes.
+fn bot_http_client_with(total: Duration, connect: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(total)
+        .connect_timeout(connect)
+        .tcp_nodelay(true)
+        .build()
+        .expect("bot HTTP client construction failed (startup path)")
+}
 
 pub struct BotContext {
     pub id: i64,
@@ -68,7 +120,10 @@ impl BotManager {
         let primary = std::sync::Arc::new(BotContext {
             id: 0,
             key: "primary".to_string(),
-            bot: Bot::new("0:placeholder".to_string()),
+            // Placeholder never talks to the network, but route it through
+            // the shared client anyway so no bot-shaped handle bypasses the
+            // transport budget.
+            bot: Bot::with_client("0:placeholder".to_string(), bot_http_client()),
             owner_id: 0,
             shared,
             db: db.clone(),
@@ -151,6 +206,45 @@ mod tests {
     use super::*;
     use crate::config::SharedConfig;
     use crate::identity::{IdentityHandle, SendError, SenderIdentity};
+
+    /// Pins the load-bearing transport contract: a request whose peer accepts
+    /// the connection but never responds must be cut off by the client's
+    /// total timeout, not hang forever (the deaf-poller failure mode). Runs
+    /// against loopback with a 1s budget so the suite stays fast — the
+    /// production client is this exact code path with the (45s, 10s)
+    /// constants. Without a configured timeout this test fails by hanging
+    /// until the peer socket drops (~10s) instead of erroring promptly.
+    #[tokio::test]
+    async fn http_client_total_timeout_caps_black_holed_requests() {
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap();
+        // Accept and hold: connection established, no HTTP response, ever
+        // (longer than every budget in this test).
+        let holder = std::thread::spawn(move || {
+            let (_conn, _) = srv.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+
+        let client = bot_http_client_with(Duration::from_secs(1), Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let res = client.get(format!("http://{addr}/")).send().await;
+        let elapsed = started.elapsed();
+
+        assert!(res.is_err(), "a black-holed request must error, not hang");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "total timeout must cap the request promptly, took {elapsed:?}"
+        );
+        holder.join().unwrap();
+    }
+
+    /// The production client must build (startup-path `expect` never fires)
+    /// and be shareable across bots.
+    #[test]
+    fn bot_http_client_builds() {
+        let _a = bot_http_client();
+        let _b = bot_http_client();
+    }
 
     fn test_cfg() -> SharedConfig {
         SharedConfig {

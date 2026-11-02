@@ -56,6 +56,9 @@ and the setup & management UX polish
 - Owner-only `bot_key`/`bot_id` selectors on the MCP `publish_post`,
   `broadcast` and `ai_publish_post` tools; per-seller MCP tokens ignore them
   and act through their own seller's bot.
+- MCP `publish_post`/`edit_post` accept an optional `parse_mode` (`"html"` 
+  only): the send carries Telegram HTML entities; absent keeps the
+  historical plain-text path with zero drift for scripted callers.
 
 ### Changed
 - Setup and management UX polish (per
@@ -101,6 +104,11 @@ and the setup & management UX polish
 - Build/CI: toolchain pinned at 1.99.1 across CI and Docker; `build.rs` fails
   loudly on a missing Windows icon; `make restore` added; doctor probes are
   base-path aware.
+- Bot transport budgets: every bot shares one reqwest client (30 s long poll,
+  45 s total, 10 s connect) wired via `Bot::with_client`, with an explicit
+  `Polling` listener (30 s hold per cycle) and dispatcher-death logging — a
+  wedged call is cut off and retried by the backoff instead of leaving the
+  bot deaf on high-latency routes. Pinned by a loopback black-hole test.
 
 ### Fixed
 - Invoice claim/release lifecycle covers products (previously invoices only):
@@ -115,6 +123,9 @@ and the setup & management UX polish
   setups silently fell back to the manual copy-paste snippet. TOML writes now
   validate with the document parser and land in `bots.toml` directly.
 - Crypto Pay client requests time out after 15s.
+- P1: live dispatch stack overflow — tokio worker stacks raised to 16 MiB
+  (runtime semantics otherwise unchanged); two production crashes during
+  real-update dptree dispatch (deepest frame chain) stopped reproducibly.
 
 ### Security
 - MCP Sensitive tier is fail-closed owner-only: a per-seller token calling a
