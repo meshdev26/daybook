@@ -428,8 +428,10 @@ CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_seller ON mcp_tokens(seller_id);
 
 -- Multi-bot (v1.6): one row per configured bot. `name` is the console
--- display name (v1.7); '' falls back to the key. Declared last so legacy
--- (ALTERed) and fresh layouts match.
+-- display name (v1.7); '' falls back to the key. `bot_type` (multibot
+-- foundation) is the product/capability type of the bot; the DEFAULT
+-- backfills every legacy row to 'shop_bot' with no destructive rewrite.
+-- Declared last so legacy (ALTERed) and fresh layouts match.
 CREATE TABLE IF NOT EXISTS bots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     key               TEXT NOT NULL UNIQUE,
@@ -438,9 +440,12 @@ CREATE TABLE IF NOT EXISTS bots (
     default_channel_id INTEGER,
     enabled           INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL,
-    name              TEXT NOT NULL DEFAULT ''
+    name              TEXT NOT NULL DEFAULT '',
+    bot_type          TEXT NOT NULL DEFAULT 'shop_bot'
 );
 CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_user_id);
+-- idx_bots_type is created in Db::migrate, after the additive bot_type
+-- ALTER: a legacy bots table has no such column when schema.sql runs.
 
 -- AI-assisted post drafts
 CREATE TABLE IF NOT EXISTS ai_post_drafts (

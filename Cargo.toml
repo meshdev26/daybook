@@ -4,6 +4,38 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+# ---- Compile-time capability registry (multibot foundation) ----
+# A feature selects which product capabilities are compiled in. The default
+# set is behavior-neutral: today's shop bot plus the cross-cutting moderation
+# floor, so every existing path and dependency stays byte-identical.
+#   shop_bot   - AI shop bot (payments, products, AI drafts) — existing default.
+#   moderation - owner/seller/per-bot word policy floor — existing default;
+#                a movie-only build keeps this floor but drops shop.
+#   movie_bot  - movie catalog bot; a movie-only install enables this alone.
+#   reply_bot  - admin reply bot.
+#   file_share - file-sharing product type.
+#   web_app    - public (non-bot) Web app surface.
+#   service    - AI service surface.
+#   automation - automation rules (Workspace).
+#
+# Capability dependencies cannot become `optional = true` / `dep:`-mapped
+# yet: src/lib.rs compiles every module (ai, crypto, identity, web, ...) for
+# every target, and web/** + handlers/** reference them unconditionally, so
+# removing e.g. `reqwest` (AI/Crypto Pay) or `grammers-*`/`aes-gcm` (MTProto
+# identity storage) would break `--no-default-features --features movie_bot
+# --lib`. L7/L8 must gate those modules first; this feature set gives their
+# `#[cfg(feature = "...")]` hooks a stable surface in the meantime.
+[features]
+default = ["shop_bot", "moderation"]
+shop_bot = []
+moderation = []
+movie_bot = []
+reply_bot = []
+file_share = []
+web_app = []
+service = []
+automation = []
+
 # Smaller, self-contained release binaries for desktop distribution (.exe/.app/tar.gz).
 [profile.release]
 lto = "thin"

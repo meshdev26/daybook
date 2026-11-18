@@ -158,6 +158,7 @@ async fn make_state_multi_bot() -> (WebState, TempDir) {
             owner_id: 1,
             default_channel: None,
             token_env: Some("BOT_PRIMARY".to_string()),
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
         crate::config::BotConfig {
             key: "proxy26_bot".to_string(),
@@ -166,6 +167,7 @@ async fn make_state_multi_bot() -> (WebState, TempDir) {
             owner_id: 0,
             default_channel: None,
             token_env: Some("BOT_PROXY26_BOT".to_string()),
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
     ];
     state.cfg.bots_legacy = false;

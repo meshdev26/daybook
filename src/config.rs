@@ -3,6 +3,25 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Default product/capability type for bots that predate the multibot
+/// foundation, and for config entries that omit `bot_type`. One constant
+/// keeps the schema DEFAULT, the migration backfill and the runtime
+/// constructors in agreement.
+pub const DEFAULT_BOT_TYPE: &str = "shop_bot";
+
+/// Normalize a configured bot type: an empty/whitespace value cannot name a
+/// capability, so it fails safe to the shop bot default. Checking the value
+/// against compiled-in capabilities is the dispatcher's job (L8), not this
+/// data-layer normalization.
+pub(crate) fn normalize_bot_type(bot_type: &str) -> &str {
+    let trimmed = bot_type.trim();
+    if trimmed.is_empty() {
+        DEFAULT_BOT_TYPE
+    } else {
+        trimmed
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedConfig {
     pub db_path: String,
@@ -56,6 +75,10 @@ pub struct BotConfig {
     /// docs/MULTI_BOT.md). The variable name is non-secret config metadata
     /// (it already appears in bots.toml); the token value stays in `token`.
     pub token_env: Option<String>,
+    /// Product/capability type (multibot foundation). Absent or empty in
+    /// bots.toml / BOTS_JSON falls back to `DEFAULT_BOT_TYPE` ("shop_bot"),
+    /// so every existing config file keeps its byte-identical behavior.
+    pub bot_type: String,
 }
 
 #[derive(Clone)]
@@ -574,6 +597,7 @@ fn legacy_primary_bot(
         owner_id,
         default_channel,
         token_env: Some("TELEGRAM_BOT_TOKEN".to_string()),
+        bot_type: DEFAULT_BOT_TYPE.to_string(),
     }
 }
 
@@ -610,6 +634,8 @@ fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
         if key.is_empty() {
             continue;
         }
+        let bot_type = normalize_bot_type(v.get("bot_type").and_then(|x| x.as_str()).unwrap_or(""))
+            .to_string();
         out.push(BotConfig {
             key,
             name,
@@ -617,6 +643,7 @@ fn parse_bots_json(raw: &str) -> Result<Vec<BotConfig>, ()> {
             owner_id,
             default_channel,
             token_env,
+            bot_type,
         });
     }
     Ok(out)
@@ -663,6 +690,8 @@ fn parse_bots_toml(content: &str) -> Result<Vec<BotConfig>, ()> {
         if key.is_empty() {
             continue;
         }
+        let bot_type = normalize_bot_type(b.get("bot_type").and_then(|v| v.as_str()).unwrap_or(""))
+            .to_string();
         out.push(BotConfig {
             key,
             name,
@@ -670,6 +699,7 @@ fn parse_bots_toml(content: &str) -> Result<Vec<BotConfig>, ()> {
             owner_id,
             default_channel,
             token_env,
+            bot_type,
         });
     }
     Ok(out)
@@ -1038,6 +1068,36 @@ default_channel = \"@sales\"
         assert_eq!(bots[1].default_channel.as_deref(), Some("@sales"));
         // SAFETY: restores the test-only variable.
         unsafe { std::env::remove_var(TOKEN_ENV_SET) };
+    }
+
+    /// `bot_type` is optional config metadata: both parsers carry explicit
+    /// values through (trimmed) and default absent/blank values to
+    /// `shop_bot`, so pre-multibot config files keep their behavior.
+    #[test]
+    fn bots_parsers_read_optional_bot_type_with_default() {
+        let toml = r#"
+[[bots]]
+key = "movie"
+name = "Movie"
+token = "inline"
+bot_type = "  movie_bot  "
+
+[[bots]]
+key = "shop"
+token = "inline"
+"#;
+        let bots = parse_bots_toml(toml).expect("two-bot document parses");
+        assert_eq!(bots[0].bot_type, "movie_bot");
+        assert_eq!(bots[1].bot_type, DEFAULT_BOT_TYPE);
+
+        let json = r#"[
+            {"key":"reply","token":"inline","bot_type":"reply_bot"},
+            {"key":"plain","token":"inline","bot_type":"   "}
+        ]"#;
+        let bots = parse_bots_json(json).expect("two-bot JSON array parses");
+        assert_eq!(bots[0].bot_type, "reply_bot");
+        assert_eq!(bots[1].bot_type, DEFAULT_BOT_TYPE);
+        assert_eq!(normalize_bot_type(" movie_bot "), "movie_bot");
     }
 
     /// Malformed or bots-less documents fail closed: Err, never a silent

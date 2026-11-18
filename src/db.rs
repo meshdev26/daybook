@@ -201,6 +201,26 @@ pub struct BotRecord {
     pub created_at: String,
     /// Console display name; '' means "show the key instead".
     pub name: String,
+    /// Product/capability type (multibot foundation). Defaults to
+    /// `shop_bot` so every legacy row keeps its existing behavior.
+    pub bot_type: String,
+}
+
+/// Single mapping for every `bots` SELECT, so a new column only has to be
+/// added to the column lists (and here) once. Column order is shared by
+/// `get_bot`, `get_bot_by_key`, `list_bots`, and the typed listing methods.
+fn bot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRecord> {
+    Ok(BotRecord {
+        id: r.get(0)?,
+        key: r.get(1)?,
+        username: r.get(2)?,
+        owner_user_id: r.get(3)?,
+        default_channel_id: r.get(4)?,
+        enabled: r.get::<_, i64>(5)? != 0,
+        created_at: r.get(6)?,
+        name: r.get(7)?,
+        bot_type: r.get(8)?,
+    })
 }
 
 pub struct Db {
@@ -440,6 +460,24 @@ impl Db {
         // errors out (ignored) once the column exists.
         let _ = conn.execute(
             "ALTER TABLE bots ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Multibot foundation (v2): product/capability type on each bot.
+        // Additive + idempotent, exactly like `name` above: SQLite fills
+        // existing rows with the NOT NULL DEFAULT on ALTER, so legacy bots
+        // are backfilled to 'shop_bot' without a destructive rewrite. The
+        // defensive UPDATE normalizes NULL/'' values a partially-migrated
+        // writer could have left, and the index serves typed listing.
+        let _ = conn.execute(
+            "ALTER TABLE bots ADD COLUMN bot_type TEXT NOT NULL DEFAULT 'shop_bot'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE bots SET bot_type = 'shop_bot' WHERE bot_type IS NULL OR TRIM(bot_type) = ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bots_type ON bots(bot_type)",
             [],
         );
         let _ = conn.execute("ALTER TABLE sellers ADD COLUMN bot_id INTEGER", []);
@@ -1726,6 +1764,9 @@ impl Db {
     }
 
     // ---- Bots ----
+    /// Legacy constructor: creates a `shop_bot`, preserving the behavior of
+    /// every pre-multibot call site byte-for-byte. Typed callers should use
+    /// `create_bot_with_type`.
     pub fn create_bot(
         &self,
         key: &str,
@@ -1733,11 +1774,31 @@ impl Db {
         default_channel_id: Option<i64>,
         name: &str,
     ) -> i64 {
+        self.create_bot_with_type(
+            key,
+            owner_user_id,
+            default_channel_id,
+            name,
+            crate::config::DEFAULT_BOT_TYPE,
+        )
+    }
+
+    /// Create a bot with an explicit product/capability type. All values are
+    /// bound parameters; the default type keeps legacy callers on `shop_bot`.
+    pub fn create_bot_with_type(
+        &self,
+        key: &str,
+        owner_user_id: i64,
+        default_channel_id: Option<i64>,
+        name: &str,
+        bot_type: &str,
+    ) -> i64 {
+        let bot_type = crate::config::normalize_bot_type(bot_type);
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         let res = conn.execute(
-            "INSERT INTO bots(key, name, owner_user_id, default_channel_id, enabled, created_at) VALUES(?1,?2,?3,?4,1,?5)",
-            rusqlite::params![key, name, owner_user_id, default_channel_id, now],
+            "INSERT INTO bots(key, name, owner_user_id, default_channel_id, enabled, created_at, bot_type) VALUES(?1,?2,?3,?4,1,?5,?6)",
+            rusqlite::params![key, name, owner_user_id, default_channel_id, now, bot_type],
         );
         if res.is_ok() {
             return conn.last_insert_rowid();
@@ -1753,20 +1814,9 @@ impl Db {
     pub fn get_bot(&self, id: i64) -> Option<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE id = ?1",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE id = ?1",
             rusqlite::params![id],
-            |r| {
-                Ok(BotRecord {
-                    id: r.get(0)?,
-                    key: r.get(1)?,
-                    username: r.get(2)?,
-                    owner_user_id: r.get(3)?,
-                    default_channel_id: r.get(4)?,
-                    enabled: r.get::<_, i64>(5)? != 0,
-                    created_at: r.get(6)?,
-                    name: r.get(7)?,
-                })
-            },
+            bot_from_row,
         )
         .optional()
         .ok()
@@ -1776,20 +1826,9 @@ impl Db {
     pub fn get_bot_by_key(&self, key: &str) -> Option<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE key = ?1",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE key = ?1",
             rusqlite::params![key],
-            |r| {
-                Ok(BotRecord {
-                    id: r.get(0)?,
-                    key: r.get(1)?,
-                    username: r.get(2)?,
-                    owner_user_id: r.get(3)?,
-                    default_channel_id: r.get(4)?,
-                    enabled: r.get::<_, i64>(5)? != 0,
-                    created_at: r.get(6)?,
-                    name: r.get(7)?,
-                })
-            },
+            bot_from_row,
         )
         .optional()
         .ok()
@@ -1799,30 +1838,63 @@ impl Db {
     pub fn list_bots(&self) -> Vec<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match conn.prepare(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots ORDER BY id",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots ORDER BY id",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
-        stmt.query_map([], |r| {
-            Ok(BotRecord {
-                id: r.get(0)?,
-                key: r.get(1)?,
-                username: r.get(2)?,
-                owner_user_id: r.get(3)?,
-                default_channel_id: r.get(4)?,
-                enabled: r.get::<_, i64>(5)? != 0,
-                created_at: r.get(6)?,
-                name: r.get(7)?,
-            })
-        })
-        .ok()
-        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        stmt.query_map([], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     pub fn list_bots_enabled(&self) -> Vec<BotRecord> {
         self.list_bots().into_iter().filter(|b| b.enabled).collect()
+    }
+
+    /// List every bot of one product/capability type. The type is a bound
+    /// parameter; an unknown type yields an empty vec — never a silent
+    /// fallback to all bots (the dispatcher refuses disabled types).
+    pub fn list_bots_of_type(&self, bot_type: &str) -> Vec<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE bot_type = ?1 ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![bot_type], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Enabled-only variant of `list_bots_of_type`, mirroring
+    /// `list_bots_enabled` for callers that dispatch inbound updates.
+    pub fn list_bots_of_type_enabled(&self, bot_type: &str) -> Vec<BotRecord> {
+        self.list_bots_of_type(bot_type)
+            .into_iter()
+            .filter(|b| b.enabled)
+            .collect()
+    }
+
+    /// Seller-scoped typed listing. A seller with a NULL `bot_id` is
+    /// attributed to the primary bot (lowest id), matching `sellers_for_bot`.
+    /// Both `seller_id` and `bot_type` are bound parameters: scoping narrows
+    /// reads only and never widens permission.
+    pub fn list_bots_of_type_for_seller(&self, seller_id: i64, bot_type: &str) -> Vec<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT b.id, b.key, b.username, b.owner_user_id, b.default_channel_id, b.enabled, b.created_at, b.name, b.bot_type FROM bots b JOIN sellers s ON COALESCE(s.bot_id, (SELECT MIN(id) FROM bots)) = b.id WHERE s.user_id = ?1 AND b.bot_type = ?2 ORDER BY b.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![seller_id, bot_type], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     /// Seller user_ids whose bot_id == bot_id (or primary bot if their bot_id
@@ -1899,6 +1971,22 @@ impl Db {
             Ok(0) => Err(format!("bot {bot_id} not found")),
             Ok(_) => Ok(()),
             Err(e) => Err(format!("failed to set name for bot {bot_id}: {e}")),
+        }
+    }
+
+    /// Set a bot's product/capability type. Empty/whitespace input falls
+    /// back to `shop_bot` (fail-safe), unknown bot ids are refused, and
+    /// failures are reported honestly. Parameterized SQL only.
+    pub fn set_bot_type(&self, bot_id: i64, bot_type: &str) -> Result<(), String> {
+        let bot_type = crate::config::normalize_bot_type(bot_type);
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        match conn.execute(
+            "UPDATE bots SET bot_type = ?1 WHERE id = ?2",
+            rusqlite::params![bot_type, bot_id],
+        ) {
+            Ok(0) => Err(format!("bot {bot_id} not found")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("failed to set type for bot {bot_id}: {e}")),
         }
     }
 
@@ -2084,7 +2172,7 @@ impl Db {
                 let _ = self.add_channel(ch, 0);
                 self.get_channel_id(ch)
             });
-            self.create_bot(&b.key, b.owner_id, channel_id, b.name.trim());
+            self.create_bot_with_type(&b.key, b.owner_id, channel_id, b.name.trim(), &b.bot_type);
         }
         if let Some(primary) = self.list_bots().first() {
             let pid = primary.id;

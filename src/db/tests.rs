@@ -3053,6 +3053,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             owner_id: 100,
             default_channel: None,
             token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
         crate::config::BotConfig {
             key: "shop_bot".to_string(),
@@ -3061,6 +3062,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             owner_id: 101,
             default_channel: None,
             token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
     ];
     db.backfill_bots_at_startup(&bots);
@@ -3074,6 +3076,142 @@ fn backfill_bots_at_startup_carries_config_names() {
         "",
         "empty config name stays empty (show the key)"
     );
+}
+
+/// The multibot-foundation `bot_type` migration is additive: a legacy
+/// database with no such column gains it on `Db::new`, existing rows read
+/// back as 'shop_bot' via the NOT NULL DEFAULT (no destructive rewrite),
+/// and the new column is writable afterwards. Reopening is idempotent.
+#[test]
+fn bots_bot_type_migration_backfills_legacy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bots_legacy_type.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE bots (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bots(key, owner_user_id, created_at) VALUES('legacy_a', 100, '2026-01-01T00:00:00+00:00'), ('legacy_b', 101, '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+    }
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    for key in ["legacy_a", "legacy_b"] {
+        assert_eq!(
+            db.get_bot_by_key(key).expect("legacy row kept").bot_type,
+            crate::config::DEFAULT_BOT_TYPE,
+            "NOT NULL DEFAULT backfills existing rows"
+        );
+    }
+    drop(db);
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        db.list_bots_of_type("shop_bot").len(),
+        2,
+        "idempotent reopen"
+    );
+
+    let id = db.get_bot_by_key("legacy_a").unwrap().id;
+    db.set_bot_type(id, "movie_bot").unwrap();
+    assert_eq!(db.get_bot(id).unwrap().bot_type, "movie_bot");
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 1);
+    assert_eq!(db.list_bots_of_type("shop_bot").len(), 1);
+}
+
+/// Typed listing is parameterized (a quote cannot widen the query), returns
+/// an empty vec for unknown/disabled types, and the enabled-only variant
+/// mirrors `list_bots_enabled`. `create_bot` still defaults to `shop_bot`.
+#[test]
+fn bot_type_typed_listing_is_parameterized_and_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bot_type_list.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let shop = db.create_bot("shop-1", 100, None, "");
+    let movie = db.create_bot_with_type("movie-1", 101, None, "", "movie_bot");
+    let movie2 = db.create_bot_with_type("movie-2", 102, None, "", "movie_bot");
+    assert!(shop > 0 && movie > 0 && movie2 > 0);
+
+    assert_eq!(db.get_bot(shop).unwrap().bot_type, "shop_bot");
+    assert_eq!(db.get_bot_by_key("movie-1").unwrap().bot_type, "movie_bot");
+    assert!(db.list_bots().iter().any(|b| b.bot_type == "movie_bot"));
+
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 2);
+    assert_eq!(db.list_bots_of_type("shop_bot").len(), 1);
+    assert!(db.list_bots_of_type("reply_bot").is_empty());
+    assert!(db.list_bots_of_type("movie_bot' OR 1=1 --").is_empty());
+
+    db.set_bot_enabled(movie2, false);
+    assert_eq!(db.list_bots_of_type_enabled("movie_bot").len(), 1);
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 2);
+
+    // Empty/whitespace is normalized to the default; unknown id refused.
+    db.set_bot_type(movie, "  ").unwrap();
+    assert_eq!(db.get_bot(movie).unwrap().bot_type, "shop_bot");
+    assert!(db.set_bot_type(999_999, "movie_bot").is_err());
+}
+
+/// The seller-scoped listing uses the same COALESCE(bot_id, primary) rule as
+/// `sellers_for_bot`, binds both parameters, and never leaks another
+/// seller's typed bots.
+#[test]
+fn bot_type_listing_for_seller_is_seller_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bot_type_seller.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    db.create_bot("primary", 1, None, "");
+    let movie = db.create_bot_with_type("movie", 2, None, "", "movie_bot");
+    db.upsert_seller(10, Some("s10"), None); // NULL bot_id -> primary
+    db.upsert_seller_bot_id(11, Some(movie));
+    db.upsert_seller(12, Some("s12"), None); // NULL bot_id -> primary
+
+    assert_eq!(db.list_bots_of_type_for_seller(10, "shop_bot").len(), 1);
+    assert!(db.list_bots_of_type_for_seller(10, "movie_bot").is_empty());
+    assert_eq!(db.list_bots_of_type_for_seller(11, "movie_bot").len(), 1);
+    assert!(db.list_bots_of_type_for_seller(11, "shop_bot").is_empty());
+    assert!(db.list_bots_of_type_for_seller(999, "shop_bot").is_empty());
+    assert!(
+        db.list_bots_of_type_for_seller(10, "movie_bot' OR 1=1 --")
+            .is_empty()
+    );
+}
+
+/// Startup backfill carries each configured `BotConfig.bot_type` into the
+/// freshly created row, not just its name.
+#[test]
+fn backfill_bots_at_startup_carries_config_bot_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bots_backfill_type.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let bots = vec![
+        crate::config::BotConfig {
+            key: "movie-bot".to_string(),
+            name: "Movie".to_string(),
+            token: String::new(),
+            owner_id: 100,
+            default_channel: None,
+            token_env: None,
+            bot_type: "movie_bot".to_string(),
+        },
+        crate::config::BotConfig {
+            key: "shop-bot".to_string(),
+            name: String::new(),
+            token: String::new(),
+            owner_id: 101,
+            default_channel: None,
+            token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
+        },
+    ];
+    db.backfill_bots_at_startup(&bots);
+    assert_eq!(
+        db.get_bot_by_key("movie-bot").unwrap().bot_type,
+        "movie_bot"
+    );
+    assert_eq!(db.get_bot_by_key("shop-bot").unwrap().bot_type, "shop_bot");
 }
 
 /// `set_bot_name` persists the trimmed name, allows the empty string (show
