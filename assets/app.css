@@ -179,6 +179,13 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail .bot-scope select { width: 100%; font-size: 13px; }
 .rail .bot-scope .btn { align-self: flex-start; }
 .rail .bot-scope-pinned span.mono { font-size: 13px; color: var(--ink); }
+/* Product scope + Type facet (IA amendment §3): native controls, no new tokens. */
+.rail .product-scope { align-items: stretch; }
+.rail .product-scope select { min-height: 44px; }
+.rail .product-scope .btn { align-self: stretch; min-height: 44px; }
+.rail .bot-scope-pinned span.mono { white-space: normal; overflow-wrap: anywhere; }
+details.advanced { margin: 8px 0; }
+details.advanced > summary { font-size: 12px; font-weight: 500; color: var(--ink-3); }
 .rail nav a {
   display: flex;
   align-items: center;
@@ -654,6 +661,15 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   }
   .rail .bot-scope select { flex: 1 1 auto; width: auto; min-width: 8rem; }
   .rail .bot-scope .btn { align-self: center; }
+  /* IA amendment §3.5: stacked Type / Product label+select and a full-width
+     Switch at 375px — no side-by-side selects, no horizontal scroll. */
+  .rail .product-scope {
+    flex-direction: column; align-items: stretch;
+    flex: 1 1 100%; gap: 6px; padding: 4px 0 10px;
+  }
+  .rail .product-scope select,
+  .rail .product-scope .btn { width: 100%; min-width: 0; min-height: 44px; }
+  .rail .product-scope optgroup { white-space: normal; }
 }
 @media (max-width: 900px) { .kv { grid-template-columns: 1fr; gap: 2px 0; } .kv dt { margin-top: 8px; } }
 @media (prefers-reduced-motion: reduce) {

@@ -1,4 +1,4 @@
-use super::{Session, WebState};
+use super::{Session, WebState, capability_enabled, effective_bot};
 use axum::{
     http::header,
     response::{IntoResponse, Response},
@@ -113,6 +113,36 @@ const APP_JS: &str = r#"(function () {
         writeState(state);
       });
     });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+(function () {
+  'use strict';
+  // Product scope Type facet (IA amendment §3.2): a client-side aid only.
+  // It has no `name`, never submits and never persists; with JS unavailable
+  // every product is still present and grouped by type in the Product select.
+  function init() {
+    var typeSel = document.getElementById('scope-type');
+    var prodSel = document.getElementById('scope-product');
+    if (!typeSel || !prodSel) return;
+    function apply() {
+      var t = typeSel.value;
+      Array.prototype.forEach.call(prodSel.options, function (o) {
+        // The "All products" reset must always remain reachable.
+        if (!o.value || !o.getAttribute('data-type')) return;
+        o.hidden = !!t && o.getAttribute('data-type') !== t;
+      });
+      Array.prototype.forEach.call(prodSel.querySelectorAll('optgroup'), function (g) {
+        var any = false;
+        Array.prototype.forEach.call(g.options, function (o) { if (!o.hidden) any = true; });
+        g.disabled = !!t && !any;
+      });
+      var chosen = prodSel.options[prodSel.selectedIndex];
+      if (t && chosen && chosen.hidden) prodSel.value = '';
+    }
+    typeSel.addEventListener('change', apply);
+    apply();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
@@ -300,6 +330,14 @@ pub(super) struct NavItem {
     pub(super) roles: NavRole,
     pub(super) titles: &'static [&'static str],
     pub(super) pref: Option<&'static str>,
+    /// Compile-time capability this item belongs to. `None` = always
+    /// compiled (the shipped default build); `rail_nav` drops items whose
+    /// feature was not compiled in. View filter only — never a page gate.
+    pub(super) feature: Option<&'static str>,
+    /// Product-type metadata values this item applies to. `None` = all
+    /// types. A selected product narrows the view; "All products" (no
+    /// selection) never narrows it.
+    pub(super) product_types: Option<&'static [&'static str]>,
 }
 
 pub(super) const NAV_ITEMS: &[NavItem] = &[
@@ -312,6 +350,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Dashboard"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "analytics",
@@ -321,6 +361,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Analytics"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "monitor",
@@ -330,6 +372,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Monitor"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Offerings
     NavItem {
@@ -340,6 +384,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Products"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "plans",
@@ -349,6 +395,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Plans"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "channels",
@@ -358,6 +406,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Channels"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "bots",
@@ -367,6 +417,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Bots", "Add bot"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Sales
     NavItem {
@@ -377,6 +429,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Orders"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "customers",
@@ -386,6 +440,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Customers"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "codes",
@@ -395,6 +451,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Codes"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "promos",
@@ -404,6 +462,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Promos"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "referrals",
@@ -413,6 +473,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Referrals", "Reviews"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "cart",
@@ -422,6 +484,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Cart"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "carts",
@@ -431,6 +495,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["Carts"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Fulfill
     NavItem {
@@ -441,6 +507,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Subscriptions"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "bookings",
@@ -450,6 +518,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Bookings"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "tickets",
@@ -459,6 +529,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Tickets"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Communicate
     NavItem {
@@ -469,6 +541,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Posts"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "broadcast",
@@ -478,6 +552,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Broadcast"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Workspace
     NavItem {
@@ -488,6 +564,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Identity"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "ai",
@@ -497,6 +575,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["AI"],
         pref: Some("ai"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "crypto",
@@ -506,6 +586,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Crypto"],
         pref: Some("crypto"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "finance",
@@ -515,6 +597,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["Finance"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "admins",
@@ -524,6 +608,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Admins"],
         pref: Some("admins"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "sellers",
@@ -533,6 +619,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Sellers"],
         pref: Some("sellers"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "webusers",
@@ -542,6 +630,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Web users"],
         pref: Some("webusers"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "apikeys",
@@ -551,6 +641,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["API keys"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
 ];
 
@@ -567,6 +659,31 @@ pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
         .map(|item| item.id)
 }
 
+/// The product type metadata of the session's resolved scope, or `None` for
+/// the unscoped "All products" view. Sellers/admins are pinned to their bot;
+/// an owner with no selection is unscoped and therefore never type-narrowed.
+/// This is view metadata only — it changes no page gate or write permission.
+fn selected_product_type(state: &WebState, session: Option<&Session>) -> Option<String> {
+    let s = session?;
+    let bot_id = match s.role.as_str() {
+        "owner" => s.selected_bot_id,
+        "seller" | "admin" => Some(effective_bot(state, s).id),
+        _ => None,
+    };
+    bot_id
+        .and_then(|id| state.db.get_bot(id))
+        .map(|b| b.bot_type)
+}
+
+/// Runtime type filter. `None` on either side admits the item: an unscoped
+/// owner sees every item, and an item not tied to a type is always eligible.
+pub(super) fn nav_item_type_ok(item: &NavItem, product_type: Option<&str>) -> bool {
+    match (item.product_types, product_type) {
+        (None, _) | (Some(_), None) => true,
+        (Some(types), Some(pt)) => types.contains(&pt),
+    }
+}
+
 pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>) -> String {
     let base = &state.base_path;
     let role = session.map(|s| s.role.as_str()).unwrap_or("");
@@ -575,6 +692,9 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
         .map(|s| super::effective_sidebar_prefs(state, s));
 
     let active_id = active_nav_id(title);
+    // The compile-time capability set and the runtime product type are view
+    // filters only (IA amendment §5); neither touches a route or page gate.
+    let product_type = selected_product_type(state, session);
 
     // Group order per spec.
     let group_order = [
@@ -610,6 +730,8 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
                     true
                 }
             })
+            .filter(|item| item.feature.is_none_or(capability_enabled))
+            .filter(|item| nav_item_type_ok(item, product_type.as_deref()))
             .collect();
         if items.is_empty() {
             continue;

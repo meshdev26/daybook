@@ -511,10 +511,99 @@ fn bot_display_name(b: &crate::db::BotRecord) -> &str {
     if b.name.is_empty() { &b.key } else { &b.name }
 }
 
-/// Bot scope control for the console shell: a real form (select + submit)
-/// for the global owner — `onchange` submit is progressive enhancement and
-/// the button keeps it working without JS — and a pinned, plain-text label
-/// for roles that cannot switch (their bot is resolved server-side).
+/// The product-type metadata values the IA amendment knows about, paired
+/// with their plain-language `<optgroup>` / facet labels. The **compiled-in**
+/// subset is derived from Cargo features; every enabled product still renders
+/// in the Product select grouped by its stored type even when that type's
+/// capability was not compiled in (the picker never hides a real product).
+const ALL_PRODUCT_TYPES: &[(&str, &str)] = &[
+    ("shop_bot", "Shop bots"),
+    ("movie_bot", "Movie bots"),
+    ("reply_bot", "Reply bots"),
+    ("web_app", "Web apps"),
+    ("service", "Services"),
+    ("file_share", "File sharing"),
+    ("automation", "Automation"),
+];
+
+/// Compile-time capability check shared by the nav projection and the type
+/// facet. An unknown name is never enabled (fail closed), so a typo in a nav
+/// row can never surface a capability that was not compiled in.
+fn capability_enabled(feature: &str) -> bool {
+    match feature {
+        "shop_bot" => cfg!(feature = "shop_bot"),
+        "moderation" => cfg!(feature = "moderation"),
+        "movie_bot" => cfg!(feature = "movie_bot"),
+        "reply_bot" => cfg!(feature = "reply_bot"),
+        "web_app" => cfg!(feature = "web_app"),
+        "service" => cfg!(feature = "service"),
+        "file_share" => cfg!(feature = "file_share"),
+        "automation" => cfg!(feature = "automation"),
+        _ => false,
+    }
+}
+
+/// Product types available to the type facet / config dropdowns in this
+/// build. A movie-only install lists only movie bots; the default build
+/// lists the shop bot it compiles. Data-layer values outside this list are
+/// still rendered (see `product_type_label`) so existing config is editable.
+fn compiled_product_types() -> Vec<&'static (&'static str, &'static str)> {
+    ALL_PRODUCT_TYPES
+        .iter()
+        .filter(|(value, _)| capability_enabled(value))
+        .collect()
+}
+
+/// Plain-language group label for a stored product type. Unknown values get
+/// a neutral bucket rather than leaking a raw metadata slug into the UI.
+fn product_type_label(value: &str) -> &'static str {
+    ALL_PRODUCT_TYPES
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, label)| *label)
+        .unwrap_or("Other products")
+}
+
+/// `<option>` list for a product-type `<select>`, offering the compiled-in
+/// types plus the row's current value so a stored type from a config file is
+/// never silently rewritten on save.
+fn product_type_options(current: Option<&str>) -> String {
+    let mut out = String::new();
+    for (value, label) in compiled_product_types() {
+        out.push_str(&format!(
+            r#"<option value="{}"{}>{}</option>"#,
+            esc(value),
+            if current == Some(*value) {
+                " selected"
+            } else {
+                ""
+            },
+            esc(label)
+        ));
+    }
+    if let Some(cur) = current
+        && !cur.is_empty()
+        && !compiled_product_types().iter().any(|(v, _)| *v == cur)
+    {
+        out.push_str(&format!(
+            r#"<option value="{}" selected>{}</option>"#,
+            esc(cur),
+            esc(product_type_label(cur))
+        ));
+    }
+    out
+}
+
+/// Product scope control for the console shell (IA amendment §3.4).
+///
+/// - Owner: a Product `<select>` with `<optgroup>` grouping by type, a
+///   client-side Type facet, and a visible Switch button. `onchange` submit
+///   is progressive enhancement; the button keeps keyboard/no-JS working.
+/// - Seller/admin: a pinned plain-text label (`aria-label="Active product"`).
+/// - Buyer/pre-auth: absent.
+///
+/// "All products" (`value=""`) keeps the byte-identical widening semantics
+/// of "All bots (primary)" — no selection means the unscoped global view.
 fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
     let Some(s) = session else {
         return String::new();
@@ -522,7 +611,7 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
     if s.role == "seller" || s.role == "admin" {
         let ctx = effective_bot(state, s);
         return format!(
-            r#"<div class="bot-scope bot-scope-pinned" aria-label="Active bot"><span class="help">Bot</span><span class="mono">{}</span></div>"#,
+            r#"<div class="bot-scope bot-scope-pinned" aria-label="Active product"><span class="help">Product</span><span class="mono">{}</span></div>"#,
             esc(&ctx.key)
         );
     }
@@ -530,32 +619,86 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
         return String::new();
     }
     let bots = state.db.list_bots_enabled();
-    let mut options = r#"<option value=""{sel0}>All bots (primary)</option>"#.to_string();
-    if s.selected_bot_id.is_none() {
-        options = options.replace("{sel0}", " selected");
-    } else {
-        options = options.replace("{sel0}", "");
+    // Group options by their stored type label. Iteration stays in bot id
+    // order within each group; the group order follows ALL_PRODUCT_TYPES so
+    // the facet and the optgroups read in the same sequence.
+    let mut product_options = String::from(r#"<option value="">All products</option>"#);
+    for (value, label) in ALL_PRODUCT_TYPES {
+        let group: Vec<&crate::db::BotRecord> =
+            bots.iter().filter(|b| b.bot_type == *value).collect();
+        if group.is_empty() {
+            continue;
+        }
+        product_options.push_str(&format!(r#"<optgroup label="{}">"#, esc(label)));
+        for b in group {
+            product_options.push_str(&format!(
+                r#"<option value="{}" data-type="{}"{}>{}{}</option>"#,
+                b.id,
+                esc(&b.bot_type),
+                if s.selected_bot_id == Some(b.id) {
+                    " selected"
+                } else {
+                    ""
+                },
+                esc(bot_display_name(b)),
+                b.username
+                    .as_deref()
+                    .map(|u| format!(" · {}", esc(u)))
+                    .unwrap_or_default()
+            ));
+        }
+        product_options.push_str("</optgroup>");
     }
-    for b in &bots {
-        options.push_str(&format!(
-            r#"<option value="{}"{}>{}{}</option>"#,
-            b.id,
-            if s.selected_bot_id == Some(b.id) {
-                " selected"
-            } else {
-                ""
-            },
-            esc(bot_display_name(b)),
-            b.username
-                .as_deref()
-                .map(|u| format!(" · {}", esc(u)))
-                .unwrap_or_default()
+    // A stored type outside ALL_PRODUCT_TYPES still gets a group so no
+    // enabled product disappears from the picker.
+    let mut leftover: Vec<&crate::db::BotRecord> = bots
+        .iter()
+        .filter(|b| !ALL_PRODUCT_TYPES.iter().any(|(v, _)| *v == b.bot_type))
+        .collect();
+    if !leftover.is_empty() {
+        leftover.sort_by_key(|b| b.id);
+        product_options.push_str(r#"<optgroup label="Other products">"#);
+        for b in leftover {
+            product_options.push_str(&format!(
+                r#"<option value="{}" data-type="{}"{}>{}{}</option>"#,
+                b.id,
+                esc(&b.bot_type),
+                if s.selected_bot_id == Some(b.id) {
+                    " selected"
+                } else {
+                    ""
+                },
+                esc(bot_display_name(b)),
+                b.username
+                    .as_deref()
+                    .map(|u| format!(" · {}", esc(u)))
+                    .unwrap_or_default()
+            ));
+        }
+        product_options.push_str("</optgroup>");
+    }
+
+    // The Type facet is a client-side aid: no `name`, so it never submits and
+    // never persists. Without JS every product remains present and grouped.
+    let mut type_options = String::from(r#"<option value="">All types</option>"#);
+    for (value, label) in compiled_product_types() {
+        type_options.push_str(&format!(
+            r#"<option value="{}">{}</option>"#,
+            esc(value),
+            esc(label)
         ));
     }
     format!(
-        r#"<form method="post" action="{action}" class="bot-scope"><label for="bot-scope-select">Bot</label><select id="bot-scope-select" name="bot_id" onchange="this.form.submit()">{options}</select><button type="submit" class="btn btn-ghost btn-sm">Switch</button></form>"#,
+        r#"<form method="post" action="{action}" class="bot-scope product-scope">
+  <label for="scope-type">Type</label>
+  <select id="scope-type" aria-label="Product type">{type_options}</select>
+  <label for="scope-product">Product</label>
+  <select id="scope-product" name="bot_id" onchange="this.form.submit()">{product_options}</select>
+  <button type="submit" class="btn btn-ghost btn-sm">Switch</button>
+</form>"#,
         action = state.url("/bot/select"),
-        options = options
+        type_options = type_options,
+        product_options = product_options
     )
 }
 

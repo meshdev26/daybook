@@ -58,19 +58,53 @@ async fn bot_select_refuses_disabled_and_unknown_bots() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a forged product id is refused"
+    );
     assert_eq!(
         db.get_web_session(&token).unwrap().3,
         None,
-        "a disabled bot is not selectable"
+        "a disabled bot is not selectable and must not widen the view"
     );
     let resp = app
         .clone()
         .oneshot(post_authed_req("/bot/select", "bot_id=424242", &token))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an unknown id is refused"
+    );
     assert_eq!(db.get_web_session(&token).unwrap().3, None);
+}
+
+/// IA amendment §7: a forged type or seller id on a scope change is refused
+/// with 403. The shipped form has no such fields (the Type facet is
+/// client-side only), so their presence is always an attack.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn bot_select_rejects_forged_type_and_seller_scope() {
+    let (state, _dir) = make_state().await;
+    let bot_id = state.db.create_bot("secondary", 1, None, "");
+    let token = owner_session(&state).await;
+    let db = state.db.clone();
+    let app = router(state);
+    for body in [
+        format!("bot_id={bot_id}&seller_id=999"),
+        format!("bot_id={bot_id}&product_type=movie_bot"),
+        "bot_id=424242&seller_id=999".to_string(),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post_authed_req("/bot/select", &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(db.get_web_session(&token).unwrap().3, None);
+    }
 }
 
 #[tokio::test]
@@ -267,6 +301,70 @@ async fn bots_save_failure_rerenders_with_nothing_changed_banner() {
     assert!(body.contains("Nothing was changed."), "{body}");
 }
 
+/// IA amendment §3.3: the existing /bots edit form gains a shared Product
+/// type field and a closed-by-default Advanced disclosure for per-type
+/// settings — no new route, no other path changed.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn bots_page_has_product_type_field_and_closed_advanced() {
+    let (state, _dir) = make_state().await;
+    let id = state.db.create_bot("cinema", 1, None, "");
+    state.db.set_bot_type(id, "movie_bot").unwrap();
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/bots", &token)).await.unwrap();
+    let body = body_string(resp).await;
+    assert!(body.contains("Product type"), "{body}");
+    assert!(body.contains(r#"name="bot_type""#), "{body}");
+    assert!(body.contains(r#"<details class="advanced""#), "{body}");
+    assert!(body.contains("<summary>Advanced</summary>"), "{body}");
+    assert!(body.contains(r#"data-product-type="movie_bot""#), "{body}");
+    // A stored type from config remains selectable even when its capability
+    // was not compiled into this build.
+    assert!(
+        body.contains(r#"<option value="movie_bot" selected>Movie bots</option>"#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<details class="advanced" data-product-type="movie_bot" open>"#),
+        "Advanced must be closed by default: {body}"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn bots_save_rejects_unknown_product_type_without_changing_row() {
+    let (state, _dir) = make_state().await;
+    let id = state.db.create_bot("secondary", 1, None, "");
+    let token = owner_session(&state).await;
+    let db = state.db.clone();
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/bots",
+            "bot_id=&owner_user_id=1&bot_type=not_a_type",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A well-formed id with an unknown type is rejected in place; the row is
+    // untouched. (The malformed id above is the existing "nothing changed" path.)
+    let resp = app
+        .oneshot(post_authed_req(
+            "/bots",
+            &format!("bot_id={id}&owner_user_id=1&bot_type=not_a_type"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("Unknown product type."), "{body}");
+    assert_eq!(db.get_bot(id).unwrap().bot_type, "shop_bot");
+}
+
 /// Display-name cards: a saved name titles the card; an empty name falls
 /// back to the key with the muted "no display name set" hint beside it.
 #[tokio::test]
@@ -394,8 +492,9 @@ async fn bots_save_rejects_over_64_char_display_name_without_writing() {
     assert_eq!(b.owner_user_id, 55, "valid save applies the other fields");
 }
 
-/// The rail Bot selector labels bots by display name, falling back to the
-/// key; the option value stays the numeric bot id.
+/// The rail Product selector labels products by display name, falling back
+/// to the key; the option value stays the numeric bot id and each option
+/// carries its `data-type` for the client-side type facet.
 #[tokio::test]
 #[tracing::instrument(skip_all)]
 async fn rail_bot_selector_labels_use_display_name() {
@@ -407,11 +506,15 @@ async fn rail_bot_selector_labels_use_display_name() {
     let resp = app.oneshot(authed_req("/dashboard", &token)).await.unwrap();
     let body = body_string(resp).await;
     assert!(
-        body.contains(&format!(r#"<option value="{named}">Shop Bot</option>"#)),
+        body.contains(&format!(
+            r#"<option value="{named}" data-type="shop_bot">Shop Bot</option>"#
+        )),
         "{body}"
     );
     assert!(
-        body.contains(&format!(r#"<option value="{plain}">plain-bot</option>"#)),
+        body.contains(&format!(
+            r#"<option value="{plain}" data-type="shop_bot">plain-bot</option>"#
+        )),
         "{body}"
     );
 }
@@ -646,9 +749,9 @@ async fn shell_shows_bot_selector_for_owner_and_pinned_label_for_seller() {
         .await
         .unwrap();
     let body = body_string(resp).await;
-    assert!(body.contains("bot-scope-select"), "{body}");
+    assert!(body.contains("scope-product"), "{body}");
     assert!(body.contains("secondary"), "{body}");
-    assert!(body.contains("All bots (primary)"), "{body}");
+    assert!(body.contains("All products"), "{body}");
     // Bots rides in the Offerings rail group for the owner only
     // (BOT_SWITCHING_UX_SPEC §3); a seller's rail never carries it.
     assert!(body.contains(r#"href="/bots""#), "{body}");
@@ -660,14 +763,16 @@ async fn shell_shows_bot_selector_for_owner_and_pinned_label_for_seller() {
         .unwrap();
     let body = body_string(resp).await;
     assert!(body.contains("bot-scope-pinned"), "{body}");
-    assert!(!body.contains("bot-scope-select"), "{body}");
+    assert!(!body.contains("scope-product"), "{body}");
     assert!(!body.contains(r#"href="/bots""#), "{body}");
     // Owner with a selection: the matching option is preselected.
     db.set_web_session_selected_bot(&sha256_hex(&token), Some(bot_id));
     let resp = app.oneshot(authed_req("/dashboard", &token)).await.unwrap();
     let body = body_string(resp).await;
     assert!(
-        body.contains(&format!(r#"<option value="{bot_id}" selected>"#)),
+        body.contains(&format!(
+            r#"<option value="{bot_id}" data-type="shop_bot" selected>"#
+        )),
         "{body}"
     );
 }

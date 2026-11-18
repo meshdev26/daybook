@@ -282,3 +282,202 @@ async fn nav_page_smoke() {
     let body = body_string(resp).await;
     assert!(body.contains("skip-link"), "{body}");
 }
+
+// ---- multibot foundation: product scope + gated nav (Step 3) ------------
+
+/// The default build keeps the shipped 27 rows and every path byte-identical:
+/// no existing item is tagged with a capability or a product type, so both
+/// new filters are no-ops here. A capability/page may only be hidden when a
+/// builder opts out of that feature or selects a narrower product type.
+#[test]
+fn default_build_nav_rows_are_untagged_and_paths_unchanged() {
+    assert_eq!(NAV_ITEMS.len(), 27);
+    for item in NAV_ITEMS {
+        assert_eq!(
+            item.feature, None,
+            "{} must stay in the default build",
+            item.id
+        );
+        assert_eq!(
+            item.product_types, None,
+            "{} must not be type-filtered",
+            item.id
+        );
+    }
+    // Capability flags resolve from Cargo features; unknown never enables.
+    assert!(capability_enabled("shop_bot")); // default feature
+    assert!(!capability_enabled("movie_bot")); // not compiled by default
+    assert!(!capability_enabled("not_a_capability"));
+    assert_eq!(product_type_label("movie_bot"), "Movie bots");
+    assert_eq!(product_type_label("raw_slug"), "Other products");
+}
+
+/// A nav item whose capability was not compiled is absent. This exercises
+/// the exact filter `rail_nav` applies; a `--no-default-features --features
+/// movie_bot` build makes the mirror case (a shop-gated item absent) true.
+#[test]
+fn feature_gated_item_absent_when_not_compiled() {
+    let movie_only = NavItem {
+        id: "movie-catalog",
+        label: "Movie catalog",
+        path: "movie-catalog",
+        group: "Offerings",
+        roles: NavRole::Owner,
+        titles: &["Movie catalog"],
+        pref: None,
+        feature: Some("movie_bot"),
+        product_types: Some(&["movie_bot"]),
+    };
+    // Default build: movie_bot is not compiled -> the item is filtered out.
+    assert!(!movie_only.feature.is_none_or(capability_enabled));
+    // Runtime type filter is a view filter only: the selected movie product
+    // keeps the item; an unscoped owner ("All products") also keeps it.
+    assert!(nav_item_type_ok(&movie_only, Some("movie_bot")));
+    assert!(nav_item_type_ok(&movie_only, None));
+    assert!(!nav_item_type_ok(&movie_only, Some("shop_bot")));
+    // An untagged item is never removed by either filter.
+    let core = &NAV_ITEMS[0];
+    assert!(core.feature.is_none_or(capability_enabled));
+    assert!(nav_item_type_ok(core, Some("shop_bot")));
+}
+
+#[tokio::test]
+async fn product_scope_owner_has_type_facet_and_optgroups() {
+    let (state, _dir) = make_state().await;
+    state.db.create_bot("cinema", 1, None, "");
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
+    assert!(
+        body.contains(r#"class="bot-scope product-scope""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<label for="scope-type">Type</label>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<label for="scope-product">Product</label>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<select id="scope-type" aria-label="Product type""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="">All types</option>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="">All products</option>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="shop_bot">Shop bots</option>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<optgroup label="Shop bots">"#), "{body}");
+    assert!(body.contains(r#"data-type="shop_bot""#), "{body}");
+    assert!(body.contains(">Switch</button>"), "{body}");
+    // The old label/facet must be gone, and the facet is client-side only:
+    // no `name` on the type select and no forged seller field in the form.
+    assert!(!body.contains("All bots (primary)"), "{body}");
+    assert!(!body.contains(r#"name="seller_id""#), "{body}");
+    assert!(!body.contains(r#"name="product_type""#), "{body}");
+    let type_tag = body
+        .split(r#"<select id="scope-type" aria-label="Product type">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</select>").next())
+        .unwrap_or("");
+    assert!(!type_tag.contains("name="), "{type_tag}");
+}
+
+#[tokio::test]
+async fn product_scope_seller_pinned_buyer_absent() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .create_web_account("seller", "secret", "seller", Some(42))
+        .await
+        .unwrap();
+    state
+        .db
+        .create_web_account("buyer", "secret", "user", None)
+        .await
+        .unwrap();
+    let (sacc, _u, _h, _r, _s) = state.db.get_web_account_by_username("seller").unwrap();
+    let seller = Session {
+        account_id: sacc,
+        role: "seller".to_string(),
+        seller_id: Some(42),
+        selected_bot_id: None,
+    };
+    let seller_body = html_page(&state, Some(&seller), "Dashboard", "<p>x</p>");
+    assert!(
+        seller_body.contains(r#"aria-label="Active product""#),
+        "{seller_body}"
+    );
+    assert!(
+        seller_body.contains(r#"<span class="help">Product</span>"#),
+        "{seller_body}"
+    );
+    assert!(
+        !seller_body.contains(r#"<select id="scope-product""#),
+        "{seller_body}"
+    );
+    assert!(
+        !seller_body.contains(r#"aria-label="Active bot""#),
+        "{seller_body}"
+    );
+
+    let (bacc, _u, _h, _r, _s) = state.db.get_web_account_by_username("buyer").unwrap();
+    let buyer = Session {
+        account_id: bacc,
+        role: "user".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let buyer_body = html_page(&state, Some(&buyer), "Dashboard", "<p>x</p>");
+    assert!(!buyer_body.contains("bot-scope"), "{buyer_body}");
+    assert!(!buyer_body.contains("scope-type"), "{buyer_body}");
+}
+
+#[tokio::test]
+async fn scope_control_375px_stacked_markup_and_css() {
+    let (state, _dir) = make_state().await;
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
+    // Two labeled selects + a full-width Switch: the markup a 375px stack
+    // binds to. Ordering is Type label -> type select -> Product label ->
+    // product select -> Switch, so no side-by-side controls can form.
+    let type_label = body
+        .find(r#"<label for="scope-type">Type</label>"#)
+        .unwrap();
+    let type_sel = body.find(r#"<select id="scope-type""#).unwrap();
+    let product_label = body
+        .find(r#"<label for="scope-product">Product</label>"#)
+        .unwrap();
+    let product_sel = body.find(r#"<select id="scope-product""#).unwrap();
+    let switch = body.find(">Switch</button>").unwrap();
+    assert!(type_label < type_sel && type_sel < product_label);
+    assert!(product_label < product_sel && product_sel < switch);
+
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    assert!(css.contains(".rail .product-scope"), "{css}");
+    assert!(css.contains("flex-direction: column"), "{css}");
+    assert!(css.contains("min-height: 44px"), "{css}");
+}
