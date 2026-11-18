@@ -16,7 +16,7 @@
 ## Step 1 — Add the declarative nav table (`src/web/html.rs`)
 
 1. Define a `NavItem` struct with: `id: &'static str` (stable, never displayed), `label: &'static str`, `path: &'static str`, `group: &'static str`, `roles: Role` (a small enum or predicate set), and `titles: &'static [&'static str]` (the exact `title` strings existing pages pass to `html_page`).
-2. Add one `const NAV_ITEMS: &[NavItem]` containing exactly the 28 rows of spec §2 in render order, with groups in the order: Overview, Offerings, Sales, Fulfill, Communicate, Workspace.
+2. Add one `const NAV_ITEMS: &[NavItem]` containing exactly the 27 group rows of spec §2 in render order, with groups in the order: Overview, Offerings, Sales, Fulfill, Communicate, Workspace. The three Utilities items (Settings, Theme, Sign out) are rendered separately per step 2.5 — do not include them in the table count.
 3. Role constants derived from existing predicates only: `all`, `owner`, `seller_admin_owner` (mirrors `is_admin_role` at `src/web/mod.rs:565-567` plus seller). No new role enum or gate logic.
 4. Add `fn active_nav_id(title: &str) -> Option<&'static str>` that finds the item whose `titles` contains `title`. This centralizes the title→id mapping in one place and replaces the scattered `title.eq_ignore_ascii_case(label)` comparisons. Pages whose title has no nav entry (e.g. "Restarting", "Add bot") simply get no highlight — do not add aliases unless a test requires one.
 
