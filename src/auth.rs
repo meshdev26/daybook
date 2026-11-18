@@ -8,6 +8,18 @@ use crate::web::{Session, WebState};
 use axum::http::HeaderMap;
 use std::time::{Duration, Instant};
 
+/// Canonical key for the shared login failure bucket.
+///
+/// The web login (`web::auth_pages`) and the REST login (`api::auth_login`)
+/// both key `login_attempts` with this shape so one username gets a single
+/// 5-attempts-per-15-minutes counter across both surfaces. The `login:`
+/// namespace also prevents a raw username from colliding with the `mfa:` and
+/// `identity-unlock:` buckets held in the same map. Keep byte-identical to
+/// the web key format when changing this.
+pub fn login_throttle_key(username: &str) -> String {
+    format!("login:{}", username)
+}
+
 pub fn login_throttle(
     map: &std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
     key: &str,

@@ -30,13 +30,20 @@ proptest = "1.11"
 # whole unmaintained subtree out of the lock instead of ignoring the
 # advisory. Rebase this fork on the next teloxide bump; the diff is one
 # attribute in src/update_listeners/polling.rs plus this dependency.
+#
+# Second divergence from crates.io 0.17.0: `sqlx` is bumped 0.8.1 -> 0.9.1
+# in vendor/teloxide/Cargo.toml. sqlx-sqlite 0.8.x pins libsqlite3-sys 0.30.x,
+# which bundles SQLite < 3.54.0 (RUSTSEC-2026-0459 / CVE-2026-119375).
+# sqlx-sqlite 0.9.1 relaxes the cap to <0.41, letting the graph resolve to
+# libsqlite3-sys 0.39.x (patched SQLite 3.54.x). Upstream teloxide 0.17 still
+# declares sqlx 0.8.1, so this bump must be re-applied on every rebase.
 [patch.crates-io]
 teloxide = { path = "vendor/teloxide" }
 
 [dependencies]
 teloxide = { version = "0.17", features = ["macros", "ctrlc_handler", "sqlite-storage-rustls"] }
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

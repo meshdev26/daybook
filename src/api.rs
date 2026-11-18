@@ -135,7 +135,12 @@ struct LoginResp {
 
 async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> impl IntoResponse {
     // Records this attempt up-front; a successful login clears it below.
-    if crate::auth::login_throttle(&state.login_attempts, &f.username, 5, 900) {
+    if crate::auth::login_throttle(
+        &state.login_attempts,
+        &crate::auth::login_throttle_key(&f.username),
+        5,
+        900,
+    ) {
         return err(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_attempts",
@@ -145,7 +150,10 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
     }
     match state.db.verify_web_password(&f.username, &f.password).await {
         Some((account_id, role, seller_id)) => {
-            crate::auth::login_ok(&state.login_attempts, &f.username);
+            crate::auth::login_ok(
+                &state.login_attempts,
+                &crate::auth::login_throttle_key(&f.username),
+            );
             // MFA parity with the web login (web::login_submit): a correct
             // password alone never mints a session for a TOTP-enabled or
             // privileged account.

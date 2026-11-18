@@ -192,6 +192,75 @@ async fn api_login_and_me() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// F2: the REST login must record failures under the same namespaced key as
+/// the web login (`login:{username}`), never under the raw username (which
+/// would create a second bucket and could collide with `mfa:` /
+/// `identity-unlock:` entries in the shared map).
+#[tokio::test]
+async fn api_login_uses_namespaced_throttle_key() {
+    assert_eq!(crate::auth::login_throttle_key("owner"), "login:owner");
+    let (state, _dir) = make_state().await;
+    let attempts = state.login_attempts.clone();
+    let app = router(state);
+    // Wrong password: the attempt is counted and not cleared by login_ok.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"owner","password":"wrong-password"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let map = attempts.lock().unwrap();
+    assert!(
+        map.contains_key("login:owner"),
+        "API login must record under the shared login: key, got keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !map.contains_key("owner"),
+        "API login must not create a raw-username bucket"
+    );
+}
+
+/// F2 cross-surface proof: attempts recorded through the shared helper (as
+/// the web login does) are enforced by the REST login, even with a correct
+/// password — the throttle check runs before credential verification.
+#[tokio::test]
+async fn api_login_sees_web_throttle_attempts() {
+    let (state, _dir) = make_state().await;
+    let key = crate::auth::login_throttle_key("owner");
+    let mut locked = false;
+    for _ in 0..5 {
+        locked = crate::auth::login_throttle(&state.login_attempts, &key, 5, 900);
+    }
+    assert!(locked, "five shared-helper failures must lock the bucket");
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"owner","password":"secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"].as_str().unwrap(), "too_many_attempts");
+}
+
 #[tokio::test]
 async fn api_unauth_returns_401() {
     let (state, _dir) = make_state().await;

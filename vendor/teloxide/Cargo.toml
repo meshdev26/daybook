@@ -110,12 +110,14 @@ native-tls = ["teloxide-core/native-tls"]
 nightly = ["teloxide-core/nightly"]
 postgres-storage-nativetls = [
     "sqlx",
-    "sqlx/runtime-tokio-native-tls",
+    "sqlx/runtime-tokio",
+    "sqlx/tls-native-tls",
     "native-tls",
 ]
 postgres-storage-rustls = [
     "sqlx",
-    "sqlx/runtime-tokio-rustls",
+    "sqlx/runtime-tokio",
+    "sqlx/tls-rustls",
     "rustls",
 ]
 redis-storage = ["deadpool-redis"]
@@ -123,12 +125,14 @@ rustls = ["teloxide-core/rustls"]
 rustls-native-roots = ["teloxide-core/rustls-native-roots"]
 sqlite-storage-nativetls = [
     "sqlx",
-    "sqlx/runtime-tokio-native-tls",
+    "sqlx/runtime-tokio",
+    "sqlx/tls-native-tls",
     "native-tls",
 ]
 sqlite-storage-rustls = [
     "sqlx",
-    "sqlx/runtime-tokio-rustls",
+    "sqlx/runtime-tokio",
+    "sqlx/tls-rustls",
     "rustls",
 ]
 throttle = ["teloxide-core/throttle"]
@@ -349,7 +353,12 @@ optional = true
 version = "1.0"
 
 [dependencies.sqlx]
-version = "0.8.1"
+# Divergence from crates.io teloxide 0.17.0 (which declares 0.8.1): bumped to
+# 0.9.1 so sqlx-sqlite's libsqlite3-sys cap relaxes from 0.30.x to <0.41,
+# allowing the patched libsqlite3-sys 0.39.x (RUSTSEC-2026-0459). sqlx 0.9 also
+# split `runtime-tokio-{native-tls,rustls}` into `runtime-tokio` + `tls-*`,
+# so the four storage features below use the new names. Re-apply on rebase.
+version = "0.9.1"
 features = [
     "macros",
     "sqlite",

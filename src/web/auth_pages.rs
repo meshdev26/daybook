@@ -131,17 +131,13 @@ pub(super) async fn login_submit(
     if !state.db.owner_account_exists() {
         return claim_submit(&state, &peer, &q, &f).await;
     }
-    // Rate limit: 5 failed attempts per username per 15 minutes
-    // (a successful login clears the counter via `login_ok`). Keys are
-    // namespaced (`login:{username}`) because this map is shared with other
-    // flows that key it differently (identity unlock:
-    // `identity-unlock:{account_id}`, MFA: `mfa:{token}`) — a raw username
-    // could collide with one of those namespaces, so 5 failed logins AS the
-    // username "identity-unlock:<owner id>" would lock that owner's unlock
-    // form for 900s, repeatable by an unauthenticated attacker. Usernames
-    // that themselves start with `login:` become ambiguous with this
-    // namespace — acceptable: usernames are admin-created.
-    let throttle_key = format!("login:{}", f.username);
+    // Rate limit: 5 failed attempts per account per 15 minutes (a successful
+    // login clears the counter via `login_ok`). The key comes from the shared
+    // `crate::auth::login_throttle_key` helper so the web console and the REST
+    // API share one throttle bucket per account; its `login:` namespace cannot
+    // collide with the `mfa:` or `identity-unlock:` namespaces used by the
+    // other flows on this map.
+    let throttle_key = crate::auth::login_throttle_key(&f.username);
     if login_throttle(&state.login_attempts, &throttle_key, 5, 900) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,

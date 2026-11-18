@@ -1,0 +1,7 @@
+[advisories]
+# Pre-existing, unrelated to RUSTSEC-2026-0459. chrono is unmaintained with no
+# fixed release ("No safe upgrade is available!"); it is pulled transitively by
+# the patched vendored teloxide-core 0.13.0 as well as directly. cargo audit
+# already treats it as an allowed warning. Revisit when teloxide drops chrono
+# or a maintained replacement is adopted. Kept in lockstep with deny.toml.
+ignore = ["RUSTSEC-2026-0543"]
