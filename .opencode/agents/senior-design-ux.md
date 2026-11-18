@@ -31,7 +31,7 @@ You own UX quality.
 ## Contract
 - You specify the experience; **L7 implements it** in `src/web.rs` and the bot
   surfaces. You review the implementation against the spec; you do not write it.
-- Accessibility (WCAG 2.1 AA, contrast/focus/legibility/screen-reader semantics)
+- Accessibility (WCAG 2.2 AA, contrast/focus/legibility/screen-reader semantics)
   is a release floor, waivable by nobody.
 
 ## Focus

@@ -38,7 +38,7 @@ The answer is a **relabel and regroup**, not a rebuild: the same routes, the sam
 | Seller/admin abandoned-carts page | `src/web/cart.rs:149` (`carts_page`, title "Carts") |
 | Sidebar prefs struct + toggles | `src/web/settings.rs:4-47`, `/settings/sidebar` (`settings_sidebar`) |
 | Owner sidebar management panel | `src/web/settings.rs:354-397` |
-| AA-vs-AAA wording drift | `AUTO_ROUTE.md:102` (AA) and `.opencode/agents/senior-design-ux.md:34` (AA) vs. `aaa-gate` skill and `level-router` skill (AAA) |
+| Accessibility floor (resolved 2026-11-18) | WCAG 2.2 AA — single floor per `AUTO_ROUTE.md` §5 and this document §8 (L11 ruling) |
 
 Current groups and items (verbatim, in render order):
 
@@ -139,7 +139,7 @@ Every current item is accounted for; no item is dropped, no item is added.
 - **Cart / Carts renamed by audience.** `/cart` is the buyer's own basket → "My cart"; `/carts` is the seller/admin abandoned-carts report → "Abandoned carts". The audience cue removes the ambiguity that two near-identical labels created.
 - **Settings promoted from footer to Utilities.** The footer link (`src/web/html.rs:225`) was the only entry point and was easy to miss; promoting it to an always-visible Utilities strip makes account/console settings discoverable on every screen.
 - **Bare links eliminated.** API keys and Carts were rendered as loose links outside any group (`src/web/html.rs:470-475`). They now live inside Workspace and Sales respectively, so every item has a home and a consistent affordance.
-- **Bots → Offerings.** Bots are a posting target alongside Channels/Products/Plans, not an operate-level switch. (Documentation drift: `src/web/tests/bots.rs:652-653` and `BOT_SWITCHING_UX_SPEC.md` prose say "Bots rides in the Operate rail group for the owner only" — both become stale and must be updated by L4 during implementation. The test itself only asserts `href="/bots"` presence/absence and survives; only the comment drifts.)
+- **Bots → Offerings.** Bots are a posting target alongside Channels/Products/Plans, not an operate-level switch. (Documentation drift: `src/web/tests/bots.rs:652-653` and `BOT_SWITCHING_UX_SPEC.md` prose say "Bots rides in the Operate rail group for the owner only" — both become stale and must be updated by L7 during implementation. The test itself only asserts `href="/bots"` presence/absence and survives; only the comment drifts.)
 
 ---
 
@@ -167,9 +167,9 @@ The nav must never show a link whose page would return `forbidden_page`. Filteri
 1. **No route, schema, or DB changes.** All paths in §2 already exist in `src/web/mod.rs:229-403`. No migration of stored data.
 2. **Sidebar toggles remap to Workspace.** The five owner toggles in `src/web/settings.rs:5-47` (ai, crypto, admins, sellers, webusers) and the management panel at `src/web/settings.rs:354-397` keep their storage keys and POST route (`/settings/sidebar`); only their *grouping* changes — they now control visibility inside the Workspace group instead of a standalone Manage group. The `SidebarPrefs` struct, `effective_sidebar_prefs`, and `settings_sidebar` handler are unchanged in shape; only labels/help text may be updated to say "Workspace". No DB key migration.
 3. **Label-based nav tests must be updated; path-based tests untouched.** Any test that asserts a nav group label string (e.g. "Operate", "Sell", "Insights", "Manage", "Identity") or a nav item label ("Cart", "Carts", "API keys" as bare link) needs its expected string updated to the new labels/groups. Tests that assert only paths, hrefs, or page presence (e.g. `src/web/tests/bots.rs:633-664` asserts `href="/bots"` presence/absence) survive unchanged. Specifically:
-   - `src/web/tests/bots.rs:633-664` (`shell_shows_bot_selector_for_owner_and_pinned_label_for_seller`) survives on path; its comment at `:652-653` becomes stale and must be corrected by L4.
+   - `src/web/tests/bots.rs:633-664` (`shell_shows_bot_selector_for_owner_and_pinned_label_for_seller`) survives on path; its comment at `:652-653` becomes stale and must be corrected by L7.
    - `src/web/tests/subs.rs:17` (asserts body contains "Subscriptions") survives — label unchanged.
-   - `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by L4 during implementation.
+   - `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by L7 during implementation.
 4. **No data migration, no env changes.** `WEB_BASE_PATH`, cookies, and redirects are unaffected.
 
 ---
@@ -182,14 +182,11 @@ The nav must never show a link whose page would return `forbidden_page`. Filteri
 - **Reduced motion.** Respect `prefers-reduced-motion` for the chevron rotation (CSS-only, no JS animation added).
 - **Contrast.** All text uses token pairs from `DESIGN.md` §4 / `assets/app.css`; no new color values.
 
-### Open decision (explicit, for L11/human — not resolved here)
+### Accessibility floor — resolved 2026-11-18
 
-The repository carries two different accessibility floors:
+The single accessibility release floor for this console is **WCAG 2.2 Level AA** (L11 ruling). The token pairs are already measured against this floor in `VISUAL_POLISH_SPEC.md` §C1 and pass in both themes; this redesign changes no color values. The remaining accessibility work is the structural item set in `VISUAL_POLISH_SPEC.md` §C2, tracked separately.
 
-- `AUTO_ROUTE.md:102` and `.opencode/agents/senior-design-ux.md:34` state **WCAG 2.1 AA**.
-- The `aaa-gate` skill and the `level-router` skill state **WCAG AAA** as the release floor.
-
-This spec does not pick between them. L11/human must reconcile the wording before the nav change ships, so that the implemented nav is verified against a single, agreed floor. Until then, L7 implements to the stricter of the two (AAA) for any new markup, and the wording is left to be corrected in a separate, explicit change. No silent downgrade from AAA to AA is permitted.
+There is no AAA floor and no third theme. The token contract follows Radix 12-step role semantics over the existing ledger palette (`DESIGN.md` §4). All markup in this change is verified against WCAG 2.2 AA.
 
 ---
 
@@ -234,7 +231,7 @@ This spec does not pick between them. L11/human must reconcile the wording befor
 ## 12. Risks & rollout
 
 - **Label drift in tests.** Mitigated by §7.3: L7 updates label-based assertions in the same change; L3 confirms path-based ones are untouched.
-- **Documentation drift.** `src/web/tests/bots.rs:652-653` comment and `BOT_SWITCHING_UX_SPEC.md` prose become stale (Bots no longer in Operate). Recorded here as an L4 fix item during implementation; not blocking.
+- **Documentation drift.** `src/web/tests/bots.rs:652-653` comment and `BOT_SWITCHING_UX_SPEC.md` prose become stale (Bots no longer in Operate). Recorded here as an L7 fix item during implementation; not blocking.
 - **Active-state regression.** Mitigated by id-keyed state and L3 verification of highlight on every page.
-- **Accessibility floor ambiguity.** Mitigated by the open decision in §8, escalated to L11/human; no silent downgrade.
+- **Accessibility floor ambiguity.** Resolved 2026-11-18: WCAG 2.2 AA is the single floor (§8); no AAA upgrade and no color changes.
 - **Rollout.** Single PR, no feature flag, no DB migration. Rollback is a revert of the nav projection change.

@@ -99,7 +99,7 @@ The ladder has floors, not a total order:
 
 1. **L10 security is a floor, not a peer.** No design decision overrides a
    security finding. The remediation is negotiable; the floor is not.
-2. **WCAG AA accessibility is a release floor, waivable by nobody — including
+2. **WCAG 2.2 AA accessibility is a release floor, waivable by nobody — including
    L10.** If a11y and security genuinely cannot be reconciled, the feature
    ships blocked and escalates.
 3. **L5 wins on anything that moves money.** L5 owns the number and its

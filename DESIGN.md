@@ -21,7 +21,7 @@ This design system is informed by two lenses:
 - **Feedback**: every action gets immediate visual confirmation.
 - **Empty states**: guide users when there's no data.
 
-### Accessibility (WCAG 2.1 AA)
+### Accessibility (WCAG 2.2 AA)
 - Contrast ratio ≥ 4.5:1 for text.
 - Keyboard navigable; visible focus rings.
 - Semantic HTML (headings, landmarks, labels).
@@ -96,7 +96,7 @@ Light:
 - Brand (deep billiard green): `#1E6B52` (`--brand`); hover `#175542`; ink `#F1F7F3`
 - Status: ok `#1E6B52`; warn `#8A5A12`; danger (brick) `#A6392F`
 - Border (hairline): `#DEE3DC` (`--line`); strong `#8A958D` (`--line-strong`)
-Dark (`[data-theme="dark"]` / `prefers-color-scheme: dark`): background `#101512`, surface `#171D19`, ink `#E8EDE8`, brand `#4FBE8F`, warn `#D9A94F`, danger `#E07A6E`. All pairs WCAG 2.1 AA (checked in `app.css` header).
+Dark (`[data-theme="dark"]` / `prefers-color-scheme: dark`): background `#101512`, surface `#171D19`, ink `#E8EDE8`, brand `#4FBE8F`, warn `#D9A94F`, danger `#E07A6E`. All pairs WCAG 2.2 AA (checked in `app.css` header). The token contract uses Radix 12-step role semantics over these unchanged ledger-green values: steps 1–3 backgrounds, 6–7 borders/control edges, 9–10 solid fills, 11–12 text. WCAG 2.2 AA is the single release floor; AAA is advisory only.
 
 ### Spacing (8px grid)
 xs 4, sm 8, md 16, lg 24, xl 32, xxl 48.

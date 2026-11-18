@@ -70,7 +70,7 @@ At 1440 / 1024 / 768 / 375 px: group order, Utilities visibility, current-group 
 
 ## Open items (not blocking implementation)
 
-- **L11/human:** reconcile WCAG 2.1 AA (`AUTO_ROUTE.md:102`, `senior-design-ux.md:34`) vs AAA (`level-router`, `aaa-gate`). Build to AAA meanwhile; no silent downgrade.
+- **Floor: WCAG 2.2 AA** — ruled by L11 on 2026-11-18; recorded in `IA_REDESIGN_SPEC.md` §8. No AAA upgrade, no color changes.
 - **L6-C:** coherence sign-off on the new group/label set before merge.
 
 ## Rollback
