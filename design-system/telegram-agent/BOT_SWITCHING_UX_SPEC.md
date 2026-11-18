@@ -60,7 +60,7 @@ The PRG target re-renders with the new preselection — that is the v1 acknowled
 - **One "Edit bot" form** (`.panel`): bot `<select>` (all bots), owner user ID (number, required), default channel ID (number, optional), enabled checkbox (pre-checked), Save → POST `{base}/bots`.
 - Unknown bot id → styled 404 page, never a silent redirect (honest feedback).
 - Token editing is **out of scope by design**; the help copy under the form title says so and names the config path. No password-style field may be added here (L10 floor).
-- Rail entry lives in the **Operate** group.
+- Rail entry lives in the **Offerings** group.
 
 ---
 

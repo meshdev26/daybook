@@ -451,9 +451,9 @@ async fn settings_logout_link_lives_in_management_not_rail() {
         .await
         .unwrap();
     let body = body_string(resp).await;
-    // §7: the rail foot lost its logout anchor; the Management section
-    // carries the sign-out form instead.
-    assert!(!body.contains(r#"href="/logout""#), "{body}");
+    // The rail Utilities strip now also carries a Sign out link, and the
+    // Management section keeps its sign-out form.
+    assert!(body.contains(r#"href="/logout""#), "{body}");
     assert!(body.contains(r#"action="/logout""#), "{body}");
     assert!(body.contains("Sign out"), "{body}");
     assert!(body.contains("Sign out of this console."), "{body}");

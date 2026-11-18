@@ -357,14 +357,14 @@ fn management_panel(state: &WebState, session: &Session) -> String {
     format!(
         r#"<details open id="management"><summary>Management</summary>
 <article class="panel">
-<p class="help">Open a section to manage that area of the console. Toggle which management links appear in the sidebar.</p>
+<p class="help">Open a section to manage that area of the console. Toggle which Workspace links appear in the sidebar.</p>
 <form method="post" action="{}">
 <input type="hidden" name="section" value="management">
-<label><input type="checkbox" name="show_ai" value="1" {}> Show AI in sidebar</label>
-<label><input type="checkbox" name="show_crypto" value="1" {}> Show Crypto in sidebar</label>
-<label><input type="checkbox" name="show_admins" value="1" {}> Show Admins in sidebar</label>
-<label><input type="checkbox" name="show_sellers" value="1" {}> Show Sellers in sidebar</label>
-<label><input type="checkbox" name="show_webusers" value="1" {}> Show Web users in sidebar</label>
+<label><input type="checkbox" name="show_ai" value="1" {}> Show AI in Workspace</label>
+<label><input type="checkbox" name="show_crypto" value="1" {}> Show Crypto in Workspace</label>
+<label><input type="checkbox" name="show_admins" value="1" {}> Show Admins in Workspace</label>
+<label><input type="checkbox" name="show_sellers" value="1" {}> Show Sellers in Workspace</label>
+<label><input type="checkbox" name="show_webusers" value="1" {}> Show Web users in Workspace</label>
 <button type="submit">Save sidebar</button>
 </form>
 <div class="grid-2">

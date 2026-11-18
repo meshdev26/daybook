@@ -649,7 +649,7 @@ async fn shell_shows_bot_selector_for_owner_and_pinned_label_for_seller() {
     assert!(body.contains("bot-scope-select"), "{body}");
     assert!(body.contains("secondary"), "{body}");
     assert!(body.contains("All bots (primary)"), "{body}");
-    // Bots rides in the Operate rail group for the owner only
+    // Bots rides in the Offerings rail group for the owner only
     // (BOT_SWITCHING_UX_SPEC §3); a seller's rail never carries it.
     assert!(body.contains(r#"href="/bots""#), "{body}");
     // Seller: pinned label, no switching control.

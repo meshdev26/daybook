@@ -7,7 +7,7 @@
  * before a word. No hover-lift theatre, no gradient washes.
  *
  * Served from the binary (include_str!) — no CDN, no build step.
- * WCAG 2.1 AA: every text pair below is >= 4.5:1 on its surface
+ * WCAG 2.2 AA: every text pair below is >= 4.5:1 on its surface
  * (checked: ink/surface 12.9:1, ink-2/surface 5.6:1, brand-ink/brand 5.1:1,
  * on dark: ink/surface 11.2:1, ink-2/surface 6.1:1).
  */
@@ -193,6 +193,7 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail nav a:hover { background: var(--surface-2); color: var(--ink); text-decoration: none; }
 .rail nav a.active { background: var(--brand-tint); color: var(--brand); font-weight: 600; }
 .rail .foot { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--line); }
+.rail .utilities { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px; }
 .main { flex: 1; min-width: 0; padding: 28px 36px 60px; }
 .measure { max-width: var(--measure); }
 

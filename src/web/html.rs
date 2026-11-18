@@ -222,7 +222,6 @@ pub(super) fn html_page(
   <div class="brand">{plane}<b>Telegram Business<small>operator console</small></b></div>
   {bot_scope}
   <nav>{nav}</nav>
-  <div class="foot"><a href="{base}/settings">Settings</a> <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button></div>
 </aside>
 <main class="main" id="main"><div class="measure">{unlock_banner}{identity_flash}
 {b}
@@ -273,226 +272,406 @@ pub(super) fn html_page_bare_panel(
     )
 }
 
-pub(super) fn nav_link(out: &mut String, base: &str, path: &str, label: &str, title: &str) {
-    let active = if title.eq_ignore_ascii_case(label) {
-        " class=\"active\" aria-current=\"page\""
-    } else {
-        ""
-    };
-    out.push_str(&format!("<a href=\"{base}/{path}\"{active}>{label}</a>"));
+#[derive(Clone, Copy)]
+pub(super) enum NavRole {
+    All,
+    Owner,
+    SellerAdminOwner,
 }
 
-pub(super) fn nav_links(out: &mut String, base: &str, title: &str, items: &[(&str, &str)]) {
-    for (path, label) in items {
-        nav_link(out, base, path, label, title);
+impl NavRole {
+    pub(super) fn visible(self, role: &str) -> bool {
+        match self {
+            NavRole::All => true,
+            NavRole::Owner => role == "owner",
+            NavRole::SellerAdminOwner => {
+                role == "seller" || role == "admin" || role == "owner" || super::is_admin_role(role)
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NavItem {
+    pub(super) id: &'static str,
+    pub(super) label: &'static str,
+    pub(super) path: &'static str,
+    pub(super) group: &'static str,
+    pub(super) roles: NavRole,
+    pub(super) titles: &'static [&'static str],
+    pub(super) pref: Option<&'static str>,
+}
+
+pub(super) const NAV_ITEMS: &[NavItem] = &[
+    // Overview
+    NavItem {
+        id: "dashboard",
+        label: "Dashboard",
+        path: "dashboard",
+        group: "Overview",
+        roles: NavRole::All,
+        titles: &["Dashboard"],
+        pref: None,
+    },
+    NavItem {
+        id: "analytics",
+        label: "Analytics",
+        path: "analytics",
+        group: "Overview",
+        roles: NavRole::All,
+        titles: &["Analytics"],
+        pref: None,
+    },
+    NavItem {
+        id: "monitor",
+        label: "Monitor",
+        path: "monitor",
+        group: "Overview",
+        roles: NavRole::Owner,
+        titles: &["Monitor"],
+        pref: None,
+    },
+    // Offerings
+    NavItem {
+        id: "products",
+        label: "Products",
+        path: "products",
+        group: "Offerings",
+        roles: NavRole::All,
+        titles: &["Products"],
+        pref: None,
+    },
+    NavItem {
+        id: "plans",
+        label: "Plans",
+        path: "plans",
+        group: "Offerings",
+        roles: NavRole::All,
+        titles: &["Plans"],
+        pref: None,
+    },
+    NavItem {
+        id: "channels",
+        label: "Channels",
+        path: "channels",
+        group: "Offerings",
+        roles: NavRole::All,
+        titles: &["Channels"],
+        pref: None,
+    },
+    NavItem {
+        id: "bots",
+        label: "Bots",
+        path: "bots",
+        group: "Offerings",
+        roles: NavRole::Owner,
+        titles: &["Bots", "Add bot"],
+        pref: None,
+    },
+    // Sales
+    NavItem {
+        id: "orders",
+        label: "Orders",
+        path: "orders",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Orders"],
+        pref: None,
+    },
+    NavItem {
+        id: "customers",
+        label: "Customers",
+        path: "customers",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Customers"],
+        pref: None,
+    },
+    NavItem {
+        id: "codes",
+        label: "Codes",
+        path: "codes",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Codes"],
+        pref: None,
+    },
+    NavItem {
+        id: "promos",
+        label: "Promos",
+        path: "promos",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Promos"],
+        pref: None,
+    },
+    NavItem {
+        id: "referrals",
+        label: "Referrals",
+        path: "referrals",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Referrals", "Reviews"],
+        pref: None,
+    },
+    NavItem {
+        id: "cart",
+        label: "My cart",
+        path: "cart",
+        group: "Sales",
+        roles: NavRole::All,
+        titles: &["Cart"],
+        pref: None,
+    },
+    NavItem {
+        id: "carts",
+        label: "Abandoned carts",
+        path: "carts",
+        group: "Sales",
+        roles: NavRole::SellerAdminOwner,
+        titles: &["Carts"],
+        pref: None,
+    },
+    // Fulfill
+    NavItem {
+        id: "subs",
+        label: "Subscriptions",
+        path: "subs",
+        group: "Fulfill",
+        roles: NavRole::All,
+        titles: &["Subscriptions"],
+        pref: None,
+    },
+    NavItem {
+        id: "bookings",
+        label: "Bookings",
+        path: "bookings",
+        group: "Fulfill",
+        roles: NavRole::All,
+        titles: &["Bookings"],
+        pref: None,
+    },
+    NavItem {
+        id: "tickets",
+        label: "Tickets",
+        path: "tickets",
+        group: "Fulfill",
+        roles: NavRole::All,
+        titles: &["Tickets"],
+        pref: None,
+    },
+    // Communicate
+    NavItem {
+        id: "posts",
+        label: "Posts",
+        path: "posts",
+        group: "Communicate",
+        roles: NavRole::All,
+        titles: &["Posts"],
+        pref: None,
+    },
+    NavItem {
+        id: "broadcast",
+        label: "Broadcast",
+        path: "broadcast",
+        group: "Communicate",
+        roles: NavRole::All,
+        titles: &["Broadcast"],
+        pref: None,
+    },
+    // Workspace
+    NavItem {
+        id: "identity",
+        label: "Identity",
+        path: "identity",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Identity"],
+        pref: None,
+    },
+    NavItem {
+        id: "ai",
+        label: "AI",
+        path: "ai",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["AI"],
+        pref: Some("ai"),
+    },
+    NavItem {
+        id: "crypto",
+        label: "Crypto",
+        path: "crypto",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Crypto"],
+        pref: Some("crypto"),
+    },
+    NavItem {
+        id: "finance",
+        label: "Finance",
+        path: "finance",
+        group: "Workspace",
+        roles: NavRole::SellerAdminOwner,
+        titles: &["Finance"],
+        pref: None,
+    },
+    NavItem {
+        id: "admins",
+        label: "Admins",
+        path: "admins",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Admins"],
+        pref: Some("admins"),
+    },
+    NavItem {
+        id: "sellers",
+        label: "Sellers",
+        path: "sellers",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Sellers"],
+        pref: Some("sellers"),
+    },
+    NavItem {
+        id: "webusers",
+        label: "Web users",
+        path: "webusers",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Web users"],
+        pref: Some("webusers"),
+    },
+    NavItem {
+        id: "apikeys",
+        label: "API keys",
+        path: "keys",
+        group: "Workspace",
+        roles: NavRole::SellerAdminOwner,
+        titles: &["API keys"],
+        pref: None,
+    },
+];
+
+pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
+    // Settings is owner-only and lives in Utilities (outside NAV_ITEMS), but
+    // its active state is still resolved here by id so no title/label
+    // comparison leaks into the render code.
+    if ["Settings"].contains(&title) {
+        return Some("settings");
+    }
+    NAV_ITEMS
+        .iter()
+        .find(|item| item.titles.contains(&title))
+        .map(|item| item.id)
 }
 
 pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>) -> String {
     let base = &state.base_path;
-    let mut manage: Vec<(&str, &str)> = Vec::new();
-    if let Some(s) = session.filter(|s| s.role == "owner") {
-        let p = super::effective_sidebar_prefs(state, s);
-        if p.ai {
-            manage.push(("ai", "AI"));
-        }
-        if p.crypto {
-            manage.push(("crypto", "Crypto"));
-        }
-        if p.admins {
-            manage.push(("admins", "Admins"));
-        }
-        if p.sellers {
-            manage.push(("sellers", "Sellers"));
-        }
-        if p.webusers {
-            manage.push(("webusers", "Web users"));
-        }
-    }
+    let role = session.map(|s| s.role.as_str()).unwrap_or("");
+    let prefs = session
+        .filter(|s| s.role == "owner")
+        .map(|s| super::effective_sidebar_prefs(state, s));
+
+    let active_id = active_nav_id(title);
+
+    // Group order per spec.
+    let group_order = [
+        "Overview",
+        "Offerings",
+        "Sales",
+        "Fulfill",
+        "Communicate",
+        "Workspace",
+    ];
+
     let mut out = String::new();
-    // Operate
-    {
-        let current = ["Dashboard", "Channels", "Plans", "Products", "Bots"]
+    for group in group_order {
+        // Collect visible items for this group.
+        let items: Vec<&NavItem> = NAV_ITEMS
             .iter()
-            .any(|l| title.eq_ignore_ascii_case(l));
+            .filter(|item| item.group == group)
+            .filter(|item| item.roles.visible(role))
+            .filter(|item| {
+                if let Some(key) = item.pref {
+                    // sidebar pref gating for owner-managed items
+                    prefs
+                        .map(|p| match key {
+                            "ai" => p.ai,
+                            "crypto" => p.crypto,
+                            "admins" => p.admins,
+                            "sellers" => p.sellers,
+                            "webusers" => p.webusers,
+                            _ => true,
+                        })
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        let slug = group.to_ascii_lowercase();
+        let current = items.iter().any(|item| Some(item.id) == active_id);
         out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"operate\"{}>",
+            "<section class=\"nav-group\" data-nav-group=\"{slug}\"{}>",
             if current {
                 " data-current=\"true\""
             } else {
                 ""
             }
         ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-operate"><span class="nav-group-label">Operate</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-operate">"#);
-        nav_links(
-            &mut out,
-            base,
-            title,
-            &[
-                ("dashboard", "Dashboard"),
-                ("channels", "Channels"),
-                ("plans", "Plans"),
-                ("products", "Products"),
-            ],
-        );
-        if session.is_some_and(|s| s.role == "owner") {
-            nav_link(&mut out, base, "bots", "Bots", title);
+        out.push_str(&format!(
+            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-{slug}"><span class="nav-group-label">{group}</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
+            slug = slug,
+            group = group
+        ));
+        out.push_str(&format!(
+            r#"<div class="nav-group-panel" id="nav-panel-{slug}">"#,
+            slug = slug
+        ));
+        for item in &items {
+            let active_attr = if Some(item.id) == active_id {
+                " class=\"active\" aria-current=\"page\""
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                r#"<a href="{base}/{path}"{active}>{label}</a>"#,
+                base = base,
+                path = item.path,
+                active = active_attr,
+                label = item.label
+            ));
         }
         out.push_str("</div></section>");
     }
-    // Identity (owner only)
+
+    // Utilities strip
+    out.push_str(r#"<div class="utilities">"#);
     if session.is_some_and(|s| s.role == "owner") {
-        let current = ["Identity", "Monitor"]
-            .iter()
-            .any(|l| title.eq_ignore_ascii_case(l));
+        let active_attr = if active_id == Some("settings") {
+            " class=\"active\" aria-current=\"page\""
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"identity\"{}>",
-            if current {
-                " data-current=\"true\""
-            } else {
-                ""
-            }
+            r#"<a href="{base}/settings"{active}>Settings</a>"#,
+            base = base,
+            active = active_attr
         ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-identity"><span class="nav-group-label">Identity</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-identity">"#);
-        nav_links(
-            &mut out,
-            base,
-            title,
-            &[("identity", "Identity"), ("monitor", "Monitor")],
-        );
-        out.push_str("</div></section>");
     }
-    // Sell
-    {
-        let current = [
-            "Codes",
-            "Promos",
-            "Referrals",
-            "Orders",
-            "Finance",
-            "Customers",
-            "Cart",
-        ]
-        .iter()
-        .any(|l| title.eq_ignore_ascii_case(l));
+    if session.is_some() {
+        out.push_str(r#"<button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button>"#);
         out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"sell\"{}>",
-            if current {
-                " data-current=\"true\""
-            } else {
-                ""
-            }
+            r#"<a href="{base}/logout">Sign out</a>"#,
+            base = base
         ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-sell"><span class="nav-group-label">Sell</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-sell">"#);
-        nav_links(
-            &mut out,
-            base,
-            title,
-            &[
-                ("codes", "Codes"),
-                ("promos", "Promos"),
-                ("referrals", "Referrals"),
-                ("orders", "Orders"),
-                ("finance", "Finance"),
-                ("customers", "Customers"),
-                ("cart", "Cart"),
-            ],
-        );
-        out.push_str("</div></section>");
     }
-    // Fulfill
-    {
-        let current = ["Subscriptions", "Bookings", "Tickets"]
-            .iter()
-            .any(|l| title.eq_ignore_ascii_case(l));
-        out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"fulfill\"{}>",
-            if current {
-                " data-current=\"true\""
-            } else {
-                ""
-            }
-        ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-fulfill"><span class="nav-group-label">Fulfill</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-fulfill">"#);
-        nav_links(
-            &mut out,
-            base,
-            title,
-            &[
-                ("subs", "Subscriptions"),
-                ("bookings", "Bookings"),
-                ("tickets", "Tickets"),
-            ],
-        );
-        out.push_str("</div></section>");
-    }
-    // Insights
-    {
-        let current = ["Analytics", "Posts", "Broadcast"]
-            .iter()
-            .any(|l| title.eq_ignore_ascii_case(l));
-        out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"insights\"{}>",
-            if current {
-                " data-current=\"true\""
-            } else {
-                ""
-            }
-        ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-insights"><span class="nav-group-label">Insights</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-insights">"#);
-        nav_links(
-            &mut out,
-            base,
-            title,
-            &[
-                ("analytics", "Analytics"),
-                ("posts", "Posts"),
-                ("broadcast", "Broadcast"),
-            ],
-        );
-        out.push_str("</div></section>");
-    }
-    if session.is_some_and(|s| s.role == "seller" || super::is_admin_role(&s.role)) {
-        nav_link(&mut out, base, "keys", "API keys", title);
-    }
-    if session.is_some_and(|s| s.role == "seller" || super::is_admin_role(&s.role)) {
-        nav_link(&mut out, base, "carts", "Carts", title);
-    }
-    if !manage.is_empty() {
-        let current = manage
-            .iter()
-            .any(|(_, label)| title.eq_ignore_ascii_case(label));
-        out.push_str(&format!(
-            "<section class=\"nav-group\" data-nav-group=\"manage\"{}>",
-            if current {
-                " data-current=\"true\""
-            } else {
-                ""
-            }
-        ));
-        out.push_str(
-            r#"<button type="button" class="nav-group-toggle" aria-expanded="true" aria-controls="nav-panel-manage"><span class="nav-group-label">Manage</span><svg class="nav-chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></button>"#,
-        );
-        out.push_str(r#"<div class="nav-group-panel" id="nav-panel-manage">"#);
-        for (path, label) in &manage {
-            nav_link(&mut out, base, path, label, title);
-        }
-        out.push_str("</div></section>");
-    }
+    out.push_str("</div>");
+
     out
 }

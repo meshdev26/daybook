@@ -81,7 +81,7 @@ async fn rail_group_identity_owner_only() {
     )
     .await;
     assert!(
-        body.contains(r#"<section class="nav-group" data-nav-group="identity""#),
+        body.contains(r#"<section class="nav-group" data-nav-group="workspace""#),
         "{body}"
     );
     assert!(body.contains(r#"href="/identity""#), "{body}");

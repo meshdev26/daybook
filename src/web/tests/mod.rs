@@ -10,6 +10,7 @@ use tempfile::TempDir;
 mod bots;
 mod channels;
 mod misc;
+mod nav;
 mod settings;
 mod setup;
 mod subs;
