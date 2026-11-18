@@ -2,6 +2,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Stored post row. Field positions (index access is load-bearing in
 /// api.rs/web.rs/mcp::tools): 0 id, 1 seller_id, 2 chat_id, 3 message_id,
@@ -181,11 +182,19 @@ pub const MODERATION_MAX_TERM_LEN: usize = 200;
 /// the filtered message body — it is a short reason string or machine code.
 pub const MODERATION_MAX_REASON_LEN: usize = 280;
 
-/// Owner content-policy floor. Documented defaults until the owner "Content
-/// policy" page lands: the loosest enforcement mode and an empty baseline
-/// term set, so a fresh install's seller rules are unchanged. The floor is
-/// NON-OVERRIDABLE: seller and per-bot rules may only raise severity, and a
-/// baseline term can never be removed or weakened by the allow-list.
+/// FALLBACK DEFAULTS for the owner content-policy floor — NOT the shipped
+/// floor. The live floor is the persistent `moderation_global_floor` table,
+/// which the owner writes through the (owner-gated) console. These constants
+/// are used ONLY when that table cannot be read (e.g. an older schema or a
+/// runtime read failure): the loosest global clamp and an empty baseline term
+/// set, so the fallback leaves existing seller rules unchanged. Once the table
+/// is available the persistent terms replace this empty baseline entirely.
+///
+/// The floor is NON-OVERRIDABLE: seller and per-bot rules may only raise
+/// severity, and a floor term can never be removed or weakened by the
+/// allow-list. `MODERATION_FLOOR_MODE` is the global minimum clamp applied to
+/// every term; each persistent floor term additionally carries its own mode
+/// (clamped to at least this value).
 pub const MODERATION_FLOOR_MODE: &str = "warn";
 pub const MODERATION_FLOOR_TERMS: &[&str] = &[];
 
@@ -272,6 +281,25 @@ pub struct EffectiveModerationPolicy {
     /// True when the bot uses "Custom rules for this bot"; false when it is
     /// inheriting the seller's rules.
     pub bot_override_active: bool,
+    /// Fail-closed signal. True when moderation storage was not ready at
+    /// startup (a DDL failure) or the persistent floor could not be read, so
+    /// this policy is incomplete. L8 hooks MUST treat true as "hold the
+    /// message for review" rather than evaluating against a partial/empty
+    /// policy — an empty policy here means enforcement is unavailable, not
+    /// that the message is safe.
+    pub enforcement_degraded: bool,
+}
+
+/// One owner-enforced global floor term. Unlike the seller-scoped structs,
+/// this has NO `seller_id`: the floor applies to every seller and bot and is
+/// writable only through explicit owner-gated `Db` methods below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationGlobalFloorTerm {
+    pub id: i64,
+    pub term: String,
+    pub mode: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,21 +353,25 @@ pub struct ModerationDecision {
     pub created_at: String,
 }
 
-/// Pure precedence resolver. The floor is a parameter (production passes
-/// [`MODERATION_FLOOR_MODE`] / [`MODERATION_FLOOR_TERMS`]) so the ladder can
-/// be unit-tested against a non-empty floor without changing shipped data.
+/// Pure precedence resolver. The floor is passed in by the caller so the
+/// ladder can be unit-tested against a non-empty floor without changing
+/// shipped data. Production passes the persistent `moderation_global_floor`
+/// rows as `floor_terms` (falling back to the compile-time defaults when the
+/// table is unavailable).
 ///
 /// Rules, in order:
-/// 1. Floor terms start at the floor severity and are non-removable.
+/// 1. Each floor term starts at its own owner-set mode, clamped to at least
+///    `floor_mode` (the global minimum), and is non-removable.
 /// 2. Seller terms are added; a repeated term takes the STRICTER mode
 ///    (`max`), never a looser one, and nothing drops below the floor.
 /// 3. Per-bot terms follow the same stricter-only rule (the caller passes an
 ///    empty slice when the bot inherits).
 /// 4. Allow-list terms are removed from the effective set — EXCEPT floor
-///    terms, which "stay above the floor" by construction.
+///    terms, which "stay above the floor" by construction. A seller rule that
+///    happens to equal a floor term can raise it further but never weaken it.
 pub fn apply_moderation_precedence(
     floor_mode: &str,
-    floor_terms: &[String],
+    floor_terms: &[ModerationTermInput],
     seller_terms: &[ModerationTermInput],
     bot_terms: &[ModerationTermInput],
     allow_terms: &[String],
@@ -348,9 +380,10 @@ pub fn apply_moderation_precedence(
 
     let floor_sev = moderation_mode_severity(floor_mode);
     let mut effective: BTreeMap<String, u8> = BTreeMap::new();
-    let floor_set: BTreeSet<String> = floor_terms.iter().cloned().collect();
-    for term in floor_terms {
-        effective.insert(term.clone(), floor_sev);
+    let floor_set: BTreeSet<String> = floor_terms.iter().map(|t| t.term.clone()).collect();
+    for rule in floor_terms {
+        let sev = moderation_mode_severity(&rule.mode).max(floor_sev);
+        effective.insert(rule.term.clone(), sev);
     }
     let mut raise = |terms: &[ModerationTermInput]| {
         for rule in terms {
@@ -431,6 +464,11 @@ fn bot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRecord> {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Starts false (fail closed) and is flipped true only after every
+    /// moderation DDL statement in `migrate()` succeeds. A DDL failure leaves
+    /// it false so `resolve_effective_policy` can surface `enforcement_degraded`
+    /// instead of silently returning an empty, permissive policy.
+    moderation_storage_ready: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -447,8 +485,12 @@ impl Db {
         );
         let db = Self {
             conn: Mutex::new(conn),
+            moderation_storage_ready: AtomicBool::new(false),
         };
         db.init_schema()?;
+        // Migration remains best-effort overall so legacy databases still open
+        // (see `migrate`). Moderation DDL failures are logged and recorded in
+        // `moderation_storage_ready`; they never panic here.
         let _ = db.migrate();
         Ok(db)
     }
@@ -1015,54 +1057,87 @@ impl Db {
         // tables. schema.sql declares the same shapes for fresh databases;
         // these statements cover databases created before this feature.
         // Declared after `bots` (above) so the bot_id FKs resolve.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS moderation_blocked_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, term))",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS moderation_allow_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (seller_id, term))",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS moderation_bot_overrides (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE, term TEXT NOT NULL DEFAULT '', mode TEXT CHECK (mode IN ('hide','warn','review')), inherits INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, bot_id, term), CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL)))",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS moderation_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, term TEXT, action TEXT NOT NULL, reason TEXT, message_ref TEXT, created_at TEXT NOT NULL)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS moderation_appeals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, decision_id INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL, message_ref TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id)",
-            [],
-        );
+        //
+        // Unlike the other best-effort statements in this migration, a
+        // moderation DDL failure is NOT silent: the helper logs the failing
+        // object + error and we record readiness so policy resolution fails
+        // closed instead of returning an empty, permissive policy.
+        match Self::migrate_moderation_tables(&conn) {
+            Ok(()) => self.moderation_storage_ready.store(true, Ordering::Relaxed),
+            Err(()) => self
+                .moderation_storage_ready
+                .store(false, Ordering::Relaxed),
+        }
+        Ok(())
+    }
+
+    /// Create every moderation table/index for databases predating the
+    /// feature. Each statement is `IF NOT EXISTS`, so this is idempotent and
+    /// additive. Any failure is logged with the object name and error (no
+    /// secret is logged — these are static DDL statements) and short-circuits
+    /// with `Err(())`; the caller flips `moderation_storage_ready` to false so
+    /// enforcement fails closed rather than silently yielding an empty policy.
+    fn migrate_moderation_tables(conn: &Connection) -> Result<(), ()> {
+        const STATEMENTS: &[(&str, &str)] = &[
+            (
+                "moderation_global_floor",
+                "CREATE TABLE IF NOT EXISTS moderation_global_floor (id INTEGER PRIMARY KEY AUTOINCREMENT, term TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN ('hide','warn','review')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            ),
+            (
+                "moderation_blocked_words",
+                "CREATE TABLE IF NOT EXISTS moderation_blocked_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            ),
+            (
+                "idx_mod_blocked_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id)",
+            ),
+            (
+                "moderation_allow_words",
+                "CREATE TABLE IF NOT EXISTS moderation_allow_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            ),
+            (
+                "idx_mod_allow_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id)",
+            ),
+            (
+                "moderation_bot_overrides",
+                "CREATE TABLE IF NOT EXISTS moderation_bot_overrides (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE, term TEXT NOT NULL DEFAULT '', mode TEXT CHECK (mode IN ('hide','warn','review')), inherits INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, bot_id, term), CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL)))",
+            ),
+            (
+                "idx_mod_bot_override_scope",
+                "CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id)",
+            ),
+            (
+                "moderation_decisions",
+                "CREATE TABLE IF NOT EXISTS moderation_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, term TEXT, action TEXT NOT NULL, reason TEXT, message_ref TEXT, created_at TEXT NOT NULL)",
+            ),
+            (
+                "idx_mod_decisions_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at)",
+            ),
+            (
+                "idx_mod_decisions_bot",
+                "CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id)",
+            ),
+            (
+                "moderation_appeals",
+                "CREATE TABLE IF NOT EXISTS moderation_appeals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, decision_id INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL, message_ref TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            ),
+            (
+                "idx_mod_appeals_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status)",
+            ),
+            (
+                "idx_mod_appeals_bot",
+                "CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id)",
+            ),
+        ];
+        for (name, sql) in STATEMENTS {
+            if let Err(e) = conn.execute(sql, []) {
+                tracing::warn!("moderation DDL failed for {}: {}", name, e);
+                return Err(());
+            }
+        }
         Ok(())
     }
 
@@ -7863,12 +7938,104 @@ impl Db {
 }
 // end phase6 (placeholder marker)
 
-/// Cross-cutting moderation storage. Every method takes `seller_id` in its
-/// WHERE clause (or INSERT values): a seller can never read, change or remove
-/// another seller's rows. Per-bot overrides additionally require `bot_id`,
-/// so the same bot id under a different seller is a different namespace.
-/// All SQL is parameterized and lives only in this layer.
+/// Cross-cutting moderation storage. Seller-scoped methods take `seller_id`
+/// in their WHERE clause (or INSERT values): a seller can never read, change
+/// or remove another seller's rows. Per-bot overrides additionally require
+/// `bot_id`, so the same bot id under a different seller is a different
+/// namespace. The `moderation_global_floor_*` methods are the exception: the
+/// floor is global (no seller_id) and owner-only at the web layer — storage
+/// just exposes explicit methods that any seller-scoped caller cannot reach
+/// implicitly. All SQL is parameterized and lives only in this layer.
 impl Db {
+    fn global_floor_term_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ModerationGlobalFloorTerm> {
+        Ok(ModerationGlobalFloorTerm {
+            id: r.get(0)?,
+            term: r.get(1)?,
+            mode: r.get(2)?,
+            created_at: r.get(3)?,
+            updated_at: r.get(4)?,
+        })
+    }
+
+    /// Query the persistent global floor. `Err` here means the table is
+    /// unavailable/unreadable — callers fall back to the compile-time defaults
+    /// and mark the resolved policy as degraded.
+    fn query_global_floor(&self) -> Result<Vec<ModerationGlobalFloorTerm>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id,term,mode,created_at,updated_at FROM moderation_global_floor ORDER BY term",
+        )?;
+        let rows = stmt.query_map([], Self::global_floor_term_from_row)?;
+        rows.collect()
+    }
+
+    /// List the owner-enforced global floor terms, sorted by term. The table
+    /// is seeded empty, so a fresh/legacy install returns an empty vector.
+    pub fn list_moderation_global_floor(&self) -> Vec<ModerationGlobalFloorTerm> {
+        self.query_global_floor().unwrap_or_default()
+    }
+
+    /// Add (or re-mode) one owner-enforced global floor term. The (term) UNIQUE
+    /// key makes this idempotent; calling with a stricter/looser mode updates
+    /// it in place. Invalid terms/modes are refused (fail closed). The web
+    /// layer MUST gate this to the owner — storage has no implicit auth.
+    pub fn add_moderation_global_floor_term(&self, term: &str, mode: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_global_floor(term,mode,created_at,updated_at) VALUES(?1,?2,?3,?3)
+             ON CONFLICT(term) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at",
+            params![term, mode, now],
+        )
+        .is_ok()
+    }
+
+    /// Remove one owner-enforced global floor term. Seller/allow-list callers
+    /// never reach this method; once removed, the term is no longer protected
+    /// and normal seller precedence applies.
+    pub fn remove_moderation_global_floor_term(&self, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_global_floor WHERE term=?1",
+            params![term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Floor terms in resolver input form. Returns `None` when the table is
+    /// unreadable so `resolve_effective_policy` can use the fallback default.
+    fn load_global_floor_terms(&self) -> Option<Vec<ModerationTermInput>> {
+        self.query_global_floor().ok().map(|rows| {
+            rows.into_iter()
+                .map(|r| ModerationTermInput {
+                    term: r.term,
+                    mode: r.mode,
+                })
+                .collect()
+        })
+    }
+
     fn blocked_word_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationBlockedWord> {
         Ok(ModerationBlockedWord {
             id: r.get(0)?,
@@ -8464,9 +8631,12 @@ impl Db {
     // ---- Resolution ----
 
     /// Resolve the effective policy for one (seller, optional bot) scope.
-    /// Applies the non-overridable floor, then seller rules, then per-bot
-    /// custom rules (only when the override is active), then the seller
+    /// Reads the persistent owner floor, then applies seller rules, per-bot
+    /// custom rules (only when the override is active), and the seller
     /// allow-list — see [`apply_moderation_precedence`] for the exact ladder.
+    /// If moderation storage is not ready or the floor cannot be read, the
+    /// compile-time defaults are used and `enforcement_degraded` is set so
+    /// callers fail closed instead of trusting a partial policy.
     pub fn resolve_effective_policy(
         &self,
         seller_id: i64,
@@ -8503,10 +8673,22 @@ impl Db {
             }
         }
 
-        let floor_terms: Vec<String> = MODERATION_FLOOR_TERMS
-            .iter()
-            .map(|t| (*t).to_owned())
-            .collect();
+        // Persistent floor is the shipped source of truth. Fall back to the
+        // compile-time defaults only when the table is unavailable/unreadable.
+        let storage_ready = self.moderation_storage_ready.load(Ordering::Relaxed);
+        let (floor_terms, floor_read_failed) = match self.load_global_floor_terms() {
+            Some(terms) => (terms, false),
+            None => (
+                MODERATION_FLOOR_TERMS
+                    .iter()
+                    .map(|t| ModerationTermInput {
+                        term: (*t).to_owned(),
+                        mode: MODERATION_FLOOR_MODE.to_owned(),
+                    })
+                    .collect(),
+                true,
+            ),
+        };
         let terms = apply_moderation_precedence(
             MODERATION_FLOOR_MODE,
             &floor_terms,
@@ -8520,6 +8702,7 @@ impl Db {
             floor_mode: MODERATION_FLOOR_MODE.to_owned(),
             terms,
             bot_override_active,
+            enforcement_degraded: !storage_ready || floor_read_failed,
         }
     }
 }
@@ -8682,7 +8865,10 @@ mod moderation_tests {
     fn moderation_precedence_stricter_only_allowlist_and_floor() {
         // Floor 'hide' with a baseline term: nothing may be weaker than hide,
         // and the allow-list may not delete a floor term.
-        let floor_terms = vec!["floorword".to_string()];
+        let floor_terms = vec![ModerationTermInput {
+            term: "floorword".into(),
+            mode: "hide".into(),
+        }];
         let seller = vec![
             ModerationTermInput {
                 term: "floorword".into(),
@@ -8854,6 +9040,10 @@ mod moderation_tests {
         assert!(db.list_blocked_words(42).is_empty());
         assert!(db.list_allow_words(42).is_empty());
         assert!(db.list_bot_override_terms(42, 1).is_empty());
+        // The global floor is seeded empty for backward compatibility, and a
+        // legacy DB opens non-degraded (all moderation DDL succeeded).
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(!db.resolve_effective_policy(42, None).enforcement_degraded);
         assert!(db.add_blocked_word(42, "after-migrate", "warn", true));
         drop(db);
         // Reopening is idempotent: no data loss, no duplicate-table error.
@@ -8924,5 +9114,162 @@ mod moderation_tests {
                 .message_ref,
             "opaque-ref-123"
         );
+    }
+
+    fn mode_of<'a>(policy: &'a EffectiveModerationPolicy, term: &str) -> Option<&'a str> {
+        policy
+            .terms
+            .iter()
+            .find(|e| e.term == term)
+            .map(|e| e.mode.as_str())
+    }
+
+    #[test]
+    fn moderation_global_floor_is_persistent_owner_writable_and_non_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("mod_global_floor.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let (seller_a, seller_b) = (501_i64, 502_i64);
+
+        // Fresh install: floor seeded empty, enforcement not degraded.
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(
+            !db.resolve_effective_policy(seller_a, None)
+                .enforcement_degraded
+        );
+
+        // Owner writes a global floor term (no seller_id); invalid input is
+        // refused at the boundary (parameterized data, never SQL).
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        assert!(!db.add_moderation_global_floor_term("bad\0term", "hide"));
+        assert!(!db.add_moderation_global_floor_term("banned", "DROP"));
+        assert_eq!(db.list_moderation_global_floor().len(), 1);
+        assert_eq!(db.list_moderation_global_floor()[0].mode, "hide");
+
+        // A seller cannot weaken or allow-list away a floor term: the same term
+        // at a looser seller mode plus a seller allow-list still resolves to
+        // the floor's 'hide'.
+        assert!(db.add_blocked_word(seller_a, "globalban", "warn", true));
+        assert!(db.add_allow_word(seller_a, "globalban"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "globalban"),
+            Some("hide")
+        );
+        // Floor is global: a second tenant inherits it, but stays isolated
+        // from seller A's own rows.
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_b, None), "globalban"),
+            Some("hide")
+        );
+        assert!(db.list_blocked_words(seller_b).is_empty());
+        assert!(db.list_allow_words(seller_b).is_empty());
+
+        // Each floor term's own mode is honored, clamped to >= the global
+        // minimum; re-moding is an upsert, not a second row.
+        assert!(db.add_moderation_global_floor_term("reviewterm", "review"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "reviewterm"),
+            Some("review")
+        );
+        assert!(db.add_moderation_global_floor_term("globalban", "review"));
+        assert_eq!(db.list_moderation_global_floor().len(), 2);
+
+        // Persistence across reopen.
+        drop(db);
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_moderation_global_floor().len(), 2);
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            Some("review")
+        );
+
+        // Once the owner removes a term, ordinary seller precedence returns:
+        // seller A's looser rule is now allow-listed away entirely.
+        assert!(reopened.remove_moderation_global_floor_term("globalban"));
+        assert!(!reopened.remove_moderation_global_floor_term("globalban"));
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn moderation_floor_per_term_mode_honored_and_clamped() {
+        let floor = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "hide".into(),
+            },
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let seller = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "warn".into(),
+            }, // cannot weaken the floor term
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "hide".into(),
+            }, // may raise above its floor mode
+        ];
+        let allow = vec!["a".to_string(), "b".to_string()];
+        let out = apply_moderation_precedence("warn", &floor, &seller, &[], &allow);
+        let mode_of = |t: &str| out.iter().find(|e| e.term == t).map(|e| e.mode.as_str());
+        assert_eq!(mode_of("a"), Some("hide"));
+        assert_eq!(mode_of("b"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_ddl_failure_is_logged_and_fails_closed() {
+        // Force a moderation DDL statement to fail by pre-creating an object
+        // with the same name as one of the indexes (CREATE INDEX IF NOT EXISTS
+        // cannot succeed when a table of that name already exists).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE idx_mod_blocked_seller(x INTEGER);")
+            .unwrap();
+        assert!(Db::migrate_moderation_tables(&conn).is_err());
+        // The helper short-circuits: a later table was never created.
+        let later_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='moderation_decisions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!later_exists);
+
+        // With readiness false, policy resolution surfaces the fail-closed
+        // signal rather than silently returning an empty, permissive policy.
+        let db = test_db("mod_ddl_closed.db");
+        db.moderation_storage_ready.store(false, Ordering::Relaxed);
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        let policy = db.resolve_effective_policy(9, None);
+        assert!(policy.enforcement_degraded);
+        assert_eq!(mode_of(&policy, "globalban"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_floor_read_failure_falls_back_and_degrades() {
+        let db = test_db("mod_floor_missing.db");
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute_batch("DROP TABLE moderation_global_floor;")
+                .unwrap();
+        }
+        // No panic; the compile-time default (empty) is used and the policy
+        // is marked degraded so hooks can fail closed.
+        let policy = db.resolve_effective_policy(7, None);
+        assert!(policy.enforcement_degraded);
+        assert!(policy.terms.is_empty());
+        assert_eq!(policy.floor_mode, MODERATION_FLOOR_MODE);
     }
 }

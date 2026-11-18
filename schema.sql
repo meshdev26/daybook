@@ -606,6 +606,22 @@ CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id)
 -- defence. Do not add a content column here without an L10 review.
 -- ===========================================================================
 
+-- (a) Owner-enforced GLOBAL content-policy floor. Unlike every other table in
+-- this section there is deliberately NO seller_id: these terms apply to every
+-- seller and bot, and can never be removed or weakened by any seller's
+-- allow-list or per-bot override. Writes go only through the explicit
+-- `add_moderation_global_floor_term` / `remove_moderation_global_floor_term`
+-- Db methods, which the web layer MUST gate to the owner. Seeded empty for
+-- backward compatibility — the compile-time constants in db.rs are only a
+-- fallback when this table is unreadable. Keys/terms only, no message content.
+CREATE TABLE IF NOT EXISTS moderation_global_floor (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    term        TEXT NOT NULL UNIQUE,
+    mode        TEXT NOT NULL CHECK (mode IN ('hide','warn','review')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 -- (b) Seller-wide "Blocked words". One row per (seller, term); mode is the
 -- plain-language hide / warn / review action. `enabled` lets the console keep
 -- a word without enforcing it (inline status toggle), additive to the floor.
