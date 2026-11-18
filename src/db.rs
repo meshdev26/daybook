@@ -171,6 +171,212 @@ type McpApprovalRow = (
 );
 type McpAuditRow = (i64, String, String, bool, Option<String>, String);
 
+// ---- Cross-cutting moderation (multibot foundation, Step 4 storage) ----
+
+/// Longest accepted policy term / opaque reference. Over-long values are
+/// refused at write time (the console also validates) so stored rows stay
+/// minimal and the audit trail cannot be used as a message dump.
+pub const MODERATION_MAX_TERM_LEN: usize = 200;
+/// Longest stored appeal justification / decision reason code. This is NEVER
+/// the filtered message body — it is a short reason string or machine code.
+pub const MODERATION_MAX_REASON_LEN: usize = 280;
+
+/// Owner content-policy floor. Documented defaults until the owner "Content
+/// policy" page lands: the loosest enforcement mode and an empty baseline
+/// term set, so a fresh install's seller rules are unchanged. The floor is
+/// NON-OVERRIDABLE: seller and per-bot rules may only raise severity, and a
+/// baseline term can never be removed or weakened by the allow-list.
+pub const MODERATION_FLOOR_MODE: &str = "warn";
+pub const MODERATION_FLOOR_TERMS: &[&str] = &[];
+
+/// Enforcement severity, loosest (1) to strictest (3). This is the single
+/// ordering used by precedence resolution. An unknown stored value maps to
+/// the loosest tier so a bad value can never silently escalate a decision.
+pub fn moderation_mode_severity(mode: &str) -> u8 {
+    match mode {
+        "hide" => 3,
+        "review" => 2,
+        "warn" => 1,
+        _ => 1,
+    }
+}
+fn moderation_mode_from_severity(severity: u8) -> &'static str {
+    match severity {
+        3 => "hide",
+        2 => "review",
+        _ => "warn",
+    }
+}
+fn is_moderation_mode(mode: &str) -> bool {
+    matches!(mode, "hide" | "warn" | "review")
+}
+fn is_moderation_appeal_status(status: &str) -> bool {
+    matches!(status, "pending" | "approved" | "upheld")
+}
+/// Trim + validate a policy term. SQL metacharacters are kept as literal DATA
+/// (parameterized statements make them inert); NUL bytes, empty and
+/// over-long terms are refused. This is "injection refusal" at the storage
+/// boundary: the term can never break out of its bind parameter.
+fn normalize_moderation_term(term: &str) -> Option<String> {
+    let t = term.trim();
+    if t.is_empty() || t.len() > MODERATION_MAX_TERM_LEN || t.contains('\0') {
+        return None;
+    }
+    Some(t.to_owned())
+}
+fn normalize_moderation_ref(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.len() > MODERATION_MAX_TERM_LEN || v.contains('\0') {
+        return None;
+    }
+    Some(v.to_owned())
+}
+fn trim_moderation_reason(reason: Option<&str>) -> Option<String> {
+    reason.and_then(|r| {
+        let cleaned: String = r
+            .chars()
+            .filter(|c| *c != '\0')
+            .take(MODERATION_MAX_REASON_LEN)
+            .collect();
+        let cleaned = cleaned.trim().to_owned();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    })
+}
+
+/// One seller/override rule feeding precedence resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationTermInput {
+    pub term: String,
+    pub mode: String,
+}
+/// One effective term after floor + seller + bot precedence + allow-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveModerationTerm {
+    pub term: String,
+    pub mode: String,
+}
+/// The resolved policy a caller (L8 hook) evaluates a message against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveModerationPolicy {
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    /// Non-overridable minimum enforcement mode (owner floor).
+    pub floor_mode: String,
+    /// Effective blocked terms, each with its resolved mode; sorted by term
+    /// for deterministic matching and diffing.
+    pub terms: Vec<EffectiveModerationTerm>,
+    /// True when the bot uses "Custom rules for this bot"; false when it is
+    /// inheriting the seller's rules.
+    pub bot_override_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationBlockedWord {
+    pub id: i64,
+    pub seller_id: i64,
+    pub term: String,
+    pub mode: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationAllowWord {
+    pub id: i64,
+    pub seller_id: i64,
+    pub term: String,
+    pub created_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationBotOverrideTerm {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: i64,
+    pub term: String,
+    pub mode: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationAppeal {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    pub decision_id: Option<i64>,
+    pub message_ref: String,
+    pub reason: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationDecision {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    pub term: Option<String>,
+    pub action: String,
+    pub reason: Option<String>,
+    pub message_ref: Option<String>,
+    pub created_at: String,
+}
+
+/// Pure precedence resolver. The floor is a parameter (production passes
+/// [`MODERATION_FLOOR_MODE`] / [`MODERATION_FLOOR_TERMS`]) so the ladder can
+/// be unit-tested against a non-empty floor without changing shipped data.
+///
+/// Rules, in order:
+/// 1. Floor terms start at the floor severity and are non-removable.
+/// 2. Seller terms are added; a repeated term takes the STRICTER mode
+///    (`max`), never a looser one, and nothing drops below the floor.
+/// 3. Per-bot terms follow the same stricter-only rule (the caller passes an
+///    empty slice when the bot inherits).
+/// 4. Allow-list terms are removed from the effective set — EXCEPT floor
+///    terms, which "stay above the floor" by construction.
+pub fn apply_moderation_precedence(
+    floor_mode: &str,
+    floor_terms: &[String],
+    seller_terms: &[ModerationTermInput],
+    bot_terms: &[ModerationTermInput],
+    allow_terms: &[String],
+) -> Vec<EffectiveModerationTerm> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let floor_sev = moderation_mode_severity(floor_mode);
+    let mut effective: BTreeMap<String, u8> = BTreeMap::new();
+    let floor_set: BTreeSet<String> = floor_terms.iter().cloned().collect();
+    for term in floor_terms {
+        effective.insert(term.clone(), floor_sev);
+    }
+    let mut raise = |terms: &[ModerationTermInput]| {
+        for rule in terms {
+            let sev = moderation_mode_severity(&rule.mode).max(floor_sev);
+            effective
+                .entry(rule.term.clone())
+                .and_modify(|current| *current = (*current).max(sev))
+                .or_insert(sev);
+        }
+    };
+    raise(seller_terms);
+    raise(bot_terms);
+    for allowed in allow_terms {
+        if !floor_set.contains(allowed) {
+            effective.remove(allowed);
+        }
+    }
+    effective
+        .into_iter()
+        .map(|(term, sev)| EffectiveModerationTerm {
+            term,
+            mode: moderation_mode_from_severity(sev).to_owned(),
+        })
+        .collect()
+}
+
 /// SHA-256 hex digest of `input` — the one-time-credential storage recipe:
 /// api_keys.key_hash, web_sessions.token_hash, web_pending_mfa.token_hash and
 /// mcp_tokens.token_hash all store the hex digest, never the raw secret.
@@ -802,6 +1008,61 @@ impl Db {
                 }
             }
         }
+
+        // Cross-cutting moderation (multibot foundation Step 4). Purely
+        // additive: CREATE TABLE/INDEX IF NOT EXISTS never rewrites existing
+        // rows, so a legacy install keeps all data and gains empty policy
+        // tables. schema.sql declares the same shapes for fresh databases;
+        // these statements cover databases created before this feature.
+        // Declared after `bots` (above) so the bot_id FKs resolve.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_blocked_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_allow_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_bot_overrides (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE, term TEXT NOT NULL DEFAULT '', mode TEXT CHECK (mode IN ('hide','warn','review')), inherits INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, bot_id, term), CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL)))",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, term TEXT, action TEXT NOT NULL, reason TEXT, message_ref TEXT, created_at TEXT NOT NULL)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_appeals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, decision_id INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL, message_ref TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id)",
+            [],
+        );
         Ok(())
     }
 
@@ -7602,6 +7863,667 @@ impl Db {
 }
 // end phase6 (placeholder marker)
 
+/// Cross-cutting moderation storage. Every method takes `seller_id` in its
+/// WHERE clause (or INSERT values): a seller can never read, change or remove
+/// another seller's rows. Per-bot overrides additionally require `bot_id`,
+/// so the same bot id under a different seller is a different namespace.
+/// All SQL is parameterized and lives only in this layer.
+impl Db {
+    fn blocked_word_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationBlockedWord> {
+        Ok(ModerationBlockedWord {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            term: r.get(2)?,
+            mode: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    fn allow_word_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationAllowWord> {
+        Ok(ModerationAllowWord {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            term: r.get(2)?,
+            created_at: r.get(3)?,
+        })
+    }
+
+    fn bot_override_term_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ModerationBotOverrideTerm> {
+        Ok(ModerationBotOverrideTerm {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            term: r.get(3)?,
+            mode: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    fn appeal_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationAppeal> {
+        Ok(ModerationAppeal {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            decision_id: r.get(3)?,
+            message_ref: r.get(4)?,
+            reason: r.get(5)?,
+            status: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+        })
+    }
+
+    fn decision_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationDecision> {
+        Ok(ModerationDecision {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            term: r.get(3)?,
+            action: r.get(4)?,
+            reason: r.get(5)?,
+            message_ref: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    }
+
+    /// Upsert the single inheritance-sentinel row (term='', mode=NULL) for a
+    /// (seller, bot) scope. It is the source of truth for "Using your shop's
+    /// rules" (true) vs "Custom rules for this bot" (false).
+    fn upsert_bot_override_sentinel(
+        conn: &Connection,
+        seller_id: i64,
+        bot_id: i64,
+        inherits: bool,
+    ) -> bool {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_bot_overrides(seller_id,bot_id,term,mode,inherits,created_at,updated_at)
+             VALUES(?1,?2,'',NULL,?3,?4,?4)
+             ON CONFLICT(seller_id,bot_id,term) DO UPDATE SET inherits=excluded.inherits, updated_at=excluded.updated_at",
+            params![seller_id, bot_id, inherits as i64, now],
+        )
+        .is_ok()
+    }
+
+    // ---- (b) Seller-wide blocked words ----
+
+    /// Add or update one seller-scoped blocked word. Invalid terms/modes are
+    /// refused (fail closed); the (seller_id, term) UNIQUE key makes this
+    /// idempotent so the console's "Add a word" can be retried safely.
+    pub fn add_blocked_word(&self, seller_id: i64, term: &str, mode: &str, enabled: bool) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_blocked_words(seller_id,term,mode,enabled,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(seller_id,term) DO UPDATE SET mode=excluded.mode, enabled=excluded.enabled, updated_at=excluded.updated_at",
+            params![seller_id, term, mode, enabled as i64, now],
+        )
+        .is_ok()
+    }
+
+    pub fn set_blocked_word_mode(&self, seller_id: i64, term: &str, mode: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_blocked_words SET mode=?3, updated_at=?4 WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term, mode, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn set_blocked_word_enabled(&self, seller_id: i64, term: &str, enabled: bool) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_blocked_words SET enabled=?3, updated_at=?4 WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term, enabled as i64, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn remove_blocked_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_blocked_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_blocked_word(&self, seller_id: i64, term: &str) -> Option<ModerationBlockedWord> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,term,mode,enabled,created_at,updated_at
+             FROM moderation_blocked_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+            Self::blocked_word_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_blocked_words(&self, seller_id: i64) -> Vec<ModerationBlockedWord> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,term,mode,enabled,created_at,updated_at
+             FROM moderation_blocked_words WHERE seller_id=?1 ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id], Self::blocked_word_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- (b) "Always allow" list ----
+
+    pub fn add_allow_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_allow_words(seller_id,term,created_at) VALUES(?1,?2,?3)
+             ON CONFLICT(seller_id,term) DO NOTHING",
+            params![seller_id, term, now],
+        )
+        .is_ok()
+    }
+
+    pub fn remove_allow_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_allow_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_allow_word(&self, seller_id: i64, term: &str) -> Option<ModerationAllowWord> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,term,created_at FROM moderation_allow_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+            Self::allow_word_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_allow_words(&self, seller_id: i64) -> Vec<ModerationAllowWord> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,term,created_at FROM moderation_allow_words WHERE seller_id=?1 ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id], Self::allow_word_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- (c) Per-bot override (scoped by BOTH seller_id and bot_id) ----
+
+    /// Set "Using your shop's rules" (true) / "Custom rules for this bot"
+    /// (false). Custom terms are preserved through the toggle so returning
+    /// to inheritance is non-destructive.
+    pub fn set_bot_override_inherits(&self, seller_id: i64, bot_id: i64, inherits: bool) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::upsert_bot_override_sentinel(&conn, seller_id, bot_id, inherits)
+    }
+
+    /// Whether a bot inherits its seller's rules. Defaults to true when no
+    /// sentinel row exists — "inherits by default" per the spec.
+    pub fn bot_override_inherits(&self, seller_id: i64, bot_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT inherits FROM moderation_bot_overrides WHERE seller_id=?1 AND bot_id=?2 AND term=''",
+            params![seller_id, bot_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v != 0)
+        .unwrap_or(true)
+    }
+
+    /// Add/update a custom term for one bot. Adding the first custom term
+    /// activates "Custom rules for this bot" (inherits=false) so the console
+    /// need not issue a second call; the sentinel is written first so a
+    /// failed term insert can never leave an ignored term behind.
+    pub fn add_bot_override_term(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        term: &str,
+        mode: &str,
+    ) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !Self::upsert_bot_override_sentinel(&conn, seller_id, bot_id, false) {
+            return false;
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_bot_overrides(seller_id,bot_id,term,mode,inherits,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,0,?5,?5)
+             ON CONFLICT(seller_id,bot_id,term) DO UPDATE SET mode=excluded.mode, inherits=0, updated_at=excluded.updated_at",
+            params![seller_id, bot_id, term, mode, now],
+        )
+        .is_ok()
+    }
+
+    pub fn remove_bot_override_term(&self, seller_id: i64, bot_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_bot_overrides WHERE seller_id=?1 AND bot_id=?2 AND term=?3 AND term<>''",
+            params![seller_id, bot_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_bot_override_term(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        term: &str,
+    ) -> Option<ModerationBotOverrideTerm> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,bot_id,term,mode,created_at,updated_at
+             FROM moderation_bot_overrides
+             WHERE seller_id=?1 AND bot_id=?2 AND term=?3 AND term<>''",
+            params![seller_id, bot_id, term],
+            Self::bot_override_term_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_bot_override_terms(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+    ) -> Vec<ModerationBotOverrideTerm> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,mode,created_at,updated_at
+             FROM moderation_bot_overrides
+             WHERE seller_id=?1 AND bot_id=?2 AND term<>'' ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, bot_id], Self::bot_override_term_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- Appeals review queue (opaque refs only, never message content) ----
+
+    /// Create an appeal. `message_ref` must be an opaque token supplied by the
+    /// bot-side flow (L8); `reason` is the short appeal justification, capped
+    /// by [`MODERATION_MAX_REASON_LEN`] — neither may carry the filtered body.
+    pub fn create_moderation_appeal(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+        decision_id: Option<i64>,
+        message_ref: &str,
+        reason: Option<&str>,
+    ) -> Option<i64> {
+        let message_ref = normalize_moderation_ref(message_ref)?;
+        let reason = trim_moderation_reason(reason);
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_appeals(seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,'pending',?6,?6)",
+            params![seller_id, bot_id, decision_id, message_ref, reason, now],
+        )
+        .ok()?;
+        Some(conn.last_insert_rowid())
+    }
+
+    pub fn get_moderation_appeal(
+        &self,
+        seller_id: i64,
+        appeal_id: i64,
+    ) -> Option<ModerationAppeal> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals WHERE seller_id=?1 AND id=?2",
+            params![seller_id, appeal_id],
+            Self::appeal_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// `status` is an optional filter ('pending'|'approved'|'upheld'); an
+    /// invalid filter yields no rows instead of a raw SQL fragment.
+    pub fn list_moderation_appeals(
+        &self,
+        seller_id: i64,
+        status: Option<&str>,
+    ) -> Vec<ModerationAppeal> {
+        let status = match status {
+            None => None,
+            Some(s) if is_moderation_appeal_status(s) => Some(s.to_owned()),
+            Some(_) => return Vec::new(),
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals
+             WHERE seller_id=?1 AND (?2 IS NULL OR status=?2) ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, status], Self::appeal_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Bot-narrowed variant: both seller_id and bot_id are bound, so the same
+    /// bot id under another seller is a disjoint queue.
+    pub fn list_moderation_appeals_for_bot(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        status: Option<&str>,
+    ) -> Vec<ModerationAppeal> {
+        let status = match status {
+            None => None,
+            Some(s) if is_moderation_appeal_status(s) => Some(s.to_owned()),
+            Some(_) => return Vec::new(),
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals
+             WHERE seller_id=?1 AND bot_id=?2 AND (?3 IS NULL OR status=?3) ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, bot_id, status], Self::appeal_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn set_moderation_appeal_status(
+        &self,
+        seller_id: i64,
+        appeal_id: i64,
+        status: &str,
+    ) -> bool {
+        if !is_moderation_appeal_status(status) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_appeals SET status=?3, updated_at=?4 WHERE seller_id=?1 AND id=?2",
+            params![seller_id, appeal_id, status, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    // ---- Append-only decision audit ----
+
+    /// Record one moderation decision. There is intentionally NO message-text
+    /// parameter: `term` is the matched policy term and `message_ref` is an
+    /// opaque caller token. `reason` is a short code/justification, capped.
+    pub fn log_moderation_decision(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+        term: Option<&str>,
+        action: &str,
+        reason: Option<&str>,
+        message_ref: Option<&str>,
+    ) -> Option<i64> {
+        let term = term.and_then(normalize_moderation_term);
+        let action = normalize_moderation_ref(action)?;
+        let reason = trim_moderation_reason(reason);
+        let message_ref = message_ref.and_then(normalize_moderation_ref);
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_decisions(seller_id,bot_id,term,action,reason,message_ref,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![seller_id, bot_id, term, action, reason, message_ref, now],
+        )
+        .ok()?;
+        Some(conn.last_insert_rowid())
+    }
+
+    pub fn list_moderation_decisions(&self, seller_id: i64, limit: i64) -> Vec<ModerationDecision> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,action,reason,message_ref,created_at
+             FROM moderation_decisions WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, limit.max(0)], Self::decision_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn list_moderation_decisions_for_bot(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        limit: i64,
+    ) -> Vec<ModerationDecision> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,action,reason,message_ref,created_at
+             FROM moderation_decisions WHERE seller_id=?1 AND bot_id=?2 ORDER BY id DESC LIMIT ?3",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(
+            params![seller_id, bot_id, limit.max(0)],
+            Self::decision_from_row,
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    // ---- Resolution ----
+
+    /// Resolve the effective policy for one (seller, optional bot) scope.
+    /// Applies the non-overridable floor, then seller rules, then per-bot
+    /// custom rules (only when the override is active), then the seller
+    /// allow-list — see [`apply_moderation_precedence`] for the exact ladder.
+    pub fn resolve_effective_policy(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+    ) -> EffectiveModerationPolicy {
+        let seller_terms: Vec<ModerationTermInput> = self
+            .list_blocked_words(seller_id)
+            .into_iter()
+            .filter(|w| w.enabled)
+            .map(|w| ModerationTermInput {
+                term: w.term,
+                mode: w.mode,
+            })
+            .collect();
+        let allow_terms: Vec<String> = self
+            .list_allow_words(seller_id)
+            .into_iter()
+            .map(|w| w.term)
+            .collect();
+
+        let mut bot_override_active = false;
+        let mut bot_terms: Vec<ModerationTermInput> = Vec::new();
+        if let Some(bot_id) = bot_id {
+            bot_override_active = !self.bot_override_inherits(seller_id, bot_id);
+            if bot_override_active {
+                bot_terms = self
+                    .list_bot_override_terms(seller_id, bot_id)
+                    .into_iter()
+                    .map(|w| ModerationTermInput {
+                        term: w.term,
+                        mode: w.mode,
+                    })
+                    .collect();
+            }
+        }
+
+        let floor_terms: Vec<String> = MODERATION_FLOOR_TERMS
+            .iter()
+            .map(|t| (*t).to_owned())
+            .collect();
+        let terms = apply_moderation_precedence(
+            MODERATION_FLOOR_MODE,
+            &floor_terms,
+            &seller_terms,
+            &bot_terms,
+            &allow_terms,
+        );
+        EffectiveModerationPolicy {
+            seller_id,
+            bot_id,
+            floor_mode: MODERATION_FLOOR_MODE.to_owned(),
+            terms,
+            bot_override_active,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -7649,5 +8571,358 @@ mod delete_bot_tests {
         // A second delete reports no row.
         assert!(!db.delete_bot(bot_id));
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod moderation_tests {
+    use super::*;
+
+    fn test_db(name: &str) -> Db {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the directory alive for the test (Db::new opens the file by
+        // path); `keep` is the non-deprecated form of the old `into_path`.
+        let path = dir.keep().join(name);
+        Db::new(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn moderation_seller_isolation() {
+        let db = test_db("mod_seller.db");
+        let (a, b) = (11_i64, 22_i64);
+
+        assert!(db.add_blocked_word(a, "spam", "hide", true));
+        assert!(db.add_allow_word(a, "legit"));
+        // Seller B sees none of seller A's rows.
+        assert!(db.list_blocked_words(b).is_empty());
+        assert!(db.get_blocked_word(b, "spam").is_none());
+        assert!(db.list_allow_words(b).is_empty());
+        // Seller B cannot mutate or delete A's rows by name/id.
+        assert!(!db.set_blocked_word_mode(b, "spam", "warn"));
+        assert!(!db.set_blocked_word_enabled(b, "spam", false));
+        assert!(!db.remove_blocked_word(b, "spam"));
+        assert!(!db.remove_allow_word(b, "legit"));
+        assert_eq!(db.get_blocked_word(a, "spam").unwrap().mode, "hide");
+
+        // Appeals and decisions are seller-scoped too.
+        let appeal = db
+            .create_moderation_appeal(a, None, None, "opaque:1", Some("please review"))
+            .unwrap();
+        db.log_moderation_decision(
+            a,
+            None,
+            Some("spam"),
+            "hide",
+            Some("matched"),
+            Some("opaque:1"),
+        )
+        .unwrap();
+        assert!(db.get_moderation_appeal(b, appeal).is_none());
+        assert_eq!(db.get_moderation_appeal(a, appeal).unwrap().seller_id, a);
+        assert!(!db.set_moderation_appeal_status(b, appeal, "approved"));
+        assert!(db.set_moderation_appeal_status(a, appeal, "approved"));
+        assert_eq!(
+            db.get_moderation_appeal(a, appeal).unwrap().status,
+            "approved"
+        );
+        assert!(db.list_moderation_appeals(b, None).is_empty());
+        assert_eq!(db.list_moderation_appeals(a, None).len(), 1);
+        assert!(db.list_moderation_decisions(b, 10).is_empty());
+        assert_eq!(db.list_moderation_decisions(a, 10).len(), 1);
+    }
+
+    #[test]
+    fn moderation_bot_override_scoped_by_both_ids() {
+        let db = test_db("mod_bot_scope.db");
+        let (a, b) = (101_i64, 202_i64);
+        let bot_a1 = db.create_bot("mod-bot-a1", a, None, "");
+        let bot_a2 = db.create_bot("mod-bot-a2", a, None, "");
+        let bot_b1 = db.create_bot("mod-bot-b1", b, None, "");
+
+        // Inheritance is the default for every scope.
+        assert!(db.bot_override_inherits(a, bot_a1));
+        // Adding a custom term activates custom rules for (a, bot_a1) ONLY.
+        assert!(db.add_bot_override_term(a, bot_a1, "spoiler", "hide"));
+        assert!(!db.bot_override_inherits(a, bot_a1));
+        assert!(db.bot_override_inherits(a, bot_a2));
+        assert!(db.bot_override_inherits(b, bot_b1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(db.list_bot_override_terms(a, bot_a2).is_empty());
+        assert!(db.list_bot_override_terms(b, bot_b1).is_empty());
+
+        // Same bot id under a different seller, and a different bot under the
+        // same seller, are disjoint namespaces for reads AND writes.
+        assert!(!db.remove_bot_override_term(a, bot_a2, "spoiler"));
+        assert!(!db.remove_bot_override_term(b, bot_b1, "spoiler"));
+        assert!(db.get_bot_override_term(a, bot_a1, "spoiler").is_some());
+        let pa = db.resolve_effective_policy(a, Some(bot_a1));
+        let pb = db.resolve_effective_policy(a, Some(bot_a2));
+        assert!(pa.bot_override_active);
+        assert!(!pb.bot_override_active);
+        assert_eq!(pa.terms.len(), 1);
+        assert!(pb.terms.is_empty());
+
+        // Restoring inheritance is non-destructive: terms stay stored but are
+        // ignored while inheriting.
+        assert!(db.set_bot_override_inherits(a, bot_a1, true));
+        assert!(db.bot_override_inherits(a, bot_a1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(
+            db.resolve_effective_policy(a, Some(bot_a1))
+                .terms
+                .is_empty()
+        );
+
+        // Removal is scoped by both ids.
+        assert!(db.remove_bot_override_term(a, bot_a1, "spoiler"));
+        assert!(db.list_bot_override_terms(a, bot_a1).is_empty());
+    }
+
+    #[test]
+    fn moderation_precedence_stricter_only_allowlist_and_floor() {
+        // Floor 'hide' with a baseline term: nothing may be weaker than hide,
+        // and the allow-list may not delete a floor term.
+        let floor_terms = vec!["floorword".to_string()];
+        let seller = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "soft".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "mid".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "allowed".into(),
+                mode: "hide".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "extra".into(),
+                mode: "review".into(),
+            },
+        ];
+        let allow = vec![
+            "allowed".to_string(),
+            "floorword".to_string(),
+            "extra".to_string(),
+        ];
+        let effective = apply_moderation_precedence("hide", &floor_terms, &seller, &bot, &allow);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("allowed"), None); // allow-list wins over seller
+        assert_eq!(mode_of("extra"), None); // allow-list wins over bot
+        assert_eq!(mode_of("floorword"), Some("hide")); // floor term survives allow
+        assert_eq!(mode_of("soft"), Some("hide")); // seller term raised to floor
+        assert_eq!(mode_of("mid"), Some("hide")); // seller term raised to floor
+        assert_eq!(effective.len(), 3);
+        assert!(effective.windows(2).all(|w| w[0].term < w[1].term)); // deterministic
+
+        // Floor 'warn' does not force every term to hide: here the stricter-only
+        // rule between seller and bot layers is exercised directly.
+        let seller = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "warn".into(),
+            }, // weaker -> stays review
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "hide".into(),
+            }, // stricter -> raised to hide
+            ModerationTermInput {
+                term: "s3".into(),
+                mode: "review".into(),
+            },
+        ];
+        let effective = apply_moderation_precedence("warn", &[], &seller, &bot, &[]);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("s1"), Some("review"));
+        assert_eq!(mode_of("s2"), Some("hide"));
+        assert_eq!(mode_of("s3"), Some("review"));
+    }
+
+    #[test]
+    fn moderation_db_resolution_wiring() {
+        let db = test_db("mod_resolve.db");
+        let seller = 303_i64;
+        let bot = db.create_bot("mod-resolve", seller, None, "");
+        assert!(db.add_blocked_word(seller, "spam", "warn", true));
+        assert!(db.add_blocked_word(seller, "disabled", "hide", false));
+        assert!(db.add_allow_word(seller, "spam"));
+        assert!(db.add_bot_override_term(seller, bot, "bot-only", "review"));
+        // Adding a custom term auto-activates "Custom rules for this bot";
+        // restore inheritance to exercise the inherited view first.
+        assert!(db.set_bot_override_inherits(seller, bot, true));
+
+        // While inheriting, bot terms are ignored; allow-list removes "spam";
+        // the disabled word is skipped.
+        let inherited = db.resolve_effective_policy(seller, Some(bot));
+        assert!(!inherited.bot_override_active);
+        assert!(inherited.terms.is_empty());
+
+        // Activating the override brings in the bot's stricter local rule.
+        assert!(db.set_bot_override_inherits(seller, bot, false));
+        let active = db.resolve_effective_policy(seller, Some(bot));
+        assert!(active.bot_override_active);
+        assert_eq!(active.floor_mode, MODERATION_FLOOR_MODE);
+        let mode_of = |t: &str| {
+            active
+                .terms
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("bot-only"), Some("review"));
+        assert_eq!(mode_of("spam"), None);
+        assert_eq!(mode_of("disabled"), None);
+
+        // No bot scope: never activates a bot override.
+        let global = db.resolve_effective_policy(seller, None);
+        assert!(!global.bot_override_active);
+        assert!(global.terms.is_empty());
+    }
+
+    #[test]
+    fn moderation_terms_are_data_not_sql() {
+        let db = test_db("mod_injection.db");
+        let payload = "x'; DROP TABLE moderation_blocked_words; --";
+        assert!(db.add_blocked_word(1, payload, "hide", true));
+        // Stored verbatim as data, not executed.
+        assert_eq!(db.get_blocked_word(1, payload).unwrap().term, payload);
+        assert_eq!(db.list_blocked_words(1).len(), 1);
+        // Table still exists; a different seller's writes are unaffected.
+        assert!(db.add_blocked_word(2, "normal", "warn", true));
+        assert_eq!(db.list_blocked_words(2).len(), 1);
+        // Invalid inputs are refused at the boundary.
+        assert!(!db.add_blocked_word(1, "bad\0term", "warn", true));
+        assert!(!db.add_blocked_word(1, "   ", "warn", true));
+        assert!(!db.add_blocked_word(1, &"x".repeat(MODERATION_MAX_TERM_LEN + 1), "warn", true));
+        assert!(!db.add_blocked_word(1, "bad", "DROP", true));
+    }
+
+    #[test]
+    fn moderation_migration_is_additive_over_legacy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod_legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE bots(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
+                 INSERT INTO bots(key, owner_user_id, created_at) VALUES('legacy-bot', 42, '2026-01-01T00:00:00+00:00');
+                 INSERT INTO config(key, value, updated_at) VALUES('channel', '@legacy', '2026-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // Pre-existing data survives the additive migration.
+        assert_eq!(db.get_config("channel").as_deref(), Some("@legacy"));
+        assert!(db.get_bot_by_key("legacy-bot").is_some());
+        assert_eq!(
+            db.get_bot_by_key("legacy-bot").unwrap().bot_type,
+            "shop_bot"
+        );
+        // New tables are present, empty, and usable.
+        assert!(db.list_blocked_words(42).is_empty());
+        assert!(db.list_allow_words(42).is_empty());
+        assert!(db.list_bot_override_terms(42, 1).is_empty());
+        assert!(db.add_blocked_word(42, "after-migrate", "warn", true));
+        drop(db);
+        // Reopening is idempotent: no data loss, no duplicate-table error.
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_blocked_words(42).len(), 1);
+    }
+
+    #[test]
+    fn moderation_decisions_and_appeals_store_no_message_content() {
+        let db = test_db("mod_no_content.db");
+        let seller = 404_i64;
+        let decision = db
+            .log_moderation_decision(
+                seller,
+                None,
+                Some("badword"),
+                "hide",
+                Some("matched"),
+                Some("opaque-ref-123"),
+            )
+            .unwrap();
+        let appeal = db
+            .create_moderation_appeal(
+                seller,
+                None,
+                Some(decision),
+                "opaque-ref-123",
+                Some("false positive"),
+            )
+            .unwrap();
+
+        // No content-like column exists on either audit/appeal table.
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            for table in ["moderation_decisions", "moderation_appeals"] {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                assert!(
+                    !cols
+                        .iter()
+                        .any(|c| c == "content" || c == "text" || c == "message"),
+                    "{table} has a content-like column: {cols:?}"
+                );
+            }
+        }
+
+        // Reason is capped; opaque reference is preserved verbatim.
+        let long = "a".repeat(MODERATION_MAX_REASON_LEN + 50);
+        let capped = db
+            .create_moderation_appeal(seller, None, None, "opaque-2", Some(&long))
+            .unwrap();
+        assert_eq!(
+            db.get_moderation_appeal(seller, capped)
+                .unwrap()
+                .reason
+                .unwrap()
+                .len(),
+            MODERATION_MAX_REASON_LEN
+        );
+        assert_eq!(
+            db.get_moderation_appeal(seller, appeal)
+                .unwrap()
+                .message_ref,
+            "opaque-ref-123"
+        );
     }
 }

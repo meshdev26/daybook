@@ -587,3 +587,97 @@ CREATE TABLE IF NOT EXISTS reviews (
     UNIQUE (buyer_id, product_id)
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id);
+
+-- ===========================================================================
+-- Cross-cutting moderation (multibot foundation, Step 4 storage).
+--
+-- Every record is scoped by seller_id (the house tenant key, intentionally
+-- WITHOUT an FK so callers may scope writes before a seller row exists —
+-- this matches posts/plans/invoices). Per-bot overrides are scoped by BOTH
+-- seller_id and bot_id. bot_id carries a real FK to bots: deleting a bot
+-- cascades its local overrides and nulls the optional reference on appeals
+-- and decisions so the append-only audit trail survives bot deletion.
+--
+-- PRIVACY CONTRACT (L10 floor): these tables hold policy TERMS and OPAQUE
+-- references only. There is deliberately NO message-content column.
+-- `message_ref` is an opaque caller token (e.g. "c:123/m:456"); `reason` is
+-- the short appeal justification / decision code, never the filtered body.
+-- Length caps are enforced in the Db write methods as a second line of
+-- defence. Do not add a content column here without an L10 review.
+-- ===========================================================================
+
+-- (b) Seller-wide "Blocked words". One row per (seller, term); mode is the
+-- plain-language hide / warn / review action. `enabled` lets the console keep
+-- a word without enforcing it (inline status toggle), additive to the floor.
+CREATE TABLE IF NOT EXISTS moderation_blocked_words (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    term        TEXT NOT NULL,
+    mode        TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')),
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (seller_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id);
+
+-- (b) "Always allow" list: seller-scoped exemptions that take precedence over
+-- that seller's Blocked words, but never over the owner floor terms.
+CREATE TABLE IF NOT EXISTS moderation_allow_words (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    term        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (seller_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id);
+
+-- (c) Per-bot override. One sentinel row (term = '', mode = NULL) per
+-- (seller_id, bot_id) holds the inheritance flag: 1 = "Using your shop's
+-- rules" (default), 0 = "Custom rules for this bot". Custom-term rows (term
+-- <> '') carry stricter local rules and are ignored while inheriting. The
+-- CHECK keeps the two row shapes disjoint; UNIQUE is the idempotency guard.
+CREATE TABLE IF NOT EXISTS moderation_bot_overrides (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    bot_id      INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    term        TEXT NOT NULL DEFAULT '',
+    mode        TEXT CHECK (mode IN ('hide','warn','review')),
+    inherits    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (seller_id, bot_id, term),
+    CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id);
+
+-- Append-only audit of every moderation decision. `term` is the matched
+-- POLICY term, not the message; `message_ref` is opaque. No content column.
+CREATE TABLE IF NOT EXISTS moderation_decisions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL,
+    bot_id       INTEGER REFERENCES bots(id) ON DELETE SET NULL,
+    term         TEXT,
+    action       TEXT NOT NULL,
+    reason       TEXT,
+    message_ref  TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id);
+
+-- Appeal review queue for the console (end-user conversation is bot-side,
+-- L8). `decision_id` is an opaque link back to the audited decision.
+CREATE TABLE IF NOT EXISTS moderation_appeals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL,
+    bot_id       INTEGER REFERENCES bots(id) ON DELETE SET NULL,
+    decision_id  INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL,
+    message_ref  TEXT NOT NULL,
+    reason       TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status);
+CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id);
