@@ -185,7 +185,7 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail .product-scope .btn { align-self: stretch; min-height: 44px; }
 .rail .bot-scope-pinned span.mono { white-space: normal; overflow-wrap: anywhere; }
 details.advanced { margin: 8px 0; }
-details.advanced > summary { font-size: 12px; font-weight: 500; color: var(--ink-3); }
+details.advanced > summary { font-size: 12px; font-weight: 500; color: var(--ink-3); min-height: 44px; display: flex; align-items: center; }
 .rail nav a {
   display: flex;
   align-items: center;

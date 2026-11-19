@@ -688,17 +688,26 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
             esc(label)
         ));
     }
+    // A11y polish (L6 D1/D2): the Type facet has ONE accessible name — its
+    // visible label "Product type" — so no competing aria-label. A visually
+    // hidden role="status" region announces the resolved product at the moment
+    // a scope change is applied, on both the select's `onchange` path and the
+    // Switch button's native submit path. The PRG redirect then refreshes the
+    // rail with the new selection. No query flag, auth, or server storage.
+    let scope_status = r#"<div id="bot-scope-status" class="sr-only" role="status" aria-live="polite"></div>
+<script>function announceBotScope(){var s=document.getElementById('scope-product'),o=s&&s.options[s.selectedIndex],n=o?o.text:'',el=document.getElementById('bot-scope-status');if(el)el.textContent='Active product: '+(o&&!o.value?'All products':n);}</script>"#;
     format!(
-        r#"<form method="post" action="{action}" class="bot-scope product-scope">
-  <label for="scope-type">Type</label>
-  <select id="scope-type" aria-label="Product type">{type_options}</select>
+        r#"<form method="post" action="{action}" class="bot-scope product-scope" onsubmit="announceBotScope()">
+  <label for="scope-type">Product type</label>
+  <select id="scope-type">{type_options}</select>
   <label for="scope-product">Product</label>
-  <select id="scope-product" name="bot_id" onchange="this.form.submit()">{product_options}</select>
+  <select id="scope-product" name="bot_id" onchange="announceBotScope();this.form.submit()">{product_options}</select>
   <button type="submit" class="btn btn-ghost btn-sm">Switch</button>
-</form>"#,
+</form>{scope_status}"#,
         action = state.url("/bot/select"),
         type_options = type_options,
-        product_options = product_options
+        product_options = product_options,
+        scope_status = scope_status
     )
 }
 
