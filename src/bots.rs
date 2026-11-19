@@ -78,6 +78,24 @@ impl ContentSender for BotContext {
     }
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<SentMessage, SendError> {
+        // Outbound moderation gate (multibot foundation Step 4.2). This is the
+        // single ContentSender choke point for bot-identity sends; every post,
+        // broadcast, AI draft, delivery DM and admin reply that routes through
+        // it is checked against the receiving bot's effective policy before
+        // any transport work. The gate only READS policy (no floor writes) and
+        // fails closed to a hold when enforcement is degraded.
+        let seller_id = crate::handlers::moderation::outbound_seller_scope(&self.db, self.id);
+        let mode = crate::handlers::moderation::evaluate_outbound(
+            &self.db,
+            seller_id,
+            Some(self.id),
+            text,
+        );
+        if mode.blocks_outbound_send() {
+            return Err(SendError::Transport(
+                crate::handlers::moderation::OUTBOUND_HOLD_ERROR.to_string(),
+            ));
+        }
         match self
             .bot
             .send_message(teloxide::types::ChatId(chat_id), text)
@@ -354,5 +372,54 @@ mod tests {
         let (_dir, mgr) = setup();
         assert_eq!(mgr.primary.identity(), SenderIdentity::Bot(0));
         assert!(mgr.for_channel_sender("anything").is_bot());
+    }
+
+    /// Outbound moderation gate on the bot-identity `ContentSender` choke
+    /// point: a matching seller term holds the send before ANY transport work
+    /// (wiremock sees zero requests); a clean send passes through unchanged.
+    #[tokio::test]
+    async fn bot_context_send_text_gate_holds_then_passes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::new(dir.path().join("t.db").to_str().unwrap()).unwrap());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1, "date": 0, "chat": { "id": 42, "type": "private" } }
+            })))
+            .mount(&server)
+            .await;
+        let bot = teloxide::Bot::new("9:placeholder")
+            .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+        let ctx = BotContext {
+            id: 9,
+            key: "mod".to_string(),
+            bot,
+            owner_id: 0,
+            shared: Arc::new(test_cfg()),
+            db: db.clone(),
+        };
+
+        assert!(db.add_blocked_word(0, "banned", "hide", true));
+        let err = ctx
+            .send_text(42, "please read banned content")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Transport(m) if m.contains("moderation_hold")),
+            "got {err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a held send must not reach the transport"
+        );
+
+        assert!(db.remove_blocked_word(0, "banned"));
+        let sent = ctx.send_text(42, "clean content").await.unwrap();
+        assert_eq!(sent.chat_id, 42);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

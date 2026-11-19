@@ -154,6 +154,20 @@ impl ContentSender for UserContext {
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<SentMessage, SendError> {
         self.check_writes_enabled()?;
+        // Outbound moderation gate (multibot foundation Step 4.2), same single
+        // ContentSender choke point as the bot identity. The owner personal
+        // account has no bot/session seller, so per the documented decision in
+        // `handlers::moderation` this applies the GLOBAL FLOOR ONLY
+        // (seller_id 0, no bot override): no seller rule or per-bot override
+        // can be attributed to an owner-identity send. Fails closed on
+        // degraded enforcement. The writes gate above still fires first, so
+        // the L10 "Enable posting" behavior is unchanged.
+        let mode = crate::handlers::moderation::evaluate_outbound(&self.db, 0, None, text);
+        if mode.blocks_outbound_send() {
+            return Err(SendError::Transport(
+                crate::handlers::moderation::OUTBOUND_HOLD_ERROR.to_string(),
+            ));
+        }
         self.handle.send_text(chat_id, text).await
     }
 }
@@ -230,6 +244,46 @@ mod tests {
         assert!(matches!(err, SendError::NotAuthorized), "got {err:?}");
         let err = ctx.send_text_to("@chan", "hi").await.unwrap_err();
         assert!(matches!(err, SendError::NotAuthorized), "got {err:?}");
+    }
+
+    /// Outbound moderation gate on the owner-identity `ContentSender`
+    /// choke point. Uses seller 0 / no bot (global floor only, per the
+    /// documented decision). With posting enabled, a matching seller-0 term
+    /// holds before the actor is consulted; a clean text passes through to
+    /// the actor (which fails loudly as unconnected, never a bot fallback).
+    #[tokio::test]
+    async fn user_context_send_text_gate_holds_then_passes() {
+        let (_dir, db) = test_db();
+        // Global namespace seller 0 stands in for the owner-floor-only scope.
+        assert!(db.add_blocked_word(0, "forbidden", "hide", true));
+        db.set_config("identity_writes_enabled", "1");
+        let ctx = UserContext {
+            handle: IdentityHandle::unconnected(),
+            db: db.clone(),
+        };
+
+        let err = ctx.send_text(42, "a forbidden draft").await.unwrap_err();
+        assert!(
+            matches!(&err, SendError::Transport(m) if m.contains("moderation_hold")),
+            "got {err:?}"
+        );
+
+        assert!(db.remove_blocked_word(0, "forbidden"));
+        let err = ctx.send_text(42, "clean draft").await.unwrap_err();
+        assert!(
+            matches!(err, SendError::NotAuthorized),
+            "clean text must reach the actor, got {err:?}"
+        );
+
+        // The L10 writes gate still takes precedence over the moderation gate.
+        let (_dir2, db2) = test_db();
+        assert!(db2.add_blocked_word(0, "forbidden", "hide", true));
+        let no_writes = UserContext {
+            handle: IdentityHandle::unconnected(),
+            db: db2,
+        };
+        let err = no_writes.send_text(42, "forbidden").await.unwrap_err();
+        assert!(matches!(err, SendError::WritesDisabled), "got {err:?}");
     }
 
     /// `Sender::User` (the resolution `BotManager::for_channel_sender`

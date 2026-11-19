@@ -925,6 +925,37 @@ async fn run() {
                         },
                     ),
                 )
+                // Cross-cutting inbound moderation gate (multibot foundation
+                // Step 4.2). Runs for every message BEFORE dialogue entry or
+                // command/text routing, so a hidden/review/degraded message
+                // never reaches a handler. `evaluate_inbound` reads only the
+                // effective policy, appends one opaque audit row, and fails
+                // closed to a hold when enforcement is degraded. Pass/warn
+                // fall through unchanged (warn is recorded, not surfaced here
+                // — the warning/appeal UX is a separate dispatch).
+                .branch(
+                    dptree::filter(|msg: Message, bot_ctx: Arc<bots::BotContext>| {
+                        let text = msg
+                            .text()
+                            .or_else(|| msg.caption())
+                            .unwrap_or_default()
+                            .to_string();
+                        let sender = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+                        let seller_id = handlers::moderation::inbound_seller_scope(
+                            &bot_ctx.db,
+                            bot_ctx.id,
+                            sender,
+                        );
+                        handlers::moderation::evaluate_inbound(
+                            &bot_ctx.db,
+                            seller_id,
+                            Some(bot_ctx.id),
+                            &text,
+                        )
+                        .blocks_inbound_routing()
+                    })
+                    .endpoint(|| async { Ok(()) as HandlerResult }),
+                )
                 .enter_dialogue::<Message, ErasedStorage<State>, State>()
                 .branch(
                     dptree::case![State::Idle]
