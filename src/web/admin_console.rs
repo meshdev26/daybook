@@ -91,6 +91,10 @@ pub(super) async fn broadcast_page(
         .iter()
         .find(|(k, _)| k == "sent")
         .map(|(_, v)| v.clone());
+    // Pre-transport moderation hold: the send handler redirects here with
+    // `held=1` when the central outbound gate refuses the text. No message
+    // body is echoed — only the content-free outcome is reported.
+    let held = pairs.iter().any(|(k, v)| k == "held" && v == "1");
     let segments: Vec<String> = pairs
         .iter()
         .filter(|(k, _)| k == "segment")
@@ -99,16 +103,23 @@ pub(super) async fn broadcast_page(
     // Outcome banner from the ?sent={n} redirect (PRG). The count is what the
     // send actually delivered; 0 is a failure, not a success — nothing went
     // out.
-    let banner = match sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
-        Some(0) => Some(
-            r#"<div class="alert alert-error" role="alert">No users matched — nothing was sent.</div>"#
+    let banner = if held {
+        Some(
+            r#"<div class="alert alert-error" role="status" aria-live="polite">The broadcast was held by the content policy. Nothing was sent.</div>"#
                 .to_string(),
-        ),
-        Some(n) => Some(format!(
-            r#"<div class="alert alert-success" role="status" aria-live="polite">Sent to {} users.</div>"#,
-            n
-        )),
-        None => None,
+        )
+    } else {
+        match sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
+            Some(0) => Some(
+                r#"<div class="alert alert-error" role="alert">No users matched — nothing was sent.</div>"#
+                    .to_string(),
+            ),
+            Some(n) => Some(format!(
+                r#"<div class="alert alert-success" role="status" aria-live="polite">Sent to {} users.</div>"#,
+                n
+            )),
+            None => None,
+        }
     };
     let segment = resolve_segment(&segments);
     // Recipient scope (review P1-1, fail closed): owner → global (None);
@@ -234,6 +245,35 @@ pub(super) async fn broadcast_send(
     };
     if f.text.trim().is_empty() {
         return Redirect::to(&state.url("/broadcast")).into_response();
+    }
+    // Outbound moderation (L10 residual gap): a content-bearing broadcast
+    // must be decided BEFORE any Telegram transport call. Scope follows the
+    // acting principal — the owner is the global floor (seller 0, no bot),
+    // while a seller/admin carries the session seller id and resolved bot id.
+    // A scopeless non-owner already reaches zero recipients below; gate them
+    // against the global floor rather than widening to all sellers.
+    let (policy_seller_id, policy_bot_id) = if session.role == "owner" {
+        (0i64, None)
+    } else {
+        (
+            session.seller_id.unwrap_or(0),
+            Some(effective_bot(&state, &session).id),
+        )
+    };
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        policy_seller_id,
+        policy_bot_id,
+        &f.text,
+    ) {
+        // Only the opaque marker and numeric scope are logged — never text.
+        tracing::warn!(
+            seller_id = policy_seller_id,
+            bot_id = ?policy_bot_id,
+            outcome = %hold,
+            "broadcast held before transport"
+        );
+        return Redirect::to(&state.url("/broadcast?held=1")).into_response();
     }
     let segment = f.segment.clone().unwrap_or_else(|| "all".to_string());
     // Recipient scope (review P1-1, fail closed): owner → global (None);
