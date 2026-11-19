@@ -139,6 +139,16 @@ impl BotManager {
         self.bots.iter().find(|b| b.id == id).cloned()
     }
 
+    /// Resolve the receiving bot's product type and compiled capability
+    /// (multibot foundation, L8). Used once per dispatcher so the inbound
+    /// gate sees the bot that actually received the update, not the seller's
+    /// routing bot. Missing ids fall back to the primary context, whose type
+    /// resolves to the shop default — byte-identical legacy behavior.
+    pub fn capability_for_bot(&self, id: i64) -> crate::handlers::capabilities::BotCapability {
+        let ctx = self.get(id).unwrap_or_else(|| self.primary.clone());
+        crate::handlers::capabilities::BotCapability::for_bot(&self.db, &ctx)
+    }
+
     pub fn for_seller(&self, seller_id: i64) -> Arc<BotContext> {
         if let Some(bid) = self.db.get_seller_bot_id(seller_id)
             && let Some(ctx) = self.get(bid)

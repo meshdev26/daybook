@@ -898,6 +898,33 @@ async fn run() {
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
+                // Multibot capability gate (L8). The receiving bot's `bot_type`
+                // selects its command set / inbound handler. Only `shop_bot`
+                // (the default) falls through to the unchanged built-in tree
+                // below, so the default build's paths stay byte-identical.
+                // Every other type is intercepted here: an uncompiled or
+                // unknown type gets an explicit, logged refusal; a compiled
+                // vertical stub gets an explicit notice. Never a silent drop.
+                .branch(
+                    dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
+                        !cap.is_legacy_shop()
+                    })
+                    .endpoint(
+                        |bot: Bot,
+                         msg: Message,
+                         cap: Arc<handlers::capabilities::BotCapability>| {
+                            async move {
+                                handlers::capabilities::refuse_message(
+                                    &bot,
+                                    msg.chat.id,
+                                    &cap,
+                                    "message",
+                                )
+                                .await
+                            }
+                        },
+                    ),
+                )
                 .enter_dialogue::<Message, ErasedStorage<State>, State>()
                 .branch(
                     dptree::case![State::Idle]
@@ -1036,6 +1063,23 @@ async fn run() {
         )
         .branch(
             Update::filter_callback_query()
+                // Same gate as the message path: answer the callback with an
+                // explicit notice so no inline press is silently dropped.
+                .branch(
+                    dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
+                        !cap.is_legacy_shop()
+                    })
+                    .endpoint(
+                        |bot: Bot,
+                         q: CallbackQuery,
+                         cap: Arc<handlers::capabilities::BotCapability>| {
+                            async move {
+                                handlers::capabilities::refuse_callback(&bot, &q, &cap, "callback")
+                                    .await
+                            }
+                        },
+                    ),
+                )
                 .enter_dialogue::<CallbackQuery, ErasedStorage<State>, State>()
                 .branch(dptree::endpoint(
                     move |bot: Bot,
@@ -1106,6 +1150,9 @@ async fn run() {
         let mut tasks = Vec::new();
         let mut first = true;
         for ctx in bot_contexts.clone() {
+            // One capability selection per dispatcher: this dispatcher only
+            // ever serves `ctx`, so the gate sees the receiving bot's type.
+            let capability = Arc::new(bot_manager.capability_for_bot(ctx.id));
             let mut builder = Dispatcher::builder(ctx.bot.clone(), handler.clone()).dependencies(
                 // `bot_manager` is injected (not captured per
                 // endpoint) so per-seller moderation such as
@@ -1116,7 +1163,8 @@ async fn run() {
                     ctx.clone(),
                     ctx.owner_id,
                     registry.clone(),
-                    bot_manager.clone()
+                    bot_manager.clone(),
+                    capability
                 ],
             );
             if first {

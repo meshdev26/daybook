@@ -24,6 +24,42 @@ pub mod services;
 pub mod util;
 pub mod web;
 
+#[cfg(feature = "automation")]
+pub use handlers::capabilities::automation as automation_capability;
+#[cfg(feature = "file_share")]
+pub use handlers::capabilities::file_share as file_share_capability;
+#[cfg(feature = "movie_bot")]
+pub use handlers::capabilities::movie_bot as movie_bot_capability;
+#[cfg(feature = "reply_bot")]
+pub use handlers::capabilities::reply_bot as reply_bot_capability;
+#[cfg(feature = "service")]
+pub use handlers::capabilities::service as service_capability;
+/// Capability catalog and bot-type dispatcher (multibot foundation, L8).
+///
+/// The catalog itself is always compiled so an uncompiled/unknown bot type
+/// can still produce an explicit refusal. Each per-capability module is
+/// `#[cfg(feature = "...")]`-gated in `handlers::capabilities`; these
+/// crate-root re-exports expose exactly the capability modules compiled into
+/// this build, keeping the feature flags and runtime type catalog in sync.
+#[cfg(feature = "shop_bot")]
+pub use handlers::capabilities::shop_bot as shop_bot_capability;
+#[cfg(feature = "web_app")]
+pub use handlers::capabilities::web_app as web_app_capability;
+
+// Dependency optionalization status (L9 handoff): capability deps are still
+// NON-optional. The blockers are shared modules that are compiled for every
+// feature set and reference the deps unconditionally:
+//   * src/web/**, src/api.rs, src/auth.rs and src/embed.rs compile for every
+//     build and use axum/reqwest/oauth-adjacent crates;
+//   * src/ai/**, src/crypto.rs use reqwest; src/identity/** uses
+//     grammers-*/aes-gcm/pbkdf2 and is wired into web state;
+//   * src/main.rs (binary) builds the shop command/dialogue tree from
+//     handlers::commands / messages / callbacks unconditionally, and needs
+//     teloxide's sqlite-storage feature for every dispatcher.
+// Gating those modules is a separate, larger rung-crossing change; leaving
+// Cargo.toml (L9 territory) untouched keeps `--lib` and the default build
+// green. The feature-gated modules above are now ready for `dep:` mappings.
+
 use teloxide::prelude::*;
 
 /// Revoke every expired subscription: kick the member out of the channel
