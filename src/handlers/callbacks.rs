@@ -24,6 +24,65 @@ pub async fn callback_handler(
         return Ok(());
     };
     let chat_id = msg.chat.id;
+    if let Some(reference) = crate::handlers::moderation::parse_appeal_callback(data) {
+        // Step 4.4 (L8): the only buyer-facing moderation action. The callback
+        // carries the SAME opaque reference the decision audit wrote — no text,
+        // username or content is derived here. Answer the press first, then
+        // verify the reference against a real blocking decision in this
+        // seller/bot scope before accepting a reason.
+        bot.answer_callback_query(q.id.clone()).await?;
+        let presser = q.from.id.0 as i64;
+        let seller_id = crate::handlers::moderation::inbound_seller_scope(&db, bot_ctx.id, presser);
+        let Some(target) =
+            crate::handlers::moderation::find_appeal_target(&db, seller_id, bot_ctx.id, reference)
+        else {
+            crate::handlers::moderation::send_gated_text(
+                &bot,
+                &db,
+                chat_id,
+                seller_id,
+                bot_ctx.id,
+                crate::handlers::moderation::APPEAL_GONE_TEXT,
+            )
+            .await?;
+            return Ok(());
+        };
+        if crate::handlers::moderation::has_appeal_for_ref(
+            &db,
+            seller_id,
+            bot_ctx.id,
+            &target.message_ref,
+        ) {
+            crate::handlers::moderation::send_gated_text(
+                &bot,
+                &db,
+                chat_id,
+                seller_id,
+                bot_ctx.id,
+                crate::handlers::moderation::APPEAL_DUPLICATE_TEXT,
+            )
+            .await?;
+            return Ok(());
+        }
+        dialogue
+            .update(State::AwaitingAppealReason {
+                seller_id: target.seller_id,
+                bot_id: target.bot_id,
+                message_ref: target.message_ref,
+                decision_id: Some(target.decision_id),
+            })
+            .await?;
+        crate::handlers::moderation::send_gated_text(
+            &bot,
+            &db,
+            chat_id,
+            seller_id,
+            bot_ctx.id,
+            crate::handlers::moderation::APPEAL_PROMPT_TEXT,
+        )
+        .await?;
+        return Ok(());
+    }
     if let Some(rest) = data.strip_prefix("aipost:") {
         // format: <action>:<draft_id>
         let mut parts = rest.splitn(2, ':');

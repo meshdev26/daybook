@@ -188,6 +188,71 @@ pub async fn awaiting_ai_post_confirm_handler(
     Ok(())
 }
 
+pub async fn awaiting_appeal_reason_handler(
+    _bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
+    bot_ctx: Arc<BotContext>,
+) -> HandlerResult {
+    let bot = bot_ctx.bot.clone();
+    let db = bot_ctx.db.clone();
+    // State fields are read from the dialogue, NOT bound with dptree::case! —
+    // the latter cannot bind struct-variant fields under teloxide's eager
+    // build() type-check (see AGENT.md decision log). This handler is only
+    // reached from the dedicated pre-gate branch that matches this variant.
+    let Some(State::AwaitingAppealReason {
+        seller_id,
+        bot_id,
+        message_ref,
+        decision_id,
+    }) = dialogue.get().await?
+    else {
+        dialogue.exit().await?;
+        return Ok(());
+    };
+    if let Some(text) = msg.text()
+        && text == "/cancel"
+    {
+        dialogue.exit().await?;
+        crate::handlers::moderation::send_gated_text(
+            &bot,
+            &db,
+            msg.chat.id,
+            seller_id,
+            bot_id,
+            "Cancelled.",
+        )
+        .await?;
+        return Ok(());
+    }
+    let reason_text = msg.text().unwrap_or_default();
+    let outcome = crate::handlers::moderation::submit_appeal(
+        &db,
+        seller_id,
+        Some(bot_id),
+        decision_id,
+        &message_ref,
+        reason_text,
+    );
+    let reply = match outcome {
+        crate::handlers::moderation::AppealOutcome::Created(_) => {
+            dialogue.exit().await?;
+            crate::handlers::moderation::APPEAL_CONFIRM_TEXT
+        }
+        crate::handlers::moderation::AppealOutcome::AlreadyRequested => {
+            dialogue.exit().await?;
+            crate::handlers::moderation::APPEAL_DUPLICATE_TEXT
+        }
+        // Keep the buyer in the wizard so they can retry with a real reason.
+        crate::handlers::moderation::AppealOutcome::Invalid => {
+            crate::handlers::moderation::APPEAL_INVALID_TEXT
+        }
+    };
+    crate::handlers::moderation::send_gated_text(&bot, &db, msg.chat.id, seller_id, bot_id, reply)
+        .await?;
+    Ok(())
+}
+
 pub async fn crypto_invoice_handler(
     _bot: Bot,
     msg: Message,

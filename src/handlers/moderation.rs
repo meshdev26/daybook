@@ -257,18 +257,32 @@ pub fn outbound_seller_scope(db: &Db, bot_id: i64) -> i64 {
     if sellers.len() == 1 { sellers[0] } else { 0 }
 }
 
-/// Inbound hook: resolve, decide, audit, and report. Called from the
-/// dispatcher before command/text routing.
-pub fn evaluate_inbound(
+/// Everything the buyer-facing appeal flow needs from one moderation decision
+/// (inbound or outbound). All fields are content-free: the opaque reference
+/// and the audit row id only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationEvaluation {
+    pub mode: ModerationMode,
+    /// The SAME opaque reference stored on the audit row. It is handed to the
+    /// "Request review" callback verbatim — never re-derived from the text.
+    pub message_ref: String,
+    pub decision_id: Option<i64>,
+}
+
+/// Inbound hook with the opaque reference exposed for the appeal flow. The
+/// decision logic is identical to [`evaluate_inbound`]; this variant just
+/// hands back the reference and audit id that were already computed and
+/// appended, so a later appeal attaches to the exact same decision.
+pub fn evaluate_inbound_detailed(
     db: &Db,
     seller_id: i64,
     bot_id: Option<i64>,
     text: &str,
-) -> ModerationMode {
+) -> ModerationEvaluation {
     let policy = db.resolve_effective_policy(seller_id, bot_id);
     let decision = decide(&policy, text);
     let msg_ref = opaque_message_ref(seller_id, bot_id, text);
-    audit(db, seller_id, bot_id, "inbound", &decision, &msg_ref);
+    let decision_id = audit(db, seller_id, bot_id, "inbound", &decision, &msg_ref);
     if decision.mode == ModerationMode::Hold {
         tracing::warn!(
             seller_id = seller_id,
@@ -279,21 +293,39 @@ pub fn evaluate_inbound(
             "moderation enforcement degraded; inbound message held for review"
         );
     }
-    decision.mode
+    ModerationEvaluation {
+        mode: decision.mode,
+        message_ref: msg_ref,
+        decision_id,
+    }
 }
 
-/// Outbound hook: resolve, decide, audit, and report. Called from the single
-/// `ContentSender::send_text` choke point for both bot and owner identities.
-pub fn evaluate_outbound(
+/// Inbound hook: resolve, decide, audit, and report. Called from the
+/// dispatcher before command/text routing. Kept as the thin mode-only view so
+/// every existing caller and test stays byte-identical.
+pub fn evaluate_inbound(
     db: &Db,
     seller_id: i64,
     bot_id: Option<i64>,
     text: &str,
 ) -> ModerationMode {
+    evaluate_inbound_detailed(db, seller_id, bot_id, text).mode
+}
+
+/// Outbound hook with the opaque reference exposed. Identical decision and
+/// audit to [`evaluate_outbound`]; the returned reference is the one already
+/// written on the outbound audit row, so an outbound hold can offer the same
+/// "Request review" action without deriving a new reference from the text.
+pub fn evaluate_outbound_detailed(
+    db: &Db,
+    seller_id: i64,
+    bot_id: Option<i64>,
+    text: &str,
+) -> ModerationEvaluation {
     let policy = db.resolve_effective_policy(seller_id, bot_id);
     let decision = decide(&policy, text);
     let msg_ref = opaque_message_ref(seller_id, bot_id, text);
-    audit(db, seller_id, bot_id, "outbound", &decision, &msg_ref);
+    let decision_id = audit(db, seller_id, bot_id, "outbound", &decision, &msg_ref);
     if decision.mode == ModerationMode::Hold {
         tracing::warn!(
             seller_id = seller_id,
@@ -304,7 +336,247 @@ pub fn evaluate_outbound(
             "moderation enforcement degraded; outbound content held for review"
         );
     }
-    decision.mode
+    ModerationEvaluation {
+        mode: decision.mode,
+        message_ref: msg_ref,
+        decision_id,
+    }
+}
+
+/// Outbound hook: resolve, decide, audit, and report. Called from the single
+/// `ContentSender::send_text` choke point for both bot and owner identities.
+pub fn evaluate_outbound(
+    db: &Db,
+    seller_id: i64,
+    bot_id: Option<i64>,
+    text: &str,
+) -> ModerationMode {
+    evaluate_outbound_detailed(db, seller_id, bot_id, text).mode
+}
+
+// ---- End-user appeal flow (multibot foundation plan, Step 4.4, L8) ----
+//
+// This is the ONLY buyer-facing moderation surface. It never reads, logs or
+// stores the held message body, a username, or any other content: the inline
+// callback carries the *same opaque reference* that the decision audit wrote,
+// the reason is a short buyer justification, and the appeal row is written
+// through L9's `Db::create_moderation_appeal` with seller/bot scope bound.
+// Nothing here exposes content or presence to a web/console path — L7 owns
+// the seller/owner review queue, which shows status only.
+
+use teloxide::{
+    Bot,
+    payloads::SendMessageSetters,
+    requests::Requester,
+    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup},
+};
+
+use crate::db::MODERATION_MAX_REASON_LEN;
+
+/// Callback prefix for the single "Request review" action.
+pub const APPEAL_CALLBACK_PREFIX: &str = "appeal:";
+
+/// All buyer-facing copy is plain language and discloses no seller, policy,
+/// term, mode, or enforcement internals. One uniform message for every
+/// blocking reason (hide / review / degraded), so the verdict cannot be
+/// inferred from the wording.
+pub const APPEAL_OFFER_TEXT: &str =
+    "That message didn't go through. You can ask us to take another look.";
+pub const APPEAL_PROMPT_TEXT: &str =
+    "Tell us briefly why you think this was a mistake (a sentence is enough).";
+pub const APPEAL_CONFIRM_TEXT: &str = "Sent for review. We'll let you know.";
+pub const APPEAL_DUPLICATE_TEXT: &str = "You've already asked for a review of that message.";
+pub const APPEAL_INVALID_TEXT: &str = "Please write a short reason (or /cancel).";
+pub const APPEAL_GONE_TEXT: &str = "That review request is no longer available.";
+
+/// How many recent, scoped decision rows are searched when verifying that a
+/// callback's opaque reference belongs to a real blocking decision. Bounded on
+/// purpose: verification is a read of the append-only audit, not a dump.
+const APPEAL_DECISION_LOOKBACK: i64 = 100;
+
+/// A verified, content-free appeal target for one blocking decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppealTarget {
+    pub seller_id: i64,
+    pub bot_id: i64,
+    pub message_ref: String,
+    pub decision_id: i64,
+}
+
+/// The opaque reference handed to the buyer's "Request review" button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppealOffer {
+    pub seller_id: i64,
+    pub bot_id: i64,
+    pub message_ref: String,
+    pub decision_id: Option<i64>,
+}
+
+/// Result of a reason submission. `Created` carries the L9 appeal row id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppealOutcome {
+    Created(i64),
+    AlreadyRequested,
+    Invalid,
+}
+
+/// `opaque_message_ref` always produces `m` + 16 lowercase hex digits. Accept
+/// only that shape, so a forged/oversized callback payload cannot reach the
+/// audit lookup or the appeal writer.
+fn is_opaque_ref(reference: &str) -> bool {
+    reference.len() == 17
+        && reference.starts_with('m')
+        && reference[1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Encode the audit's opaque reference into the single callback action.
+pub fn appeal_callback_data(reference: &str) -> Option<String> {
+    is_opaque_ref(reference).then(|| format!("{APPEAL_CALLBACK_PREFIX}{reference}"))
+}
+
+/// Validate + decode a callback payload. The returned string is the exact
+/// opaque reference from the original decision audit.
+pub fn parse_appeal_callback(data: &str) -> Option<&str> {
+    let reference = data.strip_prefix(APPEAL_CALLBACK_PREFIX)?;
+    is_opaque_ref(reference).then_some(reference)
+}
+
+/// Normalize the buyer's short reason: NUL-filtered, capped at the L9 limit,
+/// trimmed. Empty after cleaning is rejected so an appeal always has a reason.
+pub fn normalize_appeal_reason(reason: &str) -> Option<String> {
+    let cleaned: String = reason
+        .chars()
+        .filter(|c| *c != '\0')
+        .take(MODERATION_MAX_REASON_LEN)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// True for the audit action codes that held content (inbound or outbound).
+fn is_blocking_action(action: &str) -> bool {
+    matches!(
+        action,
+        "inbound_hide"
+            | "inbound_review"
+            | "inbound_hold"
+            | "outbound_hide"
+            | "outbound_review"
+            | "outbound_hold"
+    )
+}
+
+/// Verify a callback reference against a real, scoped, blocking decision.
+/// Both `seller_id` and `bot_id` are bound, so a reference from another tenant
+/// or another bot can never be turned into an appeal here. A `pass`/`warn`
+/// decision has no appeal affordance and is also rejected.
+pub fn find_appeal_target(
+    db: &Db,
+    seller_id: i64,
+    bot_id: i64,
+    reference: &str,
+) -> Option<AppealTarget> {
+    if !is_opaque_ref(reference) {
+        return None;
+    }
+    db.list_moderation_decisions_for_bot(seller_id, bot_id, APPEAL_DECISION_LOOKBACK)
+        .into_iter()
+        .find(|d| d.message_ref.as_deref() == Some(reference) && is_blocking_action(&d.action))
+        .map(|d| AppealTarget {
+            seller_id,
+            bot_id,
+            message_ref: reference.to_owned(),
+            decision_id: d.id,
+        })
+}
+
+/// Idempotency check: any prior appeal for this opaque ref in this exact scope
+/// (any status) blocks a second request. No new DB method needed.
+pub fn has_appeal_for_ref(db: &Db, seller_id: i64, bot_id: i64, reference: &str) -> bool {
+    db.list_moderation_appeals_for_bot(seller_id, bot_id, None)
+        .iter()
+        .any(|a| a.message_ref == reference)
+}
+
+/// Write one appeal through L9's method, deduplicated by opaque reference.
+/// Only the scope, the audit's decision id, the opaque ref and the short
+/// reason are passed — there is no body, username, or extra field to store.
+pub fn submit_appeal(
+    db: &Db,
+    seller_id: i64,
+    bot_id: Option<i64>,
+    decision_id: Option<i64>,
+    reference: &str,
+    reason: &str,
+) -> AppealOutcome {
+    if !is_opaque_ref(reference) {
+        return AppealOutcome::Invalid;
+    }
+    let Some(reason) = normalize_appeal_reason(reason) else {
+        return AppealOutcome::Invalid;
+    };
+    let already = match bot_id {
+        Some(b) => has_appeal_for_ref(db, seller_id, b, reference),
+        None => db
+            .list_moderation_appeals(seller_id, None)
+            .iter()
+            .any(|a| a.message_ref == reference),
+    };
+    if already {
+        return AppealOutcome::AlreadyRequested;
+    }
+    match db.create_moderation_appeal(seller_id, bot_id, decision_id, reference, Some(&reason)) {
+        Some(id) => AppealOutcome::Created(id),
+        None => AppealOutcome::Invalid,
+    }
+}
+
+/// The single inline action offered on a held buyer message.
+pub fn appeal_keyboard(reference: &str) -> Option<InlineKeyboardMarkup> {
+    Some(InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Request review", appeal_callback_data(reference)?),
+    ]]))
+}
+
+/// Send one static, content-free line through the central outbound gate. The
+/// gate keeps the L10 "every content-bearing send is gated" invariant; if
+/// enforcement is degraded or the line is held, the notice is simply omitted
+/// (fail closed) — never the held body.
+pub async fn send_gated_text(
+    bot: &Bot,
+    db: &Db,
+    chat_id: ChatId,
+    seller_id: i64,
+    bot_id: i64,
+    text: &str,
+) -> Result<(), teloxide::RequestError> {
+    if gate_outbound(db, seller_id, Some(bot_id), text).is_err() {
+        return Ok(());
+    }
+    bot.send_message(chat_id, text).await?;
+    Ok(())
+}
+
+/// Send the "Request review" notice for a held buyer message, carrying the
+/// original audit reference in exactly one callback button.
+pub async fn send_appeal_offer(
+    bot: &Bot,
+    db: &Db,
+    chat_id: ChatId,
+    offer: &AppealOffer,
+) -> Result<(), teloxide::RequestError> {
+    let Some(keyboard) = appeal_keyboard(&offer.message_ref) else {
+        return Ok(());
+    };
+    if gate_outbound(db, offer.seller_id, Some(offer.bot_id), APPEAL_OFFER_TEXT).is_err() {
+        return Ok(());
+    }
+    bot.send_message(chat_id, APPEAL_OFFER_TEXT)
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -531,5 +803,225 @@ mod tests {
         }
         let db = Db::new(path.to_str().unwrap()).unwrap();
         assert!(gate_outbound(&db, 1, None, "anything clean").is_err());
+    }
+
+    // ---- End-user appeal flow (Step 4.4) ----
+
+    /// A decision is evaluated with a blocked term, then appealed. Returns the
+    /// temp dir (kept alive), db, bot id and the EXACT opaque audit reference.
+    fn appeal_fixture(name: &str, seller: i64) -> (tempfile::TempDir, Db, i64, String) {
+        let (dir, db) = test_db(name);
+        let bot = db.create_bot("appealbot", seller, None, "");
+        assert!(db.add_blocked_word(seller, "blockedterm", "hide", true));
+        let evaluation =
+            evaluate_inbound_detailed(&db, seller, Some(bot), "please send blockedterm now");
+        assert_eq!(evaluation.mode, ModerationMode::Hide);
+        (dir, db, bot, evaluation.message_ref)
+    }
+
+    #[test]
+    fn appeal_created_with_opaque_ref_reason_and_pending_status() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_create.db", 21);
+        let target = find_appeal_target(&db, 21, bot, &reference).unwrap();
+        assert_eq!(target.seller_id, 21);
+        assert_eq!(target.bot_id, bot);
+        assert_eq!(target.message_ref, reference);
+        let created = submit_appeal(
+            &db,
+            21,
+            Some(bot),
+            Some(target.decision_id),
+            &reference,
+            "I think this was a mistake",
+        );
+        let id = match created {
+            AppealOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let row = db.get_moderation_appeal(21, id).unwrap();
+        assert_eq!(row.seller_id, 21);
+        assert_eq!(row.bot_id, Some(bot));
+        assert_eq!(row.decision_id, Some(target.decision_id));
+        assert_eq!(row.message_ref, reference);
+        assert_eq!(row.reason.as_deref(), Some("I think this was a mistake"));
+        assert_eq!(row.status, "pending");
+    }
+
+    #[test]
+    fn appeal_and_target_are_scoped_by_seller_and_bot() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_scope.db", 31);
+        let other_bot = db.create_bot("other", 31, None, "");
+        assert!(matches!(
+            submit_appeal(&db, 31, Some(bot), None, &reference, "reason"),
+            AppealOutcome::Created(_)
+        ));
+        // A different seller sees no appeal and cannot verify this ref.
+        assert!(db.list_moderation_appeals(32, None).is_empty());
+        assert!(find_appeal_target(&db, 32, bot, &reference).is_none());
+        // A different bot under the SAME seller has a disjoint queue/target.
+        assert!(
+            db.list_moderation_appeals_for_bot(31, other_bot, None)
+                .is_empty()
+        );
+        assert!(find_appeal_target(&db, 31, other_bot, &reference).is_none());
+    }
+
+    #[test]
+    fn duplicate_appeal_for_same_ref_is_rejected() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_dup.db", 41);
+        assert!(matches!(
+            submit_appeal(&db, 41, Some(bot), None, &reference, "first reason"),
+            AppealOutcome::Created(_)
+        ));
+        assert_eq!(
+            submit_appeal(&db, 41, Some(bot), None, &reference, "second reason"),
+            AppealOutcome::AlreadyRequested
+        );
+        assert_eq!(db.list_moderation_appeals_for_bot(41, bot, None).len(), 1);
+        assert_eq!(
+            db.list_moderation_appeals(41, None)[0].reason.as_deref(),
+            Some("first reason")
+        );
+    }
+
+    #[test]
+    fn appeal_stores_no_message_body_or_username() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_body.db", 51);
+        // "blockedterm" is the held body; it must never appear in the appeal.
+        assert!(matches!(
+            submit_appeal(&db, 51, Some(bot), None, &reference, "please reconsider"),
+            AppealOutcome::Created(_)
+        ));
+        let row = &db.list_moderation_appeals_for_bot(51, bot, None)[0];
+        assert_eq!(
+            row.message_ref,
+            opaque_message_ref(51, Some(bot), "please send blockedterm now")
+        );
+        assert!(!row.message_ref.contains("blockedterm"));
+        assert!(!row.message_ref.contains("please"));
+        assert_eq!(row.reason.as_deref(), Some("please reconsider"));
+        // The appeal record has no body/username field: the only free text is
+        // the buyer's short justification above. No user id is a parameter.
+    }
+
+    #[test]
+    fn appeal_reason_is_capped_and_nul_filtered() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_reason.db", 61);
+        let mut reason = String::from("abc\0def");
+        reason.push_str(&"x".repeat(MODERATION_MAX_REASON_LEN + 50));
+        assert!(matches!(
+            submit_appeal(&db, 61, Some(bot), None, &reference, &reason),
+            AppealOutcome::Created(_)
+        ));
+        let stored = db.list_moderation_appeals_for_bot(61, bot, None)[0]
+            .reason
+            .clone()
+            .unwrap();
+        assert!(!stored.contains('\0'));
+        assert!(stored.chars().count() <= MODERATION_MAX_REASON_LEN);
+        assert!(stored.starts_with("abcdef"));
+        // NUL-only (or empty) reasons are refused.
+        assert_eq!(
+            submit_appeal(&db, 61, Some(bot), None, &reference, "\0\0"),
+            AppealOutcome::Invalid
+        );
+    }
+
+    #[test]
+    fn appeal_target_requires_a_real_blocking_decision() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_target.db", 71);
+        assert!(find_appeal_target(&db, 71, bot, &reference).is_some());
+        // A well-shaped but unissued reference, and malformed data, are refused.
+        assert!(find_appeal_target(&db, 71, bot, "m0000000000000000").is_none());
+        assert!(find_appeal_target(&db, 71, bot, "not-an-opaque-ref").is_none());
+        assert_eq!(
+            submit_appeal(&db, 71, Some(bot), None, "m0000000000000000", "r"),
+            AppealOutcome::Invalid
+        );
+        // A pass decision never gets an appeal affordance.
+        let passing = evaluate_inbound_detailed(&db, 71, Some(bot), "something clean");
+        assert_eq!(passing.mode, ModerationMode::Pass);
+        assert!(find_appeal_target(&db, 71, bot, &passing.message_ref).is_none());
+    }
+
+    /// An outbound hold is audited with an opaque ref that can feed the SAME
+    /// appeal flow (via `find_appeal_target` → `submit_appeal`) without ever
+    /// re-deriving a reference from the held text. No floor write occurs.
+    #[test]
+    fn outbound_hold_ref_can_feed_the_appeal_flow() {
+        let (_dir, db, bot, _inbound_ref) = appeal_fixture("appeal_outbound.db", 91);
+        let before = db.list_moderation_global_floor().len();
+        let outbound =
+            evaluate_outbound_detailed(&db, 91, Some(bot), "a blockedterm outbound draft");
+        assert_eq!(outbound.mode, ModerationMode::Hide);
+        assert!(outbound.mode.blocks_outbound_send());
+        // The outbound decision's audit ref is a valid appeal target.
+        let target = find_appeal_target(&db, 91, bot, &outbound.message_ref).unwrap();
+        assert_eq!(target.decision_id, outbound.decision_id.unwrap());
+        let row_id = match submit_appeal(
+            &db,
+            91,
+            Some(bot),
+            Some(target.decision_id),
+            &outbound.message_ref,
+            "please review",
+        ) {
+            AppealOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let row = db.get_moderation_appeal(91, row_id).unwrap();
+        assert_eq!(row.message_ref, outbound.message_ref);
+        assert!(!row.message_ref.contains("blockedterm"));
+        assert_eq!(row.status, "pending");
+        assert_eq!(db.list_moderation_global_floor().len(), before);
+    }
+
+    #[test]
+    fn appeal_callback_carries_only_the_opaque_ref() {
+        let reference = opaque_message_ref(7, Some(3), "body text");
+        let data = appeal_callback_data(&reference).unwrap();
+        assert_eq!(data, format!("appeal:{reference}"));
+        assert_eq!(parse_appeal_callback(&data), Some(reference.as_str()));
+        assert_eq!(parse_appeal_callback("menu:shop"), None);
+        assert_eq!(parse_appeal_callback("appeal:m000000000000000Z"), None);
+        assert_eq!(
+            parse_appeal_callback(&format!("appeal:{}", "x".repeat(300))),
+            None
+        );
+        assert!(appeal_keyboard(&reference).is_some());
+        assert!(appeal_keyboard("bad").is_none());
+        assert!(!data.contains("body"));
+    }
+
+    #[test]
+    fn appeal_flow_never_writes_floor_and_degraded_path_still_holds() {
+        let (_dir, db, bot, reference) = appeal_fixture("appeal_floor.db", 81);
+        let before = db.list_moderation_global_floor().len();
+        assert!(matches!(
+            submit_appeal(&db, 81, Some(bot), None, &reference, "reason"),
+            AppealOutcome::Created(_)
+        ));
+        assert_eq!(db.list_moderation_global_floor().len(), before);
+
+        // Degraded enforcement still holds the message; the audited reference
+        // is opaque and no floor term was added by the appeal path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appeal_degraded.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE idx_mod_blocked_seller(x INTEGER);")
+                .unwrap();
+        }
+        let degraded = Db::new(path.to_str().unwrap()).unwrap();
+        let evaluation = evaluate_inbound_detailed(&degraded, 1, None, "anything clean");
+        assert_eq!(evaluation.mode, ModerationMode::Hold);
+        assert!(evaluation.mode.blocks_inbound_routing());
+        let rows = degraded.list_moderation_decisions(1, 10);
+        assert!(!rows.is_empty());
+        assert_eq!(
+            rows[0].message_ref.as_deref(),
+            Some(evaluation.message_ref.as_str())
+        );
+        assert!(!rows[0].message_ref.as_ref().unwrap().contains("anything"));
     }
 }
