@@ -89,6 +89,19 @@ pages scoped to a single bot; sellers and admins see a pinned label instead
 Adding or retokenizing a bot needs a restart. Full guide:
 [docs/MULTI_BOT.md](docs/MULTI_BOT.md).
 
+### Product types & capability builds
+
+Bots carry a product type (`shop_bot` by default); the console Product / Type
+selector lets the owner pick a product while sellers and admins stay pinned.
+Capabilities are chosen at build time with Cargo features: `shop_bot`,
+`moderation` (both default), `movie_bot`, `reply_bot`, `file_share`, `web_app`,
+`service`, and `automation`. A movie-only install builds with
+`cargo build --no-default-features --features movie_bot`; changing capabilities
+means rebuilding and redeploying. Message moderation uses an owner floor,
+seller "Blocked words", and per-bot overrides — set at least one floor term
+before enabling it. Full guide:
+[docs/MULTIBOT_FOUNDATION.md](docs/MULTIBOT_FOUNDATION.md).
+
 ## Build & run
 ```bash
 cargo build --release
@@ -171,6 +184,7 @@ See `docs/` and root MD files:
 - `docs/COMMANDS.md` — command reference.
 - `docs/SETUP.md` — setup guide.
 - `docs/MULTI_BOT.md` — running several bot tokens in one instance.
+- `docs/MULTIBOT_FOUNDATION.md` — product types, capability builds, and moderation.
 - `docs/ARCHITECTURE.md` — code structure.
 - `docs/CRYPTO_PAY.md` — Crypto Pay integration.
 - `docs/SECURITY.md` — security model.

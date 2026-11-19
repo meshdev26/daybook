@@ -84,6 +84,12 @@ COPY --from=builder /app/target/release/telegram-agent /usr/local/bin/
 CMD ["telegram-agent"]
 ```
 
+For a narrow install, build with Cargo features (e.g. `cargo build --release
+--no-default-features --features movie_bot`); the default keeps `shop_bot` and
+`moderation`. If moderation ships, set at least one owner floor term before
+enabling enforcement — otherwise enforcement is degraded and matching messages
+are held for review. See [docs/MULTIBOT_FOUNDATION.md](MULTIBOT_FOUNDATION.md).
+
 ## Backups
 - Back up `data/agent.db` regularly.
 - Store `.env` securely.
