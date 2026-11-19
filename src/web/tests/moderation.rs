@@ -176,8 +176,11 @@ async fn blocked_words_roles_and_forged_seller_ids() {
 async fn blocked_words_scope_is_cross_tenant_isolated() {
     let (state, _dir) = make_state().await;
     let app = router(state.clone());
-    let a = seller_session(&state, 42).await;
-    let b = seller_session(&state, 43).await;
+    // Two distinct accounts in one state: web_accounts.username is UNIQUE,
+    // so each tenant needs its own name (the generic seller_session helper
+    // always writes "seller" and can only be called once per state).
+    let a = seller_session_named(&state, 42, "seller42").await;
+    let b = seller_session_named(&state, 43, "seller43").await;
 
     let resp = app
         .clone()

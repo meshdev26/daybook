@@ -117,14 +117,22 @@ pub async fn owner_session(state: &WebState) -> String {
 
 #[tracing::instrument(skip_all)]
 pub async fn seller_session(state: &WebState, seller_id: i64) -> String {
+    seller_session_named(state, seller_id, "seller").await
+}
+
+/// Like `seller_session`, but with an explicit username. `web_accounts.username`
+/// is UNIQUE, so cross-tenant tests that need two sellers in the same state
+/// must give each account a distinct name.
+#[tracing::instrument(skip_all)]
+pub async fn seller_session_named(state: &WebState, seller_id: i64, username: &str) -> String {
     state
         .db
-        .create_web_account("seller", "secret", "seller", Some(seller_id))
+        .create_web_account(username, "secret", "seller", Some(seller_id))
         .await
         .unwrap();
     let (acc_id, _u, _h, _r, _s) = state
         .db
-        .get_web_account_by_username("seller")
+        .get_web_account_by_username(username)
         .expect("seller account exists");
     state
         .db
