@@ -541,6 +541,9 @@ async fn run() {
                                             &kind,
                                             &pname,
                                             delivery.as_deref(),
+                                            &db_bg,
+                                            inv_seller,
+                                            Some(this_id),
                                         )
                                         .await
                                         {
@@ -651,45 +654,68 @@ async fn run() {
                             .ok()
                             .map(|l| l.invite_link);
                         match link {
-                        Some(l) => {
-                            match bot_bg
-                                .send_message(
-                                    teloxide::types::ChatId(target_user),
-                                    format!(
-                                        "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
-                                        l, sub_id
-                                    ),
+                            Some(l) => {
+                                let grant_text = format!(
+                                    "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
+                                    l, sub_id
+                                );
+                                // L10 outbound gate before this raw-Bot DM (the
+                                // grant itself is already durable and finalizes
+                                // below; only the notice is skipped while held).
+                                if crate::handlers::moderation::gate_outbound(
+                                    &db_bg,
+                                    seller_id,
+                                    Some(this_id),
+                                    &grant_text,
                                 )
-                                .await
-                            {
-                                Err(e) => tracing::warn!("failed to send grant message: {}", e),
-                                Ok(_) => metrics::bot_sent(),
+                                .is_ok()
+                                {
+                                    match bot_bg
+                                        .send_message(
+                                            teloxide::types::ChatId(target_user),
+                                            grant_text,
+                                        )
+                                        .await
+                                    {
+                                        Err(e) => {
+                                            tracing::warn!("failed to send grant message: {}", e)
+                                        }
+                                        Ok(_) => metrics::bot_sent(),
+                                    }
+                                }
+                            }
+                            None => {
+                                // Money settled and the subscription row exists,
+                                // but no invite link could be created: still
+                                // finalize (the grant is durable), then tell the
+                                // buyer honestly — never leave them waiting on a
+                                // link that will not come. DM failures are logged,
+                                // never propagated: the sweeper/granter must not
+                                // die on a send error.
+                                let notice = "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.";
+                                // L10 outbound gate before this raw-Bot DM.
+                                if crate::handlers::moderation::gate_outbound(
+                                    &db_bg,
+                                    seller_id,
+                                    Some(this_id),
+                                    notice,
+                                )
+                                .is_ok()
+                                {
+                                    match bot_bg
+                                        .send_message(teloxide::types::ChatId(target_user), notice)
+                                        .await
+                                    {
+                                        Err(e) => tracing::warn!(
+                                            "invoice {}: granted without invite link and buyer notice failed: {}",
+                                            inv_id,
+                                            e
+                                        ),
+                                        Ok(_) => metrics::bot_sent(),
+                                    }
+                                }
                             }
                         }
-                        None => {
-                            // Money settled and the subscription row exists,
-                            // but no invite link could be created: still
-                            // finalize (the grant is durable), then tell the
-                            // buyer honestly — never leave them waiting on a
-                            // link that will not come. DM failures are logged,
-                            // never propagated: the sweeper/granter must not
-                            // die on a send error.
-                            match bot_bg
-                                .send_message(
-                                    teloxide::types::ChatId(target_user),
-                                    "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.",
-                                )
-                                .await
-                            {
-                                Err(e) => tracing::warn!(
-                                    "invoice {}: granted without invite link and buyer notice failed: {}",
-                                    inv_id,
-                                    e
-                                ),
-                                Ok(_) => metrics::bot_sent(),
-                            }
-                        }
-                    }
                         // (f) Terminal: verified paid + granted.
                         db_bg.finalize_invoice_paid(&inv_id);
                     }
@@ -726,6 +752,21 @@ async fn run() {
                     // a channel owned by another bot.
                     let bot_ctx = bm_bg.for_channel(&chat_id);
                     let bot = bot_ctx.bot.clone();
+                    // L10 outbound gate before this raw-Bot scheduled send.
+                    // Seller scope is the row's own seller (owner-scheduled
+                    // posts carry 0 → global floor). A held post stays due so
+                    // a later policy change can release it; the gate already
+                    // wrote an opaque audit row and a scoped warn log.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        seller_id,
+                        Some(bot_ctx.id),
+                        &text,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
                     match bot
                         .send_message(util::to_chat_id(&chat_id), text.clone())
                         .await
@@ -789,23 +830,34 @@ async fn run() {
                 tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
                 let expired = expire_subscriptions(&bm_bg, &db_bg).await;
                 for (_sub_id, seller_id, uid, channel) in &expired {
-                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
-                    match bot
-                        .send_message(
-                            teloxide::types::ChatId(*uid),
-                            format!(
-                                "Your access to {channel} has expired. To renew, use /plans or contact the seller."
-                            ),
-                        )
-                        .await
+                    let bot_ctx = bm_bg.for_seller(*seller_id);
+                    let bot = bot_ctx.bot.clone();
+                    let notice = format!(
+                        "Your access to {channel} has expired. To renew, use /plans or contact the seller."
+                    );
+                    // L10 outbound gate before this raw-Bot DM. The expiry
+                    // transition is already durable; only the notice is
+                    // skipped while held.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        *seller_id,
+                        Some(bot_ctx.id),
+                        &notice,
+                    )
+                    .is_ok()
                     {
-                        Ok(_) => metrics::bot_sent(),
-                        Err(e) => tracing::warn!(
-                            "expiry sweeper: failed to DM user {} about expired access to {}: {}",
-                            uid,
-                            channel,
-                            e
-                        ),
+                        match bot
+                            .send_message(teloxide::types::ChatId(*uid), notice)
+                            .await
+                        {
+                            Ok(_) => metrics::bot_sent(),
+                            Err(e) => tracing::warn!(
+                                "expiry sweeper: failed to DM user {} about expired access to {}: {}",
+                                uid,
+                                channel,
+                                e
+                            ),
+                        }
                     }
                 }
                 if !expired.is_empty() {
@@ -830,23 +882,34 @@ async fn run() {
                 tokio::time::sleep(Duration::from_secs(5 * 60)).await;
                 let expired = db_bg.expire_held_bookings();
                 for (booking_id, buyer, service, seller_id) in &expired {
-                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
-                    match bot
-                        .send_message(
-                            teloxide::types::ChatId(*buyer),
-                            format!(
-                                "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
-                            ),
-                        )
-                        .await
+                    let bot_ctx = bm_bg.for_seller(*seller_id);
+                    let bot = bot_ctx.bot.clone();
+                    let notice = format!(
+                        "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
+                    );
+                    // L10 outbound gate before this raw-Bot DM. The hold
+                    // release is already durable; only the notice is skipped
+                    // while held.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        *seller_id,
+                        Some(bot_ctx.id),
+                        &notice,
+                    )
+                    .is_ok()
                     {
-                        Ok(_) => metrics::bot_sent(),
-                        Err(e) => tracing::warn!(
-                            "held-slot sweeper: failed to DM buyer {} about expired booking #{}: {}",
-                            buyer,
-                            booking_id,
-                            e
-                        ),
+                        match bot
+                            .send_message(teloxide::types::ChatId(*buyer), notice)
+                            .await
+                        {
+                            Ok(_) => metrics::bot_sent(),
+                            Err(e) => tracing::warn!(
+                                "held-slot sweeper: failed to DM buyer {} about expired booking #{}: {}",
+                                buyer,
+                                booking_id,
+                                e
+                            ),
+                        }
                     }
                 }
                 if !expired.is_empty() {

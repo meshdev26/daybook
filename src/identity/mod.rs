@@ -135,14 +135,30 @@ impl UserContext {
         }
     }
 
+    /// The L10 outbound content gate for the owner identity. Both send forms
+    /// (`send_text` and `send_text_to`) route through this single adapter: the
+    /// policy decision itself lives in the central
+    /// [`crate::handlers::moderation::gate_outbound`] helper. The owner
+    /// personal account has no bot/session seller, so it applies the GLOBAL
+    /// FLOOR ONLY (`seller_id = 0`, `bot_id = None`) — no seller rule or
+    /// per-bot override can be attributed to an owner-identity send. Fails
+    /// closed on degraded enforcement.
+    fn check_outbound(&self, text: &str) -> Result<(), SendError> {
+        crate::handlers::moderation::gate_outbound(&self.db, 0, None, text)
+            .map_err(|hold| SendError::Transport(hold.to_string()))
+    }
+
     /// Send to a channel handle (`@name` or a numeric id as a string). The
     /// [`ContentSender`] trait fixes the numeric chat-id form for the uniform
     /// posting surface; this inherent method carries the DB channel-handle
     /// form (the canonical chat identifiers of this feature are the
     /// configured channel strings — the same resolution the read path uses).
-    /// Same gates, same actor caps.
+    /// Same gates, same actor caps — including the outbound content gate,
+    /// which is why MCP `publish_as_user` (the caller of this form) can no
+    /// longer bypass the documented floor.
     pub async fn send_text_to(&self, channel: &str, text: &str) -> Result<SentMessage, SendError> {
         self.check_writes_enabled()?;
+        self.check_outbound(text)?;
         self.handle.send_text_to(channel, text).await
     }
 }
@@ -154,20 +170,10 @@ impl ContentSender for UserContext {
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<SentMessage, SendError> {
         self.check_writes_enabled()?;
-        // Outbound moderation gate (multibot foundation Step 4.2), same single
-        // ContentSender choke point as the bot identity. The owner personal
-        // account has no bot/session seller, so per the documented decision in
-        // `handlers::moderation` this applies the GLOBAL FLOOR ONLY
-        // (seller_id 0, no bot override): no seller rule or per-bot override
-        // can be attributed to an owner-identity send. Fails closed on
-        // degraded enforcement. The writes gate above still fires first, so
-        // the L10 "Enable posting" behavior is unchanged.
-        let mode = crate::handlers::moderation::evaluate_outbound(&self.db, 0, None, text);
-        if mode.blocks_outbound_send() {
-            return Err(SendError::Transport(
-                crate::handlers::moderation::OUTBOUND_HOLD_ERROR.to_string(),
-            ));
-        }
+        // Same single owner-identity outbound gate as `send_text_to` (global
+        // floor only, seller 0 / no bot). The writes gate still fires first,
+        // so the L10 "Enable posting" behavior is unchanged.
+        self.check_outbound(text)?;
         self.handle.send_text(chat_id, text).await
     }
 }
@@ -284,6 +290,34 @@ mod tests {
         };
         let err = no_writes.send_text(42, "forbidden").await.unwrap_err();
         assert!(matches!(err, SendError::WritesDisabled), "got {err:?}");
+    }
+
+    /// Regression: the CHANNEL-HANDLE send form (`send_text_to`) — the form
+    /// MCP `publish_as_user` uses — is a NON-`ContentSender` path that must be
+    /// held by a matching global-floor term BEFORE the actor is consulted.
+    #[tokio::test]
+    async fn user_context_send_text_to_holds_matching_floor_term() {
+        let (_dir, db) = test_db();
+        assert!(db.add_blocked_word(0, "forbidden", "hide", true));
+        db.set_config("identity_writes_enabled", "1");
+        let ctx = UserContext {
+            handle: IdentityHandle::unconnected(),
+            db: db.clone(),
+        };
+        let err = ctx
+            .send_text_to("@chan", "a forbidden draft")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Transport(m) if m.contains("moderation_hold")),
+            "publish_as_user path must be held, got {err:?}"
+        );
+        assert!(db.remove_blocked_word(0, "forbidden"));
+        let err = ctx.send_text_to("@chan", "clean draft").await.unwrap_err();
+        assert!(
+            matches!(err, SendError::NotAuthorized),
+            "clean text must reach the actor, got {err:?}"
+        );
     }
 
     /// `Sender::User` (the resolution `BotManager::for_channel_sender`

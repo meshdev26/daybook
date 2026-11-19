@@ -85,17 +85,8 @@ impl ContentSender for BotContext {
         // any transport work. The gate only READS policy (no floor writes) and
         // fails closed to a hold when enforcement is degraded.
         let seller_id = crate::handlers::moderation::outbound_seller_scope(&self.db, self.id);
-        let mode = crate::handlers::moderation::evaluate_outbound(
-            &self.db,
-            seller_id,
-            Some(self.id),
-            text,
-        );
-        if mode.blocks_outbound_send() {
-            return Err(SendError::Transport(
-                crate::handlers::moderation::OUTBOUND_HOLD_ERROR.to_string(),
-            ));
-        }
+        crate::handlers::moderation::gate_outbound(&self.db, seller_id, Some(self.id), text)
+            .map_err(|hold| SendError::Transport(hold.to_string()))?;
         match self
             .bot
             .send_message(teloxide::types::ChatId(chat_id), text)

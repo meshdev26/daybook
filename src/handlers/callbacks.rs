@@ -76,6 +76,19 @@ pub async fn callback_handler(
                     return Ok(());
                 }
                 bot.answer_callback_query(q.id.clone()).await?;
+                // L10 outbound gate BEFORE this raw-Bot publish. The draft's
+                // seller id is the authoritative scope (the presser may be an
+                // admin acting on someone else's draft).
+                if crate::handlers::moderation::gate_outbound(
+                    &db,
+                    seller_id,
+                    Some(bot_ctx.id),
+                    &content,
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
                 match bot
                     .send_message(util::to_chat_id(&channel), content.clone())
                     .await
@@ -158,6 +171,13 @@ pub async fn callback_handler(
         _ => "Unknown action.",
     };
     bot.answer_callback_query(q.id.clone()).await?;
+    // L10 outbound gate on this raw-Bot send path (static menu copy, but
+    // listed as a content-bearing surface). Scope to the presser so seller
+    // rules apply; the gate already audited with an opaque reference.
+    let presser = q.from.id.0 as i64;
+    if crate::handlers::moderation::gate_outbound(&db, presser, Some(bot_ctx.id), text).is_err() {
+        return Ok(());
+    }
     bot.send_message(chat_id, text).await?;
     Ok(())
 }

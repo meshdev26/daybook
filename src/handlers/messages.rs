@@ -117,8 +117,16 @@ pub async fn awaiting_ai_post_edit_handler(
             .update(State::AwaitingAiPostConfirm { draft_id })
             .await?;
         if let Some(draft) = db.get_ai_post_draft(draft_id) {
-            let (_id, _seller, channel, _template, content, _status, _c, _u, _m) = draft;
+            let (_id, seller, channel, _template, content, _status, _c, _u, _m) = draft;
             let preview = format!("Draft #{} (channel {}):\n\n{}", draft_id, channel, content);
+            // L10 outbound gate: the preview carries stored draft content, so
+            // it is content-bearing. Gate BEFORE the raw-Bot send, scoped to
+            // the draft's seller.
+            if crate::handlers::moderation::gate_outbound(&db, seller, Some(bot_ctx.id), &preview)
+                .is_err()
+            {
+                return Ok(());
+            }
             use teloxide::types::InlineKeyboardButton;
             use teloxide::types::InlineKeyboardMarkup;
             let kb = InlineKeyboardMarkup::new(vec![vec![
@@ -156,6 +164,20 @@ pub async fn awaiting_ai_post_confirm_handler(
         let _ = db.delete_ai_post_draft(draft_id);
         dialogue.exit().await?;
         bot.send_message(msg.chat.id, "Cancelled.").await?;
+        return Ok(());
+    }
+    // L10 outbound gate on this raw-Bot send path (static copy, but listed
+    // as a content-bearing surface). Scope to the acting sender so seller
+    // rules apply; the gate already audited with an opaque reference.
+    let sender = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if crate::handlers::moderation::gate_outbound(
+        &db,
+        sender,
+        Some(bot_ctx.id),
+        "Use the Publish/Edit/Cancel buttons (or /cancel).",
+    )
+    .is_err()
+    {
         return Ok(());
     }
     bot.send_message(

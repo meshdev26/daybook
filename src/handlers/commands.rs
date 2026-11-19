@@ -485,6 +485,18 @@ pub async fn cmd_handler(
                         return Ok(());
                     }
                 };
+                // L10 outbound content gate BEFORE transport. This is a raw
+                // `Bot::send_message` path (non-ContentSender); the acting
+                // seller is the best available scope, so seller rules apply
+                // alongside the non-overridable global floor.
+                if crate::handlers::moderation::gate_outbound(&db, user_id, Some(bot_ctx.id), &text)
+                    .is_err()
+                {
+                    // Held: no transport, no log_post. The gate already wrote
+                    // an opaque audit row and a scoped warn log; no body or
+                    // username is logged here.
+                    return Ok(());
+                }
                 match bot.send_message(util::to_chat_id(&ch), text.clone()).await {
                     Ok(sent) => {
                         crate::metrics::bot_sent();
@@ -2453,6 +2465,9 @@ pub async fn cmd_handler(
                                             &kind,
                                             &pname,
                                             delivery.as_deref(),
+                                            &db,
+                                            inv_seller,
+                                            Some(bot_ctx.id),
                                         )
                                         .await
                                         {
@@ -2605,6 +2620,9 @@ pub async fn cmd_handler(
                                                 &kind,
                                                 &pname,
                                                 delivery.as_deref(),
+                                                &db,
+                                                pseller,
+                                                Some(bot_ctx.id),
                                             )
                                             .await
                                             {
@@ -3365,6 +3383,18 @@ pub async fn cmd_handler(
                     bot.send_message(chat_id, "No users to broadcast to (no customers found).")
                         .await?;
                 } else {
+                    // Outbound gate before the raw-Bot broadcast fan-out
+                    // (non-ContentSender path, same shared loop as MCP).
+                    if crate::handlers::moderation::gate_outbound(
+                        &db,
+                        user_id,
+                        Some(bot_ctx.id),
+                        &text,
+                    )
+                    .is_err()
+                    {
+                        return Ok(());
+                    }
                     // Send loop shared with the MCP broadcast tool (crate::broadcast_to_users).
                     let sent = crate::broadcast_to_users(&bot, &users, &text).await;
                     bot.send_message(chat_id, format!("Broadcast sent to {} users.", sent))

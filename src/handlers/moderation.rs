@@ -46,6 +46,7 @@
 //! the shared/primary bot where the seller cannot be derived from the update.
 
 use std::collections::hash_map::DefaultHasher;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::db::{Db, EffectiveModerationPolicy, moderation_mode_severity};
@@ -55,6 +56,44 @@ use crate::db::{Db, EffectiveModerationPolicy, moderation_mode_severity};
 /// rung's territory, so the hold rides in the existing `Transport(String)`
 /// arm with a stable, content-free marker that callers/tests can identify.
 pub const OUTBOUND_HOLD_ERROR: &str = "outbound content held by content policy (moderation_hold)";
+
+/// The single, content-free error returned by the pre-transport gate
+/// [`gate_outbound`]. Its `Display` is the stable `moderation_hold` marker, so
+/// every caller can surface an opaque, uniform signal (via `?`/`map_err`)
+/// without ever echoing the held body, a username, or a secret. It implements
+/// `std::error::Error` so it converts straight into the handlers'
+/// `Box<dyn Error>` result type and into `SendError::Transport` at the sender
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundHold;
+
+impl fmt::Display for OutboundHold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(OUTBOUND_HOLD_ERROR)
+    }
+}
+
+impl std::error::Error for OutboundHold {}
+
+/// Central pre-transport outbound gate. **Every** content-bearing send path
+/// must call this (or route through the gated
+/// [`crate::identity::ContentSender::send_text`]) before touching a Telegram
+/// transport. The policy decision has exactly one implementation here:
+/// [`evaluate_outbound`] resolves + decides + audits, and this wrapper turns a
+/// blocking verdict into [`OutboundHold`]. Degraded enforcement holds, as
+/// before. Passing/warn content returns `Ok(())` with unchanged behavior.
+pub fn gate_outbound(
+    db: &Db,
+    seller_id: i64,
+    bot_id: Option<i64>,
+    text: &str,
+) -> Result<(), OutboundHold> {
+    if evaluate_outbound(db, seller_id, bot_id, text).blocks_outbound_send() {
+        Err(OutboundHold)
+    } else {
+        Ok(())
+    }
+}
 
 /// Resolution of one evaluated text, independent of *where* it is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,5 +494,42 @@ mod tests {
             evaluate_outbound(&db, 1, None, "anything"),
             ModerationMode::Hold
         );
+    }
+
+    /// The central pre-transport gate returns the opaque hold marker (never
+    /// the body) for a matching term, and passes clean content unchanged.
+    #[test]
+    fn gate_outbound_holds_matching_term_and_passes_clean_text() {
+        let (_dir, db) = test_db("gate_outbound.db");
+        assert!(db.add_blocked_word(9, "forbidden", "hide", true));
+        let held = gate_outbound(&db, 9, Some(4), "a forbidden draft").unwrap_err();
+        assert_eq!(held, OutboundHold);
+        assert!(held.to_string().contains("moderation_hold"));
+        assert!(!held.to_string().contains("forbidden"));
+        assert!(gate_outbound(&db, 9, Some(4), "clean draft").is_ok());
+    }
+
+    /// Seller scope is honored by the gate: a term configured for seller A
+    /// holds only that seller's content, not seller B's.
+    #[test]
+    fn gate_outbound_honors_seller_scope() {
+        let (_dir, db) = test_db("gate_outbound_scope.db");
+        assert!(db.add_blocked_word(77, "secretterm", "review", true));
+        assert!(gate_outbound(&db, 77, None, "secretterm here").is_err());
+        assert!(gate_outbound(&db, 78, None, "secretterm here").is_ok());
+    }
+
+    /// Degraded enforcement holds through the gate too — no term needed.
+    #[test]
+    fn gate_outbound_holds_when_enforcement_is_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate_degraded.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE idx_mod_blocked_seller(x INTEGER);")
+                .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        assert!(gate_outbound(&db, 1, None, "anything clean").is_err());
     }
 }

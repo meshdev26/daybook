@@ -1560,6 +1560,12 @@ async fn publish_post(state: WebState, principal: Principal, args: Value) -> Res
     // Multi-bot: the send goes through the principal's effective bot (owner
     // selector or the seller's mapped bot), never blindly through primary.
     let bot_ctx = resolve_tool_bot(&state, &principal, &args)?;
+    let seller_id = principal.seller_id.unwrap_or(0);
+    // Outbound content gate BEFORE transport. This is a NON-ContentSender
+    // path (raw Bot::send_message), so it must be checked here; seller scope
+    // comes from the principal, never a global 0.
+    crate::handlers::moderation::gate_outbound(&state.db, seller_id, Some(bot_ctx.id), &text)
+        .map_err(|hold| hold.to_string())?;
     let mut send = bot_ctx
         .bot
         .send_message(crate::util::to_chat_id(&ch), text.clone());
@@ -1569,7 +1575,6 @@ async fn publish_post(state: WebState, principal: Principal, args: Value) -> Res
     match send.await {
         Ok(sent) => {
             crate::metrics::bot_sent();
-            let seller_id = principal.seller_id.unwrap_or(0);
             let _ = state
                 .db
                 .log_post(seller_id, &ch, sent.id.0, "text", Some(&text), "bot");
@@ -1688,6 +1693,12 @@ async fn exec_broadcast(
     // Multi-bot: sends through the principal's effective bot (owner selector
     // or the seller's mapped bot).
     let bot_ctx = resolve_tool_bot(&state, &principal, &args)?;
+    // Outbound content gate BEFORE the broadcast loop. `broadcast_to_users`
+    // is a raw-Bot helper (non-ContentSender), so the one gate here covers the
+    // whole fan-out. Seller scope comes from the principal.
+    let seller_id = principal.seller_id.unwrap_or(0);
+    crate::handlers::moderation::gate_outbound(&state.db, seller_id, Some(bot_ctx.id), text)
+        .map_err(|hold| hold.to_string())?;
     let sent = crate::broadcast_to_users(&bot_ctx.bot, &users, text).await;
     Ok(json!({"sent": sent, "total": total}))
 }
@@ -1706,6 +1717,16 @@ async fn exec_ai_publish_post(
     // Multi-bot: the publish goes through the principal's effective bot (owner
     // selector or the seller's mapped bot), never blindly through primary.
     let bot_ctx = resolve_tool_bot(&state, &principal, &args)?;
+    // Outbound content gate BEFORE transport. The draft's own seller id is
+    // the authoritative scope (owner drafts carry 0, i.e. the global floor);
+    // fall back to the principal's seller for parity with publish_post.
+    let gate_seller = if seller_id == 0 {
+        principal.seller_id.unwrap_or(0)
+    } else {
+        seller_id
+    };
+    crate::handlers::moderation::gate_outbound(&state.db, gate_seller, Some(bot_ctx.id), &content)
+        .map_err(|hold| hold.to_string())?;
     match bot_ctx
         .bot
         .send_message(crate::util::to_chat_id(&channel), content.clone())
@@ -1849,6 +1870,10 @@ async fn exec_publish_as_user(
         return Err("channel is no longer bound to the personal identity".into());
     };
     let text_len = text.chars().count();
+    // L10 gate: this channel-handle form is gated centrally inside
+    // `UserContext::send_text_to` (identity/mod.rs) before the actor is
+    // consulted — owner identity scope 0 / no bot, i.e. global floor only.
+    // No second gate here, so the decision is audited exactly once.
     let outcome = user.send_text_to(&channel, &text).await;
     // Audit detail for the execution attempt: the channel and the text
     // LENGTH only — the text itself never lands in the audit trail.
@@ -2275,5 +2300,67 @@ mod tests {
         assert_eq!(posts[1].5.as_deref(), Some("<b>hi</b>"));
         assert_eq!(posts[0].4, "text");
         assert_eq!(posts[0].5.as_deref(), Some("hi"));
+    }
+
+    /// Regression: `publish_post` is a NON-`ContentSender` seller-content path
+    /// (it calls `Bot::send_message` directly). A seller-scoped floor term must
+    /// hold it BEFORE transport — the mock server sees zero requests and the
+    /// error carries the opaque `moderation_hold` marker (never the body).
+    #[tokio::test]
+    async fn publish_post_seller_term_holds_before_transport() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let reply = json!({
+            "ok": true,
+            "result": {
+                "message_id": 7,
+                "date": 1_700_000_000,
+                "chat": {"id": 123, "type": "private", "first_name": "T"},
+                "text": "x"
+            }
+        });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = send_test_state(&server.uri());
+        let seller_id = 77i64;
+        assert!(
+            state
+                .db
+                .add_blocked_word(seller_id, "forbidden", "hide", true)
+        );
+        let principal = Principal {
+            role: crate::roles::Role::Seller,
+            seller_id: Some(seller_id),
+        };
+        let err = publish_post(
+            state.clone(),
+            principal,
+            json!({"channel": "123", "text": "a forbidden draft"}),
+        )
+        .await
+        .expect_err("seller term must hold the post");
+        assert!(err.contains("moderation_hold"), "got {err:?}");
+        assert!(!err.contains("forbidden"), "no body in the error");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no send may reach Telegram while held"
+        );
+        // The other seller is unaffected by seller 77's term.
+        let other = Principal {
+            role: crate::roles::Role::Seller,
+            seller_id: Some(78),
+        };
+        publish_post(
+            state,
+            other,
+            json!({"channel": "123", "text": "a forbidden draft"}),
+        )
+        .await
+        .expect("other seller passes");
     }
 }

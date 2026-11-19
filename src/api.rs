@@ -1609,6 +1609,16 @@ async fn posts_create(
     // Sends go out as the session's effective bot (seller → their bot, owner →
     // selected bot, admin → their bot with primary fallback).
     let bot = crate::web::effective_bot(&state, &session);
+    // L10 outbound gate BEFORE this raw-Bot send. Seller scope comes from the
+    // principal (session), never a global 0, so seller rules apply too.
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        session.seller_id.unwrap_or(0),
+        Some(bot.id),
+        &f.text,
+    ) {
+        return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string()).into_response();
+    }
     let msg_id = match bot
         .bot
         .send_message(crate::util::to_chat_id(&ch), f.text.clone())
@@ -1871,6 +1881,16 @@ async fn broadcasts(
     let mut sent = 0i64;
     // Broadcasts go out as the session's effective bot.
     let bot = crate::web::effective_bot(&state, &session);
+    // L10 outbound gate BEFORE the raw-Bot broadcast fan-out. One decision
+    // covers every recipient; seller scope comes from the session principal.
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        session.seller_id.unwrap_or(0),
+        Some(bot.id),
+        &f.text,
+    ) {
+        return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string()).into_response();
+    }
     for uid in recipients {
         if bot
             .bot
@@ -4247,6 +4267,9 @@ async fn invoices_claim(
                         &kind,
                         &pname,
                         delivery.as_deref(),
+                        &state.db,
+                        seller_id,
+                        Some(invoice_bot.id),
                     )
                     .await
                     {
@@ -4353,13 +4376,22 @@ async fn invoices_claim(
                 .ok()
                 .map(|l| l.invite_link);
             if let Some(l) = link {
-                let _ = invoice_bot
-                    .bot
-                    .send_message(
-                        teloxide::types::ChatId(target_user),
-                        format!("Payment confirmed. Access granted.\nInvite: {}", l),
-                    )
-                    .await;
+                let grant_text = format!("Payment confirmed. Access granted.\nInvite: {}", l);
+                // L10 outbound gate before this raw-Bot DM (the grant row is
+                // already durable; only the notice is skipped while held).
+                if crate::handlers::moderation::gate_outbound(
+                    &state.db,
+                    seller_id,
+                    Some(invoice_bot.id),
+                    &grant_text,
+                )
+                .is_ok()
+                {
+                    let _ = invoice_bot
+                        .bot
+                        .send_message(teloxide::types::ChatId(target_user), grant_text)
+                        .await;
+                }
             }
             granted = true;
         }
