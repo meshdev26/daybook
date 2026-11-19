@@ -95,11 +95,15 @@ Bots carry a product type (`shop_bot` by default); the console Product / Type
 selector lets the owner pick a product while sellers and admins stay pinned.
 Capabilities are chosen at build time with Cargo features: `shop_bot`,
 `moderation` (both default), `movie_bot`, `reply_bot`, `file_share`, `web_app`,
-`service`, and `automation`. A movie-only install builds with
-`cargo build --no-default-features --features movie_bot`; changing capabilities
-means rebuilding and redeploying. Message moderation uses an owner floor,
-seller "Blocked words", and per-bot overrides — set at least one floor term
-before enabling it. Full guide:
+`service`, and `automation`. These features control which capabilities are
+registered and which bot types are accepted at runtime — a movie-only build
+registers only the movie capability and refuses other types. They do **not**
+omit dependencies or shrink the binary (all crates stay compiled); dropping
+unused dependencies is a deferred cross-rung follow-up. A movie-only install
+builds with `cargo build --no-default-features --features movie_bot`; changing
+capabilities means rebuilding and redeploying.
+Message moderation uses an owner floor, seller "Blocked words", and per-bot
+overrides — set at least one floor term before enabling it. Full guide:
 [docs/MULTIBOT_FOUNDATION.md](docs/MULTIBOT_FOUNDATION.md).
 
 ## Build & run

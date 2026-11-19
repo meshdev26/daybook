@@ -2,7 +2,7 @@
 
 One process, one database, one console — several bots and several kinds of
 product. This guide explains how products are typed, how the console scope
-selector works, how to build an install that ships only the capabilities you
+selector works, how a build registers only the capabilities you
 offer, and how message moderation is configured.
 
 ## Product types
@@ -50,8 +50,7 @@ allowed to do.
 
 ## Capability features and builds
 
-Capabilities are chosen at compile time. Each one is a Cargo feature, so an
-install ships only the capabilities it offers.
+Capabilities are chosen at compile time. Each one is a Cargo feature that controls what the binary **registers and accepts at runtime**: only compiled-in capabilities are registered, and a bot whose type was not compiled in is explicitly refused (`capability_uncompiled`). Features do not trim dependencies or binary size — see "Scope of gating" below.
 
 | Feature | Enables |
 |---------|---------|
@@ -64,13 +63,13 @@ install ships only the capabilities it offers.
 | `service` | AI service surface. |
 | `automation` | Automation rules. |
 
-The default build enables `shop_bot` and `moderation` and keeps every existing
-path unchanged. To build a movie-only binary (the movie capability plus the
-moderation floor, without the shop bot):
+The default build enables `shop_bot` and `moderation` and keeps every existing path unchanged. To build a movie-only binary that registers only the movie capability (plus the cross-cutting moderation floor) and refuses every other bot type, including the shop bot:
 
 ```bash
 cargo build --no-default-features --features movie_bot
 ```
+
+**Scope of gating (what is NOT reduced).** These features are registration switches, not dependency trims. Every dependency in `Cargo.toml` is still compiled and linked in a movie-only build — the console/web stack (axum, reqwest), the MTProto identity stack (grammers, aes-gcm, pbkdf2), and the shop/AI/payment paths all remain in the artifact; `cargo tree --depth 1` is identical to the default build and the binary is not smaller. Removing unused dependencies first requires gating the shared web/api/auth/identity/AI/shop modules (L7 + L8) and then marking the Cargo dependencies optional (L9). That cross-rung refactor is a deferred follow-up, outside this foundation's approved scope. It does not weaken the runtime guarantee above: unregistered bot types are always refused.
 
 Build the other narrow installs the same way, naming the features you want.
 Capabilities are fixed at build time: adding or removing one means rebuilding

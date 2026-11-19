@@ -21,7 +21,7 @@
 
 ## Step 2 — Compile-time capability registry (L9 + L8)
 
-1. Add Cargo features in `Cargo.toml`, e.g. `default = ["shop_bot", "moderation"]`, plus `movie_bot`, `reply_bot`, `file_share`, `web_app`, `service`, `automation`. Keep dependencies for a capability behind its feature so a movie-only build doesn't compile AI/storage deps.
+1. Add Cargo features in `Cargo.toml`, e.g. `default = ["shop_bot", "moderation"]`, plus `movie_bot`, `reply_bot`, `file_share`, `web_app`, `service`, `automation`. Keep dependencies for a capability behind its feature so a movie-only build doesn't compile AI/storage deps — deferred; see IA amendment §5.
 2. Extend `handlers::registry::CommandRegistry` so each capability contributes a `CommandSpec` set + inbound handler; registration is `#[cfg(feature = "...")]` at compile time. No dynamic `.so` loading (deferred non-goal).
 3. Dispatcher (`src/main.rs` + `src/handlers/**`) selects the capability set by the receiving bot's `bot_type` through the existing `BotContext` / `BotManager`. Unknown/disabled type → explicit refusal, never silent drop.
 4. All existing command paths remain byte-identical in the default build; `git diff --stat -- src/web/mod.rs` stays empty for this step.
