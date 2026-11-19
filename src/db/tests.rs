@@ -3243,3 +3243,520 @@ fn set_bot_name_trims_persists_and_allows_empty() {
     // Unknown bot id: honest Err, nothing to update.
     assert!(db.set_bot_name(999_999, "Ghost").is_err());
 }
+
+#[cfg(test)]
+mod moderation_tests {
+    use super::*;
+
+    fn test_db(name: &str) -> Db {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the directory alive for the test (Db::new opens the file by
+        // path); `keep` is the non-deprecated form of the old `into_path`.
+        let path = dir.keep().join(name);
+        Db::new(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn moderation_seller_isolation() {
+        let db = test_db("mod_seller.db");
+        let (a, b) = (11_i64, 22_i64);
+
+        assert!(db.add_blocked_word(a, "spam", "hide", true));
+        assert!(db.add_allow_word(a, "legit"));
+        // Seller B sees none of seller A's rows.
+        assert!(db.list_blocked_words(b).is_empty());
+        assert!(db.get_blocked_word(b, "spam").is_none());
+        assert!(db.list_allow_words(b).is_empty());
+        // Seller B cannot mutate or delete A's rows by name/id.
+        assert!(!db.set_blocked_word_mode(b, "spam", "warn"));
+        assert!(!db.set_blocked_word_enabled(b, "spam", false));
+        assert!(!db.remove_blocked_word(b, "spam"));
+        assert!(!db.remove_allow_word(b, "legit"));
+        assert_eq!(db.get_blocked_word(a, "spam").unwrap().mode, "hide");
+
+        // Appeals and decisions are seller-scoped too.
+        let appeal = db
+            .create_moderation_appeal(a, None, None, "opaque:1", Some("please review"))
+            .unwrap();
+        db.log_moderation_decision(
+            a,
+            None,
+            Some("spam"),
+            "hide",
+            Some("matched"),
+            Some("opaque:1"),
+        )
+        .unwrap();
+        assert!(db.get_moderation_appeal(b, appeal).is_none());
+        assert_eq!(db.get_moderation_appeal(a, appeal).unwrap().seller_id, a);
+        assert!(!db.set_moderation_appeal_status(b, appeal, "approved"));
+        assert!(db.set_moderation_appeal_status(a, appeal, "approved"));
+        assert_eq!(
+            db.get_moderation_appeal(a, appeal).unwrap().status,
+            "approved"
+        );
+        assert!(db.list_moderation_appeals(b, None).is_empty());
+        assert_eq!(db.list_moderation_appeals(a, None).len(), 1);
+        assert!(db.list_moderation_decisions(b, 10).is_empty());
+        assert_eq!(db.list_moderation_decisions(a, 10).len(), 1);
+    }
+
+    #[test]
+    fn moderation_bot_override_scoped_by_both_ids() {
+        let db = test_db("mod_bot_scope.db");
+        let (a, b) = (101_i64, 202_i64);
+        let bot_a1 = db.create_bot("mod-bot-a1", a, None, "");
+        let bot_a2 = db.create_bot("mod-bot-a2", a, None, "");
+        let bot_b1 = db.create_bot("mod-bot-b1", b, None, "");
+
+        // Inheritance is the default for every scope.
+        assert!(db.bot_override_inherits(a, bot_a1));
+        // Adding a custom term activates custom rules for (a, bot_a1) ONLY.
+        assert!(db.add_bot_override_term(a, bot_a1, "spoiler", "hide"));
+        assert!(!db.bot_override_inherits(a, bot_a1));
+        assert!(db.bot_override_inherits(a, bot_a2));
+        assert!(db.bot_override_inherits(b, bot_b1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(db.list_bot_override_terms(a, bot_a2).is_empty());
+        assert!(db.list_bot_override_terms(b, bot_b1).is_empty());
+
+        // Same bot id under a different seller, and a different bot under the
+        // same seller, are disjoint namespaces for reads AND writes.
+        assert!(!db.remove_bot_override_term(a, bot_a2, "spoiler"));
+        assert!(!db.remove_bot_override_term(b, bot_b1, "spoiler"));
+        assert!(db.get_bot_override_term(a, bot_a1, "spoiler").is_some());
+        let pa = db.resolve_effective_policy(a, Some(bot_a1));
+        let pb = db.resolve_effective_policy(a, Some(bot_a2));
+        assert!(pa.bot_override_active);
+        assert!(!pb.bot_override_active);
+        assert_eq!(pa.terms.len(), 1);
+        assert!(pb.terms.is_empty());
+
+        // Restoring inheritance is non-destructive: terms stay stored but are
+        // ignored while inheriting.
+        assert!(db.set_bot_override_inherits(a, bot_a1, true));
+        assert!(db.bot_override_inherits(a, bot_a1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(
+            db.resolve_effective_policy(a, Some(bot_a1))
+                .terms
+                .is_empty()
+        );
+
+        // Removal is scoped by both ids.
+        assert!(db.remove_bot_override_term(a, bot_a1, "spoiler"));
+        assert!(db.list_bot_override_terms(a, bot_a1).is_empty());
+    }
+
+    #[test]
+    fn moderation_precedence_stricter_only_allowlist_and_floor() {
+        // Floor 'hide' with a baseline term: nothing may be weaker than hide,
+        // and the allow-list may not delete a floor term.
+        let floor_terms = vec![ModerationTermInput {
+            term: "floorword".into(),
+            mode: "hide".into(),
+        }];
+        let seller = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "soft".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "mid".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "allowed".into(),
+                mode: "hide".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "extra".into(),
+                mode: "review".into(),
+            },
+        ];
+        let allow = vec![
+            "allowed".to_string(),
+            "floorword".to_string(),
+            "extra".to_string(),
+        ];
+        let effective = apply_moderation_precedence("hide", &floor_terms, &seller, &bot, &allow);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("allowed"), None); // allow-list wins over seller
+        assert_eq!(mode_of("extra"), None); // allow-list wins over bot
+        assert_eq!(mode_of("floorword"), Some("hide")); // floor term survives allow
+        assert_eq!(mode_of("soft"), Some("hide")); // seller term raised to floor
+        assert_eq!(mode_of("mid"), Some("hide")); // seller term raised to floor
+        assert_eq!(effective.len(), 3);
+        assert!(effective.windows(2).all(|w| w[0].term < w[1].term)); // deterministic
+
+        // Floor 'warn' does not force every term to hide: here the stricter-only
+        // rule between seller and bot layers is exercised directly.
+        let seller = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "warn".into(),
+            }, // weaker -> stays review
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "hide".into(),
+            }, // stricter -> raised to hide
+            ModerationTermInput {
+                term: "s3".into(),
+                mode: "review".into(),
+            },
+        ];
+        let effective = apply_moderation_precedence("warn", &[], &seller, &bot, &[]);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("s1"), Some("review"));
+        assert_eq!(mode_of("s2"), Some("hide"));
+        assert_eq!(mode_of("s3"), Some("review"));
+    }
+
+    #[test]
+    fn moderation_db_resolution_wiring() {
+        let db = test_db("mod_resolve.db");
+        let seller = 303_i64;
+        let bot = db.create_bot("mod-resolve", seller, None, "");
+        assert!(db.add_blocked_word(seller, "spam", "warn", true));
+        assert!(db.add_blocked_word(seller, "disabled", "hide", false));
+        assert!(db.add_allow_word(seller, "spam"));
+        assert!(db.add_bot_override_term(seller, bot, "bot-only", "review"));
+        // Adding a custom term auto-activates "Custom rules for this bot";
+        // restore inheritance to exercise the inherited view first.
+        assert!(db.set_bot_override_inherits(seller, bot, true));
+
+        // While inheriting, bot terms are ignored; allow-list removes "spam";
+        // the disabled word is skipped.
+        let inherited = db.resolve_effective_policy(seller, Some(bot));
+        assert!(!inherited.bot_override_active);
+        assert!(inherited.terms.is_empty());
+
+        // Activating the override brings in the bot's stricter local rule.
+        assert!(db.set_bot_override_inherits(seller, bot, false));
+        let active = db.resolve_effective_policy(seller, Some(bot));
+        assert!(active.bot_override_active);
+        assert_eq!(active.floor_mode, MODERATION_FLOOR_MODE);
+        let mode_of = |t: &str| {
+            active
+                .terms
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("bot-only"), Some("review"));
+        assert_eq!(mode_of("spam"), None);
+        assert_eq!(mode_of("disabled"), None);
+
+        // No bot scope: never activates a bot override.
+        let global = db.resolve_effective_policy(seller, None);
+        assert!(!global.bot_override_active);
+        assert!(global.terms.is_empty());
+    }
+
+    #[test]
+    fn moderation_terms_are_data_not_sql() {
+        let db = test_db("mod_injection.db");
+        let payload = "x'; DROP TABLE moderation_blocked_words; --";
+        assert!(db.add_blocked_word(1, payload, "hide", true));
+        // Stored verbatim as data, not executed.
+        assert_eq!(db.get_blocked_word(1, payload).unwrap().term, payload);
+        assert_eq!(db.list_blocked_words(1).len(), 1);
+        // Table still exists; a different seller's writes are unaffected.
+        assert!(db.add_blocked_word(2, "normal", "warn", true));
+        assert_eq!(db.list_blocked_words(2).len(), 1);
+        // Invalid inputs are refused at the boundary.
+        assert!(!db.add_blocked_word(1, "bad\0term", "warn", true));
+        assert!(!db.add_blocked_word(1, "   ", "warn", true));
+        assert!(!db.add_blocked_word(1, &"x".repeat(MODERATION_MAX_TERM_LEN + 1), "warn", true));
+        assert!(!db.add_blocked_word(1, "bad", "DROP", true));
+    }
+
+    #[test]
+    fn moderation_migration_is_additive_over_legacy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod_legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE bots(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
+                 INSERT INTO bots(key, owner_user_id, created_at) VALUES('legacy-bot', 42, '2026-01-01T00:00:00+00:00');
+                 INSERT INTO config(key, value, updated_at) VALUES('channel', '@legacy', '2026-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // Pre-existing data survives the additive migration.
+        assert_eq!(db.get_config("channel").as_deref(), Some("@legacy"));
+        assert!(db.get_bot_by_key("legacy-bot").is_some());
+        assert_eq!(
+            db.get_bot_by_key("legacy-bot").unwrap().bot_type,
+            "shop_bot"
+        );
+        // New tables are present, empty, and usable.
+        assert!(db.list_blocked_words(42).is_empty());
+        assert!(db.list_allow_words(42).is_empty());
+        assert!(db.list_bot_override_terms(42, 1).is_empty());
+        // The global floor is seeded empty for backward compatibility, and a
+        // legacy DB opens non-degraded (all moderation DDL succeeded).
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(!db.resolve_effective_policy(42, None).enforcement_degraded);
+        assert!(db.add_blocked_word(42, "after-migrate", "warn", true));
+        drop(db);
+        // Reopening is idempotent: no data loss, no duplicate-table error.
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_blocked_words(42).len(), 1);
+    }
+
+    #[test]
+    fn moderation_decisions_and_appeals_store_no_message_content() {
+        let db = test_db("mod_no_content.db");
+        let seller = 404_i64;
+        let decision = db
+            .log_moderation_decision(
+                seller,
+                None,
+                Some("badword"),
+                "hide",
+                Some("matched"),
+                Some("opaque-ref-123"),
+            )
+            .unwrap();
+        let appeal = db
+            .create_moderation_appeal(
+                seller,
+                None,
+                Some(decision),
+                "opaque-ref-123",
+                Some("false positive"),
+            )
+            .unwrap();
+
+        // No content-like column exists on either audit/appeal table.
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            for table in ["moderation_decisions", "moderation_appeals"] {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                assert!(
+                    !cols
+                        .iter()
+                        .any(|c| c == "content" || c == "text" || c == "message"),
+                    "{table} has a content-like column: {cols:?}"
+                );
+            }
+        }
+
+        // Reason is capped; opaque reference is preserved verbatim.
+        let long = "a".repeat(MODERATION_MAX_REASON_LEN + 50);
+        let capped = db
+            .create_moderation_appeal(seller, None, None, "opaque-2", Some(&long))
+            .unwrap();
+        assert_eq!(
+            db.get_moderation_appeal(seller, capped)
+                .unwrap()
+                .reason
+                .unwrap()
+                .len(),
+            MODERATION_MAX_REASON_LEN
+        );
+        assert_eq!(
+            db.get_moderation_appeal(seller, appeal)
+                .unwrap()
+                .message_ref,
+            "opaque-ref-123"
+        );
+    }
+
+    fn mode_of<'a>(policy: &'a EffectiveModerationPolicy, term: &str) -> Option<&'a str> {
+        policy
+            .terms
+            .iter()
+            .find(|e| e.term == term)
+            .map(|e| e.mode.as_str())
+    }
+
+    #[test]
+    fn moderation_global_floor_is_persistent_owner_writable_and_non_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("mod_global_floor.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let (seller_a, seller_b) = (501_i64, 502_i64);
+
+        // Fresh install: floor seeded empty, enforcement not degraded.
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(
+            !db.resolve_effective_policy(seller_a, None)
+                .enforcement_degraded
+        );
+
+        // Owner writes a global floor term (no seller_id); invalid input is
+        // refused at the boundary (parameterized data, never SQL).
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        assert!(!db.add_moderation_global_floor_term("bad\0term", "hide"));
+        assert!(!db.add_moderation_global_floor_term("banned", "DROP"));
+        assert_eq!(db.list_moderation_global_floor().len(), 1);
+        assert_eq!(db.list_moderation_global_floor()[0].mode, "hide");
+
+        // A seller cannot weaken or allow-list away a floor term: the same term
+        // at a looser seller mode plus a seller allow-list still resolves to
+        // the floor's 'hide'.
+        assert!(db.add_blocked_word(seller_a, "globalban", "warn", true));
+        assert!(db.add_allow_word(seller_a, "globalban"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "globalban"),
+            Some("hide")
+        );
+        // Floor is global: a second tenant inherits it, but stays isolated
+        // from seller A's own rows.
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_b, None), "globalban"),
+            Some("hide")
+        );
+        assert!(db.list_blocked_words(seller_b).is_empty());
+        assert!(db.list_allow_words(seller_b).is_empty());
+
+        // Each floor term's own mode is honored, clamped to >= the global
+        // minimum; re-moding is an upsert, not a second row.
+        assert!(db.add_moderation_global_floor_term("reviewterm", "review"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "reviewterm"),
+            Some("review")
+        );
+        assert!(db.add_moderation_global_floor_term("globalban", "review"));
+        assert_eq!(db.list_moderation_global_floor().len(), 2);
+
+        // Persistence across reopen.
+        drop(db);
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_moderation_global_floor().len(), 2);
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            Some("review")
+        );
+
+        // Once the owner removes a term, ordinary seller precedence returns:
+        // seller A's looser rule is now allow-listed away entirely.
+        assert!(reopened.remove_moderation_global_floor_term("globalban"));
+        assert!(!reopened.remove_moderation_global_floor_term("globalban"));
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn moderation_floor_per_term_mode_honored_and_clamped() {
+        let floor = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "hide".into(),
+            },
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let seller = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "warn".into(),
+            }, // cannot weaken the floor term
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "hide".into(),
+            }, // may raise above its floor mode
+        ];
+        let allow = vec!["a".to_string(), "b".to_string()];
+        let out = apply_moderation_precedence("warn", &floor, &seller, &[], &allow);
+        let mode_of = |t: &str| out.iter().find(|e| e.term == t).map(|e| e.mode.as_str());
+        assert_eq!(mode_of("a"), Some("hide"));
+        assert_eq!(mode_of("b"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_ddl_failure_is_logged_and_fails_closed() {
+        // Force a moderation DDL statement to fail by pre-creating an object
+        // with the same name as one of the indexes (CREATE INDEX IF NOT EXISTS
+        // cannot succeed when a table of that name already exists).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE idx_mod_blocked_seller(x INTEGER);")
+            .unwrap();
+        assert!(Db::migrate_moderation_tables(&conn).is_err());
+        // The helper short-circuits: a later table was never created.
+        let later_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='moderation_decisions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!later_exists);
+
+        // With readiness false, policy resolution surfaces the fail-closed
+        // signal rather than silently returning an empty, permissive policy.
+        let db = test_db("mod_ddl_closed.db");
+        db.moderation_storage_ready.store(false, Ordering::Relaxed);
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        let policy = db.resolve_effective_policy(9, None);
+        assert!(policy.enforcement_degraded);
+        assert_eq!(mode_of(&policy, "globalban"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_floor_read_failure_falls_back_and_degrades() {
+        let db = test_db("mod_floor_missing.db");
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute_batch("DROP TABLE moderation_global_floor;")
+                .unwrap();
+        }
+        // No panic; the compile-time default (empty) is used and the policy
+        // is marked degraded so hooks can fail closed.
+        let policy = db.resolve_effective_policy(7, None);
+        assert!(policy.enforcement_degraded);
+        assert!(policy.terms.is_empty());
+        assert_eq!(policy.floor_mode, MODERATION_FLOOR_MODE);
+    }
+}
