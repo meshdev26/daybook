@@ -46,6 +46,8 @@ mod html;
 mod identity;
 mod keys_setup;
 mod mfa_users;
+#[cfg(feature = "moderation")]
+mod moderation;
 mod monitor;
 mod promos;
 mod referrals;
@@ -93,6 +95,8 @@ use html::*;
 use identity::*;
 use keys_setup::*;
 use mfa_users::*;
+#[cfg(feature = "moderation")]
+use moderation::*;
 use monitor::*;
 use promos::*;
 use referrals::*;
@@ -211,6 +215,10 @@ pub fn router(state: WebState) -> Router {
     let r = routes_admin(r);
     let r = routes_mfa_posts(r);
     let r = routes_identity_bots(r);
+    // Moderation capability pages register only when compiled in. No existing
+    // route is renamed or moved; the default build keeps every prior path.
+    #[cfg(feature = "moderation")]
+    let r = routes_moderation(r);
     let r = r
         .nest_service("/static", ServeDir::new("static"))
         .fallback(not_found);
@@ -401,6 +409,33 @@ fn routes_identity_bots(r: Router<WebState>) -> Router<WebState> {
         .route("/bots/add/snippet", get(bots_add_snippet))
         .route("/bots/{id}/disable", post(bots_disable))
         .route("/bots/{id}/delete", post(bots_delete))
+}
+
+/// Moderation capability routes (IA amendment §4/§5). Registered only when
+/// the `moderation` feature is compiled in; all writes go through `Db`
+/// methods that bind `seller_id` (and `bot_id` for per-bot overrides).
+#[cfg(feature = "moderation")]
+fn routes_moderation(r: Router<WebState>) -> Router<WebState> {
+    r.route("/content-policy", get(content_policy_page))
+        .route("/content-policy/add", post(content_policy_add))
+        .route("/content-policy/remove", post(content_policy_remove))
+        .route("/blocked-words", get(blocked_words_page))
+        .route("/blocked-words/add", post(blocked_words_add))
+        .route("/blocked-words/mode", post(blocked_words_set_mode))
+        .route("/blocked-words/remove", post(blocked_words_remove))
+        .route("/blocked-words/allow", post(blocked_words_allow))
+        .route(
+            "/blocked-words/allow/remove",
+            post(blocked_words_allow_remove),
+        )
+        .route(
+            "/blocked-words/appeal/status",
+            post(blocked_words_appeal_status),
+        )
+        .route("/bots/{id}/moderation/inherit", post(bot_override_inherit))
+        .route("/bots/{id}/moderation/add", post(bot_override_add))
+        .route("/bots/{id}/moderation/mode", post(bot_override_set_mode))
+        .route("/bots/{id}/moderation/remove", post(bot_override_remove))
 }
 
 /// Mount `router` under a base path. An empty base returns the router

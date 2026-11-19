@@ -646,6 +646,40 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
     },
 ];
 
+/// Capability items are kept OUT of `NAV_ITEMS` so the shipped 27 group rows
+/// and their `feature: None` contract stay byte-identical. `rail_nav` injects
+/// them after their anchor row only when the capability is compiled in (IA
+/// amendment §5). A view filter only — the page handlers carry their own gate.
+pub(super) const FEATURE_NAV_ITEMS: &[NavItem] = &[
+    NavItem {
+        id: "blocked-words",
+        label: "Blocked words",
+        path: "blocked-words",
+        group: "Offerings",
+        roles: NavRole::SellerAdminOwner,
+        titles: &["Blocked words"],
+        pref: None,
+        feature: Some("moderation"),
+        product_types: None,
+    },
+    NavItem {
+        id: "content-policy",
+        label: "Content policy",
+        path: "content-policy",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Content policy"],
+        pref: None,
+        feature: Some("moderation"),
+        product_types: None,
+    },
+];
+
+/// Stable insertion anchors for the capability rows: "Blocked words" follows
+/// Bots in Offerings, "Content policy" sits beside AI in Workspace.
+pub(super) const FEATURE_NAV_AFTER: &[(&str, &str)] =
+    &[("blocked-words", "bots"), ("content-policy", "ai")];
+
 pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
     // Settings is owner-only and lives in Utilities (outside NAV_ITEMS), but
     // its active state is still resolved here by id so no title/label
@@ -655,6 +689,7 @@ pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
     }
     NAV_ITEMS
         .iter()
+        .chain(FEATURE_NAV_ITEMS.iter())
         .find(|item| item.titles.contains(&title))
         .map(|item| item.id)
 }
@@ -708,14 +743,12 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
 
     let mut out = String::new();
     for group in group_order {
-        // Collect visible items for this group.
-        let items: Vec<&NavItem> = NAV_ITEMS
-            .iter()
-            .filter(|item| item.group == group)
-            .filter(|item| item.roles.visible(role))
-            .filter(|item| {
-                if let Some(key) = item.pref {
-                    // sidebar pref gating for owner-managed items
+        // One shared visibility predicate for core and capability rows: role,
+        // sidebar pref, compile-time feature and runtime product type. Keeping
+        // it in one place means a capability row can never bypass a core gate.
+        let visible = |item: &NavItem| {
+            item.roles.visible(role)
+                && if let Some(key) = item.pref {
                     prefs
                         .map(|p| match key {
                             "ai" => p.ai,
@@ -729,10 +762,32 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
                 } else {
                     true
                 }
-            })
-            .filter(|item| item.feature.is_none_or(capability_enabled))
-            .filter(|item| nav_item_type_ok(item, product_type.as_deref()))
-            .collect();
+                && item.feature.is_none_or(capability_enabled)
+                && nav_item_type_ok(item, product_type.as_deref())
+        };
+        // Core rows render first, byte-identical to the shipped table. Each
+        // capability row is injected directly after its anchor so "beside AI"
+        // holds without touching the 27-row constant.
+        let mut items: Vec<&NavItem> = Vec::new();
+        for item in NAV_ITEMS.iter().filter(|item| item.group == group) {
+            if visible(item) {
+                items.push(item);
+            }
+            // Inject at the anchor's slot even when the anchor itself is
+            // pref-hidden, so "beside AI" survives sidebar customisation.
+            for extra in FEATURE_NAV_ITEMS
+                .iter()
+                .filter(|extra| extra.group == group)
+                .filter(|extra| {
+                    FEATURE_NAV_AFTER
+                        .iter()
+                        .any(|(id, anchor)| *id == extra.id && *anchor == item.id)
+                })
+                .filter(|extra| visible(extra))
+            {
+                items.push(extra);
+            }
+        }
         if items.is_empty() {
             continue;
         }

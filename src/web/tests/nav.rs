@@ -131,6 +131,8 @@ async fn nav_role_visibility_owner() {
     // owner sees all incl. Settings in utilities
     for p in [
         "/bots",
+        "/blocked-words",
+        "/content-policy",
         "/identity",
         "/ai",
         "/crypto",
@@ -168,8 +170,9 @@ async fn nav_role_visibility_seller() {
         selected_bot_id: None,
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
-    // seller sees finance, api keys, abandoned carts
-    for p in ["finance", "keys", "carts"] {
+    // seller sees finance, api keys, abandoned carts and the Blocked words
+    // capability page, but never the owner-only global policy.
+    for p in ["finance", "keys", "carts", "blocked-words"] {
         assert!(
             body.contains(&format!(r#"href="/{}""#, p)),
             "seller missing {} in:\n{}",
@@ -179,7 +182,15 @@ async fn nav_role_visibility_seller() {
     }
     // seller does not see owner-only
     for p in [
-        "bots", "identity", "ai", "crypto", "admins", "sellers", "webusers", "settings",
+        "bots",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "admins",
+        "sellers",
+        "webusers",
+        "settings",
     ] {
         assert!(
             !body.contains(&format!(r#"href="/{}""#, p)),
@@ -233,8 +244,20 @@ async fn nav_role_visibility_buyer() {
         );
     }
     let forbidden = [
-        "monitor", "bots", "identity", "ai", "crypto", "finance", "admins", "sellers", "webusers",
-        "keys", "carts", "settings",
+        "monitor",
+        "bots",
+        "blocked-words",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "finance",
+        "admins",
+        "sellers",
+        "webusers",
+        "keys",
+        "carts",
+        "settings",
     ];
     for p in forbidden {
         assert!(
@@ -358,17 +381,14 @@ async fn product_scope_owner_has_type_facet_and_optgroups() {
         "{body}"
     );
     assert!(
-        body.contains(r#"<label for="scope-type">Type</label>"#),
+        body.contains(r#"<label for="scope-type">Product type</label>"#),
         "{body}"
     );
     assert!(
         body.contains(r#"<label for="scope-product">Product</label>"#),
         "{body}"
     );
-    assert!(
-        body.contains(r#"<select id="scope-type" aria-label="Product type""#),
-        "{body}"
-    );
+    assert!(body.contains(r#"<select id="scope-type""#), "{body}");
     assert!(
         body.contains(r#"<option value="">All types</option>"#),
         "{body}"
@@ -390,7 +410,7 @@ async fn product_scope_owner_has_type_facet_and_optgroups() {
     assert!(!body.contains(r#"name="seller_id""#), "{body}");
     assert!(!body.contains(r#"name="product_type""#), "{body}");
     let type_tag = body
-        .split(r#"<select id="scope-type" aria-label="Product type">"#)
+        .split(r#"<select id="scope-type">"#)
         .nth(1)
         .and_then(|rest| rest.split("</select>").next())
         .unwrap_or("");
@@ -462,7 +482,7 @@ async fn scope_control_375px_stacked_markup_and_css() {
     // binds to. Ordering is Type label -> type select -> Product label ->
     // product select -> Switch, so no side-by-side controls can form.
     let type_label = body
-        .find(r#"<label for="scope-type">Type</label>"#)
+        .find(r#"<label for="scope-type">Product type</label>"#)
         .unwrap();
     let type_sel = body.find(r#"<select id="scope-type""#).unwrap();
     let product_label = body
@@ -480,4 +500,88 @@ async fn scope_control_375px_stacked_markup_and_css() {
     assert!(css.contains(".rail .product-scope"), "{css}");
     assert!(css.contains("flex-direction: column"), "{css}");
     assert!(css.contains("min-height: 44px"), "{css}");
+}
+
+// ---- Step 4.3: feature-gated moderation nav items -------------------------
+
+/// The 27 shipped group rows are untouched; capability rows live in their own
+/// table and are all tagged with `moderation` so they disappear in a build
+/// that opts out of the capability. Buyers never see either one.
+#[test]
+fn moderation_nav_rows_are_gated_and_separate_from_core_table() {
+    assert_eq!(NAV_ITEMS.len(), 27);
+    assert!(NAV_ITEMS.iter().all(|item| item.feature.is_none()));
+    assert_eq!(FEATURE_NAV_ITEMS.len(), 2);
+    for item in FEATURE_NAV_ITEMS {
+        assert_eq!(item.feature, Some("moderation"), "{}", item.id);
+        assert!(!item.roles.visible("user"), "{}", item.id);
+        // Compiled-in by default; a movie-only build filters it out.
+        assert!(item.feature.is_none_or(capability_enabled));
+        assert!(!item.feature.is_none_or(|f| f == "movie_bot"));
+    }
+    let ids: Vec<&str> = FEATURE_NAV_ITEMS.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec!["blocked-words", "content-policy"]);
+    let anchors: Vec<(&str, &str)> = FEATURE_NAV_AFTER
+        .iter()
+        .map(|(id, anchor)| (*id, *anchor))
+        .collect();
+    assert_eq!(
+        anchors,
+        vec![("blocked-words", "bots"), ("content-policy", "ai")]
+    );
+    assert_eq!(active_nav_id("Blocked words"), Some("blocked-words"));
+    assert_eq!(active_nav_id("Content policy"), Some("content-policy"));
+}
+
+/// A capability row is injected after its anchor (Content policy beside AI),
+/// and the active state is id-keyed with `aria-current="page"`.
+#[tokio::test]
+async fn moderation_nav_placement_and_active_state() {
+    let (state, _dir) = make_state().await;
+    state.db.set_config(
+        "sidebar_items",
+        r#"{"ai":true,"crypto":true,"admins":true,"sellers":true,"webusers":true}"#,
+    );
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = rail_nav(&state, "Content policy", Some(&sess));
+    let bots = body.find(">Bots</a>").unwrap();
+    let blocked = body.find(">Blocked words</a>").unwrap();
+    let products = body.find(">Products</a>").unwrap();
+    assert!(products < bots && bots < blocked, "{body}");
+    let ai = body.find(">AI</a>").unwrap();
+    let policy = body.find(">Content policy</a>").unwrap();
+    let crypto = body.find(">Crypto</a>").unwrap();
+    assert!(ai < policy && policy < crypto, "{body}");
+    assert!(body.contains(r#"href="/blocked-words""#), "{body}");
+    let active = body
+        .split(r#"href="/content-policy""#)
+        .nth(1)
+        .unwrap_or("")
+        .split('>')
+        .next()
+        .unwrap_or("");
+    assert!(active.contains("aria-current=\"page\""), "{active}");
+    // No seventh group was introduced.
+    assert_eq!(body.matches("data-nav-group=\"").count(), 6);
+}
+
+/// The 375px rules for moderation forms reuse the shipped token contract and
+/// enforce ≥44px targets with a stacked layout at the drawer breakpoint.
+#[tokio::test]
+async fn moderation_forms_have_375px_targets_and_stacked_rules() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    assert!(css.contains(".mod-form"), "{css}");
+    assert!(css.contains(".moderation-override"), "{css}");
+    assert!(css.contains("min-height: 44px"), "{css}");
+    assert!(css.contains(".mod-row-form"), "{css}");
 }

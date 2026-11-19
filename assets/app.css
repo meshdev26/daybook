@@ -691,3 +691,27 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
 .timeline li { border-bottom: 1px solid var(--line); padding: 10px 0; }
 .timeline li:last-child { border-bottom: none; }
 .timeline .timeline, .timeline ol { margin-top: 6px; padding-left: 18px; }
+
+/* ---- Moderation configuration surfaces (IA amendment §4/§8) --------------
+ * Layout and touch targets only. Every colour, border and type value comes
+ * from the shipped token contract above; status is a dot before a WORD. */
+.moderation-override { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.moderation-override h4 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 4px; }
+.moderation-state { text-align: left; padding: 10px 2px; }
+.mod-term { flex: 1 1 160px; overflow-wrap: anywhere; }
+.mod-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
+.mod-form .mod-field { flex: 1 1 220px; }
+.mod-form .mod-field select { flex: 1 1 180px; }
+.mod-row-form, .moderation-override .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* ≥44px targets at every viewport (spec §8), including mode selects and the
+ * single primary action on each moderation screen. */
+.mod-form input[type="text"], .mod-form select, .mod-form button,
+.mod-row select, .mod-row button, .moderation-override input[type="text"],
+.moderation-override select, .moderation-override button { min-height: 44px; }
+@media (max-width: 900px) {
+  .mod-form .mod-field, .mod-form select, .mod-form button { flex: 1 1 100%; width: 100%; }
+  .mod-row, .mod-row-form, .moderation-override .inline-form {
+    flex-direction: column; align-items: stretch; width: 100%;
+  }
+  .moderation-override .btn { width: 100%; }
+}

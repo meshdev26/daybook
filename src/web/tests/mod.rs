@@ -10,6 +10,8 @@ use tempfile::TempDir;
 mod bots;
 mod channels;
 mod misc;
+#[cfg(feature = "moderation")]
+mod moderation;
 mod nav;
 mod settings;
 mod setup;

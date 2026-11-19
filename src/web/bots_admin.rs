@@ -350,6 +350,13 @@ fn bot_card_form(
     // Advanced disclosure for per-type settings. No new route — both ride the
     // existing /bots save form so existing paths stay byte-identical.
     let type_options = product_type_options(Some(&b.bot_type));
+    // IA amendment §4.3: the per-bot moderation override rides this existing
+    // closed-by-default Advanced disclosure — no new configuration route for
+    // the field itself. Its write actions are feature-gated capability routes.
+    #[cfg(feature = "moderation")]
+    let moderation_advanced = bot_override_advanced_html(state, b);
+    #[cfg(not(feature = "moderation"))]
+    let moderation_advanced = String::new();
     let token_line = if multi_bot_mode(state) {
         format!(
             r#"Token: set it in Settings → <a href="{}">{}</a>."#,
@@ -379,12 +386,13 @@ fn bot_card_form(
       <input id="bot-channel-{id}" type="number" name="default_channel_id" value="{channel_val}">
       <span class="help">Numeric chat ID of the channel (starts with -100…). Leave blank if this bot has no default channel.</span>
       <label class="check"><input type="checkbox" name="enabled"{enabled_attr}> Enabled</label>
-      <details class="advanced" data-product-type="{type_value}">
-        <summary>Advanced</summary>
-        <p class="help">Type-specific settings for this product type appear here once its capability is enabled. The shared fields above apply to every product.</p>
-      </details>
       <button type="submit">Save</button>
     </form>
+    <details class="advanced" data-product-type="{type_value}">
+      <summary>Advanced</summary>
+      <p class="help">Type-specific settings for this product type appear here once its capability is enabled. The shared fields above apply to every product.</p>
+      {moderation_advanced}
+    </details>
     <p class="help">Disabling is reversible — the bot stays listed, it just stops after the next restart. Deleting removes its settings from the console.</p>
     <div class="row-actions">
       <form method="post" action="{disable_url}" class="inline-form">
@@ -401,6 +409,7 @@ fn bot_card_form(
         name_val = esc(&b.name),
         type_options = type_options,
         type_value = esc(&b.bot_type),
+        moderation_advanced = moderation_advanced,
         bots_url = state.url("/bots"),
         owner_val = esc(owner_val),
         channel_val = esc(channel_val),
