@@ -3759,4 +3759,135 @@ mod moderation_tests {
         assert!(policy.terms.is_empty());
         assert_eq!(policy.floor_mode, MODERATION_FLOOR_MODE);
     }
+
+    #[test]
+    fn moderation_appeals_duplicate_and_concurrent_inserts_are_idempotent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = test_db("mod_appeals_dedup.db");
+        let seller = 700_i64;
+
+        // Sequential duplicate of the same tuple: exactly one row, the second
+        // submission is a no-op and reports "no row created".
+        let first = db
+            .create_moderation_appeal(seller, None, None, "opaque:dup", Some("first"))
+            .expect("first appeal inserts");
+        assert!(
+            db.create_moderation_appeal(seller, None, None, "opaque:dup", Some("second"))
+                .is_none()
+        );
+        assert_eq!(db.list_moderation_appeals(seller, None).len(), 1);
+        assert_eq!(
+            db.get_moderation_appeal(seller, first)
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("first")
+        );
+
+        // Concurrent double-submission (bot-less tuple included): exactly one
+        // of the racing writers wins, so no duplicate rows can be created.
+        let shared = Arc::new(db);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let db = Arc::clone(&shared);
+            handles.push(thread::spawn(move || {
+                db.create_moderation_appeal(seller, None, None, "opaque:race", Some("race"))
+            }));
+        }
+        let ids: Vec<Option<i64>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .collect();
+        assert_eq!(ids.iter().filter(|id| id.is_some()).count(), 1);
+        assert_eq!(shared.list_moderation_appeals(seller, None).len(), 2);
+
+        // Distinct seller / ref / bot are still allowed — dedup is scoped to
+        // the exact (seller_id, bot_id, message_ref) tuple.
+        assert!(
+            shared
+                .create_moderation_appeal(seller + 1, None, None, "opaque:dup", None)
+                .is_some()
+        );
+        assert!(
+            shared
+                .create_moderation_appeal(seller, None, None, "opaque:other", None)
+                .is_some()
+        );
+        let bot = shared.create_bot("appeal-dedup-bot", seller, None, "");
+        assert!(
+            shared
+                .create_moderation_appeal(seller, Some(bot), None, "opaque:dup", None)
+                .is_some()
+        );
+        assert_eq!(shared.list_moderation_appeals(seller, None).len(), 4);
+    }
+
+    #[test]
+    fn moderation_appeals_legacy_duplicates_are_cleaned_up_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("mod_appeals_legacy_dup.db");
+        let path = path.to_str().unwrap().to_owned();
+        let seller = 701_i64;
+        let bot;
+        {
+            let db = Db::new(&path).unwrap();
+            bot = db.create_bot("appeal-legacy-bot", seller, None, "");
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            // Simulate a legacy DB: drop the unique index, then plant the
+            // duplicate rows the old check-then-insert handler could create.
+            conn.execute_batch("DROP INDEX IF EXISTS idx_mod_appeals_dedup;")
+                .unwrap();
+            for (id, reason, bot_id, reference) in [
+                (1_i64, "original", None, "opaque:legacy"),
+                (2_i64, "duplicate-1", None, "opaque:legacy"),
+                (3_i64, "duplicate-2", None, "opaque:legacy"),
+                (4_i64, "other-ref", None, "opaque:distinct"),
+                (5_i64, "other-bot", Some(bot), "opaque:legacy"),
+            ] {
+                conn.execute(
+                    "INSERT INTO moderation_appeals
+                     (id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
+                     VALUES(?1,?2,?3,NULL,?4,?5,'pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    params![id, seller, bot_id, reference, reason],
+                )
+                .unwrap();
+            }
+        }
+        // Reopening runs init_schema (dedup before the unique index) followed
+        // by the idempotent migrate pass — the legacy DB opens with the
+        // duplicates collapsed and every distinct tuple preserved.
+        let reopened = Db::new(&path).unwrap();
+        let rows = reopened.list_moderation_appeals(seller, None);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.message_ref == "opaque:legacy"
+            && r.bot_id.is_none()
+            && r.reason.as_deref() == Some("original")));
+        assert!(
+            rows.iter()
+                .any(|r| r.message_ref == "opaque:distinct" && r.bot_id.is_none())
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.message_ref == "opaque:legacy" && r.bot_id == Some(bot))
+        );
+
+        let indexed: bool = {
+            let conn = reopened.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_mod_appeals_dedup')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(indexed);
+        // The restored index blocks any further duplicate submission.
+        assert!(
+            reopened
+                .create_moderation_appeal(seller, None, None, "opaque:legacy", Some("late"))
+                .is_none()
+        );
+    }
 }

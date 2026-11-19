@@ -697,3 +697,25 @@ CREATE TABLE IF NOT EXISTS moderation_appeals (
 );
 CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status);
 CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id);
+
+-- Appeal dedup is enforced by the DB, not by the handler's check-then-insert
+-- (L10 LOW: concurrent double-submissions could create duplicate rows).
+-- COALESCE(bot_id, 0) folds the bot-less queue into the same key; bot ids are
+-- AUTOINCREMENT so 0 is never a real bot. The cleanup MUST precede the index
+-- creation: init_schema() executes this file before Db::migrate(), so an
+-- upgrade of a legacy DB that already holds duplicate (seller, bot, ref)
+-- tuples would otherwise fail to open. Keep the oldest row per tuple (lowest
+-- id); distinct tuples are untouched. Idempotent on every subsequent open.
+DELETE FROM moderation_appeals
+WHERE id IN (
+    SELECT d.id FROM moderation_appeals AS d
+    WHERE EXISTS (
+        SELECT 1 FROM moderation_appeals AS k
+        WHERE k.seller_id = d.seller_id
+          AND COALESCE(k.bot_id, 0) = COALESCE(d.bot_id, 0)
+          AND k.message_ref = d.message_ref
+          AND k.id < d.id
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_appeals_dedup
+    ON moderation_appeals(seller_id, COALESCE(bot_id, 0), message_ref);

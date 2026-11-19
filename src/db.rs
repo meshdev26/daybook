@@ -1138,6 +1138,50 @@ impl Db {
                 return Err(());
             }
         }
+
+        // L10 LOW: make appeal submission idempotent in storage rather than
+        // relying on the handler's check-then-insert. Collapse any legacy
+        // duplicate tuples *before* the unique index is created, keeping the
+        // oldest row per (seller, bot, ref). This mirrors the cleanup in
+        // schema.sql (which runs earlier in init_schema) so an upgrade of a
+        // DB already holding duplicates never fails to open; the second pass
+        // here is idempotent and also covers an index-less DB.
+        if let Err(e) = Self::dedup_moderation_appeals(conn) {
+            tracing::warn!("moderation appeal dedup failed: {}", e);
+            return Err(());
+        }
+        if let Err(e) = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_appeals_dedup
+             ON moderation_appeals(seller_id, COALESCE(bot_id, 0), message_ref)",
+            [],
+        ) {
+            tracing::warn!("moderation DDL failed for idx_mod_appeals_dedup: {}", e);
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Delete later duplicates of the same appeal tuple, keeping the oldest
+    /// (lowest `id`) row. `COALESCE(bot_id, 0)` matches the unique index so
+    /// non-null and bot-less submissions are deduped by the same rule; bot ids
+    /// are AUTOINCREMENT, so 0 is never a real bot. Purely additive/idempotent:
+    /// a second run deletes nothing. Parameterized SQL only, no data loss of
+    /// distinct (seller, bot, ref) tuples, and no message text is read/logged.
+    fn dedup_moderation_appeals(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute(
+            "DELETE FROM moderation_appeals
+             WHERE id IN (
+                 SELECT d.id FROM moderation_appeals AS d
+                 WHERE EXISTS (
+                     SELECT 1 FROM moderation_appeals AS k
+                     WHERE k.seller_id = d.seller_id
+                       AND COALESCE(k.bot_id, 0) = COALESCE(d.bot_id, 0)
+                       AND k.message_ref = d.message_ref
+                       AND k.id < d.id
+                 )
+             )",
+            [],
+        )?;
         Ok(())
     }
 
@@ -8429,6 +8473,13 @@ impl Db {
     /// Create an appeal. `message_ref` must be an opaque token supplied by the
     /// bot-side flow (L8); `reason` is the short appeal justification, capped
     /// by [`MODERATION_MAX_REASON_LEN`] — neither may carry the filtered body.
+    ///
+    /// Atomic dedup (L10 LOW): the unique index on
+    /// `(seller_id, COALESCE(bot_id, 0), message_ref)` makes concurrent
+    /// double-submissions a no-op instead of two rows. `None` is returned on
+    /// conflict — the existing `Option<i64>` signature already means "no row
+    /// created", so L8/L7 call sites need no change (the handler's pre-check
+    /// still reports `AlreadyRequested` in the non-racy case).
     pub fn create_moderation_appeal(
         &self,
         seller_id: i64,
@@ -8444,12 +8495,19 @@ impl Db {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO moderation_appeals(seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,'pending',?6,?6)",
-            params![seller_id, bot_id, decision_id, message_ref, reason, now],
-        )
-        .ok()?;
+        let inserted = conn
+            .execute(
+                "INSERT INTO moderation_appeals(seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,'pending',?6,?6)
+                 ON CONFLICT(seller_id, COALESCE(bot_id, 0), message_ref) DO NOTHING",
+                params![seller_id, bot_id, decision_id, message_ref, reason, now],
+            )
+            .ok()?;
+        // `last_insert_rowid()` is per-connection and is NOT advanced by a
+        // DO NOTHING conflict; only report an id when a row was really added.
+        if inserted == 0 {
+            return None;
+        }
         Some(conn.last_insert_rowid())
     }
 
