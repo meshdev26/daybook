@@ -46,19 +46,29 @@ pub use handlers::capabilities::shop_bot as shop_bot_capability;
 #[cfg(feature = "web_app")]
 pub use handlers::capabilities::web_app as web_app_capability;
 
-// Dependency optionalization status (L9 handoff): capability deps are still
-// NON-optional. The blockers are shared modules that are compiled for every
-// feature set and reference the deps unconditionally:
-//   * src/web/**, src/api.rs, src/auth.rs and src/embed.rs compile for every
-//     build and use axum/reqwest/oauth-adjacent crates;
-//   * src/ai/**, src/crypto.rs use reqwest; src/identity/** uses
-//     grammers-*/aes-gcm/pbkdf2 and is wired into web state;
+// L9 feature-optionalization investigation (complete): the capability
+// features are inert markers today and no dependency is optionalizable from
+// this crate root. Verified with `cargo tree --depth 1`: the default and
+// `--no-default-features --features movie_bot` direct dependency sets are
+// identical. Every crate in `[dependencies]` is referenced by a module that
+// compiles for every feature set:
+//   * src/web/**, src/api.rs, src/auth.rs, src/embed.rs, src/mcp/**,
+//     src/bots.rs, src/services/** -> axum/reqwest/serde/tokio/tracing/
+//     chrono/sha2/cookie/bcrypt/getrandom;
+//   * src/ai/**, src/crypto.rs -> reqwest/async-trait;
+//   * src/identity/** -> grammers-*/aes-gcm/pbkdf2/zeroize/thiserror, and it
+//     is wired into WebState by web/identity.rs so it cannot be cfg-gated here;
+//   * src/db.rs -> rusqlite; src/config.rs + web/bots_*.rs -> toml;
 //   * src/main.rs (binary) builds the shop command/dialogue tree from
-//     handlers::commands / messages / callbacks unconditionally, and needs
+//     handlers::commands / messages / callbacks unconditionally and needs
 //     teloxide's sqlite-storage feature for every dispatcher.
-// Gating those modules is a separate, larger rung-crossing change; leaving
-// Cargo.toml (L9 territory) untouched keeps `--lib` and the default build
-// green. The feature-gated modules above are now ready for `dep:` mappings.
+// The capability modules re-exported above are stub `Descriptor` constants
+// with no dependency of their own, and every crate-root module below is
+// shared infrastructure. Gating any of them requires edits to L7 (web/api/
+// auth/embed) and L8 (handlers core, main.rs) files — out of L9 territory.
+// Until those rungs gate their modules there is no safe `#[cfg(feature=...)]`
+// addition here and no safe `optional = true` / `dep:` mapping in Cargo.toml;
+// both builds stay green and the default build stays byte-identical.
 
 use teloxide::prelude::*;
 
