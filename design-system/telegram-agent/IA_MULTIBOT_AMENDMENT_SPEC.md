@@ -20,7 +20,7 @@ The owner now wants a family of surfaces in the same platform: **Movie bot**, **
 - Some are non-bot surfaces (public Web app, AI service, File Share) — they have no bot id and cannot be expressed by a bot-only selector.
 - Some are cross-cutting capabilities (Automation, moderation) — they apply across products rather than being a product of their own.
 
-Fitting these into the current IA by adding a nav group per product would explode the rail, and giving each product its own console would fragment login and tenancy. The structural answer is a new concept — **product type** — carried as metadata on a generalized scope selector, plus a **cross-cutting moderation layer** rather than a "moderation bot." This document is a **bounded amendment**: the six groups, every existing path, every existing gate, and every token stay as approved. Only the selector is generalized, product type is added as metadata, three new capability surfaces are introduced, and capabilities are packaged so an install compiles only what it ships.
+Fitting these into the current IA by adding a nav group per product would explode the rail, and giving each product its own console would fragment login and tenancy. The structural answer is a new concept — **product type** — carried as metadata on a generalized scope selector, plus a **cross-cutting moderation layer** rather than a "moderation bot." This document is a **bounded amendment**: the six groups, every existing path, every existing gate, and every token stay as approved. Only the selector is generalized, product type is added as metadata, three new capability surfaces are introduced, and capabilities are packaged so an install registers only what it ships.
 
 ---
 
@@ -33,7 +33,7 @@ Fitting these into the current IA by adding a nav group per product would explod
 - Introduce **product type** as metadata: Telegram bot types and non-bot surfaces are described by data, not by new nav groups.
 - Disclose per-type configuration progressively: basics first, type-specific settings behind an "Advanced" disclosure.
 - Add a **cross-cutting moderation hierarchy** at three levels (owner floor, seller-wide Blocked words, per-bot override) with empty, error, and appeal states plus an allow-list.
-- Package capabilities behind feature flags so a **movie-only install compiles only that capability**; the default build keeps all existing paths.
+- Package capabilities behind feature flags so a **movie-only install registers only the movie capability and refuses other bot types**; the default build keeps all existing paths. (Dependency/binary-size trimming is deferred — see §5.)
 - Hold the WCAG 2.2 AA floor and the unchanged token contract across every added control and state.
 
 **Non-goals**
@@ -132,11 +132,11 @@ Inside the existing `/bots` Edit form's Advanced disclosure, a per-bot moderatio
 
 ## 5. Feature-gated capability packaging
 
-Capabilities are packaged so an install compiles and ships only what it offers:
+Capabilities are selected at compile time and gate **registration, navigation visibility, and which bot types are accepted at runtime** — they do not trim dependencies or binary size:
 
 - Each nav item in the declarative table carries an optional `feature: &'static str` and an optional `product_types` set. `rail_nav` filters items by compile-time `#[cfg(feature = "...")]` and, at runtime, by the selected product's `type` metadata.
-- A **movie-only install** enables the `movies` capability (plus the moderation floor) and compiles only that capability's nav item, config fields, and handler module. Capabilities for shop, reply, web app, AI service, file share, and automation are absent from the nav and from the type facet because they were not compiled in.
-- The **default build** keeps every path in `IA_REDESIGN_SPEC.md` §2 registered and byte-identical. Feature gating changes nav visibility and which capability modules compile — it never renames, moves, or removes an existing path, and it introduces no new route for an existing page.
+- A **movie-only install** enables the `movie_bot` capability and **registers** only that capability's nav item, config fields, and handler module; other types are absent from nav/type facet and bots of those types are explicitly refused (`capability_uncompiled`). **All Cargo dependencies remain compiled and linked** (`cargo tree --depth 1` identical to default; binary not smaller); omission requires L7+L8 module gating then L9 `Cargo.toml` optional/dep mappings — a deferred cross-rung follow-up outside this foundation's scope.
+- The **default build** keeps every path in `IA_REDESIGN_SPEC.md` §2 registered and byte-identical. Feature gating changes nav visibility and which capability modules are registered — it never renames, moves, or removes an existing path, and it introduces no new route for an existing page.
 - The runtime type filter is a view filter only: hiding an item for a product type does not change a page gate or a write authorization. This mirrors the shipped selector rule that scoping narrows what is read, not what is permitted.
 - Capability pages introduced by this amendment (Blocked words, Content policy, Automation) follow the same rule: their own routes are registered only when their capability is compiled in; no existing route is altered.
 
@@ -199,7 +199,7 @@ Capabilities are packaged so an install compiles and ships only what it offers:
 - [ ] A forged product id, type value, or seller id is rejected server-side (403); scope narrows reads only.
 - [ ] Product type is metadata on the selector; bot types and non-bot surfaces are represented without new nav groups.
 - [ ] Per-type configuration is progressively disclosed behind a closed-by-default Advanced disclosure on existing pages, with no new route for those fields.
-- [ ] A movie-only feature build compiles only the movie capability; the default build keeps every existing path registered.
+- [ ] A movie-only feature build registers only the movie capability and refuses other bot types; the default build keeps every existing path registered. Dependency sets are intentionally unchanged (§5).
 - [ ] Moderation is a cross-cutting layer with no standalone bot: owner Content policy (non-overridable floor), seller Blocked words (one "Add a word" action, hide / warn / review), per-bot override defaulting to "Using your shop's rules."
 - [ ] Blocked words has an empty state, inline validation with retry that preserves input, an appeal review list with "Request review" + reason + status, and an "Always allow" allow-list taking precedence over blocked words while staying above the floor.
 - [ ] Seller / bot / appeal records are scoped by `seller_id` (and `bot_id` for overrides); no new auth, cookie, or role tier.
