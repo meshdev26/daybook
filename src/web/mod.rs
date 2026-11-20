@@ -748,24 +748,6 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
     )
 }
 
-/// Normalizes a console channel target for owner comparison: trimmed, no
-/// leading `@`, ASCII-lowercased. Stored channel names may be `@handles` or
-/// numeric chat ids, so the comparison tolerates both forms — the value that
-/// is actually sent to Telegram is never rewritten.
-fn channel_key(channel: &str) -> String {
-    channel.trim().trim_start_matches('@').to_ascii_lowercase()
-}
-
-/// Whether the `channels` row for this target belongs to `seller_id`, keyed
-/// exactly as stored first and then in normalized form.
-fn owns_channel_row(state: &WebState, seller_id: i64, chat_id: &str) -> bool {
-    state
-        .db
-        .get_channel_seller_id(chat_id.trim())
-        .or_else(|| state.db.get_channel_seller_id(&channel_key(chat_id)))
-        == Some(seller_id)
-}
-
 /// Tenant gate for every channel-addressed console mutation (post edits,
 /// deletes, pins, the channel title/description, the schedule destination).
 ///
@@ -780,24 +762,14 @@ fn owns_channel_row(state: &WebState, seller_id: i64, chat_id: &str) -> bool {
 /// bound to the target channel is what performs the mutation, so this check is
 /// what stops tenant A's session from driving tenant B's bot (review H1).
 fn may_mutate_channel(state: &WebState, session: &Session, chat_id: &str) -> bool {
-    if Role::from_role_str(&session.role).has_level(Role::Admin) {
-        return true;
-    }
-    let key = channel_key(chat_id);
-    if key.is_empty() {
-        return false;
-    }
-    let Some(sid) = session.seller_id else {
-        return false;
-    };
-    if owns_channel_row(state, sid, chat_id) {
-        return true;
-    }
-    state
-        .db
-        .seller_channel(sid)
-        .map(|own| channel_key(&own))
-        .is_some_and(|own| !own.is_empty() && own == key)
+    crate::handlers::channel_access::may_mutate_channel(
+        state.db.as_ref(),
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }
 
 /// Post-row ownership for the unscoped `update_post_content` / `delete_post`
@@ -822,12 +794,12 @@ fn may_mutate_post(state: &WebState, session: &Session, post_id: Option<i64>) ->
 /// address a global row or a channel they own — never another seller's
 /// channel (review H1: that send is executed by the victim channel's bot).
 fn may_post_to_channel(state: &WebState, session: &Session, chat_id: &str) -> bool {
-    if may_mutate_channel(state, session, chat_id) {
-        return true;
-    }
-    let key = channel_key(chat_id);
-    if key.is_empty() {
-        return false;
-    }
-    owns_channel_row(state, 0, chat_id)
+    crate::handlers::channel_access::may_post_to_channel(
+        state.db.as_ref(),
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }
