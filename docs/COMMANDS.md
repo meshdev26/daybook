@@ -91,9 +91,9 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/buy <name>` — buy a product or plan by exact name; returns a Crypto Pay invoice. Ambiguous names (two sellers) are refused — ask the seller.
 - Delivery: after verified payment the buyer receives the payload as a private message (document re-sent for `digital_file`).
 
-## Finance (v1.2, owner/admin via API or bot)
+## Finance (v1.2, owner approval for money movement; seller/admin may view and request)
 
-- Refunds: create (seller, from a paid invoice) → approve → execute (owner/admin; executes a Crypto Pay transfer, revokes the grant and kicks the buyer; every step audited).
+- Refunds: create (seller, from a paid invoice) → approve → execute (owner only for all money movement, with creator separation: the creator may not approve or execute their own refund, `403 creator_forbidden`; non-owners get `403 owner_required`). Execute performs a Crypto Pay transfer; only a FULL refund revokes the grant and kicks the buyer (a partial refund leaves the invoice `paid` with no grant revocation or kick); every step audited.
 - Payouts: create (seller) → approve → execute (owner only; transfers to destination).
 - `/refundapprove [id]` — owner-only flow via bot: with no id it lists pending refunds (max 10); with an id it approves the refund. Creator separation: the creator may not approve their own refund (`403 creator_forbidden`), and non-owners get `403 owner_required`. State machine mirrors the REST approve endpoint; every approval is audit-logged. A partial refund leaves the invoice `paid` with no grant revocation or kick.
 - `/payoutapprove [id]` — same for payouts (max 10 listed, approve by id, audit-logged); refused if the approver's own seller account would benefit.
