@@ -178,9 +178,9 @@ Money movement is owner-approved (T2) and audited (`audit_log`).
 | Method & path | Role | Description |
 |---|---|---|
 | `POST /api/v1/finance/refunds` | seller | Create refund request from one of their paid invoices (amount/asset default to the invoice's). Seller callers: `amount` must parse as a number (400 otherwise), is clamped to the invoice amount, and `asset` must equal the invoice asset (400 `invalid_asset`). |
-| `POST /api/v1/finance/refunds/{id}/approve` | admin/owner | pending → approved. |
-| `POST /api/v1/finance/refunds/{id}/process` | admin/owner | approved → processed (no transfer): invoice marked refunded, buyer kicked, tied subscriptions expired. 409 unless status is `approved`. |
-| `POST /api/v1/finance/refunds/{id}/execute` | admin/owner | Executes Crypto Pay `transfer` to the invoice's buyer; on success: executed, invoice refunded, subscription revoked + buyer kicked. |
+| `POST /api/v1/finance/refunds/{id}/approve` | owner only | pending → approved (owner-only flow). Creator separation: the creator may not approve their own refund (`403 creator_forbidden`); non-owners get `403 owner_required`. |
+| `POST /api/v1/finance/refunds/{id}/process` | owner only | approved → processed (no transfer): on a full refund the invoice is marked refunded, buyer kicked, tied subscriptions expired; a partial refund leaves the invoice `paid` with no grant revocation or kick. Owner-only flow — the creator may not settle their own refund. 409 unless status is `approved`. |
+| `POST /api/v1/finance/refunds/{id}/execute` | owner only | Executes Crypto Pay `transfer` to the invoice's buyer; on success of a full refund: executed, invoice refunded, subscription revoked + buyer kicked; a partial refund leaves the invoice `paid` with no grant revocation or kick. Owner-only flow — the creator may not execute their own refund. |
 | `POST /api/v1/finance/payouts` | seller | Create payout request `{amount, asset, destination?}` (admins must name `seller_id`). |
 | `POST /api/v1/finance/payouts/{id}/process` | owner | approved → paid (manual mark-as-paid outside Crypto Pay). 409 unless status is `approved`. |
 | `POST /api/v1/finance/payouts/{id}/approve` / `{id}/execute` | owner only | Approve, then execute the transfer (destination must be the Telegram user id to pay). |

@@ -42,8 +42,11 @@ free-confirmation unchanged; everything below gates the v1.5 priced-bookings spe
 3. **Seller no-show (paid booking never confirmed) = automatic refund *initiation*;
    execution stays owner-side.** The sweeper auto-creates the refund row (`pending`)
    and DMs the buyer — "refund queued" at expiry, "refund sent" on execution.
-   Approval/execution remain the existing owner/admin flow (two-person rule intact:
-   the benefiting seller is never in the approval path). No code-enforced SLA in v1.5.
+   Approval/execution remain an owner-only flow: the owner alone approves and
+   executes, with creator separation intact — the creator may not approve, execute
+   or settle their own refund, so the benefiting seller is never in the approval
+   path. A partial refund leaves the invoice `paid` with no grant revocation or kick.
+   No code-enforced SLA in v1.5.
 
 4. **Buyer cancels a CONFIRMED paid booking: full auto refund if the cancel is
    ≥ `CANCELLATION_WINDOW_HOURS` (default 24, global constant) before slot start;
