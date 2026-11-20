@@ -20,6 +20,10 @@ setup: ## Interactive first-run configuration (writes .env, 0600)
 run: ## Build (debug) and run locally
 	cargo run
 
+.PHONY: tg
+tg: ## Short alias: build and run Daybook locally
+	@$(MAKE) run
+
 .PHONY: run-release
 run-release: ## Build (release) and run locally
 	cargo build --release && ./target/release/telegram-agent
