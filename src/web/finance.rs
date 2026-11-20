@@ -2,7 +2,7 @@ use super::*;
 use crate::db::ReconciliationRow;
 use crate::handlers::money::{
     all_reconciliation_rows, format_digest, paid_ungranted_escalation_cutoff,
-    reconciliation_cutoffs, refund_creator, should_run_digest,
+    reconciliation_cutoffs, should_run_digest,
 };
 // ---------- Finance ----------
 
@@ -643,8 +643,8 @@ fn finance_refund_table(state: &WebState, session: &Session, filter: &str) -> St
             .map(|r| {
                 // §2: hide the controls from the human creator as well as
                 // from non-owners; the server enforces the same gate.
-                let creator_owned = refund_creator(&state.db, r.0)
-                    .is_some_and(|(creator, _)| creator == session.account_id);
+                let creator_owned =
+                    crate::handlers::money::creator_owns_refund(&state.db, session.account_id, r.0);
                 finance_refund_row(state, is_admin, is_owner, creator_owned, r)
             })
             .collect::<Vec<_>>()

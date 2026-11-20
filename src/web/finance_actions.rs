@@ -2,7 +2,7 @@ use super::*;
 use crate::db::{ReconcileError, ReconciliationOutcome, RefundCreateError, RefundInput};
 use crate::handlers::money::{
     GuardedTransferOutcome, execute_guarded_transfer, fresh_idem_key, is_full_refund,
-    paid_ungranted_escalation_cutoff, refund_creator,
+    paid_ungranted_escalation_cutoff,
 };
 
 /// §2: money approvals, executions and manual settlements require the exact
@@ -16,7 +16,7 @@ fn is_owner(session: &Session) -> bool {
 /// execute or manually settle their own row. System-created refunds have no
 /// creator audit event and are exempt (they still need an Owner).
 fn creator_owns_refund(state: &WebState, session: &Session, refund_id: i64) -> bool {
-    refund_creator(&state.db, refund_id).is_some_and(|(creator, _)| creator == session.account_id)
+    crate::handlers::money::creator_owns_refund(&state.db, session.account_id, refund_id)
 }
 
 /// §3.5 data predicate used by the payout-create hold. Kept as a small
