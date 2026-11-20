@@ -292,37 +292,45 @@ fn login_throttle_hard_cap_bounds_the_map() {
     );
 }
 
-// ---- CryptoPay transfer error classification (BLOCK-2) ----
+// ---- CryptoPay transfer error classification (BLOCK-2 / MONEY_SAFETY §4.2) ----
 
 #[test]
 fn transfer_rejection_classification() {
+    // The web no longer owns a second classifier: REST, bot and web all use
+    // the shared fail-closed enum. Only positively recognized API refusals
+    // are definite; everything else is Ambiguous.
+    use crate::handlers::money::{TransferOutcome, classify_transfer_error};
+    let definite = |e: &str| {
+        assert_eq!(
+            classify_transfer_error(e),
+            TransferOutcome::DefiniteRejected,
+            "{e}"
+        )
+    };
+    let ambiguous = |e: &str| {
+        assert_eq!(
+            classify_transfer_error(e),
+            TransferOutcome::Ambiguous,
+            "{e}"
+        )
+    };
     // Parsed ok:false from the API: definite refusal, no money moved.
-    assert!(transfer_rejected_definitely("INSUFFICIENT_FUNDS"));
-    assert!(transfer_rejected_definitely("unknown error"));
+    definite("INSUFFICIENT_FUNDS");
+    definite("unknown error");
     // 4xx from the API: the request was seen and rejected.
-    assert!(transfer_rejected_definitely(
-        "HTTP 400 Bad Request - {\"ok\":false}"
-    ));
-    assert!(transfer_rejected_definitely("HTTP 401 Unauthorized - {}"));
+    definite("HTTP 400 Bad Request - {\"ok\":false}");
+    definite("HTTP 401 Unauthorized - {}");
     // 5xx and 408: an intermediary may have dropped a processed transfer.
-    assert!(!transfer_rejected_definitely(
-        "HTTP 502 Bad Gateway - proxy"
-    ));
-    assert!(!transfer_rejected_definitely(
-        "HTTP 504 Gateway Timeout - proxy"
-    ));
-    assert!(!transfer_rejected_definitely(
-        "HTTP 408 Request Timeout - {}"
-    ));
+    ambiguous("HTTP 502 Bad Gateway - proxy");
+    ambiguous("HTTP 504 Gateway Timeout - proxy");
+    ambiguous("HTTP 408 Request Timeout - {}");
     // reqwest transport shapes (connect/timeout/body/decode): ambiguous.
-    assert!(!transfer_rejected_definitely(
-        "error sending request for url (https://pay.crypt.bot/api/transfer): operation timed out"
-    ));
-    assert!(!transfer_rejected_definitely(
-        "error decoding response body"
-    ));
-    assert!(!transfer_rejected_definitely(
-        "error reading a body from connection"
-    ));
-    assert!(!transfer_rejected_definitely("builder error"));
+    ambiguous(
+        "error sending request for url (https://pay.crypt.bot/api/transfer): operation timed out",
+    );
+    ambiguous("error decoding response body");
+    ambiguous("error reading a body from connection");
+    ambiguous("builder error");
+    // A novel error shape must default to Ambiguous, never definite.
+    ambiguous("a brand new provider error we did not anticipate");
 }

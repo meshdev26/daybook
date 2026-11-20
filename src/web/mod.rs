@@ -338,6 +338,10 @@ fn routes_finance(r: Router<WebState>) -> Router<WebState> {
         .route("/finance/refund/create", post(finance_refund_create))
         .route("/finance/refund/approve", post(finance_refund_approve))
         .route("/finance/refund/execute", post(finance_refund_execute))
+        .route(
+            "/finance/reconciliation/resolve",
+            post(finance_reconciliation_resolve),
+        )
         .route("/broadcast", get(broadcast_page))
         .route("/broadcast/send", post(broadcast_send))
         .route("/crypto", get(crypto_page))
