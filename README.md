@@ -1,4 +1,6 @@
-# Telegram Channel & Subscription Operator Agent (Rust)
+# Daybook — Telegram commerce back-office
+
+Daybook — the calm back-office ledger for your Telegram commerce.
 
 An **owner-only** Telegram bot that:
 - Posts and manages a target Telegram channel **only on your command**.

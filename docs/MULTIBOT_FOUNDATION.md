@@ -1,5 +1,7 @@
 # Multi-Bot Foundation
 
+Daybook is the calm back-office ledger these products live in.
+
 One process, one database, one console — several bots and several kinds of
 product. This guide explains how products are typed, how the console scope
 selector works, how a build registers only the capabilities you
