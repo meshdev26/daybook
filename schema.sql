@@ -38,8 +38,23 @@ CREATE TABLE IF NOT EXISTS invoices (
     user_id      INTEGER,
     attempts     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    -- Money Safety Spec §3 (Decision 3): paid-but-ungranted recovery clock.
+    -- Non-money TEXT timestamp; NULL unless the invoice entered that state.
+    -- Legacy DBs gain it via the additive ALTER in Db::migrate_money_safety.
+    paid_ungranted_at TEXT
 );
+
+-- Decision 3.1: 'failed' is never terminal once money was confirmed paid.
+-- The trigger is declared here (it only reads the pre-existing `status`
+-- column, so it is safe to create on a legacy DB during init_schema) and
+-- mirrored in Db::migrate_money_safety for completeness. L8 owns the audit
+-- event `invoice_failed_after_paid_blocked`; the DB owns the hard refusal.
+CREATE TRIGGER IF NOT EXISTS trg_invoice_no_failed_after_paid
+BEFORE UPDATE ON invoices
+FOR EACH ROW
+WHEN OLD.status IN ('paid','paid_ungranted') AND NEW.status = 'failed'
+BEGIN SELECT RAISE(ABORT, 'invoice_failed_after_paid_blocked'); END;
 
 -- Admin allow-list (superadmin always admin)
 CREATE TABLE IF NOT EXISTS admins (
@@ -219,6 +234,14 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 );
 
 -- Refunds
+-- Money Safety Spec §1 (Decision 1) + §5 (Decision 5). All new columns are
+-- TEXT/INTEGER (G3: no new REAL money column). Amount/asset stay untouched.
+-- The partial-unique indexes, asset-match trigger, immutability trigger and
+-- resolution append-only trigger are created in Db::migrate_money_safety
+-- (AFTER the additive ALTERs that give legacy DBs these columns) — declaring
+-- them here would fail init_schema on a legacy DB whose refunds table predates
+-- these columns. Defaults exist only so legacy ALTER TABLE ADD COLUMN works
+-- with rows present; all INSERTs in db.rs supply explicit values.
 CREATE TABLE IF NOT EXISTS refunds (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id   INTEGER NOT NULL,
@@ -229,10 +252,19 @@ CREATE TABLE IF NOT EXISTS refunds (
     reason      TEXT,
     status      TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    idem_key    TEXT NOT NULL DEFAULT '',
+    created_by  INTEGER NOT NULL DEFAULT -1,
+    created_role TEXT NOT NULL DEFAULT 'unknown',
+    executing_since TEXT,
+    reconciliation_since TEXT,
+    resolution  TEXT,
+    resolved_by INTEGER,
+    resolved_at TEXT
 );
 
--- Payouts
+-- Payouts (Decision 5 columns mirror refunds; Decision 1 cap/idempotency
+-- is refund-only per the spec).
 CREATE TABLE IF NOT EXISTS payouts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id    INTEGER NOT NULL,
@@ -241,7 +273,12 @@ CREATE TABLE IF NOT EXISTS payouts (
     destination  TEXT,
     status       TEXT NOT NULL DEFAULT 'pending',
     created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    executing_since TEXT,
+    reconciliation_since TEXT,
+    resolution  TEXT,
+    resolved_by INTEGER,
+    resolved_at TEXT
 );
 
 -- Audit log
@@ -719,3 +756,26 @@ WHERE id IN (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_appeals_dedup
     ON moderation_appeals(seller_id, COALESCE(bot_id, 0), message_ref);
+
+-- Money Safety Spec §4 (Decision 4): append-only spend-id ledger. One row
+-- per transfer ATTEMPT, persisted in a committed transaction BEFORE any
+-- Crypto Pay call. `spend_id` is globally unique (a duplicate insert is a
+-- hard error, never an overwrite); ambiguous retries reuse the persisted
+-- spend_id, definite rejections mint a fresh one and a fresh attempt_no.
+-- seller_id keeps every new money record tenant-scoped. No REAL column.
+CREATE TABLE IF NOT EXISTS transfer_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_type    TEXT NOT NULL CHECK (row_type IN ('refund','payout')),
+    row_id      INTEGER NOT NULL,
+    attempt_no  INTEGER NOT NULL,
+    spend_id    TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    outcome     TEXT,
+    resolved_at TEXT,
+    seller_id   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (row_type, row_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_attempts_row
+    ON transfer_attempts(row_type, row_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_transfer_attempts_seller
+    ON transfer_attempts(seller_id);

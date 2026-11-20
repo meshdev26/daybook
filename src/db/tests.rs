@@ -3891,3 +3891,842 @@ mod moderation_tests {
         );
     }
 }
+
+// ---- Money Safety Spec: data-layer tests (decisions 1/3/4/5) ----
+
+fn money_test_db(name: &str) -> (Db, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    // Keep the tempdir alive for the test's lifetime by leaking it; these
+    // are short-lived unit tests and the OS reclaims the directory.
+    std::mem::forget(dir);
+    (db, path)
+}
+
+fn refund_input<'a>(
+    seller_id: i64,
+    invoice_id: Option<&'a str>,
+    amount: &'a str,
+    asset: &'a str,
+    idem_key: &'a str,
+    created_by: i64,
+    created_role: &'a str,
+) -> RefundInput<'a> {
+    RefundInput {
+        seller_id,
+        invoice_id,
+        user_id: None,
+        amount,
+        asset,
+        reason: Some("test refund"),
+        idem_key,
+        created_by,
+        created_role,
+    }
+}
+
+/// §1.1/§1.2: one in-flight refund per invoice; idem replay returns the
+/// same row; a completed partial refund frees the in-flight slot for a
+/// later, distinctly-keyed partial (no blanket UNIQUE(invoice_id)).
+#[test]
+fn money_refund_inflight_uniqueness_and_partial_after_completion() {
+    let (db, _path) = money_test_db("refund_inflight.db");
+    db.save_invoice(
+        "inv-u1",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let first = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "4",
+            "USDT",
+            "key-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(first.created_new);
+
+    let replay = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "4",
+            "USDT",
+            "key-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert_eq!(replay.id, first.id);
+    assert!(!replay.created_new);
+    assert_eq!(db.list_refunds(Some(1)).len(), 1);
+
+    let blocked = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "1",
+            "USDT",
+            "key-2",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(blocked, RefundCreateError::InFlight);
+
+    db.set_refund_status(first.id, "executed");
+    let second = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "3",
+            "USDT",
+            "key-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(second.created_new);
+    assert_ne!(second.id, first.id);
+    assert_eq!(db.list_refunds(Some(1)).len(), 2);
+}
+
+/// §1.2 step 3/4: the cap counts every non-void row (including terminal
+/// `executed` and the legacy `processed` alias); `void` is not counted.
+#[test]
+fn money_refund_cumulative_cap_across_states() {
+    let (db, path) = money_test_db("refund_cap.db");
+    db.save_invoice(
+        "inv-cap",
+        1,
+        "10.00000001",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let r1 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "6",
+            "USDT",
+            "cap-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    db.set_refund_status(r1.id, "executed");
+    // 6 + 4.00000001 == the invoiced amount: allowed to the last minor unit.
+    let r2 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "4.00000001",
+            "USDT",
+            "cap-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(r2.created_new);
+    // One more minor unit exceeds the cap.
+    db.set_refund_status(r2.id, "executed");
+    let err = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "0.00000001",
+            "USDT",
+            "cap-3",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(err, RefundCreateError::CapExceeded);
+
+    // A `void` row is excluded from the cumulative sum and the in-flight set.
+    let voided = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "1",
+            "USDT",
+            "void-1",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(voided, RefundCreateError::InvoiceNotFound);
+    db.save_invoice(
+        "inv-void",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let r3 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "5",
+            "USDT",
+            "void-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    db.set_refund_status(r3.id, "void");
+    let r4 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "5",
+            "USDT",
+            "void-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(
+        r4.created_new,
+        "void must not consume cap or in-flight slot"
+    );
+
+    // Legacy `processed` alias on a fresh row is still counted (read-only).
+    db.save_invoice(
+        "inv-processed",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,idem_key,created_by,created_role,created_at,updated_at) VALUES(1,'inv-processed',42,'4','USDT','processed','legacy:900',-1,'unknown','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    let blocked = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-processed"),
+            "2",
+            "USDT",
+            "cap-4",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(blocked, RefundCreateError::CapExceeded);
+}
+
+/// §1.1: asset is locked to the invoice, actor is persisted, and money
+/// columns are immutable even from a raw writer.
+#[test]
+fn money_refund_asset_lock_actor_and_immutability() {
+    let (db, path) = money_test_db("refund_immutable.db");
+    db.save_invoice(
+        "inv-asset",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let mismatch = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-asset"),
+            "5",
+            "TON",
+            "asset-1",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(mismatch, RefundCreateError::AssetMismatch);
+    let created = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-asset"),
+            "5",
+            "USDT",
+            "asset-2",
+            77,
+            "Owner",
+        ))
+        .unwrap();
+    assert!(created.created_new);
+    let row = db.get_refund(created.id).unwrap();
+    assert_eq!(row.1, 1);
+    assert_eq!(row.5, "USDT");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        let idem: String = conn
+            .query_row(
+                "SELECT idem_key FROM refunds WHERE id=?1",
+                [created.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idem, "asset-2");
+        let actor: (i64, String) = conn
+            .query_row(
+                "SELECT created_by,created_role FROM refunds WHERE id=?1",
+                [created.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor.0, 77);
+        assert_eq!(actor.1, "Owner");
+        assert!(
+            conn.execute("UPDATE refunds SET amount='999' WHERE id=?1", [created.id])
+                .is_err(),
+            "money columns must be immutable"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE refunds SET status='executed' WHERE id=?1",
+                [created.id]
+            )
+            .is_ok(),
+            "status is allowed to change"
+        );
+    }
+}
+
+/// §1.4 + §2.7 legacy migration: columns backfilled idempotently, audit
+/// actor recovered where present, sentinels otherwise, no row deletions.
+#[test]
+fn money_migration_legacy_is_additive_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_money.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id TEXT NOT NULL UNIQUE, seller_id INTEGER NOT NULL DEFAULT 0, amount TEXT NOT NULL, asset TEXT NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'active', pay_url TEXT, plan_id TEXT, user_id INTEGER, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, invoice_id TEXT, user_id INTEGER, amount TEXT NOT NULL, asset TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, amount TEXT NOT NULL, asset TEXT NOT NULL, destination TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT, metadata TEXT, created_at TEXT NOT NULL);
+             INSERT INTO invoices(invoice_id,seller_id,amount,asset,status,created_at,updated_at) VALUES('old-inv',3,'2.5','USDT','paid','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(3,'old-inv',42,'2.5','USDT','executed','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,metadata,created_at) VALUES(55,'Owner','refund_create','refund','1','{}','2020-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    // First open migrates; a second open is byte-identical (idempotent).
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let reopened = Db::new(path.to_str().unwrap()).unwrap();
+    for db in [&db, &reopened] {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (idem, actor, role): (String, i64, String) = conn
+            .query_row(
+                "SELECT idem_key,created_by,created_role FROM refunds WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(idem, "legacy:1");
+        assert_eq!(actor, 55, "actor comes from the refund_create audit row");
+        assert_eq!(role, "Owner");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refunds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "migration deletes no money rows");
+    }
+}
+
+/// §1.4: legacy DBs with two in-flight refunds for one invoice fail closed
+/// with the offending ids; after an audited void leaves one survivor the
+/// same DB opens and the unique index is present.
+#[test]
+fn money_migration_fails_closed_on_duplicate_inflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_duplicate.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, invoice_id TEXT, user_id INTEGER, amount TEXT NOT NULL, asset TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(1,'dup',42,'1','USDT','pending','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(1,'dup',42,'1','USDT','approved','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let err = match Db::new(path.to_str().unwrap()) {
+        Ok(_) => panic!("legacy duplicate in-flight refunds must fail closed"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("money-safety migration refused"), "{msg}");
+    assert!(msg.contains("dup"), "{msg}");
+    // Audited void resolution leaves one survivor; no money row is deleted.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE refunds SET status='void' WHERE id=2", [])
+            .unwrap();
+    }
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let indexed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='uq_refunds_invoice_inflight')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(indexed);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM refunds", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "both historical rows survive resolution");
+}
+
+/// §3: paid_ungranted is non-terminal, stamped once, retryable back to
+/// paid, and never becomes `failed` after payment. 72h rows with no
+/// executed auto-refund block the seller.
+#[test]
+fn money_paid_ungranted_transitions_and_failed_guard() {
+    let (db, path) = money_test_db("paid_ungranted.db");
+    db.save_invoice(
+        "inv-ung",
+        9,
+        "3",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    assert!(db.mark_invoice_paid_ungranted("inv-ung"));
+    let stamp = db.invoice_paid_ungranted_at("inv-ung").unwrap();
+    assert!(!stamp.is_empty());
+    // The DB trigger refuses `failed` from a paid state (best-effort callers
+    // see no write; a raw writer sees a hard error).
+    db.update_invoice_status("inv-ung", "failed");
+    assert_eq!(db.get_invoice("inv-ung").unwrap().2, "paid_ungranted");
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE invoices SET status='failed' WHERE invoice_id='inv-ung'",
+                []
+            )
+            .is_err()
+        );
+    }
+
+    // Injected clock boundaries.
+    assert_eq!(db.paid_ungranted_before("2999-01-01T00:00:00Z").len(), 1);
+    assert!(db.paid_ungranted_before("2000-01-01T00:00:00Z").is_empty());
+    assert_eq!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .len(),
+        1
+    );
+
+    // Successful retry returns to paid and clears the clock.
+    assert!(db.finalize_invoice_grant_retry("inv-ung"));
+    assert_eq!(db.get_invoice("inv-ung").unwrap().2, "paid");
+    assert!(db.invoice_paid_ungranted_at("inv-ung").is_none());
+    // A fresh ungranted event starts a fresh window.
+    assert!(db.mark_invoice_paid_ungranted("inv-ung"));
+    assert_ne!(db.invoice_paid_ungranted_at("inv-ung").unwrap(), stamp);
+
+    // The auto-refund (documented idem key) clears the blocking liability
+    // only once it is executed.
+    let auto = db
+        .create_refund_guarded(refund_input(
+            9,
+            Some("inv-ung"),
+            "3",
+            "USDT",
+            "auto:ungranted:inv-ung",
+            -1,
+            "system",
+        ))
+        .unwrap();
+    assert!(auto.created_new);
+    assert_eq!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .len(),
+        1
+    );
+    db.set_refund_status(auto.id, "executed");
+    assert!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+    // Other sellers are never blocked by this seller's liability.
+    assert!(
+        db.unresolved_ungranted_invoices(10, "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+}
+
+/// §4.1: spend_id is persisted before transfer, attempt_no is monotonic,
+/// duplicate keys are hard errors, and ambiguous retries can look up the
+/// same key.
+#[test]
+fn money_transfer_attempt_spend_id_persistence() {
+    let (db, _path) = money_test_db("spend_id.db");
+    let a1 = db
+        .record_transfer_attempt("refund", 11, 3, "spend-aaa")
+        .unwrap();
+    let a2 = db
+        .record_transfer_attempt("refund", 11, 3, "spend-bbb")
+        .unwrap();
+    assert!(a2 > a1);
+    let first = db.get_transfer_attempt("spend-aaa").unwrap();
+    let second = db.get_transfer_attempt("spend-bbb").unwrap();
+    assert_eq!(first.attempt_no, 1);
+    assert_eq!(second.attempt_no, 2);
+    assert_eq!(second.row_type, "refund");
+    assert_eq!(second.row_id, 11);
+    assert_eq!(second.seller_id, 3);
+    assert!(db.get_transfer_attempt("spend-nope").is_none());
+    assert!(
+        db.record_transfer_attempt("refund", 12, 3, "spend-aaa")
+            .is_err()
+    );
+    assert!(
+        db.record_transfer_attempt("bogus", 12, 3, "spend-ccc")
+            .is_err()
+    );
+    assert!(db.record_transfer_attempt("payout", 12, 3, "").is_err());
+
+    let latest = db.latest_transfer_attempt("refund", 11).unwrap();
+    assert_eq!(latest.spend_id, "spend-bbb");
+    assert!(db.latest_transfer_attempt("refund", 99).is_none());
+
+    assert!(db.set_transfer_attempt_outcome("spend-aaa", "ambiguous"));
+    let resolved = db.get_transfer_attempt("spend-aaa").unwrap();
+    assert_eq!(resolved.outcome.as_deref(), Some("ambiguous"));
+    assert!(resolved.resolved_at.is_some());
+}
+
+/// §5.1-§5.4: executing stamps a clock, the sweeper moves due rows to
+/// needs_reconciliation, the three owner outcomes are append-only, and
+/// the digest carries the persisted spend_id.
+#[test]
+fn money_reconciliation_state_transitions() {
+    let (db, path) = money_test_db("reconcile.db");
+    db.save_invoice(
+        "inv-rec",
+        4,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let refund = db
+        .create_refund_guarded(refund_input(
+            4,
+            Some("inv-rec"),
+            "10",
+            "USDT",
+            "rec-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    let payout = db.create_payout(4, "2", "USDT", Some("@dest"));
+    db.set_refund_status(refund.id, "approved");
+    db.set_payout_status(payout, "approved");
+    assert!(db.begin_refund_execution(refund.id));
+    assert!(db.begin_payout_execution(payout));
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (table, id) in [("refunds", refund.id), ("payouts", payout)] {
+            let since: Option<String> = conn
+                .query_row(
+                    &format!("SELECT executing_since FROM {table} WHERE id=?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(since.is_some(), "CAS must stamp executing_since");
+        }
+    }
+
+    // Nothing is due before the injected cutoff; everything is due after it.
+    assert!(
+        db.reconciliation_rows("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+    assert!(
+        db.record_transfer_attempt("refund", refund.id, 4, "rec-spend")
+            .is_ok()
+    );
+    let rows = db.reconciliation_rows("2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|r| r.spend_id.as_deref() == Some("rec-spend"))
+    );
+
+    assert!(db.mark_needs_reconciliation("refund", refund.id, "2999-01-01T00:00:00Z"));
+    assert!(!db.mark_needs_reconciliation("refund", refund.id, "2999-01-01T00:00:00Z"));
+    assert_eq!(db.get_refund(refund.id).unwrap().7, "needs_reconciliation");
+
+    // Reason is mandatory; already-final rows cannot be resolved.
+    assert_eq!(
+        db.resolve_reconciliation(
+            "refund",
+            refund.id,
+            ReconciliationOutcome::Executed,
+            99,
+            "  "
+        ),
+        Err(ReconcileError::ReasonRequired)
+    );
+    assert_eq!(
+        db.resolve_reconciliation(
+            "payout",
+            payout,
+            ReconciliationOutcome::Executed,
+            99,
+            "receipt checked"
+        ),
+        Err(ReconcileError::NotDue)
+    );
+    db.resolve_reconciliation(
+        "refund",
+        refund.id,
+        ReconciliationOutcome::Executed,
+        99,
+        "receipt checked",
+    )
+    .unwrap();
+    let resolution = db.money_resolution("refund", refund.id).unwrap();
+    assert_eq!(resolution.0, "executed");
+    assert_eq!(resolution.1, "receipt checked");
+    assert_eq!(resolution.2, 99);
+    assert_eq!(
+        db.resolve_reconciliation(
+            "refund",
+            refund.id,
+            ReconciliationOutcome::Void,
+            99,
+            "second try"
+        ),
+        Err(ReconcileError::AlreadyResolved)
+    );
+    // Append-only is enforced by the trigger too, not just the method CAS.
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE refunds SET resolution='tampered' WHERE id=?1",
+                [refund.id]
+            )
+            .is_err()
+        );
+    }
+
+    // The other two outcomes map to `approved` and `void`.
+    assert!(db.mark_needs_reconciliation("payout", payout, "2999-01-01T00:00:00Z"));
+    db.resolve_reconciliation(
+        "payout",
+        payout,
+        ReconciliationOutcome::RevertedToApproved,
+        99,
+        "transfer never landed",
+    )
+    .unwrap();
+    assert_eq!(db.get_payout_status(payout).as_deref(), Some("approved"));
+    assert!(
+        db.resolve_reconciliation(
+            "payout",
+            payout,
+            ReconciliationOutcome::Void,
+            99,
+            "too late"
+        )
+        .is_err()
+    );
+}
+
+/// Every new money record is seller-scoped; listings and digest rows never
+/// cross tenant boundaries.
+#[test]
+fn money_safety_seller_isolation() {
+    let (db, _path) = money_test_db("scope.db");
+    db.save_invoice(
+        "inv-s1",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(11),
+        None,
+    );
+    db.save_invoice(
+        "inv-s2",
+        2,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(22),
+        None,
+    );
+    let r1 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-s1"),
+            "5",
+            "USDT",
+            "s1-key",
+            1,
+            "Seller",
+        ))
+        .unwrap();
+    let r2 = db
+        .create_refund_guarded(refund_input(
+            2,
+            Some("inv-s2"),
+            "5",
+            "USDT",
+            "s2-key",
+            2,
+            "Seller",
+        ))
+        .unwrap();
+    assert_eq!(db.list_refunds(Some(1)).len(), 1);
+    assert_eq!(db.list_refunds(Some(2)).len(), 1);
+    assert_eq!(db.list_refunds(Some(3)).len(), 0);
+    assert_eq!(db.get_refund(r1.id).unwrap().1, 1);
+    assert_eq!(db.get_refund(r2.id).unwrap().1, 2);
+
+    db.record_transfer_attempt("refund", r1.id, 1, "s1-spend")
+        .unwrap();
+    db.record_transfer_attempt("refund", r2.id, 2, "s2-spend")
+        .unwrap();
+    assert_eq!(db.get_transfer_attempt("s1-spend").unwrap().seller_id, 1);
+    assert_eq!(db.get_transfer_attempt("s2-spend").unwrap().seller_id, 2);
+}
+
+/// G3 (deferred decision 8 guard): no NEW REAL/DOUBLE/FLOAT money column,
+/// and all §1/§4/§5 columns exist with the expected shapes.
+#[test]
+fn money_safety_schema_shape() {
+    let (db, _path) = money_test_db("shape.db");
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    for table in ["invoices", "refunds", "payouts", "transfer_attempts"] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let info: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for (name, ty) in &info {
+            let ty = ty.to_ascii_uppercase();
+            assert!(
+                !matches!(ty.as_str(), "REAL" | "DOUBLE" | "FLOAT"),
+                "{table}.{name} is a forbidden floating money column"
+            );
+        }
+        let names: Vec<&str> = info.iter().map(|(n, _)| n.as_str()).collect();
+        match table {
+            "refunds" => {
+                for expected in [
+                    "idem_key",
+                    "created_by",
+                    "created_role",
+                    "executing_since",
+                    "reconciliation_since",
+                    "resolution",
+                    "resolved_by",
+                    "resolved_at",
+                ] {
+                    assert!(names.contains(&expected), "refunds.{expected} missing");
+                }
+            }
+            "payouts" => {
+                for expected in [
+                    "executing_since",
+                    "reconciliation_since",
+                    "resolution",
+                    "resolved_by",
+                    "resolved_at",
+                ] {
+                    assert!(names.contains(&expected), "payouts.{expected} missing");
+                }
+            }
+            "invoices" => assert!(names.contains(&"paid_ungranted_at")),
+            "transfer_attempts" => {
+                for expected in [
+                    "spend_id",
+                    "attempt_no",
+                    "seller_id",
+                    "outcome",
+                    "resolved_at",
+                ] {
+                    assert!(
+                        names.contains(&expected),
+                        "transfer_attempts.{expected} missing"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let index_names: Vec<String> = conn
+        .prepare("PRAGMA index_list(refunds)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        index_names
+            .iter()
+            .any(|n| n == "uq_refunds_invoice_inflight")
+    );
+    assert!(index_names.iter().any(|n| n == "uq_refunds_invoice_idem"));
+}

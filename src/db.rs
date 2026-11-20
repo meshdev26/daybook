@@ -1,8 +1,8 @@
 #![allow(clippy::type_complexity)]
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Stored post row. Field positions (index access is load-bearing in
 /// api.rs/web.rs/mcp::tools): 0 id, 1 seller_id, 2 chat_id, 3 message_id,
@@ -80,6 +80,142 @@ pub const SETUP_LINK_TTL_MINUTES: i64 = 15;
 /// Purpose tag one-time setup links carry in `web_pending_mfa.purpose` (D7);
 /// pub because the claim routes (L7) validate the same string on GET/POST.
 pub const SETUP_LINK_PURPOSE: &str = "setup_link";
+
+// ---- Money Safety Spec (approved batch, decisions 1/3/4/5) ----
+// Internal operational timers, NOT customer SLAs (spec §3/§5, G7). Kept in
+// the data layer as constants so L8's injectable-clock sweeper and L3's
+// boundary tests quote the same numbers.
+/// §5.1: executing rows older than this move to `needs_reconciliation`.
+pub const RECONCILIATION_DUE_MINUTES: i64 = 30;
+/// §5.2: needs-reconciliation rows older than this raise the blocking alert.
+pub const RECONCILIATION_OVERDUE_HOURS: i64 = 24;
+/// §3.3: retry cadence for `paid_ungranted` grant claims.
+pub const PAID_UNGRANTED_RETRY_SECONDS: i64 = 30;
+/// §3.4: paid-but-ungranted rows older than this queue an auto-refund.
+pub const PAID_UNGRANTED_AUTO_REFUND_HOURS: i64 = 24;
+/// §3.5: paid-but-ungranted rows older than this block new seller payouts.
+pub const PAID_UNGRANTED_ESCALATION_HOURS: i64 = 72;
+/// §1.2: all money amounts are base-10 decimals in integer minor units at
+/// this scale (10^8). No f64, no `CAST(... AS REAL)` (CRYPTO_PAY.md:57-59).
+const MONEY_MINOR_SCALE: u32 = 8;
+
+/// Creation input for the guarded refund path (§1.2). Every new refund is
+/// seller-scoped and carries an actor and an idempotency key; L8 passes the
+/// real actor, the legacy `create_refund` wrapper passes sentinels.
+#[derive(Debug, Clone, Copy)]
+pub struct RefundInput<'a> {
+    pub seller_id: i64,
+    pub invoice_id: Option<&'a str>,
+    pub user_id: Option<i64>,
+    pub amount: &'a str,
+    pub asset: &'a str,
+    pub reason: Option<&'a str>,
+    pub idem_key: &'a str,
+    pub created_by: i64,
+    pub created_role: &'a str,
+}
+
+/// Outcome of a guarded refund creation. `Existing` is an idempotent replay
+/// of the same `(invoice_id, idem_key)` and MUST NOT emit a second money
+/// audit event (§1.2 step 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundCreation {
+    pub id: i64,
+    pub created_new: bool,
+}
+
+/// Fail-closed creation errors. The HTTP/UX mapping is L8's; the variants
+/// carry the spec's stable error codes in their doc comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefundCreateError {
+    /// 404 — no such invoice.
+    InvoiceNotFound,
+    /// 400 — invoice is not `paid`/`paid_ungranted`.
+    InvoiceNotPaid,
+    /// 400 — refund asset differs from the invoiced asset (§1.1 trigger).
+    AssetMismatch,
+    /// 409 `unquantifiable_legacy_refund` — a stored amount is negative,
+    /// non-finite or not a base-10 decimal at scale 8.
+    UnquantizableLegacy,
+    /// 409 `refund_cap_exceeded` — cumulative counted refunds + request exceed
+    /// the invoiced amount.
+    CapExceeded,
+    /// 409 `refund_in_flight` — a distinct key tried while another refund is
+    /// pending/approved/executing/needs_reconciliation for the same invoice.
+    InFlight,
+    /// Any rusqlite failure (including a uniqueness-race loser).
+    Database(String),
+}
+
+/// The three owner reconciliation outcomes (§5.3). The resulting row status
+/// is the persisted outcome token: executed / approved / void. `resolution`
+/// stores the human reason; `resolved_by`/`resolved_at` the auditor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconciliationOutcome {
+    Executed,
+    RevertedToApproved,
+    Void,
+}
+
+impl ReconciliationOutcome {
+    fn status_for(self, row_type: &str) -> &'static str {
+        match self {
+            Self::Executed if row_type == "refund" => "executed",
+            Self::Executed => "paid",
+            Self::RevertedToApproved => "approved",
+            Self::Void => "void",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileError {
+    NotFound,
+    /// Row is not `needs_reconciliation` (only that state may be resolved).
+    NotDue,
+    /// Append-only: a resolution was already recorded.
+    AlreadyResolved,
+    /// Owner must supply a non-empty reason (audited by L8).
+    ReasonRequired,
+    Database(String),
+}
+
+/// One row in the §5.4 daily digest / §5.1-5.2 sweeps. `spend_id` is the
+/// latest persisted attempt for the row (None only for a pre-spend-id legacy
+/// row that never had an attempt recorded).
+#[derive(Debug, Clone)]
+pub struct ReconciliationRow {
+    pub row_type: String,
+    pub id: i64,
+    pub seller_id: i64,
+    pub amount: String,
+    pub asset: String,
+    pub status: String,
+    pub since: String,
+    pub spend_id: Option<String>,
+    pub overdue: bool,
+}
+
+/// One append-only transfer attempt (§4.1).
+#[derive(Debug, Clone)]
+pub struct TransferAttemptRow {
+    pub id: i64,
+    pub row_type: String,
+    pub row_id: i64,
+    pub attempt_no: i64,
+    pub spend_id: String,
+    pub created_at: String,
+    pub outcome: Option<String>,
+    pub resolved_at: Option<String>,
+    pub seller_id: i64,
+}
+
+// Legacy `create_refund` callers (api.rs / web finance) predate the idem-key
+// contract; the wrapper synthesizes a unique sentinel key so the DB layer
+// can still enforce in-flight uniqueness for them. L8 replaces those callers
+// with `create_refund_guarded` carrying the real actor/key.
+static REFUND_IDEM_SEQ: AtomicU64 = AtomicU64::new(0);
+
 // Named-field row (not a tuple alias) — a new public surface consumed by the
 // web channels manager; seller_id 0 = global namespace, is_default flags the
 // single global default.
@@ -492,6 +628,13 @@ impl Db {
         // (see `migrate`). Moderation DDL failures are logged and recorded in
         // `moderation_storage_ready`; they never panic here.
         let _ = db.migrate();
+        // Money-safety DDL is deliberately NOT best-effort. A legacy DB that
+        // already holds two in-flight refunds for one invoice fails closed
+        // here with the offending invoice ids (spec §1.4) until an owner voids
+        // the duplicates through the audited resolution path. Clean legacy
+        // and fresh DBs are unchanged: every statement is additive and
+        // idempotent.
+        db.migrate_money_safety()?;
         Ok(db)
     }
 
@@ -1068,6 +1211,222 @@ impl Db {
                 .moderation_storage_ready
                 .store(false, Ordering::Relaxed),
         }
+        Ok(())
+    }
+
+    /// Money-safety additive migration (spec §1.1/§1.4, §3, §4, §5).
+    ///
+    /// Unlike `migrate` this is fallible and `Db::new` propagates the error:
+    /// a legacy DB holding more than one in-flight refund for an invoice
+    /// fails closed, listing the invoice ids, until an owner voids the
+    /// duplicates through the audited Decision-5 path. No money row is ever
+    /// deleted or merged (G8). Everything else is `IF NOT EXISTS` /
+    /// probe-then-ALTER, so a second open is byte-identical.
+    fn migrate_money_safety(&self) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 1. Additive columns. Fresh DBs already declare these in schema.sql;
+        //    the probe keeps the fresh path free of redundant ALTERs. The
+        //    DEFAULT only exists so SQLite can add NOT NULL columns to a
+        //    legacy table that already holds rows (§1.1).
+        const COLUMN_DDLS: &[(&str, &str, &str)] = &[
+            (
+                "refunds",
+                "idem_key",
+                "ALTER TABLE refunds ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "refunds",
+                "created_by",
+                "ALTER TABLE refunds ADD COLUMN created_by INTEGER NOT NULL DEFAULT -1",
+            ),
+            (
+                "refunds",
+                "created_role",
+                "ALTER TABLE refunds ADD COLUMN created_role TEXT NOT NULL DEFAULT 'unknown'",
+            ),
+            (
+                "refunds",
+                "executing_since",
+                "ALTER TABLE refunds ADD COLUMN executing_since TEXT",
+            ),
+            (
+                "refunds",
+                "reconciliation_since",
+                "ALTER TABLE refunds ADD COLUMN reconciliation_since TEXT",
+            ),
+            (
+                "refunds",
+                "resolution",
+                "ALTER TABLE refunds ADD COLUMN resolution TEXT",
+            ),
+            (
+                "refunds",
+                "resolved_by",
+                "ALTER TABLE refunds ADD COLUMN resolved_by INTEGER",
+            ),
+            (
+                "refunds",
+                "resolved_at",
+                "ALTER TABLE refunds ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "payouts",
+                "executing_since",
+                "ALTER TABLE payouts ADD COLUMN executing_since TEXT",
+            ),
+            (
+                "payouts",
+                "reconciliation_since",
+                "ALTER TABLE payouts ADD COLUMN reconciliation_since TEXT",
+            ),
+            (
+                "payouts",
+                "resolution",
+                "ALTER TABLE payouts ADD COLUMN resolution TEXT",
+            ),
+            (
+                "payouts",
+                "resolved_by",
+                "ALTER TABLE payouts ADD COLUMN resolved_by INTEGER",
+            ),
+            (
+                "payouts",
+                "resolved_at",
+                "ALTER TABLE payouts ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "invoices",
+                "paid_ungranted_at",
+                "ALTER TABLE invoices ADD COLUMN paid_ungranted_at TEXT",
+            ),
+        ];
+        for (table, column, ddl) in COLUMN_DDLS {
+            // `table` comes from the static table above, never from user input.
+            let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1");
+            let exists = conn
+                .query_row(&probe, params![column], |_| Ok::<_, rusqlite::Error>(1))
+                .optional()?;
+            if exists.is_none() {
+                conn.execute(ddl, [])?;
+            }
+        }
+
+        // 2. Backfill legacy rows. `idem_key = 'legacy:' || id` is unique by
+        //    PK (§1.4); actors come from the refund_create audit row when one
+        //    exists, otherwise the documented -1/'unknown' sentinels — never
+        //    guessed. Fresh rows never match these predicates.
+        conn.execute_batch(
+            "UPDATE refunds SET idem_key = 'legacy:' || id
+              WHERE idem_key IS NULL OR idem_key = '';
+             UPDATE refunds SET created_by = (
+                SELECT a.actor_id FROM audit_log a
+                WHERE a.action='refund_create' AND a.target_type='refund'
+                  AND a.target_id = CAST(refunds.id AS TEXT)
+                ORDER BY a.id LIMIT 1
+             )
+              WHERE (created_by IS NULL OR created_by = -1)
+                AND EXISTS (
+                   SELECT 1 FROM audit_log a
+                   WHERE a.action='refund_create' AND a.target_type='refund'
+                     AND a.target_id = CAST(refunds.id AS TEXT)
+                     AND a.actor_id IS NOT NULL AND a.actor_id <> -1
+                );
+             UPDATE refunds SET created_role = (
+                SELECT a.actor_role FROM audit_log a
+                WHERE a.action='refund_create' AND a.target_type='refund'
+                  AND a.target_id = CAST(refunds.id AS TEXT)
+                ORDER BY a.id LIMIT 1
+             )
+              WHERE (created_role IS NULL OR created_role = 'unknown')
+                AND EXISTS (
+                   SELECT 1 FROM audit_log a
+                   WHERE a.action='refund_create' AND a.target_type='refund'
+                     AND a.target_id = CAST(refunds.id AS TEXT)
+                     AND a.actor_role IS NOT NULL AND a.actor_role <> 'unknown'
+                );",
+        )?;
+
+        // 3. Migration preflight (§1.4): fail closed on duplicate in-flight
+        //    refunds. NEVER delete or merge money rows to make the index fit.
+        let duplicates: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT invoice_id, COUNT(*) AS n FROM refunds
+                 WHERE status IN ('pending','approved','executing','needs_reconciliation')
+                   AND invoice_id IS NOT NULL
+                 GROUP BY invoice_id HAVING n > 1 ORDER BY invoice_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!(
+                    "{} ({} in-flight rows)",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?
+                ))
+            })?;
+            let mut found = Vec::new();
+            for row in rows {
+                found.push(row?);
+            }
+            found
+        };
+        if !duplicates.is_empty() {
+            return Err(Self::sqlite_fail(format!(
+                "money-safety migration refused: multiple in-flight refunds for invoice(s): {}; \
+                 resolve each to a single survivor via the audited Decision-5 void path, then reopen",
+                duplicates.join(", ")
+            )));
+        }
+
+        // 4. Invariants. Declared here (not in schema.sql) because the
+        //    indexes/triggers reference columns a legacy DB only gains above;
+        //    init_schema runs before this method.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_refunds_invoice_inflight
+                ON refunds(invoice_id)
+                WHERE status IN ('pending','approved','executing','needs_reconciliation');
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_refunds_invoice_idem
+                ON refunds(invoice_id, idem_key);
+             CREATE TRIGGER IF NOT EXISTS trg_refund_asset_matches_invoice
+             BEFORE INSERT ON refunds
+             WHEN NEW.invoice_id IS NOT NULL
+              AND NEW.asset IS NOT (SELECT asset FROM invoices WHERE invoice_id = NEW.invoice_id)
+             BEGIN SELECT RAISE(ABORT, 'refund_asset_mismatch'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_refund_money_immutable
+             BEFORE UPDATE ON refunds
+             WHEN OLD.seller_id   IS NOT NEW.seller_id
+               OR OLD.invoice_id  IS NOT NEW.invoice_id
+               OR OLD.user_id     IS NOT NEW.user_id
+               OR OLD.amount      IS NOT NEW.amount
+               OR OLD.asset       IS NOT NEW.asset
+               OR OLD.reason      IS NOT NEW.reason
+               OR OLD.idem_key    IS NOT NEW.idem_key
+               OR OLD.created_by  IS NOT NEW.created_by
+               OR OLD.created_role IS NOT NEW.created_role
+             BEGIN SELECT RAISE(ABORT, 'refund_row_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_payout_money_immutable
+             BEFORE UPDATE ON payouts
+             WHEN OLD.seller_id   IS NOT NEW.seller_id
+               OR OLD.amount      IS NOT NEW.amount
+               OR OLD.asset       IS NOT NEW.asset
+               OR OLD.destination IS NOT NEW.destination
+             BEGIN SELECT RAISE(ABORT, 'payout_row_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_refund_resolution_append_only
+             BEFORE UPDATE ON refunds
+             WHEN OLD.resolution IS NOT NULL AND NEW.resolution IS NOT OLD.resolution
+             BEGIN SELECT RAISE(ABORT, 'refund_resolution_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_payout_resolution_append_only
+             BEFORE UPDATE ON payouts
+             WHEN OLD.resolution IS NOT NULL AND NEW.resolution IS NOT OLD.resolution
+             BEGIN SELECT RAISE(ABORT, 'payout_resolution_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_invoice_no_failed_after_paid
+             BEFORE UPDATE ON invoices
+             FOR EACH ROW
+             WHEN OLD.status IN ('paid','paid_ungranted') AND NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'invoice_failed_after_paid_blocked'); END;",
+        )?;
         Ok(())
     }
 
@@ -1962,6 +2321,123 @@ impl Db {
             params![invoice_id, now],
         ) {
             tracing::warn!("failed to mark invoice {} as paid: {}", invoice_id, e);
+        }
+    }
+
+    /// §3.2: server-side verification said `paid` but the exactly-once grant
+    /// claim produced no subscription/product grant. CAS from any non-terminal
+    /// state into `paid_ungranted`, stamping the recovery clock ONCE (the 24h
+    /// and 72h timers are measured from this value, never from a retry).
+    /// Returns false for a terminal `refunded`/`failed` row.
+    pub fn mark_invoice_paid_ungranted(&self, invoice_id: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE invoices SET status='paid_ungranted', \
+             paid_ungranted_at=COALESCE(paid_ungranted_at, ?2), updated_at=?2 \
+             WHERE invoice_id=?1 AND status NOT IN ('refunded','failed')",
+            params![invoice_id, now],
+        ) == Ok(1)
+    }
+
+    /// §3.3 success path: a later exactly-once claim succeeded, so the row
+    /// returns to `paid` and leaves the recovery queue. Clears the clock so a
+    /// subsequent ungranted event starts a fresh window.
+    pub fn finalize_invoice_grant_retry(&self, invoice_id: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE invoices SET status='paid', paid_ungranted_at=NULL, updated_at=?2 \
+             WHERE invoice_id=?1 AND status='paid_ungranted'",
+            params![invoice_id, now],
+        ) == Ok(1)
+    }
+
+    /// The recovery clock of one invoice, if it is (or was) ungranted.
+    pub fn invoice_paid_ungranted_at(&self, invoice_id: &str) -> Option<String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT paid_ungranted_at FROM invoices WHERE invoice_id=?1",
+            params![invoice_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// §3.3/§3.4 queue: every still-ungranted invoice whose clock is at or
+    /// before the injected cutoff. Returns
+    /// (invoice_id, seller_id, amount, asset, paid_ungranted_at) — all
+    /// seller-scoped and fully parameterized.
+    #[allow(clippy::type_complexity)]
+    pub fn paid_ungranted_before(
+        &self,
+        cutoff: &str,
+    ) -> Vec<(String, i64, String, String, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT invoice_id,seller_id,amount,asset,paid_ungranted_at FROM invoices \
+             WHERE status='paid_ungranted' AND paid_ungranted_at IS NOT NULL \
+               AND paid_ungranted_at <= ?1 ORDER BY paid_ungranted_at, invoice_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// §3.5 blocking-liability check: seller invoices still ungranted past
+    /// the escalation cutoff whose auto-refund (`idem_key` is the documented
+    /// `auto:ungranted:<invoice_id>`) has NOT reached a terminal executed
+    /// state. L8 returns 409 `unresolved_ungranted_liability` for these.
+    pub fn unresolved_ungranted_invoices(
+        &self,
+        seller_id: i64,
+        escalation_cutoff: &str,
+    ) -> Vec<String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT i.invoice_id FROM invoices i \
+             WHERE i.seller_id=?1 AND i.status='paid_ungranted' \
+               AND i.paid_ungranted_at IS NOT NULL AND i.paid_ungranted_at <= ?2 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM refunds r \
+                 WHERE r.invoice_id=i.invoice_id \
+                   AND r.idem_key='auto:ungranted:' || i.invoice_id \
+                   AND r.status IN ('executed','processed') \
+               ) ORDER BY i.invoice_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![seller_id, escalation_cutoff], |r| {
+            r.get::<_, String>(0)
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
         }
     }
 
@@ -4919,6 +5395,59 @@ impl Db {
     }
 
     // ---- Refunds ----
+
+    /// Build a fail-closed rusqlite error carrying an operator-readable reason.
+    /// rusqlite 0.41 removed `Error::Msg`, so use a SQLite constraint failure
+    /// with a message; `Db::new` propagates it verbatim to the operator.
+    fn sqlite_fail(msg: impl Into<String>) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(msg.into()),
+        )
+    }
+
+    /// Parse a stored amount as base-10 decimal integer minor units at
+    /// scale 8 (spec §1.2). No `f64`, no `CAST(... AS REAL)`. Negative,
+    /// non-finite, over-precise or overflowing values are unquantizable and
+    /// must fail closed until an owner resolves them.
+    fn minor_units(value: &str) -> Option<i128> {
+        let text = value.trim();
+        if text.is_empty() || text.starts_with('-') || text.starts_with('+') {
+            return None;
+        }
+        let mut pieces = text.split('.');
+        let whole = pieces.next()?;
+        let frac = pieces.next().unwrap_or("");
+        if pieces.next().is_some()
+            || whole.is_empty()
+            || !whole.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+            || frac.len() > MONEY_MINOR_SCALE as usize
+        {
+            return None;
+        }
+        let whole_units: i128 = whole.parse().ok()?;
+        // `"".parse::<i128>()` fails; an empty fractional part is zero.
+        let mut frac_units: i128 = if frac.is_empty() {
+            0
+        } else {
+            frac.parse().ok()?
+        };
+        for _ in frac.len()..MONEY_MINOR_SCALE as usize {
+            frac_units = frac_units.checked_mul(10)?;
+        }
+        whole_units
+            .checked_mul(10_i128.pow(MONEY_MINOR_SCALE))?
+            .checked_add(frac_units)
+    }
+
+    /// Legacy-compatible wrapper (api.rs / web finance still call this with
+    /// the original six arguments). It now runs the full §1.2 safety block,
+    /// synthesizing a unique sentinel idem key and the documented
+    /// `created_by = -1` / `created_role = 'unknown'` actor. L8 switches
+    /// those call sites to `create_refund_guarded` so the real actor is
+    /// recorded. Returns 0 on any refusal, matching the old "insert failed"
+    /// shape; never returns an id for a refund that was not created.
     pub fn create_refund(
         &self,
         seller_id: i64,
@@ -4928,30 +5457,188 @@ impl Db {
         asset: &str,
         reason: Option<&str>,
     ) -> i64 {
-        let conn = self
+        let seq = REFUND_IDEM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let idem_key = format!(
+            "auto:{}:{}:{}",
+            Utc::now().timestamp_micros(),
+            std::process::id(),
+            seq
+        );
+        match self.create_refund_guarded(RefundInput {
+            seller_id,
+            invoice_id,
+            user_id,
+            amount,
+            asset,
+            reason,
+            idem_key: &idem_key,
+            created_by: -1,
+            created_role: "unknown",
+        }) {
+            Ok(created) => created.id,
+            Err(_) => 0,
+        }
+    }
+
+    /// §1.2 creation algorithm in ONE `BEGIN IMMEDIATE`: WAL + busy_timeout
+    /// (`Db::new`) makes the immediate transaction the serialization point,
+    /// so two concurrent creators cannot both pass the cumulative cap.
+    /// An idem-key replay returns the existing row (no second money event);
+    /// a distinct key while another refund is in flight is refused.
+    pub fn create_refund_guarded(
+        &self,
+        input: RefundInput<'_>,
+    ) -> Result<RefundCreation, RefundCreateError> {
+        use RefundCreateError::*;
+        let mut conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| Database(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
-        // best-effort: fall back to the invoice's buyer when user_id unknown
-        let user_id = match user_id {
-            Some(u) => Some(u),
-            None => invoice_id.and_then(|inv| {
-                conn.query_row(
-                    "SELECT user_id FROM invoices WHERE invoice_id=?1",
+
+        // Idempotent replay first: same key for the same invoice is the SAME
+        // money movement, whatever state that row has reached.
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT id FROM refunds WHERE invoice_id IS ?1 AND idem_key=?2 ORDER BY id LIMIT 1",
+                params![input.invoice_id, input.idem_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Database(e.to_string()))?
+        {
+            tx.commit().map_err(|e| Database(e.to_string()))?;
+            return Ok(RefundCreation {
+                id: existing,
+                created_new: false,
+            });
+        }
+
+        // Fall back to the invoice's buyer when none was supplied, and load
+        // the fields needed for the cap / asset lock in the same snapshot.
+        let mut user_id = input.user_id;
+        if let Some(inv) = input.invoice_id {
+            let (inv_user, inv_amount, inv_asset, inv_status): (
+                Option<i64>,
+                String,
+                String,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT user_id,amount,asset,status FROM invoices WHERE invoice_id=?1",
+                    params![inv],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(|e| Database(e.to_string()))?
+                .ok_or(InvoiceNotFound)?;
+            if user_id.is_none() {
+                user_id = inv_user;
+            }
+            // Decision 3 keeps paid_ungranted non-terminal and its auto-refund
+            // must be creatable while the invoice is still in that state.
+            if inv_status != "paid" && inv_status != "paid_ungranted" {
+                return Err(InvoiceNotPaid);
+            }
+            if input.asset.trim() != inv_asset.trim() {
+                return Err(AssetMismatch);
+            }
+
+            let invoice_minor = Self::minor_units(&inv_amount).ok_or(UnquantizableLegacy)?;
+            let requested = if input.amount.trim().is_empty() {
+                invoice_minor
+            } else {
+                Self::minor_units(input.amount).ok_or(UnquantizableLegacy)?
+            };
+            // Counted states: every row except 'void' — including terminal
+            // executed/processed (a reverted attempt is still spent once).
+            let mut counted: Vec<String> = tx
+                .prepare("SELECT amount FROM refunds WHERE invoice_id=?1 AND status <> 'void'")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![inv], |r| r.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|e| Database(e.to_string()))?;
+            let mut cumulative: i128 = 0;
+            for row in counted.drain(..) {
+                let units = Self::minor_units(&row).ok_or(UnquantizableLegacy)?;
+                cumulative = cumulative.checked_add(units).ok_or(UnquantizableLegacy)?;
+            }
+            let total = cumulative
+                .checked_add(requested)
+                .ok_or(UnquantizableLegacy)?;
+            if total > invoice_minor {
+                return Err(CapExceeded);
+            }
+
+            let in_flight: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM refunds WHERE invoice_id=?1 \
+                     AND status IN ('pending','approved','executing','needs_reconciliation') LIMIT 1",
                     params![inv],
                     |r| r.get(0),
                 )
                 .optional()
-                .ok()
-                .flatten()
-            }),
-        };
-        let _ = conn.execute(
-            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,reason,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?7)",
-            params![seller_id, invoice_id, user_id, amount, asset, reason, now],
+                .map_err(|e| Database(e.to_string()))?;
+            if in_flight.is_some() {
+                return Err(InFlight);
+            }
+        }
+
+        let insert = tx.execute(
+            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,reason,status,idem_key,created_by,created_role,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?10)",
+            params![
+                input.seller_id,
+                input.invoice_id,
+                user_id,
+                input.amount,
+                input.asset,
+                input.reason,
+                input.idem_key,
+                input.created_by,
+                input.created_role,
+                now
+            ],
         );
-        conn.last_insert_rowid()
+        let id = match insert {
+            Ok(_) => tx.last_insert_rowid(),
+            Err(e) => {
+                // A concurrent creator can win either unique index between
+                // our read and our write; translate that race to the same
+                // stable outcome instead of leaking a rusqlite error.
+                let msg = e.to_string();
+                if msg.contains("uq_refunds_invoice_idem") {
+                    let existing = tx
+                        .query_row(
+                            "SELECT id FROM refunds WHERE invoice_id IS ?1 AND idem_key=?2 ORDER BY id LIMIT 1",
+                            params![input.invoice_id, input.idem_key],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|inner| Database(inner.to_string()))?;
+                    if let Some(id) = existing {
+                        tx.commit().map_err(|inner| Database(inner.to_string()))?;
+                        return Ok(RefundCreation {
+                            id,
+                            created_new: false,
+                        });
+                    }
+                }
+                if msg.contains("uq_refunds_invoice_inflight") {
+                    return Err(InFlight);
+                }
+                return Err(Database(msg));
+            }
+        };
+        tx.commit().map_err(|e| Database(e.to_string()))?;
+        Ok(RefundCreation {
+            id,
+            created_new: true,
+        })
     }
 
     /// (id, seller_id, invoice_id, user_id, amount, asset, reason, status)
@@ -5080,7 +5767,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE refunds SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            "UPDATE refunds SET status='executing', updated_at=?2, executing_since=?2 \
+             WHERE id=?1 AND status='approved'",
             params![id, now],
         ) == Ok(1)
     }
@@ -5245,7 +5933,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE payouts SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            "UPDATE payouts SET status='executing', updated_at=?2, executing_since=?2 \
+             WHERE id=?1 AND status='approved'",
             params![id, now],
         ) == Ok(1)
     }
@@ -5289,6 +5978,325 @@ impl Db {
         conn.query_row("SELECT status FROM payouts WHERE id=?1", params![id], |r| {
             r.get(0)
         })
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    // ---- Money safety: spend-id ledger + reconciliation (§4 / §5) ----
+
+    /// §4.1: persist a FRESH spend_id in a committed transaction BEFORE any
+    /// transfer call. `attempt_no` increments monotonically per
+    /// (row_type, row_id) inside the same immediate transaction so two
+    /// concurrent attempts cannot claim the same number. A duplicate
+    /// spend_id is a hard error — never an overwrite. Returns the new row id.
+    pub fn record_transfer_attempt(
+        &self,
+        row_type: &str,
+        row_id: i64,
+        seller_id: i64,
+        spend_id: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        if !matches!(row_type, "refund" | "payout") || spend_id.trim().is_empty() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(attempt_no),0) FROM transfer_attempts \
+                 WHERE row_type=?1 AND row_id=?2",
+                params![row_type, row_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let now = Utc::now().to_rfc3339();
+        let attempt_no = last
+            .checked_add(1)
+            .ok_or_else(|| Self::sqlite_fail("transfer attempt number overflow"))?;
+        tx.execute(
+            "INSERT INTO transfer_attempts(row_type,row_id,attempt_no,spend_id,created_at,seller_id) \
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![row_type, row_id, attempt_no, spend_id, now, seller_id],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Look up an attempt by its globally unique spend_id — used by the
+    /// ambiguous-retry path (§4.1) to reuse the SAME key.
+    pub fn get_transfer_attempt(&self, spend_id: &str) -> Option<TransferAttemptRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,row_type,row_id,attempt_no,spend_id,created_at,outcome,resolved_at,seller_id \
+             FROM transfer_attempts WHERE spend_id=?1",
+            params![spend_id],
+            |r| {
+                Ok(TransferAttemptRow {
+                    id: r.get(0)?,
+                    row_type: r.get(1)?,
+                    row_id: r.get(2)?,
+                    attempt_no: r.get(3)?,
+                    spend_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    outcome: r.get(6)?,
+                    resolved_at: r.get(7)?,
+                    seller_id: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// The most recent attempt for a money row (highest attempt_no). The
+    /// digest (§5.4) attaches this spend_id to executing/reconciling rows.
+    pub fn latest_transfer_attempt(
+        &self,
+        row_type: &str,
+        row_id: i64,
+    ) -> Option<TransferAttemptRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,row_type,row_id,attempt_no,spend_id,created_at,outcome,resolved_at,seller_id \
+             FROM transfer_attempts WHERE row_type=?1 AND row_id=?2 \
+             ORDER BY attempt_no DESC, id DESC LIMIT 1",
+            params![row_type, row_id],
+            |r| {
+                Ok(TransferAttemptRow {
+                    id: r.get(0)?,
+                    row_type: r.get(1)?,
+                    row_id: r.get(2)?,
+                    attempt_no: r.get(3)?,
+                    spend_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    outcome: r.get(6)?,
+                    resolved_at: r.get(7)?,
+                    seller_id: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// §4.2 outcome persistence. Callers branch on the shared classifier
+    /// enum (L8); the data layer only stores the token and stamps the
+    /// resolution clock. A missing spend_id is a no-op (never an overwrite).
+    pub fn set_transfer_attempt_outcome(&self, spend_id: &str, outcome: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE transfer_attempts SET outcome=?2, resolved_at=?3 WHERE spend_id=?1",
+            params![spend_id, outcome, now],
+        ) == Ok(1)
+    }
+
+    /// §5.1: `executing` older than the injected cutoff -> `needs_reconciliation`.
+    /// No transfer is attempted and no state is guessed. The spend-id rows and
+    /// `executing_since` stay attached; `reconciliation_since` starts the 24h
+    /// owner-decision clock. CAS on the exact status, so a concurrent finish
+    /// can never be overwritten by the sweeper.
+    pub fn mark_needs_reconciliation(
+        &self,
+        row_type: &str,
+        id: i64,
+        executing_before: &str,
+    ) -> bool {
+        if !matches!(row_type, "refund" | "payout") {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let table = if row_type == "refund" {
+            "refunds"
+        } else {
+            "payouts"
+        };
+        // `table` is chosen from a fixed two-value match above, never input.
+        let sql = format!(
+            "UPDATE {table} SET status='needs_reconciliation', \
+             updated_at=?3, reconciliation_since=?3 \
+             WHERE id=?1 AND status='executing' \
+               AND executing_since IS NOT NULL AND executing_since <= ?2"
+        );
+        conn.execute(&sql, params![id, executing_before, now]) == Ok(1)
+    }
+
+    /// §5.4 digest input: every `executing` row past the due cutoff and every
+    /// `needs_reconciliation` row (with its overdue flag past the decision
+    /// cutoff), both money types, with the latest persisted spend_id. All
+    /// timestamps are injected so L3 can test 30min/24h boundaries.
+    #[allow(clippy::type_complexity)]
+    pub fn reconciliation_rows(
+        &self,
+        executing_cutoff: &str,
+        overdue_cutoff: &str,
+    ) -> Vec<ReconciliationRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out = Vec::new();
+        for row_type in ["refund", "payout"] {
+            let table = if row_type == "refund" {
+                "refunds"
+            } else {
+                "payouts"
+            };
+            // `table`/`row_type` are fixed literals from the loop above.
+            let sql = format!(
+                "SELECT m.id,m.seller_id,m.amount,m.asset,m.status, \
+                 COALESCE(m.reconciliation_since,m.executing_since,'') AS since, \
+                 (SELECT t.spend_id FROM transfer_attempts t \
+                   WHERE t.row_type=?1 AND t.row_id=m.id \
+                   ORDER BY t.attempt_no DESC, t.id DESC LIMIT 1) AS spend_id \
+                 FROM {table} m \
+                 WHERE (m.status='executing' AND m.executing_since IS NOT NULL \
+                          AND m.executing_since <= ?2) \
+                    OR (m.status='needs_reconciliation' \
+                          AND COALESCE(m.reconciliation_since,m.executing_since,'') <= ?3) \
+                 ORDER BY m.id"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt.query_map(params![row_type, executing_cutoff, overdue_cutoff], |r| {
+                let since: String = r.get(5)?;
+                Ok(ReconciliationRow {
+                    row_type: row_type.to_string(),
+                    id: r.get(0)?,
+                    seller_id: r.get(1)?,
+                    amount: r.get(2)?,
+                    asset: r.get(3)?,
+                    status: r.get(4)?,
+                    overdue: since.as_str() <= overdue_cutoff,
+                    since,
+                    spend_id: r.get(6)?,
+                })
+            });
+            if let Ok(iter) = rows {
+                out.extend(iter.filter_map(|r| r.ok()));
+            }
+        }
+        out
+    }
+
+    /// §5.3 owner resolution. Exactly three outcomes; append-only (a second
+    /// resolution is rejected by the `resolution IS NULL` CAS and the
+    /// append-only trigger). `resolution` stores the human reason; the
+    /// resulting status stores the outcome token; `resolved_by`/`resolved_at`
+    /// record the auditor. The caller (L8) writes the audit row with
+    /// spend_id + actor + reason.
+    pub fn resolve_reconciliation(
+        &self,
+        row_type: &str,
+        id: i64,
+        outcome: ReconciliationOutcome,
+        resolved_by: i64,
+        reason: &str,
+    ) -> Result<(), ReconcileError> {
+        use ReconcileError::*;
+        if !matches!(row_type, "refund" | "payout") {
+            return Err(NotFound);
+        }
+        if reason.trim().is_empty() {
+            return Err(ReasonRequired);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let existing: (String, Option<String>) = conn
+            .query_row(
+                &format!(
+                    "SELECT status,resolution FROM {} WHERE id=?1",
+                    if row_type == "refund" {
+                        "refunds"
+                    } else {
+                        "payouts"
+                    }
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Database(e.to_string()))?
+            .ok_or(NotFound)?;
+        if existing.1.is_some() {
+            return Err(AlreadyResolved);
+        }
+        if existing.0 != "needs_reconciliation" {
+            return Err(NotDue);
+        }
+        let status = outcome.status_for(row_type);
+        let now = Utc::now().to_rfc3339();
+        let table = if row_type == "refund" {
+            "refunds"
+        } else {
+            "payouts"
+        };
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE {table} SET status=?2, resolution=?3, resolved_by=?4, \
+                     resolved_at=?5, updated_at=?5 \
+                     WHERE id=?1 AND status='needs_reconciliation' AND resolution IS NULL"
+                ),
+                params![id, status, reason.trim(), resolved_by, now],
+            )
+            .map_err(|e| Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(AlreadyResolved);
+        }
+        Ok(())
+    }
+
+    /// Persisted resolution of a money row, if any:
+    /// (outcome-status, reason, resolved_by, resolved_at).
+    pub fn money_resolution(
+        &self,
+        row_type: &str,
+        id: i64,
+    ) -> Option<(String, String, i64, String)> {
+        let table = if row_type == "refund" {
+            "refunds"
+        } else if row_type == "payout" {
+            "payouts"
+        } else {
+            return None;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            &format!(
+                "SELECT status,resolution,resolved_by,resolved_at FROM {table} \
+                 WHERE id=?1 AND resolution IS NOT NULL"
+            ),
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()
         .ok()
         .flatten()
