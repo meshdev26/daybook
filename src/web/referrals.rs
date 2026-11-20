@@ -82,6 +82,27 @@ pub(super) fn order_badge(status: &str) -> &'static str {
     }
 }
 
+/// M4: the inline status select must reflect the row's current state. Without
+/// an explicit `selected`, submitting the *tracking* form silently sent the
+/// first option (`pending`) and reset delivered/shipped orders. Preselect the
+/// current status; for states we deliberately do not offer here (`refunded`,
+/// which only the audited Finance flow sets) show a disabled neutral prompt so
+/// no submit can reset the row by accident.
+fn order_status_options(current: &str) -> String {
+    const OFFERED: &[&str] = &["pending", "shipped", "delivered", "cancelled"];
+    let mut out = String::new();
+    if !OFFERED.contains(&current) {
+        out.push_str(r#"<option value="" selected disabled>Change status…</option>"#);
+    }
+    for status in OFFERED {
+        let selected = if *status == current { " selected" } else { "" };
+        out.push_str(&format!(
+            r#"<option value="{status}"{selected}>{status}</option>"#
+        ));
+    }
+    out
+}
+
 type OrderRow = (String, i64, i64, String, Option<String>, String);
 
 fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
@@ -111,8 +132,8 @@ fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
             };
             format!(
                 r#"<tr><td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="mono">{}</td><td>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><select name="status" aria-label="New status for order {}"><option value="pending">pending</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</select><button type="submit" class="btn btn-secondary btn-sm">Save</button></form>
-<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><input type="text" name="tracking" placeholder="Tracking number" aria-label="Tracking number for order {}"><button type="submit" class="btn btn-secondary btn-sm">Save</button></form>
+<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><select name="status" aria-label="New status for order {oid}">{status_opts}</select><button type="submit" class="btn btn-secondary btn-sm" aria-label="Save status for order {oid}">Save</button></form>
+<form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><input type="text" name="tracking" placeholder="Tracking number" aria-label="Tracking number for order {oid}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Save tracking for order {oid}">Save</button></form>
 {}</td></tr>"#,
                 esc(&o.0),
                 o.1,
@@ -125,11 +146,11 @@ fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
                 esc(&o.5),
                 state.url("/orders/status"),
                 esc(&o.0),
-                esc(&o.0),
                 state.url("/orders/tracking"),
                 esc(&o.0),
-                esc(&o.0),
-                refund_link
+                refund_link,
+                oid = esc(&o.0),
+                status_opts = order_status_options(&o.3),
             )
         })
         .collect::<Vec<_>>()

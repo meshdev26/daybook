@@ -650,6 +650,9 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   .nav-group-toggle { display: none; }
   .nav-group, .nav-group-panel { display: contents; }
   .nav-group-panel { max-height: none; opacity: 1; overflow: visible; }
+  /* Defensive: a stale is-collapsed class (before APP_JS runs, or if JS is
+   * unavailable) must never hide links on mobile — the toggle is gone here. */
+  .nav-group.is-collapsed .nav-group-panel { max-height: none; overflow: visible; }
   .rail nav { display: flex; flex-wrap: wrap; gap: 2px; }
   .rail .foot { margin: 0 0 0 auto; padding: 0; border: none; }
   .main { padding: 20px 16px 48px; }

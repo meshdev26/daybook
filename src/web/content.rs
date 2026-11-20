@@ -101,6 +101,7 @@ pub(super) async fn plans_page(
 pub(super) async fn posts_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<SubsQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
@@ -145,12 +146,20 @@ pub(super) async fn posts_page(
         r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Recent posts"><table aria-label="Recent posts"><thead><tr><th scope="col">ID</th><th scope="col">Channel</th><th scope="col">Kind</th><th scope="col">Content</th><th scope="col">Created</th></tr></thead><tbody>{}</tbody></table></div>"#,
         rows
     );
+    // M2: the gate refuses held edits before transport; the only feedback is
+    // this opaque, content-free status line (no held body, no buyer presence).
+    let held_banner = if q.held.as_deref() == Some("1") {
+        r#"<div class="alert alert-warn" role="status" aria-live="polite">The edit was held by the content policy. Nothing was changed.</div>"#
+    } else {
+        ""
+    };
     let body = format!(
         r#"<h1>Posts <span class="sub">recent sends</span></h1>
-<p class="help">Use the <a href="{}">dashboard form</a> to create a post.</p>
+{held_banner}<p class="help">Use the <a href="{}">dashboard form</a> to create a post.</p>
 {}"#,
         state.url("/dashboard"),
-        table
+        table,
+        held_banner = held_banner
     );
     Html(html_page(&state, Some(&session), "Posts", &body)).into_response()
 }

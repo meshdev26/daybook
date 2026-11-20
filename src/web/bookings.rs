@@ -113,7 +113,7 @@ fn bookings_banner_slot(q: &BookingsQuery) -> String {
         };
         if !msg.is_empty() {
             banners.push(format!(
-                r#"<div class="alert alert-error" role="alert" aria-live="polite">{}</div>"#,
+                r#"<div class="alert alert-error" role="alert">{}</div>"#,
                 msg
             ));
         }

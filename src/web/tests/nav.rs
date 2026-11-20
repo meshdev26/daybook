@@ -649,3 +649,82 @@ async fn moderation_forms_have_375px_targets_and_stacked_rules() {
     assert!(css.contains("min-height: 44px"), "{css}");
     assert!(css.contains(".mod-row-form"), "{css}");
 }
+
+/// B1 (WCAG 2.2 AA 2.1.1 / 2.4.3 / 4.1.2 / 1.3.1): at 375px the rail is
+/// flattened and the group toggles are hidden. A non-current group must stay
+/// navigable — APP_JS forces every panel open on mobile, so no visible link is
+/// `inert` or `aria-hidden` and every `<a href>` stays keyboard-focusable.
+#[tokio::test]
+async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
+    let (state, _dir) = make_state().await;
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    // A seller at the drawer breakpoint: the B1 report's exact scenario.
+    let sess = Session {
+        account_id: acc,
+        role: "seller".to_string(),
+        seller_id: Some(41),
+        selected_bot_id: None,
+    };
+    let nav = rail_nav(&state, "Dashboard", Some(&sess));
+
+    // The CSS that flattens every group at 375px must still ship, including a
+    // stale-class fallback for the no-JS / pre-JS paint.
+    let app = router(state.clone());
+    let css = body_string(
+        app.clone()
+            .oneshot(get_req("/assets/app.css"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        css.contains(".nav-group-toggle { display: none; }"),
+        "{css}"
+    );
+    assert!(
+        css.contains(".nav-group, .nav-group-panel { display: contents; }"),
+        "{css}"
+    );
+    assert!(
+        css.contains(
+            ".nav-group.is-collapsed .nav-group-panel { max-height: none; overflow: visible; }"
+        ),
+        "{css}"
+    );
+
+    // APP_JS: force open on mobile, re-apply when the breakpoint is crossed,
+    // and refuse a phantom collapse from an invisible toggle.
+    let js = super::super::html::APP_JS;
+    assert!(js.contains("if (isMobile()) open = true;"), "{js}");
+    assert!(
+        js.contains("mq.addEventListener('change', applyStored)"),
+        "{js}"
+    );
+    assert!(js.contains("if (isMobile()) return;"), "{js}");
+
+    // DOM-equivalent assertion on the markup the mobile JS enhances: no panel
+    // or link carries inert / aria-hidden="true", and every panel link is a
+    // native, focusable <a href> (no tabindex="-1").
+    assert!(!nav.contains("inert"), "{nav}");
+    let panels: Vec<&str> = nav
+        .split("<div class=\"nav-group-panel\"")
+        .skip(1)
+        .map(|chunk| chunk.split("</div>").next().unwrap_or(""))
+        .collect();
+    assert!(panels.len() >= 2, "expected several nav groups: {nav}");
+    let mut links = 0usize;
+    for panel in panels {
+        assert!(!panel.contains("inert"), "{panel}");
+        assert!(!panel.contains("aria-hidden=\"true\""), "{panel}");
+        for anchor in panel.split("<a ").skip(1) {
+            let tag = anchor.split('>').next().unwrap_or("");
+            assert!(tag.contains("href="), "nav link without href: {tag}");
+            assert!(
+                !tag.contains("tabindex=\"-1\""),
+                "unfocusable nav link: {tag}"
+            );
+            links += 1;
+        }
+    }
+    assert!(links >= 5, "expected seller nav links, got {links}: {nav}");
+}

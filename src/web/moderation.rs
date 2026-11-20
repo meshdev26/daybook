@@ -74,6 +74,43 @@ fn mode_glossary(id: &str) -> String {
     )
 }
 
+/// M5: a plain-language configuration-status warning. It describes POLICY
+/// STATE only — never a term, a message body, a username, or any message
+/// presence — so it cannot leak individual moderation events (L10 constraint).
+/// `degraded` is L9's `resolve_effective_policy().enforcement_degraded` flag;
+/// `floor_empty` is the "no minimum words configured" case, which otherwise
+/// looks identical to healthy enforcement.
+pub(super) fn moderation_notice_html(floor_empty: bool, degraded: bool) -> String {
+    if !floor_empty && !degraded {
+        return String::new();
+    }
+    let mut notes: Vec<&str> = Vec::new();
+    if floor_empty {
+        notes.push("No platform minimum words are set yet, so the shared floor filters nothing.");
+    }
+    if degraded {
+        notes.push(
+            "Automatic enforcement is temporarily unavailable; new content is held for review until it is restored.",
+        );
+    }
+    format!(
+        r#"<div class="alert alert-warn" role="status" aria-live="polite"><b>Content checks are limited right now.</b> {}</div>"#,
+        notes.join(" ")
+    )
+}
+
+/// Resolve the two signals for a rendered moderation page. Owner surfaces use
+/// seller 0 (the global floor); the seller surface uses its own scope so a
+/// per-seller storage failure is reported honestly.
+fn moderation_health_notice(state: &WebState, seller_id: i64) -> String {
+    let floor_empty = state.db.list_moderation_global_floor().is_empty();
+    let degraded = state
+        .db
+        .resolve_effective_policy(seller_id, None)
+        .enforcement_degraded;
+    moderation_notice_html(floor_empty, degraded)
+}
+
 /// Feedback rendered above a re-rendered form. Errors are focusable alerts so
 /// a failed POST does not strand keyboard and screen-reader users; success is
 /// a polite `role="status"` region.
@@ -229,7 +266,7 @@ fn content_policy_body(
         mode: crate::db::MODERATION_FLOOR_MODE.to_owned(),
     });
     format!(
-        r#"{feedback}<h1>Content policy <span class="sub">the floor for every shop and bot</span></h1>
+        r#"{feedback}{health}<h1>Content policy <span class="sub">the floor for every shop and bot</span></h1>
 <article class="panel">
   <p class="help">These words are the minimum for the whole platform. Shops and bots can add words or be stricter, but they cannot switch these off or loosen them.</p>
   <p class="help">Minimum enforcement: <span class="badge badge-success">{floor_mode}</span> — a shop can never handle a floor word less strictly than this.</p>
@@ -250,6 +287,7 @@ fn content_policy_body(
 </article>
 <article class="panel"><h3>Floor words</h3><ul class="rows">{rows}</ul></article>"#,
         feedback = feedback(error, saved),
+        health = moderation_health_notice(state, 0),
         floor_mode = esc(mode_label(crate::db::MODERATION_FLOOR_MODE)),
         add_url = state.url("/content-policy/add"),
         term = esc(&draft.term),
@@ -497,7 +535,7 @@ fn blocked_words_body(
     });
     let retry = error.is_some() && !draft.term.is_empty();
     format!(
-        r#"{feedback}<h1>Blocked words <span class="sub">shop-wide rules</span></h1>
+        r#"{feedback}{health}<h1>Blocked words <span class="sub">shop-wide rules</span></h1>
 <article class="panel">
   <p class="help">Your shop builds on the owner's content policy. You can add words or make a word stricter, but you cannot loosen the owner's floor.</p>
 </article>
@@ -529,6 +567,7 @@ fn blocked_words_body(
 </article>
 {appeals}"#,
         feedback = feedback(error, saved),
+        health = moderation_health_notice(state, seller_id),
         add_url = state.url("/blocked-words/add"),
         term = esc(&draft.term),
         max_len = MODERATION_MAX_TERM_LEN,

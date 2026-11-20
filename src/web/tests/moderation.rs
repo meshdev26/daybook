@@ -681,3 +681,150 @@ async fn per_bot_override_defaults_to_inheritance_and_is_scoped() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(state.db.bot_override_inherits(0, bot_id));
 }
+
+/// M2: a web post edit replaces message text, so it is a content-bearing
+/// outbound send. A matching floor term must hold it BEFORE the edit reaches
+/// Telegram — the mock server records zero requests on a hold.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn post_edit_is_gated_before_any_transport_hit() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (mut state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    assert!(
+        state
+            .db
+            .add_moderation_global_floor_term("bannedword", "hide")
+    );
+    // `moderation_decisions.bot_id` is an FK to bots(id): the mock context
+    // must use a bot row that actually exists or the audit insert is dropped.
+    let bot_id = state.db.create_bot("postedit", 0, None, "Mock bot");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": { "message_id": 1, "date": 0, "chat": { "id": 42, "type": "private" } }
+        })))
+        .mount(&server)
+        .await;
+    let bot = teloxide::Bot::new("9:placeholder")
+        .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+    let ctx = Arc::new(crate::bots::BotContext {
+        id: bot_id,
+        key: "postedit".to_string(),
+        bot,
+        owner_id: 0,
+        shared: Arc::new(state.cfg.clone()),
+        db: state.db.clone(),
+    });
+    let mut manager = crate::bots::BotManager::placeholder(
+        state.db.clone(),
+        Arc::new(state.cfg.clone()),
+        state.identity.clone(),
+    );
+    manager.bots = vec![ctx.clone()];
+    manager.primary = ctx;
+    state.bots = Arc::new(manager);
+
+    let app = router(state.clone());
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/post/edit",
+            "chat_id=-100123&message_id=42&text=please%20read%20bannedword",
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get("location").unwrap(),
+        "/posts?held=1",
+        "the gate must refuse before the edit transport"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a held post edit must never reach the transport"
+    );
+    assert!(
+        state
+            .db
+            .list_moderation_decisions(0, 10)
+            .iter()
+            .any(|d| d.action == "outbound_hide"),
+        "the hold must be audited"
+    );
+
+    // Feedback is a live status region and never echoes the held text.
+    let resp = app
+        .oneshot(authed_req("/posts?held=1", &owner))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    assert!(body.contains("held by the content policy"), "{body}");
+    assert!(body.contains(r#"role="status""#), "{body}");
+    assert!(!body.contains("bannedword"), "{body}");
+}
+
+/// M5: the warning is about POLICY STATE only. It must surface both signals,
+/// stay content-free, and be silent when enforcement is healthy with a floor set.
+#[cfg(feature = "moderation")]
+#[test]
+fn moderation_notice_is_content_free_and_covers_both_signals() {
+    use super::super::moderation::moderation_notice_html;
+
+    let healthy = moderation_notice_html(false, false);
+    assert!(healthy.is_empty(), "{healthy}");
+
+    let empty_floor = moderation_notice_html(true, false);
+    assert!(empty_floor.contains("Content checks are limited right now."));
+    assert!(empty_floor.contains("No platform minimum words are set yet"));
+    assert!(!empty_floor.contains("temporarily unavailable"));
+
+    let degraded = moderation_notice_html(false, true);
+    assert!(degraded.contains("Content checks are limited right now."));
+    assert!(degraded.contains("temporarily unavailable"));
+    assert!(!degraded.contains("No platform minimum words"));
+
+    let both = moderation_notice_html(true, true);
+    assert!(both.contains("No platform minimum words are set yet"));
+    assert!(both.contains("temporarily unavailable"));
+
+    // A screen reader hears a polite status; no transcript/term/presence
+    // language ever reaches the surface.
+    for notice in [&empty_floor, &degraded, &both] {
+        assert!(notice.contains(r#"role="status""#), "{notice}");
+        assert!(notice.contains("aria-live=\"polite\""), "{notice}");
+        assert!(!notice.contains("bannedword"), "{notice}");
+        assert!(!notice.contains("message from"), "{notice}");
+    }
+}
+
+/// M5: a freshly installed floor is empty, so the Content policy and Blocked
+/// words pages must render the plain-language warning to the operator.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+async fn empty_floor_warning_is_rendered_on_both_moderation_pages() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let seller = seller_session(&state, 51).await;
+    let app = router(state);
+
+    for (path, token) in [("/content-policy", &owner), ("/blocked-words", &seller)] {
+        let resp = app.clone().oneshot(authed_req(path, token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("Content checks are limited right now."),
+            "{path}: {body}"
+        );
+        assert!(
+            body.contains("No platform minimum words are set yet"),
+            "{path}: {body}"
+        );
+    }
+}

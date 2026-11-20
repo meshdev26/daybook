@@ -10,7 +10,7 @@ const FONT_SANS: &[u8] = include_bytes!("../../assets/fonts/IBMPlexSans-var.woff
 const FONT_MONO_400: &[u8] = include_bytes!("../../assets/fonts/IBMPlexMono-400.woff2");
 const FONT_MONO_500: &[u8] = include_bytes!("../../assets/fonts/IBMPlexMono-500.woff2");
 
-const APP_JS: &str = r#"(function () {
+pub(super) const APP_JS: &str = r#"(function () {
   'use strict';
   function init() {
     var toggles = document.querySelectorAll('.secret-toggle');
@@ -81,6 +81,12 @@ const APP_JS: &str = r#"(function () {
     return el.getAttribute('data-group');
   }
   function setGroup(group, open) {
+    // At <=900px CSS flattens every group (`.nav-group-panel { display:contents }`)
+    // and hides the toggle. A non-current group must still be fully navigable:
+    // marking its visible links inert/aria-hidden strands touch + keyboard
+    // users (WCAG 2.2 AA 2.1.1 / 2.4.3 / 4.1.2 / 1.3.1). Force every group
+    // open on mobile; desktop keeps its stored, collapsible behaviour + ARIA.
+    if (isMobile()) open = true;
     var el = document.querySelector('.nav-group[data-nav-group="' + group + '"]') || document.querySelector('.nav-group[data-group="' + group + '"]');
     if (!el) return;
     el.classList.toggle('is-collapsed', !open);
@@ -92,20 +98,22 @@ const APP_JS: &str = r#"(function () {
       panel.setAttribute('aria-hidden', open ? 'false' : 'true');
     }
   }
-  function init() {
+  function applyStored() {
     document.querySelectorAll('.nav-group').forEach(function (el) {
       var g = groupKey(el);
       var stored = Object.prototype.hasOwnProperty.call(state, g) ? state[g] : null;
-      var open;
-      if (stored !== null) open = !!stored;
-      else if (isMobile()) open = el.getAttribute('data-current') === 'true';
-      else open = true;
-      setGroup(g, open);
+      setGroup(g, stored !== null ? !!stored : true);
     });
+  }
+  function init() {
+    applyStored();
     document.querySelectorAll('.nav-group-toggle').forEach(function (btn) {
       if (btn.dataset.sidebarBound) return;
       btn.dataset.sidebarBound = '1';
       btn.addEventListener('click', function () {
+        // The toggle is display:none on mobile; never record a phantom collapse
+        // that would resurface as a closed group after returning to desktop.
+        if (isMobile()) return;
         var el = this.closest('.nav-group');
         var g = groupKey(el);
         var nowOpen = el.classList.contains('is-collapsed');
@@ -114,6 +122,12 @@ const APP_JS: &str = r#"(function () {
         writeState(state);
       });
     });
+    // Crossing the breakpoint re-evaluates every group: desktop collapses
+    // become fully navigable mobile links, and the stored preference returns
+    // on the way back.
+    var mq = window.matchMedia('(max-width: 900px)');
+    if (mq.addEventListener) mq.addEventListener('change', applyStored);
+    else if (mq.addListener) mq.addListener(applyStored);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
@@ -147,6 +161,21 @@ const APP_JS: &str = r#"(function () {
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+})();
+(function () {
+  'use strict';
+  // Theme is a two-state toggle: the pressed state is the fact for screen
+  // readers. The inline head script resolves light/dark before paint; this
+  // deferred pass mirrors that resolved value onto every Theme control.
+  function syncThemeButtons() {
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    document.querySelectorAll('.theme-toggle').forEach(function (b) {
+      b.setAttribute('aria-pressed', dark ? 'true' : 'false');
+      b.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncThemeButtons);
+  else syncThemeButtons();
 })();
 "#;
 
@@ -259,7 +288,7 @@ pub(super) fn html_page(
 {b}
 </div></main>
 </div>
-<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}}</script>
+<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);document.querySelectorAll('.theme-toggle').forEach(function(b){{b.setAttribute('aria-pressed',n==='dark'?'true':'false');b.setAttribute('aria-label',n==='dark'?'Switch to light theme':'Switch to dark theme');}});}}</script>
 </body></html>"##,
         base = base,
         t = title,
@@ -291,10 +320,10 @@ pub(super) fn html_page_bare_panel(
 <a class="skip-link" href='#main'>Skip to content</a>
 <main class="door" id="main">
   <div class="brand">{plane}<b>Telegram Business</b></div>
-  <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button>
+  <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()" aria-pressed="false" aria-label="Switch to dark theme">Theme</button>
   <div class="{panel_class}">{b}</div>
 </main>
-<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}}</script>
+<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);document.querySelectorAll('.theme-toggle').forEach(function(b){{b.setAttribute('aria-pressed',n==='dark'?'true':'false');b.setAttribute('aria-label',n==='dark'?'Switch to light theme':'Switch to dark theme');}});}}</script>
 </body></html>"#,
         base = base,
         t = title,
@@ -854,7 +883,7 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
         ));
     }
     if session.is_some() {
-        out.push_str(r#"<button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button>"#);
+        out.push_str(r#"<button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()" aria-pressed="false" aria-label="Switch to dark theme">Theme</button>"#);
         out.push_str(&format!(
             r#"<a href="{base}/logout">Sign out</a>"#,
             base = base

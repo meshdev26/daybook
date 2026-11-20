@@ -37,6 +37,9 @@ pub(super) struct SubsQuery {
     /// /codes delete flag (EDIT_FLOW_SPEC E5): the codes page shares this
     /// struct and renders "Code deleted." from it; /subs ignores it.
     pub(super) deleted: Option<String>,
+    /// /posts outcome flag (M2): a post edit held by the outbound gate
+    /// redirects here. Content-free feedback only — never the held text.
+    pub(super) held: Option<String>,
 }
 
 pub(super) fn normalize_sub_status(s: Option<String>) -> String {

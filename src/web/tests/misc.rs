@@ -439,3 +439,78 @@ async fn broadcast_single_custom_segment_input() {
         .expect("the custom input exists");
     assert!(input_pos > details_pos, "the custom input lives in details");
 }
+
+/// M4: the inline status select must preselect the row's current status so
+/// saving tracking (a separate form) cannot silently reset delivered→pending.
+/// m1: the two Save buttons in a row carry distinct accessible names.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn orders_status_select_preselects_current_and_save_buttons_are_labeled() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let oid = state.db.create_order(7, 1, 999, "inv-orders-ui").unwrap();
+    assert!(state.db.set_order_status(7, &oid, "delivered"));
+
+    let resp = router(state)
+        .oneshot(authed_req("/orders", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"<option value="delivered" selected>delivered</option>"#),
+        "current status must be selected: {body}"
+    );
+    assert!(
+        !body.contains("Change status…"),
+        "delivered is offered, no placeholder needed: {body}"
+    );
+    assert!(
+        body.contains(&format!(r#"aria-label="Save status for order {oid}""#)),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(r#"aria-label="Save tracking for order {oid}""#)),
+        "{body}"
+    );
+
+    // A state we deliberately do not offer (`refunded`) falls back to a
+    // neutral, disabled prompt rather than silently submitting `pending`.
+    let (state2, _dir2) = make_state().await;
+    let owner2 = owner_session(&state2).await;
+    let oid2 = state2
+        .db
+        .create_order(7, 1, 999, "inv-orders-ui-2")
+        .unwrap();
+    assert!(state2.db.set_order_status(7, &oid2, "refunded"));
+    let resp2 = router(state2)
+        .oneshot(authed_req("/orders", &owner2))
+        .await
+        .unwrap();
+    let body2 = body_string(resp2).await;
+    assert!(
+        body2.contains(r#"<option value="" selected disabled>Change status…</option>"#),
+        "{body2}"
+    );
+}
+
+/// m2: `role="alert"` is already an assertive live region; duplicating
+/// `aria-live="polite"` on the same element gives screen readers conflicting
+/// instructions.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn bookings_alert_is_not_a_redundant_live_region() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let resp = router(state)
+        .oneshot(authed_req("/bookings?error=invalid", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"<div class="alert alert-error" role="alert">Invalid booking id.</div>"#),
+        "{body}"
+    );
+    assert!(!body.contains(r#"role="alert" aria-live"#), "{body}");
+}
