@@ -111,8 +111,33 @@ impl CryptoPay {
 
     /// Transfer funds from the app balance to a user (Crypto Pay `transfer`).
     /// Spends from the bot's balance; the result carries the transfer receipt.
+    ///
+    /// Legacy entry point: delegates to [`CryptoPay::transfer_with_spend_id`]
+    /// with an empty id. An empty `spend_id` is omitted from the request body,
+    /// so this method's wire format stays byte-compatible with pre-idempotency
+    /// callers (and their existing wiremock expectations).
     pub async fn transfer(&self, user_id: i64, asset: &str, amount: &str) -> Result<Value, String> {
-        let body = serde_json::json!({ "user_id": user_id, "asset": asset, "amount": amount });
+        self.transfer_with_spend_id(user_id, asset, amount, "")
+            .await
+    }
+
+    /// Like [`CryptoPay::transfer`], but attaches a caller-supplied `spend_id`
+    /// so Crypto Pay deduplicates retried transfers (idempotency key).
+    ///
+    /// The `spend_id` field is included only when non-empty; an empty id
+    /// reproduces the legacy body exactly. Callers must persist a fresh,
+    /// unique id before the first attempt and reuse it on every retry.
+    pub async fn transfer_with_spend_id(
+        &self,
+        user_id: i64,
+        asset: &str,
+        amount: &str,
+        spend_id: &str,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({ "user_id": user_id, "asset": asset, "amount": amount });
+        if !spend_id.is_empty() {
+            body["spend_id"] = Value::String(spend_id.to_string());
+        }
         self.call("transfer", Some(body)).await
     }
 }
@@ -121,7 +146,7 @@ impl CryptoPay {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client_for(server: &MockServer) -> CryptoPay {
@@ -137,6 +162,62 @@ mod tests {
             .and(body_partial_json(
                 json!({"user_id": 42, "asset": "USDT", "amount": "1.5"}),
             ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {"transfer_id": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let res = client_for(&server)
+            .transfer(42, "USDT", "1.5")
+            .await
+            .unwrap();
+        assert_eq!(res["transfer_id"], 1);
+    }
+
+    /// transfer_with_spend_id() posts the exact caller-supplied idempotency
+    /// key alongside the usual fields. body_json is an exact-body matcher, so
+    /// any extra/missing field would fail this expectation.
+    #[tokio::test]
+    async fn transfer_with_spend_id_posts_exact_spend_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transfer"))
+            .and(body_json(json!({
+                "user_id": 42,
+                "asset": "USDT",
+                "amount": "1.5",
+                "spend_id": "refund-7-attempt-2",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {"transfer_id": 9}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let res = client_for(&server)
+            .transfer_with_spend_id(42, "USDT", "1.5", "refund-7-attempt-2")
+            .await
+            .unwrap();
+        assert_eq!(res["transfer_id"], 9);
+    }
+
+    /// The legacy transfer() path must omit spend_id entirely; an exact-body
+    /// matcher proves no idempotency field is emitted when the id is empty.
+    #[tokio::test]
+    async fn transfer_legacy_omits_spend_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transfer"))
+            .and(body_json(json!({
+                "user_id": 42,
+                "asset": "USDT",
+                "amount": "1.5",
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ok": true,
                 "result": {"transfer_id": 1}
