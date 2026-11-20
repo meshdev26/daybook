@@ -1,4 +1,4 @@
-# Design System — Telegram Business Platform
+# Daybook — Design System
 
 ## Perspectives
 This design system is informed by two lenses:
@@ -68,6 +68,8 @@ operator's ledger — a commerce back-office set like a well-kept financial
 book. Borders lead, shadows whisper, figures sit in mono, status is a dot
 before a word. No hover-lift theatre, no gradient washes. Generous
 whitespace, precise typography, subtle depth, single clear action per screen.
+
+**Brand (L6-C):** the product is called **Daybook** — a "daybook" is the daily account book itself, so the name makes the ledger metaphor callable; display text only, no token or path changes.
 
 ## 4. Tokens
 
