@@ -222,11 +222,31 @@ async fn refund_seller_flow(app: Router, seller: String, db: Arc<crate::db::Db>)
 }
 
 async fn refund_owner_flow(app: Router, owner: String, db: Arc<crate::db::Db>) {
-    // Admins/owner keep the looser form (they approve what gets created).
+    // Admins/owner keep the looser web form (they approve what gets created),
+    // but the data layer enforces the cumulative cap for everyone: an
+    // over-cap request must never persist a money row, even for the owner.
     let resp = app
+        .clone()
         .oneshot(post_authed_req(
             "/finance/refund/create",
             "invoice_id=inv-2&amount=99&asset=USDT",
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let all = db.list_refunds(None);
+    assert!(
+        !all.iter().any(|r| r.2.as_deref() == Some("inv-2")),
+        "an over-cap refund must not be persisted, even for the owner: {all:?}"
+    );
+    // The owner is still authorised to refund another seller's invoice with
+    // a valid (≤ invoice) amount — the gating intent of this test. A partial
+    // amount is honoured verbatim (the web form does not clamp admins).
+    let resp = app
+        .oneshot(post_authed_req(
+            "/finance/refund/create",
+            "invoice_id=inv-2&amount=2&asset=USDT",
             &owner,
         ))
         .await
@@ -236,7 +256,11 @@ async fn refund_owner_flow(app: Router, owner: String, db: Arc<crate::db::Db>) {
         "/finance?refund_created=1"
     );
     let all = db.list_refunds(None);
-    assert!(all.iter().any(|r| r.4 == "99" && r.5 == "USDT"));
+    assert!(
+        all.iter()
+            .any(|r| r.2.as_deref() == Some("inv-2") && r.4 == "2" && r.5 == "USDT"),
+        "authorised owner refund must be persisted: {all:?}"
+    );
 }
 
 // ---- Login throttle hard cap (LOW-10) ----
