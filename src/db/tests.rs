@@ -4227,6 +4227,43 @@ fn money_refund_asset_lock_actor_and_immutability() {
     }
 }
 
+/// F3: `refund_creator` reads the actor from the persisted refund row written
+/// by `create_refund_guarded` (not the age-limited audit log), so separation
+/// of duties survives on mature DBs; unknown ids resolve to `None`.
+#[test]
+fn money_refund_creator_returns_persisted_actor() {
+    let (db, _path) = money_test_db("refund_creator.db");
+    db.save_invoice(
+        "inv-creator",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let created = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-creator"),
+            "3",
+            "USDT",
+            "creator-key",
+            88,
+            "Owner",
+        ))
+        .unwrap();
+    assert!(created.created_new);
+    assert_eq!(
+        db.refund_creator(created.id),
+        Some((88, "Owner".to_string()))
+    );
+    assert_eq!(db.refund_creator(created.id + 9999), None);
+}
+
 /// §1.4 + §2.7 legacy migration: columns backfilled idempotently, audit
 /// actor recovered where present, sentinels otherwise, no row deletions.
 #[test]

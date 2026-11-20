@@ -5711,6 +5711,25 @@ impl Db {
         ).optional().ok().flatten()
     }
 
+    /// Persisted creator actor for a refund: (created_by, created_role).
+    /// Reads the authoritative columns written by `create_refund_guarded`,
+    /// which — unlike the `refund_create` audit event — never age out of the
+    /// audit window on a mature DB (§2 separation of duties).
+    pub fn refund_creator(&self, id: i64) -> Option<(i64, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT created_by, created_role FROM refunds WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn update_refund_status(&self, id: impl ToString, status: impl AsRef<str>) {
         self.update_refund_status_by(id, status, None);
     }
