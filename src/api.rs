@@ -59,40 +59,19 @@ fn seller_scope(session: &crate::web::Session) -> Option<i64> {
     }
 }
 
-fn channel_key(channel: &str) -> String {
-    channel.trim().trim_start_matches('@').to_ascii_lowercase()
-}
-
-/// Tenant gate for channel-addressed REST mutations. Mirrors the web console's
-/// `may_mutate_channel` (`web/channel_ops.rs`): owner/admin keep the global
-/// tier, a seller may address only a channel row they own or their own default
-/// channel, and everything else fails closed. Run before ANY Bot API call so
-/// one tenant's session cannot drive another tenant's bot.
+/// Tenant gate for channel-addressed REST mutations. Delegates to the single
+/// shared policy in `handlers::channel_access` so the REST surface and the
+/// console cannot drift. Run before ANY Bot API call or DB row write so one
+/// tenant's session cannot drive another tenant's bot.
 fn api_may_mutate_channel(state: &WebState, session: &crate::web::Session, chat_id: &str) -> bool {
-    if Role::from_role_str(&session.role).has_level(Role::Admin) {
-        return true;
-    }
-    let key = channel_key(chat_id);
-    if key.is_empty() {
-        return false;
-    }
-    let Some(sid) = session.seller_id else {
-        return false;
-    };
-    // Exact stored form first, then the normalized key, matching the web gate.
-    if state
-        .db
-        .get_channel_seller_id(chat_id.trim())
-        .or_else(|| state.db.get_channel_seller_id(&key))
-        == Some(sid)
-    {
-        return true;
-    }
-    state
-        .db
-        .seller_channel(sid)
-        .map(|own| channel_key(&own))
-        .is_some_and(|own| !own.is_empty() && own == key)
+    crate::handlers::channel_access::may_mutate_channel(
+        &state.db,
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }
 
 /// Extract the invoice array from a Crypto Pay `getInvoices` response,
@@ -1666,6 +1645,20 @@ async fn posts_create(
         )
         .into_response();
     }
+    // The target is client-supplied and the send is logged against it. Apply
+    // the console's composer-target policy (owned rows + global rows) before
+    // any moderation check, Bot API call or DB write: a seller must not be able
+    // to post into another seller's channel through REST either.
+    if !crate::handlers::channel_access::may_post_to_channel(
+        &state.db,
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        &ch,
+    ) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
+    }
     // Sends go out as the session's effective bot (seller → their bot, owner →
     // selected bot, admin → their bot with primary fallback).
     let bot = crate::web::effective_bot(&state, &session);
@@ -1732,6 +1725,14 @@ async fn posts_schedule(
             "channel/text/scheduled_at required",
         )
         .into_response();
+    }
+    // F1: the scheduler sends through the bot bound to the TARGET channel
+    // (BotManager::for_channel in main.rs), not the caller's effective bot.
+    // Without this gate a seller could queue text into a foreign channel under
+    // the victim bot's identity while the moderation gate checked the attacker
+    // scope. Authorize before the row write; owner/admin keep the global tier.
+    if !api_may_mutate_channel(&state, &session, &ch) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
     }
     let seller_id = session.seller_id.unwrap_or(0);
     let id = state

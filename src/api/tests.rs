@@ -2617,3 +2617,145 @@ async fn posts_update_allows_clean_content_after_gate() {
     let content = state.db.list_posts(Some(42), 1000)[0].5.clone();
     assert_eq!(content.as_deref(), Some("clean edited text"));
 }
+
+// F1: the scheduled-post worker resolves its sender from the TARGET channel
+// (BotManager::for_channel), so a foreign destination would post attacker text
+// under the victim bot's identity. The gate must fire before any transport work
+// and before the row is written.
+#[tokio::test]
+async fn posts_schedule_blocks_cross_tenant_channel_before_transport_and_db_write() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@victim", 99).unwrap();
+    let server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/posts/schedule")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"channel":"@victim","text":"attacker text","scheduled_at":"2030-01-01T00:00:00+00:00"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a cross-tenant scheduled post must never reach the transport"
+    );
+    assert!(
+        state.db.list_scheduled_posts(None).is_empty(),
+        "a refused scheduled post must leave no row in any tenant scope"
+    );
+}
+
+#[tokio::test]
+async fn posts_schedule_allows_own_default_and_owner_targets() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@mine", 42).unwrap();
+    state.db.add_channel("@victim", 99).unwrap();
+    let _server = attach_mock_bot(&mut state).await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let app = router(state.clone());
+
+    for (token, ch) in [
+        (&seller, "@mine"),
+        (&seller, "@chan42"),
+        (&owner, "@victim"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/posts/schedule")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"channel":"{ch}","text":"scheduled text","scheduled_at":"2030-01-01T00:00:00+00:00"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "channel {ch}");
+    }
+    let rows = state.db.list_scheduled_posts(None);
+    assert_eq!(rows.len(), 3);
+    for ch in ["@mine", "@chan42", "@victim"] {
+        assert!(
+            rows.iter().any(|r| r.2 == ch),
+            "expected a scheduled row for {ch}"
+        );
+    }
+}
+
+// Sibling check: immediate post creation must not accept a foreign channel
+// target either. Its send uses the caller's bot, but the destination is still
+// client-supplied and logged, so the console's composer gate applies here too.
+#[tokio::test]
+async fn posts_create_blocks_cross_tenant_channel_before_transport() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@victim", 99).unwrap();
+    let server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/posts")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"text":"attacker text","channel":"@victim"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a cross-tenant immediate post must never reach the transport"
+    );
+    assert!(state.db.list_posts(Some(42), 1000).is_empty());
+}
+
+#[tokio::test]
+async fn posts_create_allows_own_default_and_global_channels() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@mine", 42).unwrap();
+    state.db.add_channel("@global", 0).unwrap();
+    let _server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    for ch in ["@mine", "@chan42", "@global"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/posts")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"text":"hello {ch}","channel":"{ch}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "channel {ch}");
+    }
+    assert_eq!(state.db.list_posts(Some(42), 1000).len(), 3);
+}
