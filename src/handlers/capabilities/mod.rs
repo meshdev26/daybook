@@ -24,6 +24,12 @@ use crate::{bots::BotContext, db::Db, handlers::commands::Command};
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// Buyer-facing refusal copy. Internal feature/product-type details stay in
+/// [`BotCapability::log`]; buyers never see `movie_bot`,
+/// `capability_uncompiled` or other build jargon.
+const BUYER_NOTICE: &str =
+    "This shop isn't taking messages right now — please try again later or contact support";
+
 /// How an inbound Telegram update is handled once a capability is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundHandler {
@@ -238,23 +244,12 @@ impl BotCapability {
         }
     }
 
-    /// Plain-language text sent to the user. Never contains secrets or
-    /// transcript content.
+    /// Plain-language text sent to the buyer. Identical for every internal
+    /// refusal reason: no product types, feature flags or build jargon (those
+    /// stay in [`BotCapability::log`] for operators). Never contains secrets
+    /// or transcript content.
     pub fn notice_text(&self) -> String {
-        match &self.selection {
-            Ok(d) => format!(
-                "The \"{}\" capability ({}) is compiled in, but no vertical handler is registered yet. This product cannot process updates.",
-                d.label, self.bot_type
-            ),
-            Err(ResolveError::Uncompiled { feature, .. }) => format!(
-                "This bot type \"{}\" is not available in this build: the \"{}\" capability is not compiled in. Ask the operator to enable it.",
-                self.bot_type, feature
-            ),
-            Err(ResolveError::Unknown { .. }) => format!(
-                "This bot has an unsupported product type \"{}\". Ask the operator to configure a supported type.",
-                self.bot_type
-            ),
-        }
+        BUYER_NOTICE.to_string()
     }
 }
 
@@ -329,8 +324,9 @@ mod tests {
         let cap = BotCapability::new(42, "movie", "movie_bot");
         assert!(!cap.is_legacy_shop());
         let text = cap.notice_text();
-        assert!(text.contains("movie_bot"), "{text}");
-        assert!(text.contains("not compiled in"), "{text}");
+        assert_eq!(text, BUYER_NOTICE);
+        assert!(!text.contains("movie_bot"), "{text}");
+        assert!(!text.contains("not compiled in"), "{text}");
     }
 
     #[cfg(feature = "movie_bot")]
@@ -341,7 +337,7 @@ mod tests {
         assert!(d.command_set().is_empty());
         let cap = BotCapability::new(42, "movie", "movie_bot");
         assert!(!cap.is_legacy_shop());
-        assert!(cap.notice_text().contains("no vertical handler"));
+        assert_eq!(cap.notice_text(), BUYER_NOTICE);
     }
 
     #[test]
@@ -351,7 +347,7 @@ mod tests {
             other => panic!("expected Unknown, got {other:?}"),
         }
         let cap = BotCapability::new(1, "odd", "totally_unknown");
-        assert!(cap.notice_text().contains("unsupported product type"));
+        assert_eq!(cap.notice_text(), BUYER_NOTICE);
     }
 
     #[cfg(feature = "shop_bot")]
@@ -421,7 +417,8 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let text = body["text"].as_str().unwrap_or_default();
-        assert!(text.contains("movie_bot"), "{text}");
-        assert!(text.contains("not compiled in"), "{text}");
+        assert_eq!(text, BUYER_NOTICE);
+        assert!(!text.contains("movie_bot"), "{text}");
+        assert!(!text.contains("not compiled in"), "{text}");
     }
 }

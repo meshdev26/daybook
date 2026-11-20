@@ -59,6 +59,42 @@ fn seller_scope(session: &crate::web::Session) -> Option<i64> {
     }
 }
 
+fn channel_key(channel: &str) -> String {
+    channel.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+/// Tenant gate for channel-addressed REST mutations. Mirrors the web console's
+/// `may_mutate_channel` (`web/channel_ops.rs`): owner/admin keep the global
+/// tier, a seller may address only a channel row they own or their own default
+/// channel, and everything else fails closed. Run before ANY Bot API call so
+/// one tenant's session cannot drive another tenant's bot.
+fn api_may_mutate_channel(state: &WebState, session: &crate::web::Session, chat_id: &str) -> bool {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
+        return true;
+    }
+    let key = channel_key(chat_id);
+    if key.is_empty() {
+        return false;
+    }
+    let Some(sid) = session.seller_id else {
+        return false;
+    };
+    // Exact stored form first, then the normalized key, matching the web gate.
+    if state
+        .db
+        .get_channel_seller_id(chat_id.trim())
+        .or_else(|| state.db.get_channel_seller_id(&key))
+        == Some(sid)
+    {
+        return true;
+    }
+    state
+        .db
+        .seller_channel(sid)
+        .map(|own| channel_key(&own))
+        .is_some_and(|own| !own.is_empty() && own == key)
+}
+
 /// Extract the invoice array from a Crypto Pay `getInvoices` response,
 /// tolerating the API's envelope variations: a bare array `[...]`,
 /// `{"items":[...]}`, or `{"result":{"items":[...]}}` (this crate's
@@ -1142,12 +1178,30 @@ async fn subs_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    // Subscription status is a privileged mutation: only the owner may change
+    // it (mirrors the web `subs_revoke` / `subs_expirecheck` owner gates). A
+    // seller session never reaches the mutation, even for its own row.
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
+    }
+    // Resolve the target inside the caller's tenant scope before touching it.
+    // Owner scope is global, but an id that does not exist must still fail
+    // closed (404) rather than mutate an arbitrary row.
+    let scope = seller_scope(&session);
+    let in_scope = state
+        .db
+        .list_subscriptions(scope, 1000)
+        .iter()
+        .any(|s| s.0 == id);
+    if !in_scope {
+        return err(StatusCode::NOT_FOUND, "not_found", "subscription not found").into_response();
+    }
     if let Some(status) = &f.status
         && status == "expired"
     {
         state.db.mark_subscription_expired(id);
     }
-    let _ = (session, f.expires_at);
+    let _ = f.expires_at;
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -1750,8 +1804,21 @@ async fn posts_update(
     }
     let new_content = f.content.or(f.text);
     if let Some(c) = &new_content {
+        // L10 outbound gate BEFORE the raw-Bot edit. A post edit is a
+        // content-bearing send path like any other; without this call it
+        // bypasses the moderation floor that the create/broadcast paths
+        // already honour. Seller scope comes from the session principal.
+        let bot = crate::web::effective_bot(&state, &session);
+        if let Err(hold) = crate::handlers::moderation::gate_outbound(
+            &state.db,
+            session.seller_id.unwrap_or(0),
+            Some(bot.id),
+            c,
+        ) {
+            return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string())
+                .into_response();
+        }
         if p.3 != 0 {
-            let bot = crate::web::effective_bot(&state, &session);
             let _ = bot
                 .bot
                 .edit_message_text(crate::util::to_chat_id(&p.2), MessageId(p.3), c.clone())
@@ -1948,6 +2015,12 @@ async fn channels_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    // H1 tenant gate: a session may only mutate channels inside its own
+    // scope. Without this, patching the path id lets one seller deface
+    // another seller's channel through this raw-Bot path.
+    if !api_may_mutate_channel(&state, &session, &id) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
+    }
     let chat = crate::util::to_chat_id(&id);
     // Channel metadata edits run as the session's effective bot (the bot that
     // owns the seller's channel).
@@ -2222,8 +2295,11 @@ async fn config_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
-        return err(StatusCode::FORBIDDEN, "forbidden", "insufficient role").into_response();
+    // The global default channel is owner-only (the web `channels_default`
+    // route carries the same gate). A seller writing it would steer every
+    // tenant's fallback channel, so sellers are refused outright.
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.set_config("channel", &f.channel);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()

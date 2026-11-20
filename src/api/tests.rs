@@ -475,6 +475,7 @@ async fn api_plans_update_delete() {
 async fn api_subs_create_list_get_patch() {
     let (state, _dir) = make_seller_state().await;
     let token = seller_token(&state);
+    let owner = owner_token(&state);
     let app = router(state);
     let resp = app
         .clone()
@@ -521,13 +522,29 @@ async fn api_subs_create_list_get_patch() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // PATCH is an owner-only mutation: a seller is refused even for its own row.
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PATCH")
                 .uri(format!("/api/v1/subscriptions/{}", sub_id))
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {}", token))
+                .body(Body::from(r#"{"status":"expired"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // The owner still has the successful path.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/subscriptions/{}", sub_id))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", owner))
                 .body(Body::from(r#"{"status":"expired"}"#))
                 .unwrap(),
         )
@@ -2288,4 +2305,315 @@ async fn api_finance_refunds_requires_paid_invoice() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Production-blocker regressions (L10 REST audit / L9 ops audit) ----
+
+/// Point the effective bot at a wiremock Bot API so channel/post mutations in
+/// these tests never reach the real Telegram transport. The returned server
+/// lets a test prove that a gate held BEFORE any transport work (zero hits).
+async fn attach_mock_bot(state: &mut WebState) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })),
+        )
+        .mount(&server)
+        .await;
+    let bot = teloxide::Bot::new("9:placeholder")
+        .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+    let ctx = Arc::new(crate::bots::BotContext {
+        id: 9,
+        key: "mock".to_string(),
+        bot,
+        owner_id: 0,
+        shared: Arc::new(state.cfg.clone()),
+        db: state.db.clone(),
+    });
+    state.bots = Arc::new(crate::bots::BotManager {
+        bots: vec![ctx.clone()],
+        primary: ctx,
+        db: state.db.clone(),
+        identity: crate::identity::IdentityHandle::unconnected(),
+    });
+    server
+}
+
+// H1: subs_patch must be owner-only and must resolve the target inside the
+// caller's tenant scope before mutating it.
+#[tokio::test]
+async fn subs_patch_rejects_non_owner_and_leaves_row_untouched() {
+    let (state, _dir) = make_seller_state().await;
+    let sub_id = state
+        .db
+        .create_subscription(42, 4242, None, "@chan42", 7, None, None);
+    let token = seller_token(&state);
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/subscriptions/{sub_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"expired"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let row = state
+        .db
+        .list_subscriptions(Some(42), 1000)
+        .into_iter()
+        .find(|s| s.0 == sub_id)
+        .expect("subscription must still exist");
+    assert_ne!(
+        row.4, "expired",
+        "a seller must not expire any subscription"
+    );
+}
+
+#[tokio::test]
+async fn subs_patch_owner_expires_scoped_id_and_404s_unknown_id() {
+    let (state, _dir) = make_state().await;
+    let sub_id = state
+        .db
+        .create_subscription(42, 4242, None, "@chan42", 7, None, None);
+    let token = owner_token(&state);
+    let app = router(state.clone());
+
+    // Unknown id fails closed: nothing outside the resolved scope is touched.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/subscriptions/999999")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"expired"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // In-scope id succeeds for the owner.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/subscriptions/{sub_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"expired"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let row = state
+        .db
+        .list_subscriptions(None, 1000)
+        .into_iter()
+        .find(|s| s.0 == sub_id)
+        .expect("subscription must exist");
+    assert_eq!(row.4, "expired");
+}
+
+// H2: the GLOBAL default channel is owner-only; a seller must get 403.
+#[tokio::test]
+async fn config_set_channel_is_owner_only() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/channel")
+                .header("authorization", format!("Bearer {seller}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel":"@hijacked"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_ne!(state.db.get_config("channel").as_deref(), Some("@hijacked"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/channel")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel":"@ownerchan"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        state.db.get_config("channel").as_deref(),
+        Some("@ownerchan")
+    );
+}
+
+// H3: channels_patch must apply the same tenant gate as the web console.
+#[tokio::test]
+async fn channels_patch_blocks_cross_tenant_deface_before_transport() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@victim", 99).unwrap();
+    let server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/channels/@victim")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"PWNED"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a cross-tenant channel edit must never reach the transport"
+    );
+}
+
+#[tokio::test]
+async fn channels_patch_allows_own_channel_and_default_channel() {
+    let (mut state, _dir) = make_seller_state().await;
+    state.db.add_channel("@mine", 42).unwrap();
+    let _server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    for channel in ["@mine", "@chan42"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/channels/{channel}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "channel {channel}");
+    }
+}
+
+#[tokio::test]
+async fn channels_patch_owner_may_edit_any_channel() {
+    let (mut state, _dir) = make_state().await;
+    state.db.add_channel("@victim", 99).unwrap();
+    let _server = attach_mock_bot(&mut state).await;
+    let token = owner_token(&state);
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/channels/@victim")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"owner edit"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// M2: posts_update must call gate_outbound before edit_message_text.
+#[tokio::test]
+async fn posts_update_holds_matching_term_before_transport() {
+    let (mut state, _dir) = make_seller_state().await;
+    state
+        .db
+        .log_post(42, "@chan42", 55, "text", Some("original"), "bot")
+        .unwrap();
+    let post_id = state.db.list_posts(Some(42), 1000)[0].0;
+    assert!(state.db.add_blocked_word(42, "floorterm", "hide", true));
+    let server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/posts/{post_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"please read floorterm now"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"].as_str(), Some("moderation_hold"));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "the matching term must hold the edit before any transport work"
+    );
+    let content = state.db.list_posts(Some(42), 1000)[0].5.clone();
+    assert_eq!(
+        content.as_deref(),
+        Some("original"),
+        "held edit must not update the row"
+    );
+}
+
+#[tokio::test]
+async fn posts_update_allows_clean_content_after_gate() {
+    let (mut state, _dir) = make_seller_state().await;
+    state
+        .db
+        .log_post(42, "@chan42", 56, "text", Some("original"), "bot")
+        .unwrap();
+    let post_id = state.db.list_posts(Some(42), 1000)[0].0;
+    let server = attach_mock_bot(&mut state).await;
+    let token = seller_token(&state);
+    let app = router(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/posts/{post_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"clean edited text"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let content = state.db.list_posts(Some(42), 1000)[0].5.clone();
+    assert_eq!(content.as_deref(), Some("clean edited text"));
 }
