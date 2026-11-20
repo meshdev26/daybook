@@ -4775,8 +4775,10 @@ async fn handle_refund_approve(
             return Ok(());
         }
     };
-    // §2: the human creator may never approve their own money row. System-
-    // created refunds carry no creator audit event and are exempt.
+    // §2: the human creator may never approve their own money row. The shared
+    // helper reads the persisted created_by column first (F3), falling back to
+    // the audit event only for legacy sentinel rows; system-created refunds
+    // carry the sentinel and are exempt.
     if let Some((creator, _)) = crate::handlers::money::refund_creator(db, id)
         && creator == user_id
     {

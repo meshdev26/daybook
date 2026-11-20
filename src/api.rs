@@ -1345,6 +1345,8 @@ async fn invoices_get(
 #[derive(Deserialize)]
 struct InvoiceStatusReq {
     status: String,
+    /// Required only for the operator-forced `failed` transition (§3.6).
+    reason: Option<String>,
 }
 async fn invoices_status(
     State(state): State<WebState>,
@@ -1364,16 +1366,68 @@ async fn invoices_status(
     } else {
         return err(StatusCode::NOT_FOUND, "not_found", "invoice not found").into_response();
     }
-    // 'paid' is a verified state, not a manual one: it may only be reached
-    // through the verified webhook or the claim flow.
-    if f.status == "paid" {
+    // 'paid' and 'paid_ungranted' are verified/system states, never manual:
+    // they may only be reached through the webhook, claim or recovery flow
+    // (§3.2/§3.6). Refuse both explicitly.
+    if f.status == "paid" || f.status == "paid_ungranted" {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_status",
-            "paid transitions require verified webhook/claim",
+            "paid/paid_ungranted transitions require verified webhook/claim",
         )
         .into_response();
     }
+    if f.status == "failed" {
+        // §3.6 / D3.6: an operator-forced failure requires the exact Owner
+        // role (not Admin/Seller), a non-empty reason, and an audit event.
+        // 'failed' is legal only from a pre-payment state — never from a paid
+        // or paid_ungranted invoice (§3.1).
+        if Role::from_role_str(&session.role) != Role::Owner {
+            return err(StatusCode::FORBIDDEN, "owner_required", "owner required").into_response();
+        }
+        let reason = f.reason.as_deref().unwrap_or("").trim();
+        if reason.is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "reason_required",
+                "a non-empty reason is required to fail an invoice",
+            )
+            .into_response();
+        }
+        let previous_status = state
+            .db
+            .get_invoice(&invoice_id)
+            .map(|inv| inv.2)
+            .unwrap_or_default();
+        if previous_status == "paid" || previous_status == "paid_ungranted" {
+            return err(
+                StatusCode::CONFLICT,
+                "invalid_status",
+                "cannot fail a paid or paid_ungranted invoice",
+            )
+            .into_response();
+        }
+        state.db.update_invoice_status(&invoice_id, "failed");
+        let meta = serde_json::json!({
+            "reason": reason, "previous_status": previous_status,
+        })
+        .to_string();
+        state.db.log_action(
+            session.account_id,
+            &session.role,
+            "invoice_manual_failed",
+            "invoice",
+            &invoice_id,
+            Some(&meta),
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "status": "failed"})),
+        )
+            .into_response();
+    }
+    // All other transitions keep their prior behaviour (seller may e.g. mark
+    // an unpaid invoice 'expired'/'cancelled' without a reason).
     state.db.update_invoice_status(&invoice_id, &f.status);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -2999,10 +3053,13 @@ async fn finance_payouts_process(
 }
 
 /// Refund processing (manual mark-as-settled without a Crypto Pay transfer):
-/// approved -> processed, marking the invoice refunded and revoking access.
-/// This finalizes money, so it is Owner-only with creator separation just like
-/// `finance_refunds_execute` (§2) — an Admin must not be able to bypass the
-/// two-person rule through this path.
+/// approved -> executed, applying the SAME full/partial settlement decision as
+/// the transfer-backed execute and reconciliation paths (§1.3). The legacy
+/// `"processed"` status is forbidden: it bypassed the `is_full_refund` guard
+/// and expired the subscription / kicked the buyer even on a PARTIAL refund
+/// (L10 F1). This finalizes money, so it is Owner-only with creator separation
+/// just like `finance_refunds_execute` (§2) — an Admin must not be able to
+/// bypass the two-person rule through this path.
 async fn finance_refunds_process(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -3026,9 +3083,9 @@ async fn finance_refunds_process(
     };
     let (
         _rid,
-        _seller,
+        refund_seller,
         invoice_id,
-        _user_id,
+        refund_user,
         _amount,
         _asset,
         _reason,
@@ -3038,7 +3095,7 @@ async fn finance_refunds_process(
         _pa,
         _pb,
     ) = refund;
-    if status == "executed" {
+    if status == "executed" || status == "processed" {
         return err(
             StatusCode::CONFLICT,
             "invalid_state",
@@ -3054,41 +3111,38 @@ async fn finance_refunds_process(
         )
         .into_response();
     }
+    // Finalize the money row as EXECUTED — never the forbidden legacy
+    // "processed" status. Side-effects go through the single shared
+    // settlement helper so a PARTIAL refund leaves the invoice paid with no
+    // subscription expiry and no channel kick (L10 F1).
     state
         .db
-        .update_refund_status_by(id, "processed", Some(session.account_id));
-    if let Some(inv) = invoice_id {
-        state.db.update_invoice_status(&inv, "refunded");
-        // optionally revoke subscription access for subscriptions tied to this invoice
-        let subs = state.db.subscriptions_for_invoice(&inv);
-        for (sub_id, sid, uid, ch) in subs {
-            if !ch.is_empty() {
-                let cid = crate::util::to_chat_id(&ch);
-                // The channel belongs to the subscription's seller, so the
-                // kick must be issued by that seller's bot (primary when the
-                // seller has no dedicated bot).
-                let kick_bot = state.bots.for_seller(sid);
-                let _ = kick_bot
-                    .bot
-                    .ban_chat_member(cid.clone(), teloxide::types::UserId(uid as u64))
-                    .await;
-                let _ = kick_bot
-                    .bot
-                    .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
-                    .await;
-            }
-            state.db.mark_subscription_expired(sub_id);
-        }
-    }
+        .update_refund_status_by(id, "executed", Some(session.account_id));
+    let subscription_revoked = apply_refund_settlement(
+        &state,
+        invoice_id.as_deref(),
+        refund_user.unwrap_or(0),
+        refund_seller,
+    )
+    .await;
+    let meta = serde_json::json!({
+        "invoice_id": invoice_id,
+        "subscription_revoked": subscription_revoked,
+    })
+    .to_string();
     state.db.log_action(
         session.account_id,
         &session.role,
         "refund_process",
         "refund",
         id.to_string(),
-        None,
+        Some(&meta),
     );
-    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "status": "executed"})),
+    )
+        .into_response()
 }
 
 async fn finance_refunds_list(
@@ -3734,6 +3788,21 @@ async fn finance_reconciliation_resolve(
             .into_response();
         }
     };
+    // L10 F2: an "executed" resolution of a refund is a manual settlement, so
+    // the human creator may never resolve their own money row — exactly the
+    // gate the web form applies. Both surfaces call the same shared helper in
+    // `handlers::money` so they cannot drift.
+    if row_type == "refund"
+        && outcome == crate::db::ReconciliationOutcome::Executed
+        && crate::handlers::money::creator_owns_refund(&state.db, session.account_id, id)
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            "creator_forbidden",
+            "creator cannot settle their own refund",
+        )
+        .into_response();
+    }
     if body.reason.trim().is_empty() {
         return err(
             StatusCode::BAD_REQUEST,

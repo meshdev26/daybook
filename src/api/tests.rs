@@ -3154,3 +3154,465 @@ async fn reconciliation_endpoints_owner_only_cas_and_resolve() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+// ---- L10 F1/F2/F5 remediation tests ----
+
+/// Create a paid invoice bound to buyer 99 through the REST surface as
+/// `seller`, with an explicit amount (used for full vs partial refunds).
+async fn seed_paid_invoice(
+    app: &axum::Router,
+    db: &std::sync::Arc<Db>,
+    seller: &str,
+    amount: &str,
+) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "amount": amount,
+                        "asset": "USDT",
+                        "description": "t",
+                        "user_id": 99,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let inv = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["invoice_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    db.save_invoice(
+        &inv,
+        42,
+        amount,
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(99),
+        None,
+    );
+    inv
+}
+
+/// F1: manual `process` on a PARTIAL refund must write status `executed`
+/// (never legacy `processed`) and must leave the invoice paid with the
+/// subscription untouched — no expiry, no kick.
+#[tokio::test]
+async fn finance_refunds_process_partial_keeps_invoice_paid_and_subscription_active() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let inv = seed_paid_invoice(&app, &db, &seller, "5").await;
+    // A live subscription bound to the invoice — must NOT be expired by a
+    // partial settlement. Empty channel avoids a real Bot API call.
+    let sub_id = db.create_subscription(42, 99, None, "", 30, Some(&inv), None);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "invoice_id": inv, "amount": "2", "idem_key": "api:f1-partial",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(db.get_refund(id).unwrap().4, "2"); // partial amount
+    assert!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                    .header("authorization", format!("Bearer {owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/process"))
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "executed");
+    // No legacy status and no legacy side-effects.
+    assert_eq!(db.get_refund(id).unwrap().7, "executed");
+    assert_eq!(db.get_invoice(&inv).unwrap().2, "paid");
+    let status = db
+        .list_subscriptions(Some(42), 100)
+        .into_iter()
+        .find(|s| s.0 == sub_id)
+        .map(|s| s.4);
+    assert_eq!(status.as_deref(), Some("active"));
+}
+
+/// F1 counterpart: a FULL manual settlement still flips the invoice and
+/// revokes the subscription, and the row is `executed`.
+#[tokio::test]
+async fn finance_refunds_process_full_settles_and_marks_executed() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let inv = seed_paid_invoice(&app, &db, &seller, "5").await;
+    let sub_id = db.create_subscription(42, 99, None, "", 30, Some(&inv), None);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "invoice_id": inv, "idem_key": "api:f1-full",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                    .header("authorization", format!("Bearer {owner}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/process"))
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_refund(id).unwrap().7, "executed");
+    assert_eq!(db.get_invoice(&inv).unwrap().2, "refunded");
+    let status = db
+        .list_subscriptions(Some(42), 100)
+        .into_iter()
+        .find(|s| s.0 == sub_id)
+        .map(|s| s.4);
+    assert_eq!(status.as_deref(), Some("refunded"));
+}
+
+/// F2: REST reconciliation-resolve must enforce the same creator separation
+/// as the web form for `refund` + `executed`.
+#[tokio::test]
+async fn reconciliation_execute_resolve_enforces_creator_separation() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let owner_id = state.db.get_web_account_by_username("owner").unwrap().0;
+    let db = state.db.clone();
+    let app = router(state);
+
+    // Case A — the Owner created the refund: they must not be able to settle
+    // their own money row through reconciliation.
+    let inv_a = seed_paid_invoice(&app, &db, &seller, "5").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "invoice_id": inv_a, "idem_key": "api:f2-owner-created",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let a_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(db.refund_creator(a_id).unwrap().0, owner_id);
+    db.set_refund_status(a_id, "approved");
+    assert!(db.begin_refund_execution(a_id));
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    assert!(db.mark_needs_reconciliation("refund", a_id, &future));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/finance/reconciliation/refund/{a_id}/resolve"
+                ))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"outcome":"executed","reason":"owner attests receipt"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "creator_forbidden");
+    // Nothing was resolved by the refused attempt.
+    assert_eq!(db.get_refund(a_id).unwrap().7, "needs_reconciliation");
+
+    // Case B — the Seller created the refund: a DIFFERENT owner may resolve.
+    let inv_b = seed_paid_invoice(&app, &db, &seller, "5").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "invoice_id": inv_b, "idem_key": "api:f2-seller-created",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let b_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(db.refund_creator(b_id).unwrap().0, owner_id);
+    db.set_refund_status(b_id, "approved");
+    assert!(db.begin_refund_execution(b_id));
+    assert!(db.mark_needs_reconciliation("refund", b_id, &future));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/finance/reconciliation/refund/{b_id}/resolve"
+                ))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"outcome":"executed","reason":"receipt verified on chain"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_refund(b_id).unwrap().7, "executed");
+}
+
+/// F5: operator-forced `failed` is Owner-only, needs a non-empty reason,
+/// persists audit `invoice_manual_failed`, and refuses paid/paid_ungranted.
+#[tokio::test]
+async fn invoice_manual_failed_owner_reason_audit_and_refuses_paid() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+
+    // Fresh (unpaid) invoice.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    r#"{"amount":"5","asset":"USDT","description":"t"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let inv = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["invoice_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let post_status = |token: &str, body: &'static str| {
+        let app = app.clone();
+        let inv = inv.clone();
+        let token = token.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/invoices/{inv}/status"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Non-owner is refused.
+    let resp = post_status(&seller, r#"{"status":"failed"}"#).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "owner_required"
+    );
+
+    // Owner without a usable reason is refused (missing + whitespace).
+    for body in [
+        r#"{"status":"failed"}"#,
+        r#"{"status":"failed","reason":"   "}"#,
+    ] {
+        let resp = post_status(&owner, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]["code"],
+            "reason_required"
+        );
+    }
+
+    // System-only state cannot be set manually.
+    let resp = post_status(&owner, r#"{"status":"paid_ungranted"}"#).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]["code"],
+        "invalid_status"
+    );
+
+    // Valid forced failure: 200, persisted, audited with the reason.
+    let resp = post_status(
+        &owner,
+        r#"{"status":"failed","reason":"definitive non-payment proof"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_invoice(&inv).unwrap().2, "failed");
+    let audited = db.list_audit_log(100).into_iter().any(|row| {
+        row.3 == "invoice_manual_failed"
+            && row.5.as_deref() == Some(inv.as_str())
+            && row
+                .6
+                .as_deref()
+                .is_some_and(|m| m.contains("definitive non-payment proof"))
+    });
+    assert!(audited, "missing invoice_manual_failed audit row");
+
+    // A paid invoice must never be forced to failed.
+    let paid_inv = seed_paid_invoice(&app, &db, &seller, "5").await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/invoices/{paid_inv}/status"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"status":"failed","reason":"late reversal attempt"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(db.get_invoice(&paid_inv).unwrap().2, "paid");
+}

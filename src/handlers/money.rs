@@ -393,12 +393,39 @@ pub fn has_audit_action(
     })
 }
 
-/// Resolve a refund's human creator from the authoritative `refund_create`
-/// audit event (§2 separation of duties). The refund row itself does not
-/// expose `created_by` through the current Db surface, so the audit log is
-/// the source of truth. System-created refunds carry no such event and are
-/// exempt from the creator check (they still require an Owner approver).
+/// Sentinel written by legacy `create_refund` rows before the creator columns
+/// existed (L9 migration, `db.rs`). Such rows carry no attributable human in
+/// the persisted columns, so — and only so — do we consult the audit log.
+const LEGACY_CREATOR_ID: i64 = -1;
+const LEGACY_CREATOR_ROLE: &str = "unknown";
+
+/// Resolve a refund's human creator (§2 separation of duties).
+///
+/// The authoritative source is the persisted `created_by`/`created_role`
+/// columns written by `Db::create_refund_guarded` (L9). Unlike a `refund_create`
+/// audit event these never age out of the audit window on a mature database,
+/// so a creator cannot escape the separation check simply by waiting long
+/// enough. AUDIT FALLBACK is deliberately narrow: it applies only to legacy
+/// rows whose persisted creator is the `-1` / `"unknown"` sentinel (created
+/// before the columns existed, or never backfilled because they had no audit
+/// event). A missing refund row returns `None` — there is no row to gate.
+/// System-created refunds carry the sentinel and are exempt from the creator
+/// check (they still require an Owner approver).
 pub fn refund_creator(db: &crate::db::Db, id: i64) -> Option<(i64, String)> {
+    match db.refund_creator(id) {
+        Some((creator, role)) if creator != LEGACY_CREATOR_ID && role != LEGACY_CREATOR_ROLE => {
+            Some((creator, role))
+        }
+        Some(_) => refund_creator_from_audit(db, id),
+        None => None,
+    }
+}
+
+/// Narrow legacy-only fallback: read the oldest `refund_create` audit event
+/// for the row. It is the creation event, never a later approver. Once a
+/// legacy row ages out of the audit window it can no longer be attributed and
+/// this returns `None` (fail closed — no guessed creator).
+fn refund_creator_from_audit(db: &crate::db::Db, id: i64) -> Option<(i64, String)> {
     let target = id.to_string();
     db.list_audit_log(100_000)
         .into_iter()
@@ -409,6 +436,16 @@ pub fn refund_creator(db: &crate::db::Db, id: i64) -> Option<(i64, String)> {
                 && target_id.as_deref() == Some(target.as_str())
         })
         .map(|(_, actor_id, actor_role, _, _, _, _, _)| (actor_id, actor_role))
+}
+
+/// §2 separation of duties, shared by the REST and web surfaces: `true` when
+/// `account_id` is the human that created `refund_id`. Both the REST
+/// reconciliation-resolve gate and the web `creator_owns_refund` gate call
+/// this single helper so the two paths cannot drift. System-created refunds
+/// have no attributable creator and therefore return `false` (they are still
+/// Owner-gated by the callers).
+pub fn creator_owns_refund(db: &crate::db::Db, account_id: i64, refund_id: i64) -> bool {
+    refund_creator(db, refund_id).is_some_and(|(creator, _)| creator == account_id)
 }
 
 #[cfg(test)]
@@ -781,6 +818,62 @@ mod tests {
             .unwrap();
         let _ = partial;
         assert!(!is_full_refund(&db, "invp"));
+    }
+
+    #[test]
+    fn refund_creator_reads_persisted_column_not_audit_window() {
+        use crate::db::RefundInput;
+        let (db, _dir) = test_db("money_creator_persisted");
+        db.save_invoice(
+            "invc",
+            42,
+            "5",
+            "USDT",
+            None,
+            "paid",
+            None,
+            None,
+            Some(99),
+            None,
+        );
+        let made = db
+            .create_refund_guarded(RefundInput {
+                seller_id: 42,
+                invoice_id: Some("invc"),
+                user_id: None,
+                amount: "5",
+                asset: "USDT",
+                reason: None,
+                idem_key: "api:creator-persisted",
+                created_by: 7,
+                created_role: "owner",
+            })
+            .unwrap();
+        // A conflicting (later) audit row must NOT win over the persisted
+        // column — the whole point of F3 is that the creator cannot be aged
+        // out or shadowed by audit history.
+        db.log_action(999, "owner", "refund_create", "refund", made.id, None);
+        assert_eq!(refund_creator(&db, made.id), Some((7, "owner".into())));
+        assert!(creator_owns_refund(&db, 7, made.id));
+        assert!(!creator_owns_refund(&db, 999, made.id));
+        assert_eq!(refund_creator(&db, made.id + 12345), None);
+        assert!(!creator_owns_refund(&db, 7, made.id + 12345));
+    }
+
+    #[test]
+    fn refund_creator_falls_back_to_audit_only_for_legacy_sentinel() {
+        let (db, _dir) = test_db("money_creator_sentinel");
+        // Legacy `create_refund` writes the -1 / 'unknown' sentinel.
+        let legacy_id = db.create_refund(42, None, None, "5", "USDT", None);
+        assert!(legacy_id > 0);
+        assert_eq!(db.refund_creator(legacy_id), Some((-1, "unknown".into())));
+        // No audit event yet -> fail closed, no guessed creator.
+        assert_eq!(refund_creator(&db, legacy_id), None);
+        // The backfill-style audit event supplies the human actor.
+        db.log_action(55, "seller", "refund_create", "refund", legacy_id, None);
+        assert_eq!(refund_creator(&db, legacy_id), Some((55, "seller".into())));
+        assert!(creator_owns_refund(&db, 55, legacy_id));
+        assert!(!creator_owns_refund(&db, 7, legacy_id));
     }
 
     #[test]
