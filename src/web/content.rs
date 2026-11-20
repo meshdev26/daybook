@@ -45,7 +45,7 @@ pub(super) async fn plans_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -106,7 +106,7 @@ pub(super) async fn posts_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -345,7 +345,7 @@ pub(super) async fn create_post(
     // session whose target resolves to the operator's personal account is
     // refused BEFORE any Telegram traffic — no bot fallback, no send, no
     // log_post row. Fail-closed on every non-owner role.
-    if !sender.is_bot() && session.role != "owner" {
+    if !sender.is_bot() && !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Posts", "Personal-identity posting");
     }
     let sender_word = if sender.is_bot() { "bot" } else { "user" };
@@ -486,7 +486,7 @@ pub(super) async fn delete_plan_by_id(
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
     if let Some((sid, price, asset, name, days, channel)) = state.db.get_plan_by_id(id) {
-        if session.role == "seller" && session.seller_id != Some(sid) {
+        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
             return Redirect::to(&state.url("/plans")).into_response();
         }
         let _ = (price, asset, days, channel);
@@ -547,7 +547,7 @@ pub(super) async fn products_page(
 /// create-product DB-error path can re-render in place (EDIT_FLOW_SPEC E3 —
 /// the typed form's context stays instead of a bare dead-end page).
 fn products_body(state: &WebState, session: &Session, banner: &str) -> String {
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

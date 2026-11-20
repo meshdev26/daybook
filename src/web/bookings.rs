@@ -23,12 +23,12 @@ pub(super) fn booking_badge(status: &str) -> &'static str {
 }
 
 /// The console list/write scope (spec §3.7): derived from the session role
-/// only — `is_admin_role`, never a query or form value. `Some(None)` =
+/// only — `Role` level, never a query or form value. `Some(None)` =
 /// admin/owner, unscoped; `Some(Some(sid))` = that seller's rows; `None` =
 /// a seller account with no seller binding, which may list and mutate
 /// nothing (the Db scope `None` would be unscoped, so it must not be passed).
 pub(super) fn booking_seller_scope(session: &Session) -> Option<Option<i64>> {
-    if is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
         Some(None)
     } else {
         session.seller_id.map(Some)
@@ -321,7 +321,7 @@ fn bookings_services_panel(
 }
 
 pub(super) fn bookings_body(state: &WebState, session: &Session, q: &BookingsQuery) -> String {
-    let is_admin = is_admin_role(&session.role);
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
     let (scope, may_list) = match booking_seller_scope(session) {
         Some(s) => (s, true),
         None => (None, false),

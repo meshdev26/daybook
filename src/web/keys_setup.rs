@@ -88,7 +88,9 @@ pub(super) async fn keys_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "API keys", "API keys").into_response();
     }
     let banner = if q.revoked.as_deref() == Some("1") {
@@ -123,7 +125,9 @@ pub(super) async fn keys_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "API keys", "API keys").into_response();
     }
     let (id, raw) = state.db.create_api_key_full(
@@ -170,14 +174,16 @@ pub(super) async fn keys_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "API keys", "API keys").into_response();
     }
     let Ok(id) = f.id.trim().parse::<i64>() else {
         return Redirect::to(&state.url("/keys")).into_response();
     };
     // Ownership check for non-admin, word for word the REST handler's rule.
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         let own = state
             .db
             .list_api_keys(session.account_id)
@@ -210,7 +216,7 @@ pub(super) async fn settings_setupbot(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings").into_response();
     }
     // The bot's own /setupbot (handlers/commands.rs::setup_bot_profile) pushes

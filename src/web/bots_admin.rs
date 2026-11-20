@@ -98,7 +98,7 @@ pub(super) async fn bot_select(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         // Sellers and admins are pinned to their resolved bot; a crafted
         // switch form must never widen their view.
         return forbidden_page(&state, "Bots", "Bot switching").into_response();
@@ -433,7 +433,7 @@ pub(super) async fn bots_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     Html(bots_page_html(&state, &session, &q, "")).into_response()
@@ -449,7 +449,7 @@ pub(super) async fn bots_save(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // A malformed id or owner never redirects silently: re-render the Bots
@@ -546,7 +546,7 @@ pub(super) async fn bots_disable(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // Unknown id: honest no-op (P3-3) — no mutation, no restart flag, no
@@ -590,7 +590,7 @@ pub(super) async fn bots_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // Unknown id: honest no-op (P3-3) — nothing deleted, no restart flag,

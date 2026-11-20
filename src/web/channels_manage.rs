@@ -17,7 +17,7 @@ use super::*;
 /// `set_channel_title` only matches `channels` rows; seller channels live in
 /// `sellers.default_channel`, so a seller-typed title would be dropped).
 fn channels_add_body(state: &WebState, session: &Session, banner: &str) -> String {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         return channels_add_body_seller(state, banner);
     }
     channels_add_body_owner(state, banner)
@@ -120,7 +120,9 @@ pub(super) async fn channels_add_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" && session.role != "seller" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner)
+        && Role::from_role_str(&session.role) != Role::Seller
+    {
         return forbidden_page(&state, "Channels", "Global channels");
     }
     let banner = q
@@ -193,7 +195,7 @@ pub(super) async fn channels_manage_page(
     else {
         return Redirect::to(&state.url("/channels")).into_response();
     };
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         // The seller's own channel (the legacy entry may have no `channels`
         // row — the sellers column is the source of truth), NOCASE-matched.
         let sid = session.seller_id.unwrap_or(0);
@@ -236,7 +238,7 @@ pub(super) async fn channels_manage_page(
         );
         return Html(html_page(&state, Some(&session), "Channels", &body)).into_response();
     }
-    let body = if session.role == "owner" {
+    let body = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         channels_manage_body_owner(&state, &session, &row, &q)
     } else {
         channels_manage_body_admin(&state, &row)

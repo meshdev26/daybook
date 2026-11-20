@@ -15,6 +15,19 @@ async fn buyer_session(state: &WebState) -> String {
     state.db.create_web_session(id, "user", None, 7)
 }
 
+/// Admin sessions deliberately vary by seller binding: the L10 LOW finding
+/// was that an admin WITHOUT one got a 403 on Blocked words even though Admin
+/// outranks Seller. Both variants share one helper; username stays UNIQUE.
+async fn admin_session(state: &WebState, username: &str, seller_id: Option<i64>) -> String {
+    state
+        .db
+        .create_web_account(username, "secret", "admin", seller_id)
+        .await
+        .unwrap();
+    let (id, _u, _h, _r, _s) = state.db.get_web_account_by_username(username).unwrap();
+    state.db.create_web_session(id, "admin", seller_id, 7)
+}
+
 // ---- (a) owner floor ------------------------------------------------------
 
 #[cfg(feature = "moderation")]
@@ -169,6 +182,109 @@ async fn blocked_words_roles_and_forged_seller_ids() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(state.db.list_blocked_words(43).is_empty());
+}
+
+/// L10 LOW functional finding: an admin provisioned without a seller id used
+/// to get 403 on Blocked words. Admin outranks Seller, so the role gate now
+/// passes; with no seller binding the data scope is the owner's global 0.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+async fn blocked_words_admin_without_seller_uses_global_scope() {
+    let (state, _dir) = make_state().await;
+    let app = router(state.clone());
+    let admin = admin_session(&state, "admin-global", None).await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_req("/blocked-words", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains(">Add a word</button>"), "{body}");
+
+    // A write from the scopeless admin lands in namespace 0, the same floor
+    // the owner uses — not in an arbitrary seller's list.
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/blocked-words/add",
+            "term=global&mode=hide",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        state.db.get_blocked_word(0, "global").map(|w| w.mode),
+        Some("hide".to_string())
+    );
+    assert!(state.db.get_blocked_word(42, "global").is_none());
+
+    // Forged seller_id stays a 403 for admin on both read and write paths.
+    let resp = app
+        .clone()
+        .oneshot(authed_req("/blocked-words?seller_id=42", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/blocked-words/add",
+            "term=x&mode=warn&seller_id=42",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(state.db.get_blocked_word(42, "x").is_none());
+
+    // A seller without a seller binding still fails closed: no widening.
+    state
+        .db
+        .create_web_account("scopeless-seller", "secret", "seller", None)
+        .await
+        .unwrap();
+    let (sid, _u, _h, _r, _s) = state
+        .db
+        .get_web_account_by_username("scopeless-seller")
+        .unwrap();
+    let scopeless = state.db.create_web_session(sid, "seller", None, 7);
+    let resp = app
+        .oneshot(authed_req("/blocked-words", &scopeless))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// Content policy stays owner-only after the ordered-role change: an admin,
+/// with or without a seller binding, cannot reach the global floor.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+async fn content_policy_remains_owner_only_for_admin() {
+    let (state, _dir) = make_state().await;
+    let app = router(state.clone());
+    for (name, seller) in [("admin-global", None), ("admin-scoped", Some(42))] {
+        let admin = admin_session(&state, name, seller).await;
+        let resp = app
+            .clone()
+            .oneshot(authed_req("/content-policy", &admin))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        let resp = app
+            .clone()
+            .oneshot(post_authed_req(
+                "/content-policy/add",
+                "term=x&mode=warn",
+                &admin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+    }
+    assert!(state.db.list_moderation_global_floor().is_empty());
 }
 
 #[cfg(feature = "moderation")]

@@ -648,7 +648,7 @@ pub(super) async fn webusers_resetmfa(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
@@ -697,7 +697,7 @@ pub(super) async fn webusers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     let accounts = state.db.list_web_accounts_full();
@@ -793,10 +793,14 @@ pub(super) async fn webusers_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
-    let role = if f.role == "owner" { "owner" } else { "seller" };
+    let role = if Role::from_role_str(&f.role) == Role::Owner {
+        "owner"
+    } else {
+        "seller"
+    };
     // E13: empty seller_id stays None (platform-level) — the select's first
     // option submits "" and the parse here already maps that to None.
     let seller_id = f
@@ -827,7 +831,7 @@ pub(super) async fn webusers_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
@@ -847,7 +851,7 @@ pub(super) async fn webusers_password(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {

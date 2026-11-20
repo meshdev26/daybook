@@ -210,10 +210,12 @@ pub(super) async fn finance_page(
     // Seller-or-admin, the same population the REST finance list endpoints
     // serve; a seller without a seller profile is the REST `not_a_seller`
     // case.
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
-    if session.role == "seller" && session.seller_id.is_none() {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id.is_none() {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
     let filter = normalize_finance_status(q.status.clone());
@@ -346,9 +348,9 @@ fn finance_payout_row(
 }
 
 fn finance_payout_table(state: &WebState, session: &Session, filter: &str) -> String {
-    let is_admin = is_admin_role(&session.role);
-    let is_owner = session.role == "owner";
-    let scope = if session.role == "seller" {
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -471,8 +473,8 @@ fn finance_refund_row(state: &WebState, is_admin: bool, r: &RefundRow) -> String
 }
 
 fn finance_refund_table(state: &WebState, session: &Session, filter: &str) -> String {
-    let is_admin = is_admin_role(&session.role);
-    let scope = if session.role == "seller" {
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -571,13 +573,13 @@ pub(super) fn finance_body(
     refund_prefill: Option<String>,
 ) -> String {
     let banners = banners.unwrap_or_default();
-    let is_admin = is_admin_role(&session.role);
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
     let payout_form = finance_payout_form(state, is_admin);
     let refund_form = finance_refund_form(state, refund_prefill);
     let payout_table = finance_payout_table(state, session, filter);
     let refund_table = finance_refund_table(state, session, filter);
     let filter_nav = finance_filter_nav(state, filter);
-    let scoping_note = if session.role == "seller" {
+    let scoping_note = if Role::from_role_str(&session.role) == Role::Seller {
         "Showing payouts and refunds for your seller account."
     } else {
         "Showing payouts and refunds for all sellers."

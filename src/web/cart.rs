@@ -154,10 +154,12 @@ pub(super) async fn carts_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !(session.role == "seller" || is_admin_role(&session.role)) {
+    if !(Role::from_role_str(&session.role) == Role::Seller
+        || Role::from_role_str(&session.role).has_level(Role::Admin))
+    {
         return forbidden_page(&state, "Carts", "Active carts").into_response();
     }
-    let seller_filter = if session.role == "seller" {
+    let seller_filter = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

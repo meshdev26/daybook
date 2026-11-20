@@ -201,6 +201,70 @@ async fn nav_role_visibility_seller() {
     }
 }
 
+/// Admin sits above Seller in the ordered Role ladder: it keeps the
+/// seller-tier rows (including the Blocked words capability row) but still
+/// never sees owner-only rows. The check is by level, not by role string.
+#[tokio::test]
+async fn nav_role_visibility_admin() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("admin").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "admin".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = rail_nav(&state, "Dashboard", Some(&sess));
+    // Admin outranks Seller: same non-owner tier, including Blocked words.
+    for p in ["finance", "keys", "carts", "blocked-words"] {
+        assert!(
+            body.contains(&format!(r#"href="/{}""#, p)),
+            "admin missing {} in:\n{}",
+            p,
+            body
+        );
+    }
+    // Owner-only rows stay hidden from admin.
+    for p in [
+        "bots",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "admins",
+        "sellers",
+        "webusers",
+        "settings",
+    ] {
+        assert!(
+            !body.contains(&format!(r#"href="/{}""#, p)),
+            "admin should not see {} in:\n{}",
+            p,
+            body
+        );
+    }
+}
+
+/// The nav visibility predicate consumes Role levels directly, so unknown
+/// session strings degrade to User (least privilege) and cannot unlock rows.
+#[test]
+fn nav_visibility_uses_ordered_role_levels() {
+    assert!(NavRole::Owner.visible(Role::Owner));
+    assert!(!NavRole::Owner.visible(Role::Admin));
+    assert!(!NavRole::Owner.visible(Role::Seller));
+    assert!(!NavRole::Owner.visible(Role::User));
+    for role in [Role::Seller, Role::Admin, Role::Owner] {
+        assert!(NavRole::SellerAdminOwner.visible(role));
+    }
+    assert!(!NavRole::SellerAdminOwner.visible(Role::User));
+    assert!(NavRole::All.visible(Role::User));
+}
+
 #[tokio::test]
 async fn nav_role_visibility_buyer() {
     let (state, _dir) = make_state().await;
@@ -514,7 +578,7 @@ fn moderation_nav_rows_are_gated_and_separate_from_core_table() {
     assert_eq!(FEATURE_NAV_ITEMS.len(), 2);
     for item in FEATURE_NAV_ITEMS {
         assert_eq!(item.feature, Some("moderation"), "{}", item.id);
-        assert!(!item.roles.visible("user"), "{}", item.id);
+        assert!(!item.roles.visible(Role::User), "{}", item.id);
         // Compiled-in by default; a movie-only build filters it out.
         assert!(item.feature.is_none_or(capability_enabled));
         assert!(!item.feature.is_none_or(|f| f == "movie_bot"));

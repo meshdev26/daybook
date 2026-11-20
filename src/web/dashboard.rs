@@ -42,7 +42,7 @@ pub(super) async fn dashboard(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -222,7 +222,7 @@ fn dashboard_banners(state: &WebState, session: &Session, q: &DashboardQuery) ->
             let secs = q.post_retry.unwrap_or(0);
             let msg = match key {
                 "writes_disabled" => {
-                    if session.role == "owner" {
+                    if Role::from_role_str(&session.role).has_level(Role::Owner) {
                         format!(
                             "Posting as your personal account isn't enabled yet. Enable it on the <a href=\"{}\">Identity page</a> first.",
                             state.url("/identity")
@@ -304,7 +304,7 @@ async fn dashboard_channel_options(
     }
     let composer_note = match state.db.default_channel() {
         Some(ch) if state.db.get_channel_sender_identity(&ch).as_deref() == Some("user") => {
-            if session.role == "owner" {
+            if Role::from_role_str(&session.role).has_level(Role::Owner) {
                 let identity_locked =
                     state.identity.status().await.state == IdentityState::Locked;
                 let label = channel_label(

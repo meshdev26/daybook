@@ -11,7 +11,7 @@ pub(super) async fn referrals_page(
     };
     // Collect referrals across the visible seller scope.
     let mut all: Vec<(i64, i64, i64, i64, String, String, f64)> = Vec::new(); // (seller, id, referrer, referee, code, status, reward)
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             for r in state.db.list_referrals(sid, None) {
                 all.push((sid, r.0, r.1, r.2, r.3, r.4, r.5));
@@ -145,7 +145,7 @@ pub(super) async fn orders_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -243,7 +243,7 @@ pub(super) async fn reviews_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -307,7 +307,7 @@ pub(super) async fn reviews_approve(
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
     // Seller scoping: only approve reviews belonging to this session's products.
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -323,7 +323,7 @@ pub(super) async fn reviews_approve(
                 .map(|r| r.0)
         })
         .collect();
-    if session.role == "seller" && !allowed.contains(&f.id) {
+    if Role::from_role_str(&session.role) == Role::Seller && !allowed.contains(&f.id) {
         return Redirect::to(&state.url("/reviews")).into_response();
     }
     state.db.approve_review(f.id);
@@ -353,7 +353,7 @@ pub(super) async fn orders_status(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -380,7 +380,7 @@ pub(super) async fn orders_tracking(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {

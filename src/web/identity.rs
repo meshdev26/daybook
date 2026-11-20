@@ -121,7 +121,7 @@ pub(super) fn identity_status_line(
     let Some(s) = session else {
         return String::new();
     };
-    if s.role != "owner" {
+    if !Role::from_role_str(&s.role).has_level(Role::Owner) {
         return String::new();
     }
     let shell = |inner: &str| {
@@ -357,7 +357,7 @@ pub(super) fn identity_owner_session(
     let Some(session) = session_from_headers(state, headers) else {
         return Err(Redirect::to(&state.url("/login")).into_response());
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return Err(forbidden_page(state, page, page));
     }
     Ok(session)

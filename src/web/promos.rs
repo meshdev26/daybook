@@ -58,7 +58,7 @@ pub(super) async fn promos_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let promos = if session.role == "seller" {
+    let promos = if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             state.db.list_promo_codes(sid)
         } else {
@@ -154,7 +154,7 @@ pub(super) async fn promos_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -243,7 +243,7 @@ pub(super) async fn promos_revoke(
     if code.is_empty() {
         return Redirect::to(&state.url("/promos")).into_response();
     }
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             state.db.revoke_promo_code(sid, &code);
         }

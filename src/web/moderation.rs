@@ -126,7 +126,7 @@ fn session_or_login(
 /// Owner floor gate. The page gate, not the nav item, is authoritative.
 #[allow(clippy::result_large_err)]
 fn owner_gate(state: &WebState, session: &Session) -> Result<(), Response> {
-    if session.role == "owner" {
+    if Role::from_role_str(&session.role).has_level(Role::Owner) {
         Ok(())
     } else {
         Err(forbidden_page(
@@ -143,8 +143,10 @@ fn owner_gate(state: &WebState, session: &Session) -> Result<(), Response> {
 /// carries a `seller_id` field is a forged-scope attempt (the shipped forms
 /// never emit one) and is refused with 403. Owners act in the primary shop
 /// namespace (0), the same convention the rest of the console uses for
-/// owner-authored business rows; sellers and admins must carry a session
-/// seller id. A role without one fails closed.
+/// owner-authored business rows. An admin provisioned without a seller id is
+/// treated the same as an owner (global scope 0); an admin WITH a seller id,
+/// like a seller, is scoped to that id. A seller without one, or any lower
+/// role, fails closed.
 #[allow(clippy::result_large_err)]
 fn seller_scope(
     state: &WebState,
@@ -154,12 +156,20 @@ fn seller_scope(
     if submitted_seller_id.is_some_and(|value| !value.trim().is_empty()) {
         return Err(forbidden_page(state, "Blocked words", "Seller scoping"));
     }
-    match session.role.as_str() {
-        "owner" => Ok(0),
-        "seller" | "admin" => session
+    let role = Role::from_role_str(&session.role);
+    if role.has_level(Role::Owner) {
+        Ok(0)
+    } else if role.has_level(Role::Admin) && session.seller_id.is_none() {
+        // L10 LOW finding: an admin without a seller binding used to get a
+        // 403 here. Admin outranks Seller, so the role gate passes; with no
+        // seller id there is no tenant to scope to, so use the owner's 0.
+        Ok(0)
+    } else if role.has_level(Role::Seller) {
+        session
             .seller_id
-            .ok_or_else(|| forbidden_page(state, "Blocked words", "Seller scoping")),
-        _ => Err(forbidden_page(state, "Blocked words", "Seller scoping")),
+            .ok_or_else(|| forbidden_page(state, "Blocked words", "Seller scoping"))
+    } else {
+        Err(forbidden_page(state, "Blocked words", "Seller scoping"))
     }
 }
 

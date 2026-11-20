@@ -1,4 +1,5 @@
 use super::{Session, WebState, capability_enabled, effective_bot};
+use crate::roles::Role;
 use axum::{
     http::header,
     response::{IntoResponse, Response},
@@ -223,11 +224,12 @@ pub(super) fn html_page(
 ) -> String {
     let base = &state.base_path;
     let snap = super::identity_snapshot();
-    let unlock_banner = if session.is_some_and(|s| s.role == "owner") {
-        super::identity_unlock_banner(base, &snap).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let unlock_banner =
+        if session.is_some_and(|s| Role::from_role_str(&s.role).has_level(Role::Owner)) {
+            super::identity_unlock_banner(base, &snap).unwrap_or_default()
+        } else {
+            String::new()
+        };
     let identity_flash = if snap.unlocked {
         r#"<div class="alert alert-success" role="status" aria-live="polite">Identity unlocked.</div>"#
     } else {
@@ -310,13 +312,14 @@ pub(super) enum NavRole {
 }
 
 impl NavRole {
-    pub(super) fn visible(self, role: &str) -> bool {
+    pub(super) fn visible(self, role: Role) -> bool {
         match self {
             NavRole::All => true,
-            NavRole::Owner => role == "owner",
-            NavRole::SellerAdminOwner => {
-                role == "seller" || role == "admin" || role == "owner" || super::is_admin_role(role)
-            }
+            NavRole::Owner => role.has_level(Role::Owner),
+            // Seller/Admin/Owner share the non-buyer tier. Ordered level
+            // check: a role that outranks Seller is included without naming
+            // each role string.
+            NavRole::SellerAdminOwner => role.has_level(Role::Seller),
         }
     }
 }
@@ -700,10 +703,17 @@ pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
 /// This is view metadata only — it changes no page gate or write permission.
 fn selected_product_type(state: &WebState, session: Option<&Session>) -> Option<String> {
     let s = session?;
-    let bot_id = match s.role.as_str() {
-        "owner" => s.selected_bot_id,
-        "seller" | "admin" => Some(effective_bot(state, s).id),
-        _ => None,
+    let role = Role::from_role_str(&s.role);
+    // Exact-level branches: the original gave owners their explicit
+    // selection, sellers/admins their pinned bot, and buyers nothing. An
+    // ordered `has_level(Seller)` here would wrongly catch the owner branch,
+    // so each branch keeps its exact level.
+    let bot_id = if role == Role::Owner {
+        s.selected_bot_id
+    } else if role == Role::Seller || role == Role::Admin {
+        Some(effective_bot(state, s).id)
+    } else {
+        None
     };
     bot_id
         .and_then(|id| state.db.get_bot(id))
@@ -721,9 +731,11 @@ pub(super) fn nav_item_type_ok(item: &NavItem, product_type: Option<&str>) -> bo
 
 pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>) -> String {
     let base = &state.base_path;
-    let role = session.map(|s| s.role.as_str()).unwrap_or("");
+    let role = session
+        .map(|s| Role::from_role_str(&s.role))
+        .unwrap_or(Role::User);
     let prefs = session
-        .filter(|s| s.role == "owner")
+        .filter(|s| Role::from_role_str(&s.role).has_level(Role::Owner))
         .map(|s| super::effective_sidebar_prefs(state, s));
 
     let active_id = active_nav_id(title);
@@ -829,7 +841,7 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
 
     // Utilities strip
     out.push_str(r#"<div class="utilities">"#);
-    if session.is_some_and(|s| s.role == "owner") {
+    if session.is_some_and(|s| Role::from_role_str(&s.role).has_level(Role::Owner)) {
         let active_attr = if active_id == Some("settings") {
             " class=\"active\" aria-current=\"page\""
         } else {

@@ -208,7 +208,7 @@ async fn login_complete(
         )
             .into_response();
     }
-    let privileged = role == "owner" || role == "admin";
+    let privileged = Role::from_role_str(&role).has_level(Role::Admin);
     if !mfa_disabled && privileged {
         let mut buf = [0u8; 20];
         let _ = getrandom::fill(&mut buf);

@@ -428,8 +428,8 @@ pub(super) fn subs_body(
     search_q: &str,
 ) -> String {
     let alert = alert.unwrap_or_default();
-    let is_owner = session.role == "owner";
-    let seller_scope = if session.role == "seller" {
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -467,7 +467,7 @@ pub(super) fn subs_body(
     };
     let table = subs_table_html(state, session, is_owner, &rows, filter);
 
-    let scoping_note = if session.role == "seller" {
+    let scoping_note = if Role::from_role_str(&session.role) == Role::Seller {
         "Showing your subscriptions only."
     } else {
         "Showing all sellers' subscriptions."
@@ -517,8 +517,8 @@ pub(super) async fn subs_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let is_owner = session.role == "owner";
-    let seller_scope = if session.role == "seller" {
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -596,7 +596,7 @@ pub(super) async fn subs_revoke(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Subs", "Subscriptions management").into_response();
     }
     let id = match f.id.or(f.sub_id) {
@@ -652,7 +652,7 @@ pub(super) async fn subs_expirecheck(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Subs", "Subscriptions management").into_response();
     }
     let filter = normalize_sub_status(q.status.clone());
@@ -705,7 +705,7 @@ pub(super) async fn subs_extend(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Subs", "Subscriptions management").into_response();
     }
     let id = match f.id.or(f.sub_id) {
@@ -740,7 +740,7 @@ pub(super) async fn subs_bulkrevoke(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Subs", "Subscriptions management").into_response();
     }
     // A revoke that only flips a status column leaves the buyer in the

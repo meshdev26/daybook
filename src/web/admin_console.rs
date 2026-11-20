@@ -20,7 +20,7 @@ pub(super) async fn subs_grant(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -126,12 +126,13 @@ pub(super) async fn broadcast_page(
     // a non-owner carries their seller_id; a non-owner with NO seller scope
     // must see and reach zero recipients — passing None from here would
     // mean "all platform users".
-    let seller_scope = if session.role == "owner" {
+    let seller_scope = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         None
     } else {
         session.seller_id
     };
-    let no_seller_scope = session.role != "owner" && seller_scope.is_none();
+    let no_seller_scope =
+        !Role::from_role_str(&session.role).has_level(Role::Owner) && seller_scope.is_none();
     let users = if no_seller_scope {
         Vec::new()
     } else {
@@ -252,14 +253,15 @@ pub(super) async fn broadcast_send(
     // while a seller/admin carries the session seller id and resolved bot id.
     // A scopeless non-owner already reaches zero recipients below; gate them
     // against the global floor rather than widening to all sellers.
-    let (policy_seller_id, policy_bot_id) = if session.role == "owner" {
-        (0i64, None)
-    } else {
-        (
-            session.seller_id.unwrap_or(0),
-            Some(effective_bot(&state, &session).id),
-        )
-    };
+    let (policy_seller_id, policy_bot_id) =
+        if Role::from_role_str(&session.role).has_level(Role::Owner) {
+            (0i64, None)
+        } else {
+            (
+                session.seller_id.unwrap_or(0),
+                Some(effective_bot(&state, &session).id),
+            )
+        };
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
         policy_seller_id,
@@ -279,16 +281,17 @@ pub(super) async fn broadcast_send(
     // Recipient scope (review P1-1, fail closed): owner → global (None);
     // a non-owner carries their seller_id; a non-owner with NO seller scope
     // delivers to nobody — None here would mean "all platform users".
-    let seller_scope = if session.role == "owner" {
+    let seller_scope = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         None
     } else {
         session.seller_id
     };
-    let users = if session.role != "owner" && seller_scope.is_none() {
-        Vec::new()
-    } else {
-        crate::services::broadcast::filter_broadcast_users(&state.db, seller_scope, &segment)
-    };
+    let users =
+        if !Role::from_role_str(&session.role).has_level(Role::Owner) && seller_scope.is_none() {
+            Vec::new()
+        } else {
+            crate::services::broadcast::filter_broadcast_users(&state.db, seller_scope, &segment)
+        };
     let sent =
         crate::broadcast_to_users(&effective_bot(&state, &session).bot, &users, &f.text).await;
     Redirect::to(&state.url(&format!("/broadcast?sent={}", sent))).into_response()
@@ -313,7 +316,7 @@ pub(super) async fn crypto_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     let banner = if q.saved.as_deref() == Some("1") {
@@ -377,7 +380,7 @@ pub(super) async fn crypto_setup(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     if let Some(t) = f.token.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -411,7 +414,7 @@ pub(super) async fn crypto_me(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     let token = state.db.get_config("crypto_token").unwrap_or_default();
@@ -476,7 +479,7 @@ pub(super) async fn admins_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     let admins = state.db.list_admins_detail();
@@ -546,7 +549,7 @@ pub(super) async fn admins_add(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -568,7 +571,7 @@ pub(super) async fn admins_remove(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -611,7 +614,7 @@ pub(super) async fn sellers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     let sellers = state.db.list_sellers();
@@ -695,7 +698,7 @@ pub(super) async fn sellers_upsert(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -719,7 +722,7 @@ pub(super) async fn sellers_channel(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     match f.user_id.trim().parse::<i64>() {

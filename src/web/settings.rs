@@ -34,7 +34,7 @@ impl SidebarPrefs {
 }
 
 pub(super) fn effective_sidebar_prefs(state: &WebState, session: &Session) -> SidebarPrefs {
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return SidebarPrefs::default();
     }
     let user_key = format!("sidebar_items:user:{}", session.account_id);
@@ -81,7 +81,7 @@ pub(super) async fn settings_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings");
     }
     let section = normalize_section(q.section);
@@ -408,7 +408,7 @@ pub(super) async fn settings_restart(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings");
     }
     state.db.set_config("restart_required", "1");
@@ -482,7 +482,7 @@ pub(super) async fn settings_save(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings");
     }
     let section = normalize_section(form_value(&f, "section").map(str::to_string));
@@ -578,7 +578,7 @@ pub(super) async fn settings_password(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings");
     }
     let section = normalize_section(f.section.clone());
@@ -639,7 +639,7 @@ pub(super) async fn settings_sidebar(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Settings", "Settings");
     }
     let section = normalize_section(f.section.clone());

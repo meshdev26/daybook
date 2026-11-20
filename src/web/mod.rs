@@ -14,6 +14,7 @@ use teloxide::{Bot, prelude::*};
 use tower_http::services::ServeDir;
 
 use crate::identity::{IdentityError, IdentityState, IdentityStatus, NormalizedMessage};
+use crate::roles::Role;
 use crate::{config::Config, db::Db, util::ct_eq};
 
 // Re-export auth helpers moved to `crate::auth` so existing
@@ -497,13 +498,13 @@ const SECRET_TOGGLE: &str = r#"<button type="button" class="secret-toggle" aria-
 
 /// Resolve the effective bot context for a web session.
 pub fn effective_bot(state: &WebState, session: &Session) -> Arc<crate::bots::BotContext> {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             return state.bots.for_seller(sid);
         }
         return state.bots.primary.clone();
     }
-    if session.role == "admin" {
+    if Role::from_role_str(&session.role) == Role::Admin {
         if let Some(bid) = state.db.get_admin_bot_id(session.account_id)
             && let Some(ctx) = state.bots.get(bid)
         {
@@ -525,7 +526,7 @@ pub fn effective_bot(state: &WebState, session: &Session) -> Arc<crate::bots::Bo
 /// selected bot and only rows owned by those sellers are in scope. Sellers
 /// and admins never reach this — their queries are already seller-scoped.
 fn bot_scope_sellers(state: &WebState, session: &Session) -> Option<Vec<i64>> {
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return None;
     }
     session
@@ -643,14 +644,15 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
     let Some(s) = session else {
         return String::new();
     };
-    if s.role == "seller" || s.role == "admin" {
+    let s_role = Role::from_role_str(&s.role);
+    if s_role == Role::Seller || s_role == Role::Admin {
         let ctx = effective_bot(state, s);
         return format!(
             r#"<div class="bot-scope bot-scope-pinned" aria-label="Active product"><span class="help">Product</span><span class="mono">{}</span></div>"#,
             esc(&ctx.key)
         );
     }
-    if s.role != "owner" {
+    if !Role::from_role_str(&s.role).has_level(Role::Owner) {
         return String::new();
     }
     let bots = state.db.list_bots_enabled();
@@ -746,13 +748,6 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
     )
 }
 
-/// Mirrors `api.rs`'s `is_admin_role`: admins and owners share the
-/// privileged tier, sellers are scoped to their own rows. One definition of
-/// the tier so console pages and REST endpoints can never drift apart.
-fn is_admin_role(role: &str) -> bool {
-    role == "admin" || role == "owner"
-}
-
 /// Normalizes a console channel target for owner comparison: trimmed, no
 /// leading `@`, ASCII-lowercased. Stored channel names may be `@handles` or
 /// numeric chat ids, so the comparison tolerates both forms — the value that
@@ -785,7 +780,7 @@ fn owns_channel_row(state: &WebState, seller_id: i64, chat_id: &str) -> bool {
 /// bound to the target channel is what performs the mutation, so this check is
 /// what stops tenant A's session from driving tenant B's bot (review H1).
 fn may_mutate_channel(state: &WebState, session: &Session, chat_id: &str) -> bool {
-    if session.role == "owner" || is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
         return true;
     }
     let key = channel_key(chat_id);
@@ -809,7 +804,7 @@ fn may_mutate_channel(state: &WebState, session: &Session, chat_id: &str) -> boo
 /// mutations: owner/admin pass, a seller must own the row, and a `post_id`
 /// that does not exist is a denial for a seller (fail closed).
 fn may_mutate_post(state: &WebState, session: &Session, post_id: Option<i64>) -> bool {
-    if session.role == "owner" || is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
         return true;
     }
     let Some(pid) = post_id else {

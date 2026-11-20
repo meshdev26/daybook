@@ -89,7 +89,7 @@ pub(super) async fn customers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -293,7 +293,7 @@ pub(super) async fn tickets_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -453,7 +453,7 @@ pub(super) async fn tickets_reply(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -461,7 +461,7 @@ pub(super) async fn tickets_reply(
     if let Some(t) = state.db.get_ticket(f.ticket_id) {
         let (_id, seller_id, _buyer, _subj, _status, _c, _u) = t;
         if seller_scope.is_none() || seller_scope == Some(seller_id) {
-            let role_str = if session.role == "owner" || session.role == "admin" {
+            let role_str = if Role::from_role_str(&session.role).has_level(Role::Admin) {
                 "admin"
             } else {
                 "seller"
@@ -484,7 +484,7 @@ pub(super) async fn tickets_status(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

@@ -9,7 +9,7 @@ pub(super) async fn ai_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "AI", "AI");
     }
     Html(html_page(

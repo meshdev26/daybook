@@ -192,7 +192,7 @@ pub(super) fn channels_added_callout(
     channel_added_callout(
         title.as_deref().unwrap_or(ch),
         q.notitle.as_deref() == Some("1"),
-        session.role == "owner",
+        Role::from_role_str(&session.role).has_level(Role::Owner),
     )
 }
 

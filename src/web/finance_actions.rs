@@ -20,7 +20,9 @@ pub(super) async fn finance_payout_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
     let requested = f
@@ -29,7 +31,7 @@ pub(super) async fn finance_payout_create(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<i64>().ok());
-    let seller_id = if session.role == "seller" {
+    let seller_id = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => {
                 if requested.is_some() && requested != Some(s) {
@@ -94,7 +96,7 @@ pub(super) async fn finance_payout_approve(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Finance", "Payout approval (owner only)").into_response();
     }
     let Ok(id) = f.id.trim().parse::<i64>() else {
@@ -248,7 +250,7 @@ pub(super) async fn finance_payout_execute(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Finance", "Payout execution (owner only)").into_response();
     }
     let Ok(id) = f.id.trim().parse::<i64>() else {
@@ -341,7 +343,9 @@ pub(super) async fn finance_refund_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
     let invoice_id = f.invoice_id.as_deref().map(str::trim).unwrap_or_default();
@@ -352,7 +356,7 @@ pub(super) async fn finance_refund_create(
         return finance_redirect(&state, "error=invoice_notfound");
     };
     let (inv_amount, inv_asset, inv_status, _desc, _plan, inv_user, inv_seller) = inv;
-    if session.role == "seller" && session.seller_id != Some(inv_seller) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(inv_seller) {
         return finance_redirect(&state, "error=invoice_owner");
     }
     // Only settled money can be returned.
@@ -361,7 +365,7 @@ pub(super) async fn finance_refund_create(
     }
     // Seller lock: the asset must equal the invoice's — a refund in a
     // different asset is not a return of the buyer's money.
-    if session.role == "seller"
+    if Role::from_role_str(&session.role) == Role::Seller
         && f.asset
             .as_deref()
             .map(str::trim)
@@ -373,7 +377,7 @@ pub(super) async fn finance_refund_create(
     let amount = match f.amount.as_deref().map(str::trim) {
         None | Some("") => inv_amount.clone(),
         Some(raw) => {
-            if session.role != "seller" {
+            if Role::from_role_str(&session.role) != Role::Seller {
                 raw.to_string()
             } else {
                 let Ok(requested) = raw.parse::<f64>() else {
@@ -447,7 +451,7 @@ pub(super) async fn finance_refund_approve(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return forbidden_page(&state, "Finance", "Refund approval (admin or owner)")
             .into_response();
     }
@@ -515,7 +519,7 @@ pub(super) async fn finance_refund_execute(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return forbidden_page(&state, "Finance", "Refund execution (admin or owner)")
             .into_response();
     }
