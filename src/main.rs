@@ -252,8 +252,10 @@ async fn run() {
     let db = match Db::new(&cfg.db_path) {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            eprintln!("DB error: {}", e);
-            return;
+            tracing::error!("DB error: {e}; exiting so systemd can restart");
+            // Must be non-zero: a silent `return` left systemd's
+            // Restart=on-failure blind to a dead-on-arrival process.
+            std::process::exit(1);
         }
     };
 
@@ -1278,8 +1280,12 @@ async fn run() {
     let listener = match tokio::net::TcpListener::bind(format!("{web_bind}:{web_port}")).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("failed to bind {web_bind}:{web_port}: {e}");
-            return;
+            tracing::error!(
+                "failed to bind {web_bind}:{web_port}: {e}; exiting so systemd can restart"
+            );
+            // Non-zero: a bind failure must trigger Restart=on-failure, not
+            // leave a half-dead process that answers no requests.
+            std::process::exit(1);
         }
     };
     tracing::info!(
@@ -1367,16 +1373,53 @@ async fn run() {
     // ConnectInfo<SocketAddr> so codeless claiming works only from loopback —
     // without the make-service wrapper axum cannot see peer addresses.
     let web_task = tokio::spawn(async move {
-        axum::serve(
+        match axum::serve(
             listener,
             web_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
-        .unwrap()
+        {
+            Ok(()) => tracing::info!("web server stopped"),
+            Err(e) => {
+                // Previously `.unwrap()` aborted the task with a panic that
+                // nothing surfaced as a failed process. Fail loudly instead.
+                tracing::error!("web server failed: {e}; exiting non-zero");
+                std::process::exit(1);
+            }
+        }
     });
 
+    // Shutdown must be reachable from `systemctl stop`, not just an interactive
+    // Ctrl-C. SIGTERM takes the SAME graceful path below (WAL checkpoint +
+    // teardown); without this arm systemd waits for its kill timeout and
+    // SIGKILLs the process, leaving an uncheckpointed database.
+    #[cfg(unix)]
+    let shutdown = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { tracing::info!("shutdown signal received"); }
+            _ = async {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        sigterm.recv().await;
+                        tracing::info!("SIGTERM received");
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to install SIGTERM handler: {e}");
+                        // Never let a missing handler turn into a busy loop.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {}
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+    };
+
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => { tracing::info!("shutdown signal received"); }
+        _ = shutdown => {}
         _ = async {
             match bot_task {
                 Some(t) => { let _ = t.await; }
