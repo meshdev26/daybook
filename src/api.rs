@@ -1,3 +1,4 @@
+use crate::roles::Role;
 use crate::web::WebState;
 use axum::{
     Json, Router,
@@ -51,15 +52,11 @@ fn session_or_401(
 }
 
 fn seller_scope(session: &crate::web::Session) -> Option<i64> {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
     }
-}
-
-fn is_admin_role(role: &str) -> bool {
-    role == "admin" || role == "owner"
 }
 
 /// Extract the invoice array from a Crypto Pay `getInvoices` response,
@@ -181,7 +178,7 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
                 )
                     .into_response();
             }
-            if role == "owner" || role == "admin" {
+            if Role::from_role_str(&role).has_level(Role::Admin) {
                 // The web flow forces TOTP enrollment for privileged roles
                 // before any session exists; enrollment is web-only tonight,
                 // so REST refuses rather than lowering that bar.
@@ -436,7 +433,7 @@ async fn auth_password(
     }
     // Non-owner accounts must prove knowledge of the current password via
     // the same bcrypt verification the login uses.
-    if role != "owner" {
+    if !Role::from_role_str(&role).has_level(Role::Owner) {
         // spawn_blocking hasher is async: awaiting happens here, not in a
         // sync closure (mechanical restructure of the former Option::map).
         let verified = match f.current_password.as_deref() {
@@ -473,7 +470,7 @@ async fn sellers_list(State(state): State<WebState>, headers: HeaderMap) -> impl
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -527,7 +524,7 @@ async fn seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -562,7 +559,9 @@ async fn sellers_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) && session.seller_id != Some(f.user_id) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin)
+        && session.seller_id != Some(f.user_id)
+    {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -640,7 +639,7 @@ async fn seller_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -654,7 +653,7 @@ async fn seller_set_channel(
     // set — the bootstrap path (first-run channel setup) runs before the bot
     // is a member of any chat, and admin/owner console sessions carry no
     // bound Telegram identity to run the administrators check against.
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         if let Ok(n) = channel.parse::<i64>() {
             if n >= 0 {
                 // Telegram channel/group ids are negative (`-100…` for
@@ -727,7 +726,7 @@ async fn seller_get_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -761,7 +760,7 @@ async fn seller_set_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -906,7 +905,7 @@ async fn plans_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -914,7 +913,8 @@ async fn plans_get(
     // find by id via list (no get_plan_by_id scoping helper exists for seller; use get_plan_by_id then check)
     match state.db.get_plan_by_id(id) {
         Some((sid, price, asset, name, days, channel)) => {
-            if session.role == "seller" && session.seller_id != Some(sid) {
+            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
             }
             let _ = scope;
@@ -951,7 +951,7 @@ async fn plans_update(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     // Re-add plan with merged fields (add_plan is upsert by seller+name)
@@ -1004,7 +1004,7 @@ async fn plans_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     state.db.remove_plan(sid, &name);
@@ -1031,7 +1031,7 @@ async fn plans_active(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     if f.active {
@@ -1259,7 +1259,9 @@ async fn invoices_get(
     };
     match state.db.get_invoice(&invoice_id) {
         Some((amount, asset, status, desc, plan_id, user_id, seller_id)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1287,7 +1289,7 @@ async fn invoices_status(
     };
     // ownership check
     if let Some((_a, _as, _st, _d, _p, _u, sid)) = state.db.get_invoice(&invoice_id) {
-        if session.role == "seller" && session.seller_id != Some(sid) {
+        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
             return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
         }
     } else {
@@ -1417,7 +1419,9 @@ async fn codes_get(
     };
     match state.db.get_code(&code) {
         Some((id, seller_id, plan_id, value_days, max_uses, uses, expires_at)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1444,7 +1448,7 @@ async fn codes_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "code not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(seller_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
     // Real delete via the scoped helper (L8 db.rs addition): sellers delete
@@ -1536,7 +1540,9 @@ async fn codes_redemptions(
     };
     match state.db.get_code(&code) {
         Some((_id, seller_id, _p, _v, _m, _u, _e)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
         }
@@ -1706,7 +1712,8 @@ async fn posts_get(
     let posts = state.db.list_posts(scope, 100000);
     match posts.into_iter().find(|p| p.0 == id) {
         Some(p) => {
-            if session.role == "seller" && session.seller_id != Some(p.1) {
+            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1738,7 +1745,7 @@ async fn posts_update(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     let new_content = f.content.or(f.text);
@@ -1770,7 +1777,7 @@ async fn posts_delete(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1807,7 +1814,7 @@ async fn posts_pin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1835,7 +1842,7 @@ async fn posts_unpin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1863,7 +1870,7 @@ async fn broadcasts(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -1871,7 +1878,7 @@ async fn broadcasts(
         )
         .into_response();
     }
-    let recipients = if session.role == "seller" {
+    let recipients = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
             .list_users_for_seller(session.seller_id.unwrap_or(0))
@@ -1978,7 +1985,7 @@ async fn users_get(
     };
     let (uid, username) = state.db.get_user(user_id).unwrap_or((user_id, None));
     let mut resp = serde_json::json!({"user_id": uid, "username": username});
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         let scope = session.seller_id;
         let subs = state.db.list_subscriptions(scope, 1000);
         let cnt = subs.iter().filter(|s| s.2 == user_id).count();
@@ -2109,7 +2116,7 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let ids = if session.role == "seller" {
+    let ids = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
             .list_users_for_seller(session.seller_id.unwrap_or(0))
@@ -2215,7 +2222,7 @@ async fn config_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) && session.role != "seller" {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(StatusCode::FORBIDDEN, "forbidden", "insufficient role").into_response();
     }
     state.db.set_config("channel", &f.channel);
@@ -2346,7 +2353,7 @@ async fn finance_revenue_by_seller(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -2379,7 +2386,7 @@ async fn finance_payouts_list(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => Some(s),
             None => {
@@ -2387,7 +2394,7 @@ async fn finance_payouts_list(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         None
     } else {
         return err(
@@ -2418,7 +2425,7 @@ async fn finance_payouts_create(
         Err(e) => return e.into_response(),
     };
     // Sellers create payouts for themselves; admins must name the seller.
-    let seller_id = if session.role == "seller" {
+    let seller_id = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => {
                 if f.seller_id.is_some() && f.seller_id != Some(s) {
@@ -2436,7 +2443,7 @@ async fn finance_payouts_create(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         match f.seller_id {
             Some(s) => s,
             None => {
@@ -2490,7 +2497,7 @@ async fn finance_payouts_approve(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2590,7 +2597,7 @@ async fn finance_payouts_execute(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2774,7 +2781,7 @@ async fn finance_payouts_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2820,7 +2827,7 @@ async fn finance_payouts_process(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2874,7 +2881,7 @@ async fn finance_refunds_process(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -2963,7 +2970,7 @@ async fn finance_refunds_list(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => Some(s),
             None => {
@@ -2971,7 +2978,7 @@ async fn finance_refunds_list(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         None
     } else {
         return err(
@@ -3008,7 +3015,7 @@ async fn finance_refunds_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3033,7 +3040,7 @@ async fn finance_refunds_create(
         }
     };
     let (inv_amount, inv_asset, inv_status, _desc, _plan, inv_user, inv_seller) = inv;
-    if session.role == "seller" && session.seller_id != Some(inv_seller) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(inv_seller) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
     // Only settled money can be returned.
@@ -3049,7 +3056,7 @@ async fn finance_refunds_create(
     // the invoice did not collect. Sellers are clamped to the invoice's
     // amount and locked to its asset; admins/owner keep the looser form (they
     // are the approvers of whatever gets created here).
-    if session.role == "seller"
+    if Role::from_role_str(&session.role) == Role::Seller
         && f.asset
             .as_deref()
             .map(str::trim)
@@ -3074,7 +3081,7 @@ async fn finance_refunds_create(
                 )
                 .into_response();
             };
-            if session.role == "seller" {
+            if Role::from_role_str(&session.role) == Role::Seller {
                 if requested <= 0.0 {
                     return err(
                         StatusCode::BAD_REQUEST,
@@ -3136,7 +3143,7 @@ async fn finance_refunds_approve(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3208,7 +3215,7 @@ async fn finance_refunds_execute(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3427,7 +3434,7 @@ async fn finance_export(State(state): State<WebState>, headers: HeaderMap) -> im
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3584,7 +3591,7 @@ async fn products_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = if session.role == "seller" {
+    let seller_id = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => s,
             None => {
@@ -3592,7 +3599,7 @@ async fn products_delete(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         // Resolve the owning seller by name; products are unique per
         // (seller, name), not globally.
         let owners: Vec<i64> = state
@@ -3672,7 +3679,7 @@ async fn admin_sellers(State(state): State<WebState>, headers: HeaderMap) -> imp
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3701,7 +3708,7 @@ async fn admin_stats(State(state): State<WebState>, headers: HeaderMap) -> impl 
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3735,7 +3742,7 @@ async fn admin_web_accounts(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let accounts = state.db.list_web_accounts_full();
@@ -3781,7 +3788,7 @@ async fn admin_seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3811,7 +3818,7 @@ async fn admin_seller_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3838,7 +3845,7 @@ async fn admin_admins_list(State(state): State<WebState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let admins = state.db.list_admins_detail();
@@ -3862,7 +3869,7 @@ async fn admin_admins_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.add_admin(f.user_id, f.username.as_deref());
@@ -3886,7 +3893,7 @@ async fn admin_admins_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.remove_admin(user_id);
@@ -3910,7 +3917,7 @@ async fn admin_web_accounts_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     match state
@@ -3942,7 +3949,7 @@ async fn admin_web_accounts_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.delete_web_account(id);
@@ -3967,7 +3974,7 @@ async fn admin_web_accounts_password(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     if f.password.len() < 6 {
@@ -4003,7 +4010,7 @@ async fn admin_audit_log(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4035,7 +4042,7 @@ async fn api_keys_list(State(state): State<WebState>, headers: HeaderMap) -> imp
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4063,7 +4070,7 @@ async fn api_keys_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4099,7 +4106,7 @@ async fn api_keys_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4108,7 +4115,7 @@ async fn api_keys_delete(
         .into_response();
     }
     // ownership check for non-admin
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         let own = state
             .db
             .list_api_keys(session.account_id)
@@ -4150,8 +4157,11 @@ async fn invoices_claim(
         }
     };
     let (_amount, _asset, status, _desc, plan_id, user_id, seller_id) = inv;
-    let admin = is_admin_role(&session.role);
-    if !admin && session.role == "seller" && session.seller_id != Some(seller_id) {
+    let admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    if !admin
+        && Role::from_role_str(&session.role) == Role::Seller
+        && session.seller_id != Some(seller_id)
+    {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
     // Invoice user binding (identical to /paid): an invoice bound to a user

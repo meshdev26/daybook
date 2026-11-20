@@ -1092,6 +1092,56 @@ async fn api_seller_cannot_access_admin() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// Ordered-role gate semantics: an Admin-level session satisfies an Admin
+/// gate but must not satisfy an Owner-only gate.
+#[tokio::test]
+async fn api_admin_passes_admin_gate_but_fails_owner_gate() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let (aid, _, _, _, _) = state.db.get_web_account_by_username("admin").unwrap();
+    let token = state.db.create_web_session(aid, "admin", None, 7);
+    let app = router(state);
+
+    // Admin gate: /api/v1/admin/sellers accepts Admin or Owner.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/admin/sellers")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin must pass an Admin-level gate"
+    );
+
+    // Owner gate: /api/v1/admin/admins accepts Owner only.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/admin/admins")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "admin must fail an Owner-level gate"
+    );
+}
+
 #[tokio::test]
 async fn api_unauth_all_protected() {
     let (state, _dir) = make_state().await;
