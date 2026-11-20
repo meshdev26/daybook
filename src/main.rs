@@ -39,6 +39,31 @@ const POST_ATTEMPT_CAP: i64 = 10;
 fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
     let attempts = db.bump_invoice_attempts(inv_id);
     if attempts >= VERIFY_ATTEMPT_CAP {
+        // §3.1: once the provider has verified `paid` the money is settled —
+        // terminal `failed` is illegal (it would strand a paid buyer and hide
+        // the liability). Refuse the transition and raise an audited alarm.
+        let status = db.get_invoice(inv_id).map(|i| i.2).unwrap_or_default();
+        if status == "paid" || status == "paid_ungranted" {
+            db.log_action(
+                0,
+                "system",
+                "invoice_failed_after_paid_blocked",
+                "invoice",
+                inv_id,
+                Some(&format!(
+                    "attempts={} reason={} status={}",
+                    attempts, reason, status
+                )),
+            );
+            tracing::error!(
+                "blocked terminal-failed transition on paid invoice {} (status {}, {} attempts, reason: {})",
+                inv_id,
+                status,
+                attempts,
+                reason
+            );
+            return attempts;
+        }
         db.update_invoice_status(inv_id, "failed");
         tracing::error!(
             "invoice {} failed terminally after {} verification attempts ({}); restore manually via the admin invoice-status API if needed",
@@ -56,6 +81,117 @@ fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
         );
     }
     attempts
+}
+
+/// §3.2: verification said `paid` but the exactly-once grant claim produced
+/// no subscription/product grant. Move the row to the non-terminal recovery
+/// state, stamp the clock once, and audit. Never call `finalize_invoice_paid`
+/// on this path — that would hide the ungranted liability.
+fn mark_paid_ungranted(db: &Db, inv_id: &str, seller_id: i64, reason: &str) {
+    if !db.mark_invoice_paid_ungranted(inv_id) {
+        return;
+    }
+    let inv = db.get_invoice(inv_id);
+    let meta = serde_json::json!({
+        "seller_id": seller_id,
+        "amount": inv.as_ref().map(|i| i.0.as_str()).unwrap_or("-"),
+        "asset": inv.as_ref().map(|i| i.1.as_str()).unwrap_or("-"),
+        "reason": reason,
+    })
+    .to_string();
+    db.log_action(
+        0,
+        "system",
+        "invoice_paid_ungranted",
+        "invoice",
+        inv_id,
+        Some(&meta),
+    );
+    tracing::warn!(
+        "invoice {} verified paid but not granted ({}); queued for 30s recovery",
+        inv_id,
+        reason
+    );
+}
+
+/// Best-effort owner DM from the primary bot. Send failures are logged (error
+/// text only — never message content or secrets) and never propagate into a
+/// money state transition.
+async fn dm_owner(bm: &bots::BotManager, owner_id: i64, text: String) {
+    if owner_id == 0 {
+        return;
+    }
+    let bot = bm.for_seller(0).bot.clone();
+    if let Err(e) = bot
+        .send_message(teloxide::types::ChatId(owner_id), text)
+        .await
+    {
+        tracing::warn!("money alert: failed to DM owner: {}", e);
+    }
+}
+
+/// Emit an audited BLOCKING owner alert at most once per money row. The audit
+/// is the durable "already alerted" marker, so a restart cannot re-spam.
+async fn alert_once(
+    db: &Db,
+    bm: &bots::BotManager,
+    owner_id: i64,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    text: String,
+) {
+    if crate::handlers::money::has_audit_action(db, action, target_type, target_id) {
+        return;
+    }
+    db.log_action(0, "system", action, target_type, target_id, None);
+    dm_owner(bm, owner_id, text).await;
+}
+
+/// §3.3 exactly-once grant claim replay for a `paid_ungranted` invoice.
+/// Returns true only when the durable grant (product_grant or subscription)
+/// exists for the invoice. No invite-link or DM side effects here — the
+/// claim row is the source of truth; the 24h/72h timers keep running from
+/// `paid_ungranted_at` regardless of retries.
+async fn retry_ungranted_grant(
+    db: &Db,
+    inv_id: &str,
+    seller_id: i64,
+    user_id: Option<i64>,
+) -> bool {
+    if let Some(pid) = db.invoice_product(inv_id) {
+        if db.product_grant_exists(inv_id) {
+            return true;
+        }
+        let Some(uid) = user_id.filter(|u| *u != 0) else {
+            return false;
+        };
+        return db.grant_product(seller_id, uid, pid, inv_id).is_ok();
+    }
+    if db.subscription_exists_for_invoice(inv_id) {
+        return true;
+    }
+    let Some(uid) = user_id.filter(|u| *u != 0) else {
+        return false;
+    };
+    let plan_name = db.get_invoice(inv_id).and_then(|i| i.4);
+    let plan_info = plan_name.as_ref().and_then(|pn| db.get_plan(seller_id, pn));
+    let days = plan_info
+        .as_ref()
+        .map(|p| p.4)
+        .unwrap_or(30)
+        .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+    let ch = plan_info
+        .as_ref()
+        .and_then(|p| p.5.clone())
+        .or_else(|| db.seller_channel(seller_id))
+        .or_else(|| db.get_config("channel"))
+        .unwrap_or_default();
+    if ch.is_empty() {
+        return false;
+    }
+    db.create_subscription(seller_id, uid, None, &ch, days, Some(inv_id), None);
+    db.subscription_exists_for_invoice(inv_id)
 }
 
 /// Security headers on every response of the merged router (L10). All values
@@ -526,12 +662,14 @@ async fn run() {
                             let target_user = uid.unwrap_or(0);
                             if target_user == 0 {
                                 // Verified paid but nobody bound to deliver to:
-                                // finalize so it stops re-queueing.
-                                tracing::info!(
-                                    "invoice {} paid but has no bound user; finalizing without product grant",
-                                    inv_id
+                                // this is exactly the §3.2 paid-but-ungranted
+                                // case; keep it recoverable, never finalize.
+                                mark_paid_ungranted(
+                                    &db_bg,
+                                    &inv_id,
+                                    inv_seller,
+                                    "paid product invoice has no bound user",
                                 );
-                                db_bg.finalize_invoice_paid(&inv_id);
                                 continue;
                             }
                             if !db_bg.product_grant_exists(&inv_id) {
@@ -561,18 +699,25 @@ async fn run() {
                                     // the UNIQUE(invoice_id) race; nothing to do.
                                     Ok(false) => {}
                                     // e.g. out of stock: money settled, grant not —
-                                    // surface loudly and finalize so the invoice
-                                    // stops re-queueing (manual fulfillment).
+                                    // §3.2 paid-but-ungranted, kept recoverable.
                                     Err(e) => {
                                         tracing::warn!(
-                                            "invoice {}: product grant failed ({}); finalizing without delivery",
+                                            "invoice {}: product grant failed ({}); queuing for recovery",
                                             inv_id,
                                             e
                                         );
+                                        mark_paid_ungranted(
+                                            &db_bg,
+                                            &inv_id,
+                                            inv_seller,
+                                            "product grant failed",
+                                        );
+                                        continue;
                                     }
                                 }
                             }
-                            // Terminal: verified paid + grant attempted.
+                            // Terminal: verified paid + grant succeeded (or a
+                            // concurrent granter won the idempotency race).
                             db_bg.finalize_invoice_paid(&inv_id);
                             continue;
                         }
@@ -585,13 +730,14 @@ async fn run() {
                         // (e) Grant: subscription + single-use invite link + notice.
                         let target_user = uid.unwrap_or(0);
                         if target_user == 0 {
-                            // Verified paid but nobody is bound to grant to: finalize
-                            // so it stops re-queueing instead of spinning forever.
-                            tracing::info!(
-                                "invoice {} paid but has no bound user; finalizing without grant",
-                                inv_id
+                            // Verified paid but nobody bound to grant to:
+                            // §3.2 paid-but-ungranted, never terminal 'paid'.
+                            mark_paid_ungranted(
+                                &db_bg,
+                                &inv_id,
+                                inv_seller,
+                                "paid plan invoice has no bound user",
                             );
-                            db_bg.finalize_invoice_paid(&inv_id);
                             continue;
                         }
                         // Seller-scoped plan lookup: the invoice's plan is
@@ -614,24 +760,17 @@ async fn run() {
                             .or_else(|| db_bg.get_config("channel"))
                             .unwrap_or_default();
                         if ch.is_empty() {
-                            // Paid but not grantable yet: leave the claim so the
-                            // next cycle retries once a channel is configured.
-                            // Bounded retry: an unresolvable channel is a
-                            // misconfiguration, not a buyer-side condition.
-                            let attempts = bump_invoice_failure(
+                            // Verified paid but no channel to grant into: §3.2
+                            // paid-but-ungranted with a recoverable clock. Do
+                            // NOT age this to terminal 'failed' — the money
+                            // is settled; the recovery sweeper retries the
+                            // exactly-once grant once a channel exists.
+                            mark_paid_ungranted(
                                 &db_bg,
                                 &inv_id,
-                                &format!("no channel resolvable for seller {}", seller_id),
+                                seller_id,
+                                "no channel resolvable",
                             );
-                            if attempts < VERIFY_ATTEMPT_CAP {
-                                tracing::warn!(
-                                    "invoice {} paid but no channel resolvable for seller {}; leaving for retry (attempt {}/{})",
-                                    inv_id,
-                                    seller_id,
-                                    attempts,
-                                    VERIFY_ATTEMPT_CAP
-                                );
-                            }
                             continue;
                         }
                         let sub_id = db_bg.create_subscription(
@@ -916,6 +1055,229 @@ async fn run() {
                 }
                 if !expired.is_empty() {
                     tracing::info!("held-slot sweeper expired {} bookings", expired.len());
+                }
+            }
+        });
+    }
+    // §3 paid-but-ungranted recovery. One 30s loop drives the injected-clock
+    // timeline: 30s exactly-once grant retry, 24h system auto-refund + owner
+    // and buyer alerts, 72h BLOCKING owner escalation / payout hold. A paid
+    // invoice is NEVER moved to terminal 'failed' here. All timers are
+    // internal operational targets, not customer SLAs (G7).
+    {
+        let bm_bg = bot_manager.clone();
+        let db_bg = db.clone();
+        let owner_id = cfg.owner_id;
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                tokio::time::sleep(Duration::from_secs(
+                    telegram_agent::db::PAID_UNGRANTED_RETRY_SECONDS as u64,
+                ))
+                .await;
+                let now = chrono::Utc::now();
+                let retry_cutoff = handlers::money::paid_ungranted_retry_cutoff(now);
+                let auto_cutoff = handlers::money::paid_ungranted_auto_refund_cutoff(now);
+                let escalation_cutoff = handlers::money::paid_ungranted_escalation_cutoff(now);
+                let due = db_bg.paid_ungranted_before(&retry_cutoff);
+                for (inv_id, seller_id, amount, asset, since) in due {
+                    // 72h: blocking escalation, emitted once per invoice.
+                    if since <= escalation_cutoff
+                        && db_bg
+                            .unresolved_ungranted_invoices(seller_id, &escalation_cutoff)
+                            .iter()
+                            .any(|id| id == &inv_id)
+                    {
+                        alert_once(
+                            &db_bg,
+                            &bm_bg,
+                            owner_id,
+                            "invoice_ungranted_escalation",
+                            "invoice",
+                            &inv_id,
+                            format!(
+                                "BLOCKING: invoice {inv_id} (seller {seller_id}, {amount} {asset}) is still ungranted past 72h with no executed refund. New payouts for this seller are held."
+                            ),
+                        )
+                        .await;
+                    }
+                    // 24h: a system refund suppresses any further grant retry
+                    // and stays subject to the owner-only approval flow.
+                    if since <= auto_cutoff {
+                        let idem = format!("auto:ungranted:{inv_id}");
+                        let created =
+                            db_bg.create_refund_guarded(telegram_agent::db::RefundInput {
+                                seller_id,
+                                invoice_id: Some(&inv_id),
+                                user_id: None,
+                                amount: &amount,
+                                asset: &asset,
+                                reason: Some(
+                                    "automatic refund: invoice paid but ungranted for 24h",
+                                ),
+                                idem_key: &idem,
+                                created_by: -1,
+                                created_role: "system",
+                            });
+                        match created {
+                            Ok(c) if c.created_new => {
+                                let meta = serde_json::json!({
+                                    "seller_id": seller_id, "amount": amount,
+                                    "asset": asset, "idem_key": idem,
+                                })
+                                .to_string();
+                                db_bg.log_action(
+                                    -1,
+                                    "system",
+                                    "invoice_ungranted_refund_queued",
+                                    "invoice",
+                                    &inv_id,
+                                    Some(&meta),
+                                );
+                                tracing::warn!(
+                                    "invoice {} ungranted past 24h: auto-refund #{} queued",
+                                    inv_id,
+                                    c.id
+                                );
+                                alert_once(
+                                    &db_bg,
+                                    &bm_bg,
+                                    owner_id,
+                                    "invoice_ungranted_refund_owner_notice",
+                                    "invoice",
+                                    &inv_id,
+                                    format!(
+                                        "Invoice {inv_id} ({amount} {asset}) paid but ungranted for 24h: refund #{} queued — approve in Finance.",
+                                        c.id
+                                    ),
+                                )
+                                .await;
+                                // Buyer gets a "queued" notice only; "sent"
+                                // comes after the owner executes the refund.
+                                if let Some(uid) = db_bg.get_invoice(&inv_id).and_then(|i| i.5) {
+                                    let bot_ctx = bm_bg.for_seller(seller_id);
+                                    let notice = format!(
+                                        "Your payment for invoice {inv_id} is being refunded ({amount} {asset})."
+                                    );
+                                    if handlers::moderation::gate_outbound(
+                                        &db_bg,
+                                        seller_id,
+                                        Some(bot_ctx.id),
+                                        &notice,
+                                    )
+                                    .is_ok()
+                                    {
+                                        let _ = bot_ctx
+                                            .bot
+                                            .send_message(teloxide::types::ChatId(uid), notice)
+                                            .await;
+                                    }
+                                }
+                            }
+                            // Replayed key or a manual refund already in
+                            // flight: suppressed, no second money event.
+                            Ok(_) | Err(telegram_agent::db::RefundCreateError::InFlight) => {}
+                            Err(e) => tracing::warn!(
+                                "invoice {}: auto-refund could not be queued: {:?}",
+                                inv_id,
+                                e
+                            ),
+                        }
+                        continue;
+                    }
+                    // 30s: replay the exactly-once grant claim. Each attempt is
+                    // audited; success returns the row to 'paid' and stops the
+                    // job for that invoice. The 24h clock is never reset.
+                    let user_id = db_bg.get_invoice(&inv_id).and_then(|i| i.5);
+                    let granted = retry_ungranted_grant(&db_bg, &inv_id, seller_id, user_id).await;
+                    if granted && db_bg.finalize_invoice_grant_retry(&inv_id) {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "invoice_grant_retry",
+                            "invoice",
+                            &inv_id,
+                            Some("outcome=granted"),
+                        );
+                        tracing::info!("invoice {} grant retry succeeded", inv_id);
+                    } else {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "invoice_grant_retry",
+                            "invoice",
+                            &inv_id,
+                            Some("outcome=no_grant"),
+                        );
+                    }
+                }
+            }
+        });
+    }
+    // §5 executing-row state machine + 09:00 UTC owner digest. The same
+    // injectable-clock cutoffs drive the 30min transition and the 24h overdue
+    // alert; no transfer is attempted and no state is guessed by this job.
+    {
+        let db_bg = db.clone();
+        let bm_bg = bot_manager.clone();
+        let owner_id = cfg.owner_id;
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let now = chrono::Utc::now();
+                let (due, overdue) = handlers::money::reconciliation_cutoffs(now);
+                let rows = db_bg.reconciliation_rows(&due, &overdue);
+                for r in &rows {
+                    if r.status == "executing"
+                        && db_bg.mark_needs_reconciliation(&r.row_type, r.id, &due)
+                    {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "transfer_reconciliation_due",
+                            &r.row_type,
+                            r.id,
+                            Some(&format!(
+                                "spend_id={}",
+                                r.spend_id.as_deref().unwrap_or("-")
+                            )),
+                        );
+                    }
+                    if r.overdue {
+                        alert_once(
+                            &db_bg,
+                            &bm_bg,
+                            owner_id,
+                            "transfer_reconciliation_overdue",
+                            &r.row_type,
+                            &r.id.to_string(),
+                            format!(
+                                "BLOCKING: {} #{} ({} {}) is past the 24h owner-decision deadline. Resolve it in Finance.",
+                                r.row_type, r.id, r.amount, r.asset
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                if handlers::money::should_run_digest(now) {
+                    let rows = handlers::money::all_reconciliation_rows(&db_bg, &due, &overdue);
+                    let hash = handlers::money::digest_row_ids_hash(&rows);
+                    let text = handlers::money::format_digest(&rows, now);
+                    let meta = serde_json::json!({
+                        "row_count": rows.len(), "hash": hash,
+                        "overdue": rows.iter().filter(|r| r.overdue).count(),
+                    })
+                    .to_string();
+                    db_bg.log_action(
+                        0,
+                        "system",
+                        "transfer_reconciliation_digest",
+                        "reconciliation",
+                        "digest",
+                        Some(&meta),
+                    );
+                    dm_owner(&bm_bg, owner_id, text).await;
                 }
             }
         });

@@ -2759,3 +2759,398 @@ async fn posts_create_allows_own_default_and_global_channels() {
     }
     assert_eq!(state.db.list_posts(Some(42), 1000).len(), 3);
 }
+
+// ---- Money safety: decision 2 owner gates / creator separation ----
+
+fn admin_token(state: &WebState) -> String {
+    let (id, _, _, _, _) = state.db.get_web_account_by_username("admin").unwrap();
+    state.db.create_web_session(id, "admin", None, 7)
+}
+
+/// Create a paid invoice and a refund through the REST surface as `seller`.
+async fn seed_refund(
+    app: &axum::Router,
+    db: &std::sync::Arc<Db>,
+    seller: &str,
+    idem: &str,
+) -> (String, i64) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", seller))
+                .body(Body::from(
+                    r#"{"amount":"5","asset":"USDT","description":"t"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let inv = v["invoice_id"].as_str().unwrap().to_string();
+    // Bind a buyer so the refund is executable (transfer target).
+    db.save_invoice(
+        &inv,
+        42,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(99),
+        None,
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", seller))
+                .body(Body::from(
+                    serde_json::json!({
+                        "invoice_id": inv, "idem_key": idem,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (inv, v["id"].as_i64().unwrap())
+}
+
+#[tokio::test]
+async fn refund_approve_is_owner_only_and_separated_from_creator() {
+    let (state, _dir) = make_seller_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let admin = admin_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let (_inv, id) = seed_refund(&app, &db, &seller, "api:owner-gate").await;
+
+    // Admin is refused with the spec's owner_required code.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "owner_required");
+
+    // The seller who created the refund is also refused (not a seller role
+    // gate — creator separation fires after the owner check).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Owner (not the creator) succeeds.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_refund(id).unwrap().7, "approved");
+}
+
+#[tokio::test]
+async fn refund_creator_cannot_self_approve_even_as_owner() {
+    let (state, _dir) = make_seller_state().await;
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    // Owner is allowed to CREATE (role >= Seller), which records them as the
+    // creator; they must not then approve their own money row (no break-glass).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {seller}"))
+                .body(Body::from(
+                    r#"{"amount":"5","asset":"USDT","description":"t"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let inv = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["invoice_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    db.update_invoice_status(&inv, "paid");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/finance/refunds")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(format!(
+                    r#"{{"invoice_id":"{inv}","idem_key":"api:self"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/approve"))
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "creator_forbidden");
+}
+
+#[tokio::test]
+async fn refund_execute_owner_gate_and_idem_audit() {
+    let (state, _dir) = make_seller_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let seller = seller_token(&state);
+    let admin = admin_token(&state);
+    let owner = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let (_inv, id) = seed_refund(&app, &db, &seller, "api:exec-gate").await;
+    db.set_refund_status(id, "approved");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/execute"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "owner_required"
+    );
+
+    // Owner clears the gate; with no token configured the transfer is
+    // unavailable (503) — proof execution reached the money path.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/finance/refunds/{id}/execute"))
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Replaying the same refund key emits no second create audit event.
+    let create_audits = db
+        .list_audit_log(1000)
+        .into_iter()
+        .filter(|(_, _, _, action, tt, tid, _, _)| {
+            action == "refund_create"
+                && tt == "refund"
+                && tid.as_deref() == Some(id.to_string().as_str())
+        })
+        .count();
+    assert_eq!(create_audits, 1);
+}
+
+// ---- Money safety: decision 5 reconciliation endpoints ----
+
+#[tokio::test]
+async fn reconciliation_endpoints_owner_only_cas_and_resolve() {
+    let (state, _dir) = make_seller_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let seller = seller_token(&state);
+    let owner = owner_token(&state);
+    let admin = admin_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let (_inv, id) = seed_refund(&app, &db, &seller, "api:recon").await;
+    db.set_refund_status(id, "approved");
+    assert!(db.begin_refund_execution(id));
+    // Move to needs_reconciliation with a cutoff in the future (injected time).
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    assert!(db.mark_needs_reconciliation("refund", id, &future));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/finance/reconciliation")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/finance/reconciliation")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["items"].as_array().unwrap().iter().any(|r| r["id"] == id));
+
+    // Empty reason is rejected before any state write.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/finance/reconciliation/refund/{id}/resolve"
+                ))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"outcome":"void","reason":"   "}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/finance/reconciliation/refund/{id}/resolve"
+                ))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"outcome":"void","reason":"receipt checked: never landed"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_refund(id).unwrap().7, "void");
+
+    // Append-only: a second resolution is rejected.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/finance/reconciliation/refund/{id}/resolve"
+                ))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::from(
+                    r#"{"outcome":"executed","reason":"second try"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}

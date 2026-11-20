@@ -170,7 +170,7 @@ pub enum Command {
     ExportData(String),
     /// Delete buyer data: /deletedata <user_id> [confirm] [seller_id].
     DeleteData(String),
-    /// Approve a pending refund (admin/owner): /refundapprove [refund_id].
+    /// Approve a pending refund (OWNER only, §2): /refundapprove [refund_id].
     RefundApprove(String),
     /// Approve a pending payout (admin/owner): /payoutapprove [payout_id].
     PayoutApprove(String),
@@ -260,6 +260,7 @@ pub async fn cmd_handler(
     }
     let role = roles::role_of(&db, user_id, bot_ctx.owner_id);
     let is_admin = role >= roles::Role::Admin;
+    let is_owner = role == roles::Role::Owner;
     let is_seller = role >= roles::Role::Seller;
     let user_cmd = matches!(
         cmd,
@@ -3922,7 +3923,10 @@ pub async fn cmd_handler(
             .await?;
         }
         Command::RefundApprove(arg) => {
-            if !is_admin {
+            // §2: refund approval is Owner-only on every surface. An Admin
+            // (or the seller who created the refund) gets no bot response at
+            // all, matching the REST 403 owner_required.
+            if !is_owner {
                 return Ok(());
             }
             handle_refund_approve(&bot, chat_id, &db, user_id, role, arg.trim()).await?;
@@ -4714,13 +4718,13 @@ fn audit_role_str(role: roles::Role) -> &'static str {
     }
 }
 
-/// `/refundapprove [refund_id]` — admin/owner approval of pending refunds.
+/// `/refundapprove [refund_id]` — OWNER-ONLY approval of pending refunds (§2).
 /// Mirrors the REST state machine (`api::finance_refunds_approve`) exactly:
-/// not-found reply, executed/invalid-state conflicts, approve only from
-/// pending/approved, and the same `refund_approve` audit event with the same
-/// JSON meta. With no id it lists up to 10 pending refunds. The bot never
-/// moves money: the transfer itself stays on the console Finance page or the
-/// REST execute endpoint.
+/// owner gate, creator separation, not-found reply, executed/invalid-state
+/// conflicts, approve only from pending/approved, and the same
+/// `refund_approve` audit event with the same JSON meta. With no id it lists
+/// up to 10 pending refunds. The bot never moves money: the transfer itself
+/// stays on the console Finance page or the REST execute endpoint.
 async fn handle_refund_approve(
     bot: &Bot,
     chat_id: teloxide::types::ChatId,
@@ -4771,6 +4775,18 @@ async fn handle_refund_approve(
             return Ok(());
         }
     };
+    // §2: the human creator may never approve their own money row. System-
+    // created refunds carry no creator audit event and are exempt.
+    if let Some((creator, _)) = crate::handlers::money::refund_creator(db, id)
+        && creator == user_id
+    {
+        bot.send_message(
+            chat_id,
+            "You created this refund; a different Owner must approve it.",
+        )
+        .await?;
+        return Ok(());
+    }
     let (_rid, _seller, ref invoice_id, _user, ref amount, ref asset, _reason, ref status, ..) =
         refund;
     if status == "executed" {
