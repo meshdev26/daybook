@@ -269,7 +269,7 @@ pub(super) fn finance_reconciliation_banner(rows: &[ReconciliationRow]) -> Optio
 /// Resolve the page's blocking/advisory banners from current DB state. Seller
 /// sessions see only their own liability; owner/admin sessions aggregate the
 /// sellers in their bot scope, so one tenant cannot trigger another's banner.
-fn finance_state_banners(state: &WebState, session: &Session) -> Option<String> {
+pub(super) fn finance_state_banners(state: &WebState, session: &Session) -> Option<String> {
     let role = Role::from_role_str(&session.role);
     let seller_ids: Vec<i64> = if role == Role::Seller {
         session.seller_id.into_iter().collect()
@@ -288,7 +288,15 @@ fn finance_state_banners(state: &WebState, session: &Session) -> Option<String> 
         .flat_map(|sid| state.db.unresolved_ungranted_invoices(*sid, &cutoff))
         .collect();
     let (due, overdue) = reconciliation_cutoffs(chrono::Utc::now());
-    let rows = all_reconciliation_rows(&state.db, &due, &overdue);
+    // The reconciliation desk stays owner-only, but its banner is a count on
+    // every finance page — scope it to the same seller set as the ungranted
+    // banner above so one tenant's in-flight transfers never inflate another
+    // tenant's count. Privileged tiers resolve to every in-scope seller, so
+    // their global count is unchanged.
+    let rows: Vec<ReconciliationRow> = all_reconciliation_rows(&state.db, &due, &overdue)
+        .into_iter()
+        .filter(|r| seller_ids.contains(&r.seller_id))
+        .collect();
     let mut parts = Vec::new();
     if let Some(b) = finance_ungranted_banner(&ungranted) {
         parts.push(b);

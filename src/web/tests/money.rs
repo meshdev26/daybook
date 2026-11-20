@@ -571,6 +571,56 @@ fn finance_state_banners_distinguish_blocking_from_advisory() {
     assert!(late.contains("Blocking:"));
 }
 
+/// L10 F4: the reconciliation count on the finance banner is built from the
+/// global `all_reconciliation_rows`, but a seller must only ever be shown the
+/// count for their own seller id. The owner/global count stays intact.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn finance_state_banners_scope_reconciliation_count_to_seller() {
+    let (state, _dir) = make_state().await;
+    let db = state.db.clone();
+    db.upsert_seller(7, Some("seller-7"), None);
+    db.upsert_seller(8, Some("seller-8"), None);
+    for (inv, sid) in [("scope-inv-7", 7_i64), ("scope-inv-8", 8_i64)] {
+        db.save_invoice(
+            inv,
+            sid,
+            "5",
+            "USDT",
+            None,
+            "paid",
+            None,
+            None,
+            Some(42),
+            None,
+        );
+        let refund = system_refund(&db, inv, sid, "2");
+        db.update_refund_status(refund, "needs_reconciliation");
+    }
+
+    let seller = Session {
+        account_id: 1,
+        role: "seller".to_string(),
+        seller_id: Some(7),
+        selected_bot_id: None,
+    };
+    // Assert on the count, not the blocking/advisory wording: a row without
+    // an explicit reconciliation_since is treated as overdue, and both banner
+    // variants embed the count as "N transfer(s)".
+    let banner = super::super::finance::finance_state_banners(&state, &seller).unwrap();
+    assert!(banner.contains("1 transfer(s)"), "{banner}");
+    assert!(!banner.contains("2 transfer(s)"), "{banner}");
+
+    // Owner/global visibility is preserved: both rows are still counted.
+    let owner = Session {
+        role: "owner".to_string(),
+        seller_id: None,
+        ..seller.clone()
+    };
+    let banner = super::super::finance::finance_state_banners(&state, &owner).unwrap();
+    assert!(banner.contains("2 transfer(s)"), "{banner}");
+}
+
 #[tokio::test]
 #[tracing::instrument(skip_all)]
 async fn payout_hold_predicate_and_banner_match_the_72h_rule() {
