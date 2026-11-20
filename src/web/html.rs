@@ -271,7 +271,7 @@ pub(super) fn html_page(
         identity_line
     );
     format!(
-        r##"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
+        r##"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <link rel="preload" href="{base}/assets/fonts/IBMPlexSans-var.woff2" as="font" type="font/woff2" crossorigin>
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
@@ -280,7 +280,7 @@ pub(super) fn html_page(
 <a class="skip-link" href='#main'>Skip to content</a>
 <div class="shell">
 <aside class="rail">
-  <div class="brand">{plane}<b>Telegram Business<small>operator console</small></b></div>
+  <div class="brand">{plane}<b>Daybook<small>operator console</small></b></div>
   {bot_scope}
   <nav>{nav}</nav>
 </aside>
@@ -312,14 +312,14 @@ pub(super) fn html_page_bare_panel(
     panel_class: &str,
 ) -> String {
     format!(
-        r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
+        r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
 <script src="{base}/assets/app.js" defer></script>
 </head><body>
 <a class="skip-link" href='#main'>Skip to content</a>
 <main class="door" id="main">
-  <div class="brand">{plane}<b>Telegram Business</b></div>
+  <div class="brand">{plane}<b>Daybook</b></div>
   <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()" aria-pressed="false" aria-label="Switch to dark theme">Theme</button>
   <div class="{panel_class}">{b}</div>
 </main>
