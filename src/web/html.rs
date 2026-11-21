@@ -227,12 +227,12 @@ pub(super) const APP_JS: &str = r#"(function () {
     if (!isDesktop()) return;
     var el = rail();
     if (!el || el.scrollHeight <= el.clientHeight) return;
-    try { localStorage.setItem(KEY, String(el.scrollTop)); }
+    try { sessionStorage.setItem(KEY, String(el.scrollTop)); }
     catch (_) { /* storage blocked — enhancement only */ }
   }
   if (isDesktop()) {
     var y = 0;
-    try { y = parseInt(localStorage.getItem(KEY), 10) || 0; }
+    try { y = parseInt(sessionStorage.getItem(KEY), 10) || 0; }
     catch (_) { y = 0; }
     if (y > 0) {
       requestAnimationFrame(function () {

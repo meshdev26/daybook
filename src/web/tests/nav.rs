@@ -879,6 +879,10 @@ async fn rail_scroll_memory_is_desktop_only_and_native_history_is_untouched() {
         "rail offset must be saved: {rail}"
     );
     assert!(
+        rail.contains("sessionStorage"),
+        "rail offset must be session-scoped, not shared across tabs: {rail}"
+    );
+    assert!(
         rail.contains("getItem") && rail.contains("setItem"),
         "rail offset must round-trip through Web Storage: {rail}"
     );
