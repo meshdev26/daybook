@@ -33,6 +33,12 @@ This design system is informed by two lenses:
 - Lists: swipe actions on mobile, hover on desktop.
 - Modals: only for destructive confirmations.
 - Loading: skeleton screens, not spinners where possible.
+- **Action placement (console).** Placement follows the action's role, never the page:
+  1. One primary action per screen; a form's submit is a filled button at the bottom-left of its form (`.form-row > button`).
+  2. The page-level CTA is the single exception — it sits at the right edge of the title row (`.page-head .actions`).
+  3. Per-record actions always sit flush right: tables use `<td class="actions">`, ledger rows use `.row-actions` / `margin-left:auto`.
+  4. Within an action cluster, order primary → secondary → destructive left-to-right; destructive is last, uses `.btn-danger`, and carries a confirm.
+  5. Position buttons only with sanctioned classes — no ad-hoc `float:right`, `text-align:right`, or `margin-left:auto` wrappers.
 
 ---
 

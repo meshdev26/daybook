@@ -48,6 +48,7 @@ cargo deny check
 - Scope all business data by `seller_id`.
 - Use `channel_of(db, cfg, Some(seller_id))` for per-seller channels.
 - Log via `tracing`; never log secrets.
+- UI action placement follows `DESIGN.md` §1 *Action placement* (primary bottom-left, row actions flush right, destructive last).
 
 ## 4. Adding a feature
 1. Update `schema.sql` + `Db::migrate`.
