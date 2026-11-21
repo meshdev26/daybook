@@ -310,7 +310,7 @@ fn section_identity(state: &WebState, row: &crate::db::ChannelRow) -> String {
     let name_value = current.map(esc).unwrap_or_default();
     let name_id = esc(&format!("name-{}", row.channel));
     format!(
-        r#"<article class="panel"><h2>Identity</h2><form method="post" action="{action}" class="inline-form"><input type="hidden" name="channel" value="{ch}"><label for="{name_id}">Title</label><input id="{name_id}" name="name" value="{name_value}" placeholder="Friendly name, e.g. Wire Guard" required><button type="submit" class="btn btn-secondary">Save name</button></form><span class="help">Your label for this channel — how it reads in lists and pickers. The dialed address is changed under Address.</span></article>"#,
+        r#"<article class="panel"><h2>Identity</h2><p class="help" id="identity-help">Your label for this channel — how it reads in lists and pickers. The dialed address is changed under Address.</p><form method="post" action="{action}" class="inline-form" aria-describedby="identity-help"><input type="hidden" name="channel" value="{ch}"><label for="{name_id}">Title</label><input id="{name_id}" name="name" value="{name_value}" placeholder="Friendly name, e.g. Wire Guard" required><button type="submit" class="btn btn-secondary">Save name</button></form></article>"#,
         action = state.url("/channels/name"),
         ch = esc(&row.channel),
         name_id = name_id,
@@ -337,7 +337,7 @@ fn section_address(state: &WebState, row: &crate::db::ChannelRow) -> String {
         "Private channels must keep their -100 ID. Changing this retargets where posts go."
     };
     format!(
-        r#"<article class="panel"><h2>Address</h2><p>Posts dial <span class="mono">{ch}</span>.</p><details><summary>Change address…</summary><span class="help">{addr_warning}</span><form method="post" action="{action}" class="inline-form"><input type="hidden" name="channel" value="{ch}"><label class="sr-only" for="{addr_id}">New address for {ch}</label><input id="{addr_id}" name="new" value="{ch}" required spellcheck="false"><button type="submit" class="btn btn-danger btn-sm" aria-label="Change the address of {ch}" onclick="return confirm('{confirm_msg}')">Retarget</button></form></details></article>"#,
+        r#"<article class="panel"><h2>Address</h2><p>Posts dial <span class="mono">{ch}</span>.</p><details><summary>Change address…</summary><p class="help" id="address-help">{addr_warning}</p><form method="post" action="{action}" class="inline-form" aria-describedby="address-help"><input type="hidden" name="channel" value="{ch}"><label class="sr-only" for="{addr_id}">New address for {ch}</label><input id="{addr_id}" name="new" value="{ch}" required spellcheck="false"><button type="submit" class="btn btn-danger btn-sm" aria-label="Change the address of {ch}" onclick="return confirm('{confirm_msg}')">Retarget</button></form></details></article>"#,
         action = state.url("/channels/rename"),
         ch = esc(&row.channel),
         addr_id = addr_id,
@@ -356,7 +356,7 @@ fn section_default(state: &WebState, row: &crate::db::ChannelRow) -> String {
             .to_string()
     } else {
         format!(
-            r#"<form method="post" action="{action}" class="inline-form"><input type="hidden" name="channel" value="{ch}"><button type="submit" class="btn btn-ghost btn-sm" aria-label="Set {ch} as default">Set default</button></form><span class="help">The default channel is the fallback posting target for plans and posts.</span>"#,
+            r#"<p class="help" id="default-help">The default channel is the fallback posting target for plans and posts.</p><form method="post" action="{action}" class="inline-form" aria-describedby="default-help"><input type="hidden" name="channel" value="{ch}"><button type="submit" class="btn btn-ghost btn-sm" aria-label="Set {ch} as default">Set default</button></form>"#,
             action = state.url("/channels/default"),
             ch = esc(&row.channel),
         )
@@ -401,7 +401,7 @@ fn section_posting(state: &WebState, row: &crate::db::ChannelRow, user_bound: bo
 /// refuses. Last panel, visually flagged by the `.danger-zone` CSS rule.
 fn section_danger(state: &WebState, row: &crate::db::ChannelRow) -> String {
     let inner = if row.is_default {
-        r#"<span class="help">The default channel cannot be removed — set another channel as default first.</span>"#
+        r#"<p class="help">The default channel cannot be removed — set another channel as default first.</p>"#
             .to_string()
     } else {
         let confirm_msg = esc(&format!(
@@ -409,7 +409,7 @@ fn section_danger(state: &WebState, row: &crate::db::ChannelRow) -> String {
             js_arg(&row.channel)
         ));
         format!(
-            "<form method=\"post\" action=\"{}\" class=\"inline-form\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger\" aria-label=\"Delete {}\" onclick=\"return confirm('{}')\">Delete</button></form>",
+            "<form method=\"post\" action=\"{}\" class=\"inline-form\" aria-describedby=\"danger-desc\"><input type=\"hidden\" name=\"channel\" value=\"{}\"><button type=\"submit\" class=\"btn btn-danger\" aria-label=\"Delete {}\" onclick=\"return confirm('{}')\">Delete</button></form>",
             state.url("/channels/remove"),
             esc(&row.channel),
             esc(&row.channel),
@@ -417,7 +417,7 @@ fn section_danger(state: &WebState, row: &crate::db::ChannelRow) -> String {
         )
     };
     format!(
-        r#"<article class="panel danger-zone"><h2>Danger zone</h2><p>Removing disconnects every plan and post that dials this address. This cannot be undone.</p>{inner}</article>"#
+        r#"<article class="panel danger-zone"><h2>Danger zone</h2><p id="danger-desc">Removing disconnects every plan and post that dials this address. This cannot be undone.</p>{inner}</article>"#
     )
 }
 

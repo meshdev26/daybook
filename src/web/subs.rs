@@ -298,8 +298,10 @@ fn subs_table_html(
                         r.0,
                         r.0
                     );
-                    let actions_cell =
-                        format!(r#"<td class="actions">{}{}</td>"#, revoke_form, extend_form);
+                    let actions_cell = format!(
+                        r#"<td class="actions">{}{}</td>"#,
+                        extend_form, revoke_form
+                    );
                     format!(
                         "<tr>{}{}{}{}<td>{}</td>{}{}</tr>",
                         id_cell, seller_cell, user_cell, channel_cell, status_cell, expires_cell, actions_cell

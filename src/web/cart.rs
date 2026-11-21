@@ -34,7 +34,7 @@ pub(super) async fn cart_page(
             continue;
         }
         rows.push_str(&format!(
-            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td><form method="post" action="{}" class="inline-form"><input type="hidden" name="seller_id" value="{}"><input type="hidden" name="item_type" value="{}"><input type="hidden" name="item_id" value="{}"><button type="submit" class="btn btn-danger btn-sm">Remove</button></form></td></tr>"#,
+            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td class="actions"><form method="post" action="{}" class="inline-form"><input type="hidden" name="seller_id" value="{}"><input type="hidden" name="item_type" value="{}"><input type="hidden" name="item_id" value="{}"><button type="submit" class="btn btn-danger btn-sm">Remove</button></form></td></tr>"#,
             esc(item_type),
             item_id,
             qty,

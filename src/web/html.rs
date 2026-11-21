@@ -207,7 +207,42 @@ pub(super) const APP_JS: &str = r#"(function () {
   if (navType !== 'back_forward') {
     var y = read()[urlKey()];
     if (typeof y === 'number' && y > 0) {
-      requestAnimationFrame(function () { window.scrollTo(0, y); });
+      requestAnimationFrame(function () { window.scrollTo({ top: y, behavior: 'instant' }); });
+    }
+  }
+  window.addEventListener('pagehide', save);
+  window.addEventListener('beforeunload', save);
+})();
+(function () {
+  'use strict';
+  // The rail is a sticky, independently scrolling column on desktop only;
+  // on mobile it is a wrapping header. Remember its scrollTop across full
+  // navigations so a long nav list resumes where the operator left it.
+  // Desktop + actually-scrollable only: a short nav never pins a stale
+  // offset, and the mobile rail is never forced to scroll. No-JS: top.
+  var KEY = 'tg.rail.scroll.v1';
+  function isDesktop() { return window.matchMedia('(min-width: 901px)').matches; }
+  function rail() { return document.querySelector('.rail'); }
+  function save() {
+    if (!isDesktop()) return;
+    var el = rail();
+    if (!el || el.scrollHeight <= el.clientHeight) return;
+    try { localStorage.setItem(KEY, String(el.scrollTop)); }
+    catch (_) { /* storage blocked — enhancement only */ }
+  }
+  if (isDesktop()) {
+    var y = 0;
+    try { y = parseInt(localStorage.getItem(KEY), 10) || 0; }
+    catch (_) { y = 0; }
+    if (y > 0) {
+      requestAnimationFrame(function () {
+        var el = rail();
+        if (!el) return;
+        if (typeof el.scrollTo === 'function') {
+          try { el.scrollTo({ top: y, behavior: 'instant' }); }
+          catch (_) { el.scrollTop = y; }
+        } else { el.scrollTop = y; }
+      });
     }
   }
   window.addEventListener('pagehide', save);

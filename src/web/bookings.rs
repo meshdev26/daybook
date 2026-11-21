@@ -143,10 +143,10 @@ fn bookings_counts(all_rows: &[crate::db::BookingListRow]) -> String {
     let total = all_rows.len() as i64;
     let cards = format!(
         r#"<section aria-labelledby="bookings-counts-heading"><h2 id="bookings-counts-heading">Status counts</h2><div class="grid-stats">
-<div class="panel"><div class="stat"><span class="stat-value">{held}</span><span class="stat-label">Held</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{confirmed}</span><span class="stat-label">Confirmed</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{expired}</span><span class="stat-label">Expired</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{total}</span><span class="stat-label">Total</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Held</span><span class="stat-value">{held}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Confirmed</span><span class="stat-value">{confirmed}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Expired</span><span class="stat-value">{expired}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Total</span><span class="stat-value">{total}</span></div></div>
 </div></section>"#,
         held = held,
         confirmed = confirmed,
@@ -415,7 +415,7 @@ pub(super) fn bookings_rows_html(
                 String::new()
             };
             format!(
-                r#"<tr><td class="mono">{}</td>{}<td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td>{}</td></tr>"#,
+                r#"<tr><td class="mono">{}</td>{}<td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="actions">{}</td></tr>"#,
                 esc(&r.1),
                 seller_cell,
                 r.2,

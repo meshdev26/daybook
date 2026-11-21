@@ -218,8 +218,8 @@ fn analytics_chart_section(m: &AnalyticsMetrics, export_url: &str) -> String {
     format!(
         r#"<section aria-labelledby="top-products-heading"><h2 id="top-products-heading">Top products</h2>
 <article class="panel"><div class="table-wrap" tabindex="0" role="region" aria-label="Top products"><table aria-label="Top products"><thead><tr><th scope="col">Product</th><th scope="col" class="num">Sales</th></tr></thead><tbody>{top_rows}</tbody></table></div>
-<canvas id="topProductsChart" width="400" height="200" role="img" aria-label="Bar chart of sales by product; the table above lists the same data"></canvas></article></section>
-<p class="help"><a href="{export_url}">Export CSV</a></p>
+<canvas id="topProductsChart" width="400" height="200" role="img" aria-label="Bar chart of sales by product; the table above lists the same data"></canvas>
+<p class="help"><a href="{export_url}">Export CSV</a></p></article></section>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 (function() {{

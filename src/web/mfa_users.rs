@@ -726,7 +726,7 @@ pub(super) async fn webusers_page(
             let rmf = state.url("/webusers/resetmfa");
             let toggle = SECRET_TOGGLE;
             format!(
-                r#"<tr><td class="mono">{id}</td><td>{u}</td><td>{role}</td><td class="mono">{seller_cell}</td><td>{mfa}</td><td>
+                r#"<tr><td class="mono">{id}</td><td>{u}</td><td>{role}</td><td class="mono">{seller_cell}</td><td>{mfa}</td><td class="actions">
 <form method="post" action="{pw}" class="inline-form"><input type="hidden" name="id" value="{id}"><span class="secret-field"><input type="password" name="password" placeholder="new password" aria-label="New password for {u}">{toggle}</span><button type="submit" class="btn btn-sm">Reset</button></form>
 <form method="post" action="{del}" class="inline-form" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Delete account {u}" onclick="return confirm('Delete account {u}? Their sessions end immediately.')">Delete</button></form>
 <form method="post" action="{rmf}" class="inline-form"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Reset MFA for {u}? They will sign in with password only until they enroll again.')">Reset MFA</button></form>

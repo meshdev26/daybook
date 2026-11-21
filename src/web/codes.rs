@@ -104,14 +104,14 @@ fn codes_rows_html(state: &WebState, session: &Session, codes: &[CodeRow]) -> St
             // confirm naming the code and the consequence. The per-row
             // "New length" field is gone (the 12 default stays server-side).
             let reclaim = format!(
-                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Reclaim code {}" onclick="return confirm('Reclaim code {}? The old code stops working and a new one is issued.')">Reclaim</button></form>"#,
+                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Reclaim code {}" onclick="return confirm('Reclaim code {}? The old code stops working and a new one is issued.')">Reclaim</button></form>"#,
                 state.url("/codes/reclaim"),
                 esc(&c.0),
                 esc(&c.0),
                 esc(&c.0)
             );
             format!(
-                r#"<tr><td class="mono">{}{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td><td>{}{}</td></tr>"#,
+                r#"<tr><td class="mono">{}{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td><td class="actions">{}{}</td></tr>"#,
                 esc(&c.0),
                 revoked_badge,
                 c.1.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string()),

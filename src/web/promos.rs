@@ -99,7 +99,7 @@ pub(super) async fn promos_page(
                 };
                 let expiry = p.10.clone().unwrap_or_else(|| "—".to_string());
                 format!(
-                    r#"<tr><td class="mono">{}</td><td>{}</td><td class="num">{}</td><td class="num">{}/{}</td><td class="num">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                    r#"<tr><td class="mono">{}</td><td>{}</td><td class="num">{}</td><td class="num">{}/{}</td><td class="num">{}</td><td>{}</td><td>{}</td><td class="actions">{}</td></tr>"#,
                     esc(&p.0),
                     esc(&p.2),
                     p.3,

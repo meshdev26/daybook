@@ -131,7 +131,7 @@ fn orders_rows_html(state: &WebState, filtered: &[OrderRow]) -> String {
                 String::new()
             };
             format!(
-                r#"<tr><td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="mono">{}</td><td>
+                r#"<tr><td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="mono">{}</td><td class="actions">
 <form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><select name="status" aria-label="New status for order {oid}">{status_opts}</select><button type="submit" class="btn btn-secondary btn-sm" aria-label="Save status for order {oid}">Save</button></form>
 <form method="post" action="{}" class="inline-form"><input type="hidden" name="order_id" value="{}"><input type="text" name="tracking" placeholder="Tracking number" aria-label="Tracking number for order {oid}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Save tracking for order {oid}">Save</button></form>
 {}</td></tr>"#,

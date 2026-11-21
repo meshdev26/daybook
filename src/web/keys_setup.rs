@@ -33,7 +33,7 @@ pub(super) fn keys_body(state: &WebState, session: &Session, banner: Option<&str
                 )
             };
             format!(
-                r#"<tr><td>{}{}</td><td class="mono">{}</td><td class="mono">{}</td><td>{}</td></tr>"#,
+                r#"<tr><td>{}{}</td><td class="mono">{}</td><td class="mono">{}</td><td class="actions">{}</td></tr>"#,
                 esc(name),
                 revoked_badge,
                 esc(prefix),
