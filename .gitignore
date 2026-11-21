@@ -23,6 +23,13 @@
 /.commandcode
 /.mimosa
 
+# Internal AI-agent workflow artifacts — local tooling only, never published.
+# These leak absolute developer paths, session IDs and secret-location names.
+/.agents/
+/.qoder/
+/scripts/.mimosa/
+/bots.toml
+
 # Vendored dependency sources — only the PATCHED crates are tracked (see
 # [patch.crates-io] in Cargo.toml: the teloxide fork strips aquamarine and
 # with it the unmaintained proc-macro-error2 from the dependency graph).
