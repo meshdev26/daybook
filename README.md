@@ -23,7 +23,7 @@ An **owner-only** Telegram bot that:
 - **Public (user side)**: any user can `/start`, browse `/plans` and `/shop`, `/buy`, `/paid`, `/redeem`, plus `/services` and `/book`.
 - **Admin (server side)**: sellers/admins manage their own channels, plans, codes, broadcasts.
 - `/broadcast <text>` sends a message to a seller's customers (admin: all users).
-- Owner/admin approve refunds and payouts from the bot: `/refundapprove <id>`, `/payoutapprove <id>` (approve only — transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation).
+- Refunds and payouts are **approve-only from the bot**: `/refundapprove <id>` and `/payoutapprove <id>` approve a pending request; the bot never moves money. Transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation.
 
 ### Channel management (multi-channel)
 - `/channels` — list known channels.
@@ -104,6 +104,13 @@ omit dependencies or shrink the binary (all crates stay compiled); dropping
 unused dependencies is a deferred cross-rung follow-up. A movie-only install
 builds with `cargo build --no-default-features --features movie_bot`; changing
 capabilities means rebuilding and redeploying.
+
+Only `shop_bot` has a live vertical — a real inbound command and dialogue tree.
+The other six types (`movie_bot`, `reply_bot`, `file_share`, `web_app`, `service`,
+`automation`) are build-time registration types only: inbound updates to a bot
+of one of these types return an explicit "not available" notice (`VerticalStub`)
+instead of running a product. They are not shipped products.
+
 Message moderation uses an owner floor, seller "Blocked words", and per-bot
 overrides — set at least one floor term before enabling it. Full guide:
 [docs/MULTIBOT_FOUNDATION.md](docs/MULTIBOT_FOUNDATION.md).
@@ -186,7 +193,6 @@ see [docs/DEPLOY_PROFILES.md](docs/DEPLOY_PROFILES.md).
 See `docs/` and root MD files:
 - `PLAN.md` — product vision & roadmap.
 - `ARCHITECTURE.md` — system design.
-- `AGENT.md` — AI agent instructions.
 - `docs/COMMANDS.md` — command reference.
 - `docs/SETUP.md` — setup guide.
 - `docs/MULTI_BOT.md` — running several bot tokens in one instance.
