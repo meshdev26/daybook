@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS invoices (
 -- Decision 3.1: 'failed' is never terminal once money was confirmed paid.
 -- The trigger is declared here (it only reads the pre-existing `status`
 -- column, so it is safe to create on a legacy DB during init_schema) and
--- mirrored in Db::migrate_money_safety for completeness. L8 owns the audit
+-- mirrored in Db::migrate_money_safety for completeness. The server implementation owns the audit
 -- event `invoice_failed_after_paid_blocked`; the DB owns the hard refusal.
 CREATE TRIGGER IF NOT EXISTS trg_invoice_no_failed_after_paid
 BEFORE UPDATE ON invoices
@@ -635,12 +635,12 @@ CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id)
 -- cascades its local overrides and nulls the optional reference on appeals
 -- and decisions so the append-only audit trail survives bot deletion.
 --
--- PRIVACY CONTRACT (L10 floor): these tables hold policy TERMS and OPAQUE
+-- PRIVACY CONTRACT (security floor): these tables hold policy TERMS and OPAQUE
 -- references only. There is deliberately NO message-content column.
 -- `message_ref` is an opaque caller token (e.g. "c:123/m:456"); `reason` is
 -- the short appeal justification / decision code, never the filtered body.
 -- Length caps are enforced in the Db write methods as a second line of
--- defence. Do not add a content column here without an L10 review.
+-- defence. Do not add a content column here without a security review.
 -- ===========================================================================
 
 -- (a) Owner-enforced GLOBAL content-policy floor. Unlike every other table in
@@ -720,7 +720,7 @@ CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(sell
 CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id);
 
 -- Appeal review queue for the console (end-user conversation is bot-side,
--- L8). `decision_id` is an opaque link back to the audited decision.
+-- server implementation). `decision_id` is an opaque link back to the audited decision.
 CREATE TABLE IF NOT EXISTS moderation_appeals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id    INTEGER NOT NULL,
@@ -736,7 +736,7 @@ CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_i
 CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id);
 
 -- Appeal dedup is enforced by the DB, not by the handler's check-then-insert
--- (L10 LOW: concurrent double-submissions could create duplicate rows).
+-- (LOW (security): concurrent double-submissions could create duplicate rows).
 -- COALESCE(bot_id, 0) folds the bot-less queue into the same key; bot ids are
 -- AUTOINCREMENT so 0 is never a real bot. The cleanup MUST precede the index
 -- creation: init_schema() executes this file before Db::migrate(), so an
