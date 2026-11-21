@@ -141,11 +141,18 @@ pub(super) const APP_JS: &str = r#"(function () {
         if (!o.value || !o.getAttribute('data-type')) return;
         o.hidden = !!t && o.getAttribute('data-type') !== t;
       });
-      Array.prototype.forEach.call(prodSel.querySelectorAll('optgroup'), function (g) {
-        var any = false;
-        Array.prototype.forEach.call(g.options, function (o) { if (!o.hidden) any = true; });
-        g.disabled = !!t && !any;
-      });
+      var groups = prodSel.querySelectorAll('optgroup');
+      if (groups && typeof groups.length === 'number' &&
+          (typeof NodeList === 'undefined' || groups instanceof NodeList)) {
+        Array.prototype.forEach.call(groups, function (g) {
+          if (!g || typeof g.querySelectorAll !== 'function') return;
+          var any = false;
+          // Each g is an optgroup; only <select> exposes an `options`
+          // collection, so enumerate its descendant <option> elements.
+          Array.prototype.forEach.call(g.querySelectorAll('option'), function (o) { if (!o.hidden) any = true; });
+          g.disabled = !!t && !any;
+        });
+      }
       var chosen = prodSel.options[prodSel.selectedIndex];
       if (t && chosen && chosen.hidden) prodSel.value = '';
     }

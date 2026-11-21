@@ -899,3 +899,48 @@ async fn rail_scroll_memory_is_desktop_only_and_native_history_is_untouched() {
         "back/forward scroll must stay native (no scrollRestoration access)"
     );
 }
+
+/// Regression: an <optgroup> has no `.options` property (only <select> does).
+/// Iterating `g.options` threw inside the top-level product-filter IIFE and
+/// aborted the whole deferred script, silently preventing the later theme,
+/// per-URL window-scroll and rail-scroll IIFEs from ever running — which is why
+/// sidebar scroll memory never worked. Pin the valid option collection and the
+/// presence of all six top-level IIFEs so a future crash cannot drop them.
+#[test]
+fn app_js_optgroup_iteration_does_not_abort_later_iifes() {
+    let js = super::super::html::APP_JS;
+
+    // The optgroup loop must enumerate real <option> elements, never the
+    // nonexistent `.options` collection on HTMLOptGroupElement.
+    assert!(
+        js.contains("g.querySelectorAll('option')") || js.contains("g.children"),
+        "optgroup loop must use querySelectorAll('option') or g.children: {js}"
+    );
+    assert!(
+        !js.contains("forEach.call(g.options"),
+        "optgroup loop must never iterate g.options (optgroups have no such property): {js}"
+    );
+
+    // All six APP_JS IIFEs must ship. Losing any of the later ones was the
+    // silent consequence of the top-level throw above.
+    for marker in [
+        ".secret-toggle",       // IIFE 1: secret reveal + focus-on-load
+        "tg.sidebar.groups.v1", // IIFE 2: sidebar group open/closed state
+        "scope-type",           // IIFE 3: product/type facet (the fixed loop)
+        "theme-toggle",         // IIFE 4: mirror resolved theme onto controls
+        "tg.scroll.v1",         // IIFE 5: per-URL window scroll memory
+        "tg.rail.scroll.v1",    // IIFE 6: desktop rail scroll memory
+    ] {
+        assert!(js.contains(marker), "missing APP_JS IIFE marker `{marker}`");
+    }
+    // Six top-level IIFEs (a nested navigation-type probe is indented). New
+    // IIFEs are fine; dropping one is not.
+    let top_level = js
+        .lines()
+        .filter(|line| line.starts_with("(function () {"))
+        .count();
+    assert!(
+        top_level >= 6,
+        "expected all six APP_JS IIFEs, got {top_level}"
+    );
+}
