@@ -241,17 +241,17 @@ fn content_policy_body(
 ) -> String {
     let terms = state.db.list_moderation_global_floor();
     let rows = if terms.is_empty() {
-        r#"<li class="empty"><b>No floor terms yet.</b> Add a word to set the minimum every shop and bot must follow.</li>"#.to_string()
+        r#"<li class="empty"><b>No floor terms yet.</b><span class="empty-detail">Add a word to set the minimum every shop and bot must follow.</span></li>"#.to_string()
     } else {
         terms
             .iter()
             .map(|term| {
                 format!(
-                    r#"<li class="mod-row"><span class="mod-term mono">{}</span><span class="badge">{}</span>
-  <form method="post" action="{}" class="inline-form">
+                    r#"<li class="moderation-row"><span class="mod-term mono">{}</span><span class="badge">{}</span>
+  <div class="row-actions"><form method="post" action="{}" class="inline-form">
     <input type="hidden" name="term" value="{}">
     <button type="submit" class="btn btn-sm btn-ghost">Remove</button>
-  </form></li>"#,
+  </form></div></li>"#,
                     esc(&term.term),
                     esc(mode_label(&term.mode)),
                     state.url("/content-policy/remove"),
@@ -273,14 +273,14 @@ fn content_policy_body(
 </article>
 <article class="panel">
   <h3>Add a floor word</h3>
-  <form method="post" action="{add_url}" class="mod-form">
-    <div class="mod-field"><label for="policy-term">Word or phrase</label>
+  <form method="post" action="{add_url}" class="form-row mod-form">
+    <label for="policy-term">Word or phrase
       <input id="policy-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off">
       <span class="help">One word or phrase. Matching ignores case.</span>
-    </div>
-    <div class="mod-field"><label for="policy-mode">How to handle it</label>
+    </label>
+    <label for="policy-mode">How to handle it
       <select id="policy-mode" name="mode" aria-describedby="policy-mode-help">{mode_options}</select>
-    </div>
+    </label>
     <button type="submit" class="btn">{button_label}</button>
   </form>
   {glossary}
@@ -414,7 +414,7 @@ pub(super) async fn content_policy_remove(
 fn blocked_words_rows(state: &WebState, seller_id: i64) -> String {
     let words = state.db.list_blocked_words(seller_id);
     if words.is_empty() {
-        return r#"<li class="empty"><b>No blocked words yet.</b> Add a word to hide it, warn on it, or send matching messages for review.</li>"#.to_string();
+        return r#"<li class="empty"><b>No blocked words yet.</b><span class="empty-detail">Add a word to hide it, warn on it, or send matching messages for review.</span></li>"#.to_string();
     }
     words
         .iter()
@@ -422,17 +422,17 @@ fn blocked_words_rows(state: &WebState, seller_id: i64) -> String {
             let mode_id = format!("blocked-mode-{}", word.id);
             let term = esc(&word.term);
             format!(
-                r#"<li class="mod-row"><span class="mod-term mono">{term}</span>
-  <form method="post" action="{mode_url}" class="mod-row-form">
+                r#"<li class="moderation-row"><span class="mod-term mono">{term}</span>
+  <form method="post" action="{mode_url}" class="inline-form">
     <input type="hidden" name="term" value="{term}">
     <label class="sr-only" for="{mode_id}">How to handle {term}</label>
     <select id="{mode_id}" name="mode" aria-describedby="blocked-mode-help">{options}</select>
     <button type="submit" class="btn btn-sm btn-secondary">Update</button>
   </form>
-  <form method="post" action="{remove_url}" class="inline-form">
+  <div class="row-actions"><form method="post" action="{remove_url}" class="inline-form">
     <input type="hidden" name="term" value="{term}">
     <button type="submit" class="btn btn-sm btn-ghost">Remove</button>
-  </form></li>"#,
+  </form></div></li>"#,
                 term = term,
                 mode_url = state.url("/blocked-words/mode"),
                 mode_id = mode_id,
@@ -447,18 +447,18 @@ fn blocked_words_rows(state: &WebState, seller_id: i64) -> String {
 fn allow_words_rows(state: &WebState, seller_id: i64) -> String {
     let words = state.db.list_allow_words(seller_id);
     if words.is_empty() {
-        return r#"<li class="empty"><b>No allowed words yet.</b> Add one if a word is being caught by mistake.</li>"#.to_string();
+        return r#"<li class="empty"><b>No allowed words yet.</b><span class="empty-detail">Add one if a word is being caught by mistake.</span></li>"#.to_string();
     }
     words
         .iter()
         .map(|word| {
             let term = esc(&word.term);
             format!(
-                r#"<li class="mod-row"><span class="mod-term mono">{term}</span>
-  <form method="post" action="{remove_url}" class="inline-form">
+                r#"<li class="moderation-row"><span class="mod-term mono">{term}</span>
+  <div class="row-actions"><form method="post" action="{remove_url}" class="inline-form">
     <input type="hidden" name="term" value="{term}">
     <button type="submit" class="btn btn-sm btn-ghost">Remove</button>
-  </form></li>"#,
+  </form></div></li>"#,
                 term = term,
                 remove_url = state.url("/blocked-words/allow/remove"),
             )
@@ -473,7 +473,7 @@ fn allow_words_rows(state: &WebState, seller_id: i64) -> String {
 fn appeals_section(state: &WebState, seller_id: i64) -> String {
     let appeals = state.db.list_moderation_appeals(seller_id, None);
     let rows = if appeals.is_empty() {
-        r#"<li class="empty"><b>No review requests yet.</b> Requests from your bots appear here with their status.</li>"#.to_string()
+        r#"<li class="empty"><b>No review requests yet.</b><span class="empty-detail">Requests from your bots appear here with their status.</span></li>"#.to_string()
     } else {
         appeals
             .iter()
@@ -487,20 +487,20 @@ fn appeals_section(state: &WebState, seller_id: i64) -> String {
                     appeal.id, bot_note
                 );
                 let mut row = format!(
-                    r#"<li class="mod-row">{}{}"#,
+                    r#"<li class="moderation-row">{}{}"#,
                     appeal_status_badge(&appeal.status),
                     request
                 );
                 if appeal.status == "pending" {
                     row.push_str(&format!(
-                        r#"<form method="post" action="{url}" class="mod-row-form">
+                        r#"<div class="row-actions"><form method="post" action="{url}" class="inline-form">
   <input type="hidden" name="appeal_id" value="{id}">
   <label class="sr-only" for="appeal-status-{id}">Decision for request #{id}</label>
   <select id="appeal-status-{id}" name="status">
     <option value="approved">Approved</option><option value="upheld">Upheld</option>
   </select>
   <button type="submit" class="btn btn-sm btn-secondary">Save decision</button>
-</form>"#,
+</form></div>"#,
                         url = state.url("/blocked-words/appeal/status"),
                         id = appeal.id
                     ));
@@ -541,14 +541,14 @@ fn blocked_words_body(
 </article>
 <article class="panel">
   <h3>Add a word</h3>
-  <form method="post" action="{add_url}" class="mod-form">
-    <div class="mod-field"><label for="blocked-term">Word or phrase</label>
+  <form method="post" action="{add_url}" class="form-row mod-form">
+    <label for="blocked-term">Word or phrase
       <input id="blocked-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off">
       <span class="help">One word or phrase. Matching ignores case.</span>
-    </div>
-    <div class="mod-field"><label for="blocked-mode-new">How to handle it</label>
+    </label>
+    <label for="blocked-mode-new">How to handle it
       <select id="blocked-mode-new" name="mode" aria-describedby="blocked-mode-help">{mode_options}</select>
-    </div>
+    </label>
     <button type="submit" class="btn">{button_label}</button>
   </form>
   {glossary}
@@ -557,10 +557,10 @@ fn blocked_words_body(
 <article class="panel">
   <h3>Always allow</h3>
   <p class="help">Words here are never filtered for your shop, even if a blocked word matches. The owner's floor still applies.</p>
-  <form method="post" action="{allow_url}" class="mod-form">
-    <div class="mod-field"><label for="allow-term">Allowed word or phrase</label>
+  <form method="post" action="{allow_url}" class="form-row mod-form">
+    <label for="allow-term">Allowed word or phrase
       <input id="allow-term" type="text" name="term" value="{allow_term}" maxlength="{max_len}" required autocomplete="off">
-    </div>
+    </label>
     <button type="submit" class="btn">Add an allowed word</button>
   </form>
   <ul class="rows">{allow_rows}</ul>
@@ -877,17 +877,17 @@ pub(super) fn bot_override_advanced_html(state: &WebState, b: &crate::db::BotRec
             for term in &terms {
                 let mode_id = format!("bot-mod-mode-{}-{}", b.id, term.id);
                 out.push_str(&format!(
-                    r#"<li class="mod-row"><span class="mono">{term}</span>
-  <form method="post" action="{mode_url}" class="mod-row-form">
+                    r#"<li class="moderation-row"><span class="mod-term mono">{term}</span>
+  <form method="post" action="{mode_url}" class="inline-form">
     <input type="hidden" name="term" value="{term}">
     <label class="sr-only" for="{mode_id}">How to handle {term} for this bot</label>
     <select id="{mode_id}" name="mode" aria-describedby="bot-mod-help-{id}">{options}</select>
     <button type="submit" class="btn btn-sm btn-secondary">Update</button>
   </form>
-  <form method="post" action="{remove_url}" class="inline-form">
+  <div class="row-actions"><form method="post" action="{remove_url}" class="inline-form">
     <input type="hidden" name="term" value="{term}">
     <button type="submit" class="btn btn-sm btn-ghost">Remove</button>
-  </form></li>"#,
+  </form></div></li>"#,
                     term = esc(&term.term),
                     mode_url = state.url(&format!("/bots/{}/moderation/mode", b.id)),
                     mode_id = mode_id,

@@ -36,6 +36,78 @@ proptest! {
     }
 }
 
+// ---- UI alignment: global CSS + markup contract (owner screenshot fixes) --
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn console_alignment_utilities_are_served_globally() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    for selector in [
+        ".inline-form { display: flex; align-items: center; gap: 12px",
+        ".inline-form label { display: inline-flex; align-items: center; gap: 8px",
+        ".form-row { display: flex; align-items: flex-end; gap: 12px",
+        ".form-row > label { display: flex; flex-direction: column; gap: 6px",
+        "min-height: 40px",
+        "grid-template-columns: repeat(2, minmax(0, 1fr))",
+        "ul.recovery-codes > li",
+        "ul.moderation-row, .panel ul.moderation-row {",
+        "grid-template-columns: minmax(0, 1fr) auto auto",
+        ".moderation-row > .row-actions",
+        ".filter-bar { display: flex; flex-direction: column; gap: 12px",
+        ".empty .empty-detail { display: block",
+    ] {
+        assert!(css.contains(selector), "missing `{selector}` in app.css");
+    }
+    // Mobile: grids stack; ≥44px moderation targets stay intact.
+    assert!(
+        css.contains("grid-template-columns: 1fr; justify-items: stretch"),
+        "{css}"
+    );
+    assert!(
+        css.contains(".moderation-row button { min-height: 44px"),
+        "{css}"
+    );
+}
+
+#[test]
+fn recovery_codes_render_as_escaped_compact_chips() {
+    let codes = vec!["AB12-CD34".to_owned(), "<b>&\"x".to_owned()];
+    let html = super::super::mfa_users::recovery_codes_html(&codes);
+    assert_eq!(html.matches("<li><code class=\"copyable\">").count(), 2);
+    assert!(html.contains("AB12-CD34"), "{html}");
+    assert!(html.contains("&lt;b&gt;&amp;&quot;x"), "{html}");
+    assert!(!html.contains("<b>"), "{html}");
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn customers_filter_form_uses_spaced_inline_utilities() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/customers", &owner)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains(r#"<div class="filter-bar">"#), "{body}");
+    assert!(
+        body.contains(r#"<form method="get" action="/customers" class="inline-form">"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<label for="customer-tag">Tag"#), "{body}");
+    assert!(
+        body.contains(r#"<label for="customer-search">Search"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<nav aria-label="Filter customers by status" class="inline-form">"#),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 #[tracing::instrument(skip_all)]
 async fn unauth_dashboard_redirects_to_login() {

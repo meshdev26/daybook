@@ -3,6 +3,17 @@ use super::*;
 
 // ---------- MFA / TOTP ----------
 
+/// One markup contract for freshly issued recovery codes: a compact,
+/// two-column chip grid (`.recovery-codes`), escape every code. Shared by the
+/// post-enroll page and the settings rotation banner.
+pub(super) fn recovery_codes_html(codes: &[String]) -> String {
+    codes
+        .iter()
+        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 pub(super) fn pending_from_headers(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -243,14 +254,10 @@ pub(super) async fn mfa_enroll_submit(
         None,
     ));
     let token = state.db.create_web_session(id, &role, seller_id, 7);
-    let codes_html = plain
-        .iter()
-        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
-        .collect::<Vec<_>>()
-        .join("");
+    let codes_html = recovery_codes_html(&plain);
     let body = format!(
         r#"<h1>MFA enabled</h1><div class="alert alert-warn" role="status" aria-live="polite">Save these recovery codes; they will not be shown again.</div>
-<ul>{}</ul>
+<ul class="recovery-codes" aria-label="Recovery codes">{}</ul>
 <p><a href="{}">Continue to dashboard</a></p>"#,
         codes_html,
         state.url("/dashboard")
@@ -581,13 +588,9 @@ pub(super) async fn settings_mfa_recovery(
     // replace existing recovery codes only
     let _ = state.db.delete_recovery_codes(session.account_id);
     let _ = state.db.create_recovery_codes(session.account_id, hashed);
-    let codes_html = plain
-        .iter()
-        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
-        .collect::<Vec<_>>()
-        .join("");
+    let codes_html = recovery_codes_html(&plain);
     let body = format!(
-        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once):<ul>{}</ul></div>"#,
+        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once):<ul class="recovery-codes" aria-label="New recovery codes">{}</ul></div>"#,
         codes_html
     );
     Html(html_page(&state, Some(&session), "Settings", &body)).into_response()

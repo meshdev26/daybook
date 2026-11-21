@@ -828,3 +828,33 @@ async fn empty_floor_warning_is_rendered_on_both_moderation_pages() {
         );
     }
 }
+
+/// Alignment fixes: add forms share the `.form-row` label-above-field row,
+/// word rows share the `.moderation-row` grid (actions in column 3), and the
+/// request-review empty state is two lines instead of a run-on sentence.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+async fn blocked_words_uses_shared_alignment_utilities() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    state.db.add_blocked_word(0, "spamword", "warn", true);
+    let app = router(state);
+    let resp = app
+        .oneshot(authed_req("/blocked-words", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains(r#"class="form-row mod-form""#), "{body}");
+    assert!(body.contains(r#"class="moderation-row""#), "{body}");
+    assert!(body.contains(r#"class="row-actions""#), "{body}");
+    assert!(body.contains("No review requests yet."), "{body}");
+    assert!(
+        body.contains(r#"<span class="empty-detail">Requests from your bots"#),
+        "{body}"
+    );
+    assert!(!body.contains(r#"class="mod-row""#), "{body}");
+    // The mode select keeps its accessible name and Update stay in one form.
+    assert!(body.contains("How to handle spamword"), "{body}");
+    assert!(body.contains("blocked-mode-help"), "{body}");
+}

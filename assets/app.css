@@ -356,7 +356,24 @@ form button[type="submit"] { margin-top: 16px; }
 .help-more { margin: 2px 0 0; }
 .help-more summary { padding: 2px 0; font-size: 12px; font-weight: 500; color: var(--ink-3); }
 .help-more[open] summary { margin-bottom: 4px; }
-.form-row { display: grid; gap: 0 16px; grid-template-columns: 1fr 1fr; }
+/* Shared label-above-field row: fields align on their bottom edges and the
+ * action sits with them instead of floating on its own line. Legacy two-column
+ * grids (setup, AI settings) use direct <div> children — flex:1 keeps their
+ * equal-width rhythm; a direct <label> stacks its caption over the control. */
+.form-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.form-row > div { flex: 1 1 240px; min-width: 0; }
+.form-row > label { display: flex; flex-direction: column; gap: 6px; flex: 1 1 220px; min-width: 0; margin: 0; }
+.form-row > button[type="submit"] { margin-top: 0; }
+/* One control-height baseline for inline + stacked forms. Checkboxes, radios
+ * and hidden inputs keep intrinsic sizing; :where() keeps this weaker than the
+ * shipped 44px touch-target rules (alert-form, moderation, product scope). */
+input:where(:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])),
+select,
+.form-row input:where(:not([type="checkbox"])),
+.form-row select { min-height: 40px; }
+.rail select { min-height: 0; } /* compact rail; .product-scope reasserts 44px */
+/* Filter form + status chips are one bar with a real gap between the two. */
+.filter-bar { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
 /* Compact numeric entry inside table rows and inline forms. */
 .input-num { width: 4.5em; min-width: 4.5em; margin-top: 0; }
 
@@ -448,6 +465,24 @@ article ul li:last-child, .panel ul li:last-child, .rows li:last-child { border-
   font-size: 12.5px;
 }
 .mono { font-family: var(--font-data); font-size: 13px; }
+/* ---- one-time recovery codes: compact two-column chip grid ----------------
+ * The ledger row rule above (`.panel ul li`: flex, dividers, padding) would
+ * give every code its own full-width row on the bare enroll page. These rules
+ * come after it and carry equal-or-higher specificity to opt out of that
+ * rhythm; the chip surface itself reuses the shipped `code` token pairing. */
+.recovery-codes, .panel ul.recovery-codes {
+  list-style: none; padding: 0; margin: 0 0 14px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px; align-self: stretch; width: 100%;
+}
+ul.recovery-codes > li, .panel ul.recovery-codes > li {
+  display: block; padding: 0; border-bottom: 0; font-size: inherit; min-width: 0;
+}
+.recovery-codes code.copyable {
+  display: block; margin: 0; padding: 7px 10px;
+  font-size: 12.5px; text-align: center;
+  overflow-wrap: anywhere; word-break: break-all;
+}
 /* ---- metric card (.stat) -------------------------------------------------- */
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat-value {
@@ -535,6 +570,9 @@ td.actions { text-align: right; }
 .empty b { display: block; color: var(--ink); font-size: 14.5px; margin-bottom: 4px; }
 li.empty { text-align: left; padding: 14px 2px; }
 li.empty b { display: inline; margin-right: 8px; }
+/* Two-line empty states: headline, then detail on its own line with breathing
+ * room (the inline <b> above must not run into the explanation). */
+.empty .empty-detail { display: block; margin-top: 4px; }
 
 /* ---- setup steps --------------------------------------------------------------------- */
 details { border: 1px solid var(--line); border-radius: var(--radius-ctl); background: var(--surface-2); }
@@ -573,7 +611,11 @@ details > article.panel {
   margin-bottom: 16px;
 }
 .grid-stats .panel { margin-bottom: 0; }
-.inline-form { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; vertical-align: middle; }
+/* Shared inline controls: one gap between fields, one gap between a caption
+ * and its input. Existing cart/subs/codes/nav forms keep their flex behaviour;
+ * .alert-form reasserts its tighter 8px gap further down. */
+.inline-form { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.inline-form label { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 .inline-form input:not([type="hidden"]) { width: auto; min-width: 10rem; }
 /* ---- bot cards (Bot management v2) ---------------------------------------- */
 /* Collapsed accordion cards (MANAGEMENT_DISCLOSURE_SPEC §2): the summary is
@@ -656,7 +698,9 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   .rail nav { display: flex; flex-wrap: wrap; gap: 2px; }
   .rail .foot { margin: 0 0 0 auto; padding: 0; border: none; }
   .main { padding: 20px 16px 48px; }
-  .form-row { grid-template-columns: 1fr; }
+  /* Shared rows stack full-width at the drawer breakpoint (375px included). */
+  .form-row { flex-direction: column; align-items: stretch; }
+  .form-row > label, .form-row > div { flex: 1 1 auto; width: 100%; }
   .rail .bot-scope {
     flex-direction: row; align-items: center;
     flex: 1 1 100%; gap: 8px;
@@ -706,15 +750,36 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
 .mod-form .mod-field { flex: 1 1 220px; }
 .mod-form .mod-field select { flex: 1 1 180px; }
 .mod-row-form, .moderation-override .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Shared word/appeal row: term | mode form | actions. The .panel ul li ledger
+ * rule above is why the selector carries a class on the `ul` child token —
+ * grid must win over the generic flex row. Actions always occupy column 3,
+ * even on two-cell rows (allowed words), so they line up down the list. */
+ul.moderation-row, .panel ul.moderation-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center; gap: 12px;
+}
+.moderation-row > .row-actions {
+  grid-column: 3; display: flex; gap: 8px; align-items: center;
+  justify-content: flex-end; margin-left: 0;
+}
+.moderation-row select { width: auto; min-width: 8rem; max-width: 100%; }
 /* ≥44px targets at every viewport (spec §8), including mode selects and the
  * single primary action on each moderation screen. */
 .mod-form input[type="text"], .mod-form select, .mod-form button,
 .mod-row select, .mod-row button, .moderation-override input[type="text"],
-.moderation-override select, .moderation-override button { min-height: 44px; }
+.moderation-override select, .moderation-override button,
+.moderation-row select, .moderation-row button { min-height: 44px; }
 @media (max-width: 900px) {
   .mod-form .mod-field, .mod-form select, .mod-form button { flex: 1 1 100%; width: 100%; }
   .mod-row, .mod-row-form, .moderation-override .inline-form {
     flex-direction: column; align-items: stretch; width: 100%;
   }
   .moderation-override .btn { width: 100%; }
+  /* Stack the row grid cleanly: no side-by-side select/actions, no overflow. */
+  ul.moderation-row, .panel ul.moderation-row {
+    grid-template-columns: 1fr; justify-items: stretch; gap: 8px;
+  }
+  .moderation-row > .row-actions { grid-column: auto; justify-content: flex-start; }
+  .moderation-row .inline-form { width: 100%; }
+  .moderation-row select { width: 100%; }
 }

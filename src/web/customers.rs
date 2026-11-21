@@ -112,11 +112,11 @@ pub(super) async fn customers_page(
     // Enter still submits the form (implicit submission) — the old ghost
     // Filter button is gone because the chips are the links.
     let filter_form = format!(
-        r#"<form method="get" action="{}" class="inline-form">
-<label>Tag <input name="tag" value="{}"></label>
-<label>Search <input name="q" value="{}"></label>
+        r#"<div class="filter-bar"><form method="get" action="{}" class="inline-form">
+<label for="customer-tag">Tag <input id="customer-tag" name="tag" value="{}"></label>
+<label for="customer-search">Search <input id="customer-search" name="q" value="{}"></label>
 </form>
-{}"#,
+{}</div>"#,
         state.url("/customers"),
         esc(&tag_val),
         esc(&q_val),
