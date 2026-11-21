@@ -49,7 +49,9 @@ cargo deny check
 - Use `channel_of(db, cfg, Some(seller_id))` for per-seller channels.
 - Log via `tracing`; never log secrets.
 - UI action placement follows `DESIGN.md` §1 *Action placement* (primary bottom-left, row actions flush right, destructive last).
-- Comments explain the non-obvious WHY (max 2 lines; module `//!` ≤5). No spec IDs, WCAG numbers, finding IDs, workflow labels, attack-scenario prose, or CSS specificity math — those live in `DESIGN.md`, specs, or test names. Prefer a name over a comment; section headers only for real invariants.
+- Comments explain the non-obvious WHY (≤ 2 lines; `//!` ≤ 5; `///` = summary + contract), never WHAT or a restatement of the signature. Prefer a name over a comment; section headers only for real invariants.
+- No spec IDs, WCAG numbers, finding IDs, workflow labels, attack-scenario prose, specificity math, emoji, banners, TODO walls, or commented-out code in source comments — those live in `DESIGN.md`, specs, test names, or the commit message.
+- Keep comments true: update or delete them in the same diff as the code they describe. Don't accept code you can't explain.
 
 ## 4. Adding a feature
 1. Update `schema.sql` + `Db::migrate`.

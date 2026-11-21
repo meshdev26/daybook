@@ -137,6 +137,10 @@ whole console follows. The operator console layout: left rail + ledger-style
 tables; setup and sign-in use the focused front-door shell.
 
 ## Comment style
-Code comments follow `AGENT.md` §3, the source of truth: keep them short and
-explain the non-obvious why. UI and CSS rationale belongs here or in the specs,
-not inline in source files; prefer a clear name over a comment.
+
+`AGENT.md` §3 is the source of truth: comments carry the non-obvious why, names
+carry the what. Keep them short and true; delete anything that restates the code.
+Reject in review: play-by-play narration, doc comments echoing the signature,
+spec/finding IDs or attack prose in source, emoji/banners, TODO walls, dead code —
+rename, refactor, or move the content to a spec or the commit message.
+UI/CSS rationale lives here, not inline.
