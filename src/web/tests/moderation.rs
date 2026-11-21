@@ -15,9 +15,7 @@ async fn buyer_session(state: &WebState) -> String {
     state.db.create_web_session(id, "user", None, 7)
 }
 
-/// Admin sessions deliberately vary by seller binding: the security LOW finding
-/// was that an admin WITHOUT one got a 403 on Blocked words even though Admin
-/// outranks Seller. Both variants share one helper; username stays UNIQUE.
+/// Both seller-bound and unbound admin sessions share this helper; username stays UNIQUE.
 async fn admin_session(state: &WebState, username: &str, seller_id: Option<i64>) -> String {
     state
         .db
