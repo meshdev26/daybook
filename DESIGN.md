@@ -135,3 +135,8 @@ The tokens live in `assets/app.css` (served from the binary — no CDN). Light i
 the default; `[data-theme="dark"]` mirrors it. Change the tokens there, and the
 whole console follows. The operator console layout: left rail + ledger-style
 tables; setup and sign-in use the focused front-door shell.
+
+## Comment style
+Code comments follow `AGENT.md` §3, the source of truth: keep them short and
+explain the non-obvious why. UI and CSS rationale belongs here or in the specs,
+not inline in source files; prefer a clear name over a comment.
