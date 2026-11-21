@@ -748,7 +748,7 @@ async fn nav_scroll_memory_js_and_shell_markup_unchanged() {
     ] {
         assert!(js.contains(needle), "missing `{needle}` in APP_JS");
     }
-    // NOTE: the L6-mandated snippet mentions `scrollRestoration` in a comment,
+    // NOTE: the mandated snippet mentions `scrollRestoration` in a comment,
     // so a literal `!js.contains("scrollRestoration")` cannot pass. Assert the
     // actual invariant instead: the property is never read or assigned, so
     // back/forward scroll stays native.
