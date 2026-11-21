@@ -194,7 +194,7 @@ async fn retry_ungranted_grant(
     db.subscription_exists_for_invoice(inv_id)
 }
 
-/// Security headers on every response of the merged router (L10). All values
+/// Security headers on every response of the merged router (security). All values
 /// are static, so `HeaderValue::from_static` is valid for each. Applied
 /// outside the request-timeout layer so aborted requests still carry them;
 /// the metrics layer stays outermost so those responses are still counted.
@@ -257,7 +257,7 @@ async fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    // Pin the metrics uptime gauge to process start (L8 observability).
+    // Pin the metrics uptime gauge to process start (server observability).
     metrics::note_process_start();
 
     let app_cfg = AppConfig::from_env();
@@ -800,7 +800,7 @@ async fn run() {
                                     "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
                                     l, sub_id
                                 );
-                                // L10 outbound gate before this raw-Bot DM (the
+                                // security outbound gate before this raw-Bot DM (the
                                 // grant itself is already durable and finalizes
                                 // below; only the notice is skipped while held).
                                 if crate::handlers::moderation::gate_outbound(
@@ -834,7 +834,7 @@ async fn run() {
                                 // never propagated: the sweeper/granter must not
                                 // die on a send error.
                                 let notice = "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.";
-                                // L10 outbound gate before this raw-Bot DM.
+                                // security outbound gate before this raw-Bot DM.
                                 if crate::handlers::moderation::gate_outbound(
                                     &db_bg,
                                     seller_id,
@@ -893,7 +893,7 @@ async fn run() {
                     // a channel owned by another bot.
                     let bot_ctx = bm_bg.for_channel(&chat_id);
                     let bot = bot_ctx.bot.clone();
-                    // L10 outbound gate before this raw-Bot scheduled send.
+                    // security outbound gate before this raw-Bot scheduled send.
                     // Seller scope is the row's own seller (owner-scheduled
                     // posts carry 0 → global floor). A held post stays due so
                     // a later policy change can release it; the gate already
@@ -923,7 +923,7 @@ async fn run() {
                                 "bot",
                             );
                             tracing::info!("scheduled post {} posted", id);
-                            // Metrics hook only (L8): bot_messages_sent_total.
+                            // Metrics hook only (server): bot_messages_sent_total.
                             metrics::bot_sent();
                         }
                         Err(e) => {
@@ -976,7 +976,7 @@ async fn run() {
                     let notice = format!(
                         "Your access to {channel} has expired. To renew, use /plans or contact the seller."
                     );
-                    // L10 outbound gate before this raw-Bot DM. The expiry
+                    // security outbound gate before this raw-Bot DM. The expiry
                     // transition is already durable; only the notice is
                     // skipped while held.
                     if crate::handlers::moderation::gate_outbound(
@@ -1028,7 +1028,7 @@ async fn run() {
                     let notice = format!(
                         "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
                     );
-                    // L10 outbound gate before this raw-Bot DM. The hold
+                    // security outbound gate before this raw-Bot DM. The hold
                     // release is already durable; only the notice is skipped
                     // while held.
                     if crate::handlers::moderation::gate_outbound(
@@ -1325,7 +1325,7 @@ async fn run() {
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
-                // Multibot capability gate (L8). The receiving bot's `bot_type`
+                // Multibot capability gate (server). The receiving bot's `bot_type`
                 // selects its command set / inbound handler. Only `shop_bot`
                 // (the default) falls through to the unchanged built-in tree
                 // below, so the default build's paths stay byte-identical.
@@ -1353,7 +1353,7 @@ async fn run() {
                     ),
                 )
                 // End-user appeal reason collection (multibot foundation
-                // Step 4.4, L8). This branch runs BEFORE the inbound
+                // Step 4.4, server). This branch runs BEFORE the inbound
                 // moderation gate so the buyer's short reason is not itself
                 // held by a blocked term. Reachable only from the single
                 // "Request review" callback, which stores the decision's
@@ -1623,12 +1623,12 @@ async fn run() {
         web_router
             .merge(api_router)
             .merge(mcp::router(web_state))
-            // 30s request ceiling for the whole control plane (L8). The bot
+            // 30s request ceiling for the whole control plane (server). The bot
             // long-poll never passes through axum and the cryptopay webhook
             // is two DB writes, so nothing legitimate needs longer (see
             // web::REQUEST_TIMEOUT).
             .layer(axum::middleware::from_fn(web::request_timeout))
-            // Security headers on every response (L10): outside the timeout
+            // Security headers on every response (security): outside the timeout
             // layer so aborted requests still carry them; metrics below stays
             // outermost so those responses are still counted.
             .layer(axum::middleware::from_fn(security_headers))

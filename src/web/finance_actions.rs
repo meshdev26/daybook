@@ -716,7 +716,7 @@ async fn finance_refund_finalize(
     if let Some(inv) = invoice_id.as_deref() {
         // §1.3: only a FULL refund settles the invoice and revokes access.
         // A partial refund leaves the invoice paid with no kick; this is the
-        // same read-only decision L8's REST execute uses.
+        // same read-only decision the server's REST execute uses.
         if !is_full_refund(&state.db, inv) {
             return (false, false);
         }
@@ -872,10 +872,10 @@ pub(super) struct FinanceReconciliationResolveForm {
 }
 
 /// §5.3 owner resolution of one `needs_reconciliation` row. The web surface
-/// used here is a plain POST form (no JS, no inline secrets) over L9's
+/// used here is a plain POST form (no JS, no inline secrets) over core's
 /// append-only DB CAS. A non-empty reason is mandatory at both layers, and
 /// "executed" for a refund is the manual-settlement path, so it also gets the
-/// §2 creator-separation check. Auditing mirrors L8's REST endpoint.
+/// §2 creator-separation check. Auditing mirrors the server's REST endpoint.
 #[tracing::instrument(skip_all)]
 pub(super) async fn finance_reconciliation_resolve(
     State(state): State<WebState>,

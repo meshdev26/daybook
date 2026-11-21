@@ -1,6 +1,6 @@
 // Moderation capability pages (IA amendment §4, foundation plan Step 4.3).
 // Web-surface coverage only: gates, tenancy, states, and feature packaging.
-// The data-layer precedence resolver is L9's unit-test territory.
+// The data-layer precedence resolver is core's unit-test territory.
 use super::*;
 use axum::http::StatusCode;
 use tower::ServiceExt;
@@ -15,7 +15,7 @@ async fn buyer_session(state: &WebState) -> String {
     state.db.create_web_session(id, "user", None, 7)
 }
 
-/// Admin sessions deliberately vary by seller binding: the L10 LOW finding
+/// Admin sessions deliberately vary by seller binding: the security LOW finding
 /// was that an admin WITHOUT one got a 403 on Blocked words even though Admin
 /// outranks Seller. Both variants share one helper; username stays UNIQUE.
 async fn admin_session(state: &WebState, username: &str, seller_id: Option<i64>) -> String {
@@ -184,7 +184,7 @@ async fn blocked_words_roles_and_forged_seller_ids() {
     assert!(state.db.list_blocked_words(43).is_empty());
 }
 
-/// L10 LOW functional finding: an admin provisioned without a seller id used
+/// security LOW functional finding: an admin provisioned without a seller id used
 /// to get 403 on Blocked words. Admin outranks Seller, so the role gate now
 /// passes; with no seller binding the data scope is the owner's global 0.
 #[cfg(feature = "moderation")]
@@ -489,7 +489,7 @@ async fn blocked_words_states_validation_and_appeal_queue() {
 
 // ---- (c) per-bot override -------------------------------------------------
 
-/// L10 residual gap: a content-bearing console broadcast must be decided by
+/// security residual gap: a content-bearing console broadcast must be decided by
 /// the central outbound gate BEFORE it can hit a Telegram transport. The mock
 /// API server records zero requests on a hold; a clean broadcast still sends.
 #[cfg(feature = "moderation")]

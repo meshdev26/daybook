@@ -4,7 +4,7 @@
 //! hooks. It only ever READS policy through
 //! [`Db::resolve_effective_policy`] — it has no caller path to the owner
 //! floor writers (`add/remove_moderation_global_floor_term`), which stay an
-//! L10 carry-forward. Every decision, including a pass, is appended through
+//! security carry-forward. Every decision, including a pass, is appended through
 //! [`Db::log_moderation_decision`] with an **opaque** message reference and a
 //! short reason code. No message body, username or secret is ever logged or
 //! persisted here: the reference is a one-way hash of the context plus text,
@@ -354,14 +354,14 @@ pub fn evaluate_outbound(
     evaluate_outbound_detailed(db, seller_id, bot_id, text).mode
 }
 
-// ---- End-user appeal flow (multibot foundation plan, Step 4.4, L8) ----
+// ---- End-user appeal flow (multibot foundation plan, Step 4.4, server) ----
 //
 // This is the ONLY buyer-facing moderation surface. It never reads, logs or
 // stores the held message body, a username, or any other content: the inline
 // callback carries the *same opaque reference* that the decision audit wrote,
 // the reason is a short buyer justification, and the appeal row is written
-// through L9's `Db::create_moderation_appeal` with seller/bot scope bound.
-// Nothing here exposes content or presence to a web/console path — L7 owns
+// through core's `Db::create_moderation_appeal` with seller/bot scope bound.
+// Nothing here exposes content or presence to a web/console path — web owns
 // the seller/owner review queue, which shows status only.
 
 use teloxide::{
@@ -412,7 +412,7 @@ pub struct AppealOffer {
     pub decision_id: Option<i64>,
 }
 
-/// Result of a reason submission. `Created` carries the L9 appeal row id.
+/// Result of a reason submission. `Created` carries the core appeal row id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppealOutcome {
     Created(i64),
@@ -443,7 +443,7 @@ pub fn parse_appeal_callback(data: &str) -> Option<&str> {
     is_opaque_ref(reference).then_some(reference)
 }
 
-/// Normalize the buyer's short reason: NUL-filtered, capped at the L9 limit,
+/// Normalize the buyer's short reason: NUL-filtered, capped at the core limit,
 /// trimmed. Empty after cleaning is rejected so an appeal always has a reason.
 pub fn normalize_appeal_reason(reason: &str) -> Option<String> {
     let cleaned: String = reason
@@ -500,7 +500,7 @@ pub fn has_appeal_for_ref(db: &Db, seller_id: i64, bot_id: i64, reference: &str)
         .any(|a| a.message_ref == reference)
 }
 
-/// Write one appeal through L9's method, deduplicated by opaque reference.
+/// Write one appeal through core's method, deduplicated by opaque reference.
 /// Only the scope, the audit's decision id, the opaque ref and the short
 /// reason are passed — there is no body, username, or extra field to store.
 pub fn submit_appeal(
@@ -541,7 +541,7 @@ pub fn appeal_keyboard(reference: &str) -> Option<InlineKeyboardMarkup> {
 }
 
 /// Send one static, content-free line through the central outbound gate. The
-/// gate keeps the L10 "every content-bearing send is gated" invariant; if
+/// gate keeps the security "every content-bearing send is gated" invariant; if
 /// enforcement is degraded or the line is held, the notice is simply omitted
 /// (fail closed) — never the held body.
 pub async fn send_gated_text(

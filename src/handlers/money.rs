@@ -230,7 +230,7 @@ pub fn should_run_digest(now: DateTime<Utc>) -> bool {
     now.hour() == 9 && now.minute() == 0
 }
 
-/// Complete owner view: L9's `reconciliation_rows` returns overdue-relevant
+/// Complete owner view: core's `reconciliation_rows` returns overdue-relevant
 /// rows by injected cutoff; this also folds in every `needs_reconciliation`
 /// refund/payout still inside its 24h window so the owner list and the daily
 /// digest never hide a row simply because it is young. Dedup is by
@@ -394,7 +394,7 @@ pub fn has_audit_action(
 }
 
 /// Sentinel written by legacy `create_refund` rows before the creator columns
-/// existed (L9 migration, `db.rs`). Such rows carry no attributable human in
+/// existed (core migration, `db.rs`). Such rows carry no attributable human in
 /// the persisted columns, so — and only so — do we consult the audit log.
 const LEGACY_CREATOR_ID: i64 = -1;
 const LEGACY_CREATOR_ROLE: &str = "unknown";
@@ -402,7 +402,7 @@ const LEGACY_CREATOR_ROLE: &str = "unknown";
 /// Resolve a refund's human creator (§2 separation of duties).
 ///
 /// The authoritative source is the persisted `created_by`/`created_role`
-/// columns written by `Db::create_refund_guarded` (L9). Unlike a `refund_create`
+/// columns written by `Db::create_refund_guarded` (core). Unlike a `refund_create`
 /// audit event these never age out of the audit window on a mature database,
 /// so a creator cannot escape the separation check simply by waiting long
 /// enough. AUDIT FALLBACK is deliberately narrow: it applies only to legacy

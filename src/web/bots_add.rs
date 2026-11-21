@@ -19,7 +19,7 @@ pub(super) struct BotAddForm {
     pub(super) token_env: String,
 }
 
-// ---------- Bot config wizard (L11) ----------
+// ---------- Bot config wizard (architecture) ----------
 
 static LAST_BOT_SNIPPET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 

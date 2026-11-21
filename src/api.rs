@@ -699,7 +699,7 @@ async fn seller_set_channel(
         .into_response();
     }
     let channel = f.channel.trim().to_string();
-    // Proof of control (L10 BLOCK-3): non-admin callers may only bind a
+    // Proof of control (security BLOCK-3): non-admin callers may only bind a
     // channel they actually control. Admins/owner keep the unvalidated free
     // set — the bootstrap path (first-run channel setup) runs before the bot
     // is a member of any chat, and admin/owner console sessions carry no
@@ -1574,7 +1574,7 @@ async fn codes_delete(
     if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
-    // Real delete via the scoped helper (L8 db.rs addition): sellers delete
+    // Real delete via the scoped helper (server db.rs addition): sellers delete
     // only their own codes, admin/owner any. `seller_scope` yields None for
     // admin/owner and Some(id) for sellers.
     if !state
@@ -1752,7 +1752,7 @@ async fn posts_create(
     // Sends go out as the session's effective bot (seller → their bot, owner →
     // selected bot, admin → their bot with primary fallback).
     let bot = crate::web::effective_bot(&state, &session);
-    // L10 outbound gate BEFORE this raw-Bot send. Seller scope comes from the
+    // security outbound gate BEFORE this raw-Bot send. Seller scope comes from the
     // principal (session), never a global 0, so seller rules apply too.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
@@ -1895,7 +1895,7 @@ async fn posts_update(
     }
     let new_content = f.content.or(f.text);
     if let Some(c) = &new_content {
-        // L10 outbound gate BEFORE the raw-Bot edit. A post edit is a
+        // security outbound gate BEFORE the raw-Bot edit. A post edit is a
         // content-bearing send path like any other; without this call it
         // bypasses the moderation floor that the create/broadcast paths
         // already honour. Seller scope comes from the session principal.
@@ -2046,7 +2046,7 @@ async fn broadcasts(
     let mut sent = 0i64;
     // Broadcasts go out as the session's effective bot.
     let bot = crate::web::effective_bot(&state, &session);
-    // L10 outbound gate BEFORE the raw-Bot broadcast fan-out. One decision
+    // security outbound gate BEFORE the raw-Bot broadcast fan-out. One decision
     // covers every recipient; seller scope comes from the session principal.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
@@ -3057,7 +3057,7 @@ async fn finance_payouts_process(
 /// the transfer-backed execute and reconciliation paths (§1.3). The legacy
 /// `"processed"` status is forbidden: it bypassed the `is_full_refund` guard
 /// and expired the subscription / kicked the buyer even on a PARTIAL refund
-/// (L10 F1). This finalizes money, so it is Owner-only with creator separation
+/// (security F1). This finalizes money, so it is Owner-only with creator separation
 /// just like `finance_refunds_execute` (§2) — an Admin must not be able to
 /// bypass the two-person rule through this path.
 async fn finance_refunds_process(
@@ -3114,7 +3114,7 @@ async fn finance_refunds_process(
     // Finalize the money row as EXECUTED — never the forbidden legacy
     // "processed" status. Side-effects go through the single shared
     // settlement helper so a PARTIAL refund leaves the invoice paid with no
-    // subscription expiry and no channel kick (L10 F1).
+    // subscription expiry and no channel kick (security F1).
     state
         .db
         .update_refund_status_by(id, "executed", Some(session.account_id));
@@ -3788,7 +3788,7 @@ async fn finance_reconciliation_resolve(
             .into_response();
         }
     };
-    // L10 F2: an "executed" resolution of a refund is a manual settlement, so
+    // security F2: an "executed" resolution of a refund is a manual settlement, so
     // the human creator may never resolve their own money row — exactly the
     // gate the web form applies. Both surfaces call the same shared helper in
     // `handlers::money` so they cannot drift.
@@ -4852,7 +4852,7 @@ async fn invoices_claim(
                 .map(|l| l.invite_link);
             if let Some(l) = link {
                 let grant_text = format!("Payment confirmed. Access granted.\nInvite: {}", l);
-                // L10 outbound gate before this raw-Bot DM (the grant row is
+                // security outbound gate before this raw-Bot DM (the grant row is
                 // already durable; only the notice is skipped while held).
                 if crate::handlers::moderation::gate_outbound(
                     &state.db,

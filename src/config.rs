@@ -11,7 +11,7 @@ pub const DEFAULT_BOT_TYPE: &str = "shop_bot";
 
 /// Normalize a configured bot type: an empty/whitespace value cannot name a
 /// capability, so it fails safe to the shop bot default. Checking the value
-/// against compiled-in capabilities is the dispatcher's job (L8), not this
+/// against compiled-in capabilities is the dispatcher's job (server), not this
 /// data-layer normalization.
 pub(crate) fn normalize_bot_type(bot_type: &str) -> &str {
     let trimmed = bot_type.trim();
@@ -39,7 +39,7 @@ pub struct SharedConfig {
     /// Personal-account (MTProto) identity credentials from
     /// `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` (my.telegram.org). Both must be
     /// present for the identity subsystem to offer login; the hash is a
-    /// secret and is never logged (L10 contract, user-identity design §5).
+    /// secret and is never logged (security contract, user-identity design §5).
     pub telegram_api_id: Option<i32>,
     pub telegram_api_hash: Option<String>,
     /// Transitional: primary bot's owner id (Telegram user id), 0 if none.
@@ -269,7 +269,7 @@ fn write_env_file_at(path: &Path, updates: &[(String, String)]) -> Result<PathBu
     Ok(path.to_path_buf())
 }
 
-/// `.env` writer with a PER-CALL managed-key set (L10 F6): every line whose
+/// `.env` writer with a PER-CALL managed-key set (security F6): every line whose
 /// key appears in `keys` is replaced — a `Some` value rewrites the line, a
 /// `None` value drops the line entirely — so re-saving never accumulates
 /// duplicate keys the way the fixed-`SETUP_ENV_KEYS` writer does for keys

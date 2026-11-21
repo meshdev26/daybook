@@ -22,7 +22,7 @@ use teloxide::{
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-// Re-exports preserved after extraction (L11 refactor).
+// Re-exports preserved after extraction (architecture refactor).
 pub use crate::constants::MAX_PLAN_DAYS;
 pub use crate::services::broadcast::filter_broadcast_users;
 
@@ -459,7 +459,7 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, "Usage: /setchannel @channel or id")
                     .await?;
             } else {
-                // Proof of control (L10 BLOCK-3) for non-admin senders: they
+                // Proof of control (security BLOCK-3) for non-admin senders: they
                 // may only bind a channel they actually control (admin of the
                 // chat; the bot a member). Admins/owner keep the unvalidated
                 // bootstrap path.
@@ -486,7 +486,7 @@ pub async fn cmd_handler(
                         return Ok(());
                     }
                 };
-                // L10 outbound content gate BEFORE transport. This is a raw
+                // security outbound content gate BEFORE transport. This is a raw
                 // `Bot::send_message` path (non-ContentSender); the acting
                 // seller is the best available scope, so seller rules apply
                 // alongside the non-overridable global floor.
@@ -3532,7 +3532,7 @@ pub async fn cmd_handler(
                 .or_else(|| Some(arg.trim().to_string()))
                 .filter(|s| !s.is_empty());
             if let Some(c) = ch {
-                // Proof of control (L10 BLOCK-3) on the seller onboarding
+                // Proof of control (security BLOCK-3) on the seller onboarding
                 // path: /setup registers a seller AND binds their channel, so
                 // it gets the same non-admin rules as /setchannel. The sender
                 // is present in this chat by definition, but the CHANNEL must
@@ -4107,7 +4107,7 @@ fn channel_of(db: &Db, _cfg: &SharedConfig, seller_id: Option<i64>, is_admin: bo
 }
 
 /// Resolve the target channel for a channel-scoped command, enforcing seller
-/// tenancy (AUTO_ROUTE.md principle 2: every business entity is
+/// tenancy (multi-tenancy principle: every business entity is
 /// seller-scoped). A seller may only target their OWN `seller_channel` —
 /// never an arbitrary `@channel` or numeric id the bot happens to be a member
 /// of. Admin/Owner keep the historical behavior: an explicit argument wins

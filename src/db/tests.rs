@@ -587,7 +587,7 @@ fn test_revenue_by_asset_per_asset_lines() {
         vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 70.0)]
     );
     // revenue_total's cross-asset behavior is deliberately unchanged
-    // (L5 ruling 5: the sum is a display defect handled at the callers)
+    // (finance ruling 5: the sum is a display defect handled at the callers)
     assert!((db.revenue_total(None) - 70.5).abs() < 1e-9);
 }
 
@@ -2366,7 +2366,7 @@ async fn test_claim_code_cleared_when_owner_exists() {
     assert!(db2.ensure_claim_code().is_none());
 }
 
-// ---- L9 coverage: config / web accounts / totp / api keys / mcp approvals / audit / plans / channels ----
+// ---- core coverage: config / web accounts / totp / api keys / mcp approvals / audit / plans / channels ----
 
 #[test]
 fn test_config_roundtrip() {

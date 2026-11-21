@@ -149,7 +149,7 @@ impl BotManager {
     }
 
     /// Resolve the receiving bot's product type and compiled capability
-    /// (multibot foundation, L8). Used once per dispatcher so the inbound
+    /// (multibot foundation, server). Used once per dispatcher so the inbound
     /// gate sees the bot that actually received the update, not the seller's
     /// routing bot. Missing ids fall back to the primary context, whose type
     /// resolves to the shop default — byte-identical legacy behavior.
@@ -191,7 +191,7 @@ impl BotManager {
     /// - no channel row / column / value `'bot'` → `Sender::Bot`;
     /// - value `'user'` → `Sender::User`, **always** — even when the
     ///   identity is locked or not running. A user-bound send then fails
-    ///   loudly at the caller (`SendError::WritesDisabled` while the L10 T2
+    ///   loudly at the caller (`SendError::WritesDisabled` while the security owner-approval
     ///   "Enable posting" gate is unconfirmed, `SendError::NotAuthorized`
     ///   when the subsystem is not signed in) instead of silently falling
     ///   back to the bot (IDENTITY_SENDER_UX_SPEC).
@@ -328,7 +328,7 @@ mod tests {
         assert!(!sender.is_bot());
         assert_eq!(sender.identity(), SenderIdentity::User);
 
-        // The L10 T2 "Enable posting" gate fires first: posting is not
+        // The security owner-approval "Enable posting" gate fires first: posting is not
         // enabled yet, so the send is refused as WritesDisabled — distinct
         // from the identity state, never a bot fallback.
         let err = sender.send_text(42, "hello").await.unwrap_err();

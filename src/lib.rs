@@ -34,7 +34,7 @@ pub use handlers::capabilities::movie_bot as movie_bot_capability;
 pub use handlers::capabilities::reply_bot as reply_bot_capability;
 #[cfg(feature = "service")]
 pub use handlers::capabilities::service as service_capability;
-/// Capability catalog and bot-type dispatcher (multibot foundation, L8).
+/// Capability catalog and bot-type dispatcher (multibot foundation, server).
 ///
 /// The catalog itself is always compiled so an uncompiled/unknown bot type
 /// can still produce an explicit refusal. Each per-capability module is
@@ -46,7 +46,7 @@ pub use handlers::capabilities::shop_bot as shop_bot_capability;
 #[cfg(feature = "web_app")]
 pub use handlers::capabilities::web_app as web_app_capability;
 
-// L9 feature-optionalization investigation (complete): the capability
+// core feature-optionalization investigation (complete): the capability
 // features are inert markers today and no dependency is optionalizable from
 // this crate root. Verified with `cargo tree --depth 1`: the default and
 // `--no-default-features --features movie_bot` direct dependency sets are
@@ -64,9 +64,9 @@ pub use handlers::capabilities::web_app as web_app_capability;
 //     teloxide's sqlite-storage feature for every dispatcher.
 // The capability modules re-exported above are stub `Descriptor` constants
 // with no dependency of their own, and every crate-root module below is
-// shared infrastructure. Gating any of them requires edits to L7 (web/api/
-// auth/embed) and L8 (handlers core, main.rs) files — out of L9 territory.
-// Until those rungs gate their modules there is no safe `#[cfg(feature=...)]`
+// shared infrastructure. Gating any of them requires edits to web (web/api/
+// auth/embed) and server (handlers core, main.rs) files — out of core territory.
+// Until those areas gate their modules there is no safe `#[cfg(feature=...)]`
 // addition here and no safe `optional = true` / `dep:` mapping in Cargo.toml;
 // both builds stay green and the default build stays byte-identical.
 

@@ -17,7 +17,7 @@ pub enum State {
         asset: Option<String>,
         description: Option<String>,
     },
-    /// End-user moderation appeal (multibot foundation Step 4.4, L8). Carries
+    /// End-user moderation appeal (multibot foundation Step 4.4, server). Carries
     /// ONLY the opaque decision reference and its scope — never the held
     /// message body, a username, or any other content. The next text message
     /// is treated as the buyer's short reason and then the state is cleared.

@@ -1,7 +1,7 @@
 //! Personal-account (MTProto) identity layer.
 //!
 //! Owner-owned Telegram-user identity alongside the bot identities (ratified
-//! user-identity design; AUTO_ROUTE Phase 1). Layout:
+//! user-identity design, Phase 1). Layout:
 //!
 //! - [`ops`] — the testability seam: [`MtprotoOps`] (the MTProto surface the
 //!   actor drives, implemented for real by `GrammersOps` and by a scripted
@@ -14,7 +14,7 @@
 //!   ≤30/min cap, FloodWait handling and the encrypted-session lifecycle.
 //! - [`session`] — the AES-256-GCM blob store (Phase 0a).
 //!
-//! This file also carries the L11 sender contract: [`ContentSender`],
+//! This file also carries the architecture sender contract: [`ContentSender`],
 //! [`Sender`], [`SentMessage`], [`SendError`], [`SenderIdentity`]. Posting
 //! resolves through `BotManager::for_channel_sender` (see `src/bots.rs`);
 //! payment/delivery paths never see `Sender`.
@@ -31,14 +31,14 @@ pub use actor::{IdentityHandle, IdentityManager, IdentityState, IdentityStatus};
 pub use ops::{IdentityError, LoginStep, NormalizedDialog, NormalizedMessage};
 pub use session::{SessionStore, SessionStoreError};
 
-/// A successfully posted message, exactly as the L11 contract defines it.
+/// A successfully posted message, exactly as the architecture contract defines it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SentMessage {
     pub chat_id: i64,
     pub message_id: i64,
 }
 
-/// Whether posting as the personal account is enabled (the L10 T2 "Enable
+/// Whether posting as the personal account is enabled (the security owner-approval "Enable
 /// posting" gate, design decision 5): the operator's explicit confirmation is
 /// recorded as the `identity_writes_enabled` config row — any value counts;
 /// the row's existence IS the confirmation. Every user send consults this at
@@ -68,12 +68,12 @@ pub enum SendError {
     ChatNotFound,
     /// The send surface is flood-halted (≥3 FloodWaits in an hour, or a
     /// single >30min wait): terminal until the owner resets the surfaces or
-    /// the process restarts (L10 flood-halt policy).
+    /// the process restarts (security flood-halt policy).
     #[error(
         "personal identity sends are halted after repeated Telegram flood control; an owner surface reset (or restart) is required"
     )]
     SurfaceHalted,
-    /// The L10 T2 "Enable posting" gate has not been confirmed: the operator
+    /// The security owner-approval "Enable posting" gate has not been confirmed: the operator
     /// has not recorded `identity_writes_enabled` in the config (see
     /// [`user_writes_enabled`]). Deliberately distinct from
     /// [`SendError::NotAuthorized`] — that means "not signed in", this means
@@ -81,7 +81,7 @@ pub enum SendError {
     /// at the actual fix instead of a re-login.
     #[error("posting as your personal account is disabled; enable posting in the console first")]
     WritesDisabled,
-    /// A server-enforced send cap was hit (L10: posts ≤5/hour, ≤15/day).
+    /// A server-enforced send cap was hit (security: posts ≤5/hour, ≤15/day).
     /// `limit` names the cap for honest downstream copy;
     /// `retry_after_secs` is when the sliding window frees a slot.
     #[error("personal identity post cap reached ({limit}); retry after {retry_after_secs}s")]
@@ -125,7 +125,7 @@ pub struct UserContext {
 }
 
 impl UserContext {
-    /// The L10 T2 gate: refuse before any transport work while posting is
+    /// The security owner-approval gate: refuse before any transport work while posting is
     /// disabled. Checked by every send form below.
     fn check_writes_enabled(&self) -> Result<(), SendError> {
         if user_writes_enabled(&self.db) {
@@ -135,7 +135,7 @@ impl UserContext {
         }
     }
 
-    /// The L10 outbound content gate for the owner identity. Both send forms
+    /// The security outbound content gate for the owner identity. Both send forms
     /// (`send_text` and `send_text_to`) route through this single adapter: the
     /// policy decision itself lives in the central
     /// [`crate::handlers::moderation::gate_outbound`] helper. The owner
@@ -172,7 +172,7 @@ impl ContentSender for UserContext {
         self.check_writes_enabled()?;
         // Same single owner-identity outbound gate as `send_text_to` (global
         // floor only, seller 0 / no bot). The writes gate still fires first,
-        // so the L10 "Enable posting" behavior is unchanged.
+        // so the security "Enable posting" behavior is unchanged.
         self.check_outbound(text)?;
         self.handle.send_text(chat_id, text).await
     }
@@ -281,7 +281,7 @@ mod tests {
             "clean text must reach the actor, got {err:?}"
         );
 
-        // The L10 writes gate still takes precedence over the moderation gate.
+        // The security writes gate still takes precedence over the moderation gate.
         let (_dir2, db2) = test_db();
         assert!(db2.add_blocked_word(0, "forbidden", "hide", true));
         let no_writes = UserContext {

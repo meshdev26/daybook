@@ -1,4 +1,4 @@
-//! Single source of truth for channel-target authorization (L10 F2).
+//! Single source of truth for channel-target authorization (security F2).
 //!
 //! The REST API and the server-rendered console address the same `channels`
 //! rows and both can trigger a send through the bot bound to the target. Keeping

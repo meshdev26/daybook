@@ -218,7 +218,7 @@ async fn broadcast_fails_closed_for_non_owner_without_seller_scope() {
     );
 }
 
-// ---- EDIT_FLOW_SPEC L7 pass: additive pins for the flow-break fixes ----
+// ---- EDIT_FLOW_SPEC web pass: additive pins for the flow-break fixes ----
 
 /// E2: POST /product/activate flips an inactive row back on and redirects
 /// with the `activated=1` flash (the Deactivate dead-end's counterpart).

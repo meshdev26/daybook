@@ -44,7 +44,7 @@ type InvoiceRow = (
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
 
-/// Booking row for the console table and `/mybookings` (L7/L8), adjusted to
+/// Booking row for the console table and `/mybookings` (web/server), adjusted to
 /// the real columns of schema.sql: (bookings.id, bookings.booking_id public
 /// token, buyer user_id, service name, slot starts_at, slot ends_at, status,
 /// expires_at, service seller_id). starts_at/ends_at are None for legacy rows
@@ -71,19 +71,19 @@ pub type BookingListRow = (
 const WEDGED_GRANT_STALE_MINUTES: i64 = 5;
 /// D3 (ARCHITECTURE-V1.4 §2): the booking hold IS the seller-response window —
 /// `expires_at = min(now + BOOKING_HOLD_MINUTES, slot start)`. Single tuning
-/// point for the whole booking state machine; pub so the bot copy (L8) and
-/// console copy (L7) quote the same number instead of a hardcoded string.
+/// point for the whole booking state machine; pub so the bot copy (server) and
+/// console copy (web) quote the same number instead of a hardcoded string.
 pub const BOOKING_HOLD_MINUTES: i64 = 60;
 /// TTL in minutes for one-time console setup links (D7): the DM'd link dies
 /// unclaimed after this long.
 pub const SETUP_LINK_TTL_MINUTES: i64 = 15;
 /// Purpose tag one-time setup links carry in `web_pending_mfa.purpose` (D7);
-/// pub because the claim routes (L7) validate the same string on GET/POST.
+/// pub because the claim routes (web) validate the same string on GET/POST.
 pub const SETUP_LINK_PURPOSE: &str = "setup_link";
 
 // ---- Money Safety Spec (approved batch, decisions 1/3/4/5) ----
 // Internal operational timers, NOT customer SLAs (spec §3/§5, G7). Kept in
-// the data layer as constants so L8's injectable-clock sweeper and L3's
+// the data layer as constants so the server's injectable-clock sweeper and verification's
 // boundary tests quote the same numbers.
 /// §5.1: executing rows older than this move to `needs_reconciliation`.
 pub const RECONCILIATION_DUE_MINUTES: i64 = 30;
@@ -100,7 +100,7 @@ pub const PAID_UNGRANTED_ESCALATION_HOURS: i64 = 72;
 const MONEY_MINOR_SCALE: u32 = 8;
 
 /// Creation input for the guarded refund path (§1.2). Every new refund is
-/// seller-scoped and carries an actor and an idempotency key; L8 passes the
+/// seller-scoped and carries an actor and an idempotency key; the server passes the
 /// real actor, the legacy `create_refund` wrapper passes sentinels.
 #[derive(Debug, Clone, Copy)]
 pub struct RefundInput<'a> {
@@ -124,7 +124,7 @@ pub struct RefundCreation {
     pub created_new: bool,
 }
 
-/// Fail-closed creation errors. The HTTP/UX mapping is L8's; the variants
+/// Fail-closed creation errors. The HTTP/UX mapping is the server's; the variants
 /// carry the spec's stable error codes in their doc comments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefundCreateError {
@@ -175,7 +175,7 @@ pub enum ReconcileError {
     NotDue,
     /// Append-only: a resolution was already recorded.
     AlreadyResolved,
-    /// Owner must supply a non-empty reason (audited by L8).
+    /// Owner must supply a non-empty reason (audited by server).
     ReasonRequired,
     Database(String),
 }
@@ -212,7 +212,7 @@ pub struct TransferAttemptRow {
 
 // Legacy `create_refund` callers (api.rs / web finance) predate the idem-key
 // contract; the wrapper synthesizes a unique sentinel key so the DB layer
-// can still enforce in-flight uniqueness for them. L8 replaces those callers
+// can still enforce in-flight uniqueness for them. The server replaces those callers
 // with `create_refund_guarded` carrying the real actor/key.
 static REFUND_IDEM_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -404,7 +404,7 @@ pub struct EffectiveModerationTerm {
     pub term: String,
     pub mode: String,
 }
-/// The resolved policy a caller (L8 hook) evaluates a message against.
+/// The resolved policy a caller (server hook) evaluates a message against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveModerationPolicy {
     pub seller_id: i64,
@@ -419,7 +419,7 @@ pub struct EffectiveModerationPolicy {
     pub bot_override_active: bool,
     /// Fail-closed signal. True when moderation storage was not ready at
     /// startup (a DDL failure) or the persistent floor could not be read, so
-    /// this policy is incomplete. L8 hooks MUST treat true as "hold the
+    /// this policy is incomplete. server hooks MUST treat true as "hold the
     /// message for review" rather than evaluating against a partial/empty
     /// policy — an empty policy here means enforcement is unavailable, not
     /// that the message is safe.
@@ -1498,7 +1498,7 @@ impl Db {
             }
         }
 
-        // L10 LOW: make appeal submission idempotent in storage rather than
+        // security LOW: make appeal submission idempotent in storage rather than
         // relying on the handler's check-then-insert. Collapse any legacy
         // duplicate tuples *before* the unique index is created, keeping the
         // oldest row per (seller, bot, ref). This mirrors the cleanup in
@@ -2408,7 +2408,7 @@ impl Db {
     /// §3.5 blocking-liability check: seller invoices still ungranted past
     /// the escalation cutoff whose auto-refund (`idem_key` is the documented
     /// `auto:ungranted:<invoice_id>`) has NOT reached a terminal executed
-    /// state. L8 returns 409 `unresolved_ungranted_liability` for these.
+    /// state. The server returns 409 `unresolved_ungranted_liability` for these.
     pub fn unresolved_ungranted_invoices(
         &self,
         seller_id: i64,
@@ -5444,7 +5444,7 @@ impl Db {
     /// Legacy-compatible wrapper (api.rs / web finance still call this with
     /// the original six arguments). It now runs the full §1.2 safety block,
     /// synthesizing a unique sentinel idem key and the documented
-    /// `created_by = -1` / `created_role = 'unknown'` actor. L8 switches
+    /// `created_by = -1` / `created_role = 'unknown'` actor. The server switches
     /// those call sites to `create_refund_guarded` so the real actor is
     /// recorded. Returns 0 on any refusal, matching the old "insert failed"
     /// shape; never returns an id for a refund that was not created.
@@ -6112,7 +6112,7 @@ impl Db {
     }
 
     /// §4.2 outcome persistence. Callers branch on the shared classifier
-    /// enum (L8); the data layer only stores the token and stamps the
+    /// enum (server); the data layer only stores the token and stamps the
     /// resolution clock. A missing spend_id is a no-op (never an overwrite).
     pub fn set_transfer_attempt_outcome(&self, spend_id: &str, outcome: &str) -> bool {
         let conn = self
@@ -6163,7 +6163,7 @@ impl Db {
     /// §5.4 digest input: every `executing` row past the due cutoff and every
     /// `needs_reconciliation` row (with its overdue flag past the decision
     /// cutoff), both money types, with the latest persisted spend_id. All
-    /// timestamps are injected so L3 can test 30min/24h boundaries.
+    /// timestamps are injected so verification can test 30min/24h boundaries.
     #[allow(clippy::type_complexity)]
     pub fn reconciliation_rows(
         &self,
@@ -6224,7 +6224,7 @@ impl Db {
     /// resolution is rejected by the `resolution IS NULL` CAS and the
     /// append-only trigger). `resolution` stores the human reason; the
     /// resulting status stores the outcome token; `resolved_by`/`resolved_at`
-    /// record the auditor. The caller (L8) writes the audit row with
+    /// record the auditor. The caller (server) writes the audit row with
     /// spend_id + actor + reason.
     pub fn resolve_reconciliation(
         &self,
@@ -6808,7 +6808,7 @@ impl Db {
         out
     }
 
-    /// Per-asset paid revenue — the L5 ruling (CRYPTO_PAY.md, ruling 5):
+    /// Per-asset paid revenue — the finance ruling (CRYPTO_PAY.md, ruling 5):
     /// summing CAST(amount AS REAL) across assets (0.5 BTC + 50 USDT) is a
     /// meaningless number and a display defect, so revenue is reported per
     /// asset and must never be totalled cross-asset downstream. Same
@@ -7017,7 +7017,7 @@ impl Db {
         }
     }
 
-    // ---- Append-only additions for the L8 API/observability task
+    // ---- Append-only additions for the server API/observability task
     // (2026-10-25). Kept as a clearly-marked block at the end of the impl so
     // parallel edits elsewhere in db.rs cannot collide; no existing lines
     // were modified. Lock handling follows the poisoned-mutex recovery
@@ -7025,7 +7025,7 @@ impl Db {
 
     /// Cheap liveness probe for `/health`: `SELECT 1`. Returns false on any
     /// error so the health endpoint can report `db: "error"` honestly
-    /// instead of panicking. (L8 addition)
+    /// instead of panicking. (server addition)
     pub fn ping(&self) -> bool {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
@@ -7037,7 +7037,7 @@ impl Db {
     /// `keep_token` (hashed here, matching `create_web_session`/
     /// `get_web_session`). Used by the API password change so a password
     /// rotation evicts stolen sessions but keeps the caller logged in.
-    /// (L8 addition)
+    /// (server addition)
     pub fn delete_other_web_sessions(&self, account_id: i64, keep_token: &str) {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -7058,7 +7058,7 @@ impl Db {
     /// codes owned by that seller, `None` (admin/owner) deletes any. Returns
     /// true when a row was deleted. Redemption rows for the deleted code are
     /// removed too — and only after the scope predicate matched, so a
-    /// cross-seller attempt deletes nothing at all. (L8 addition)
+    /// cross-seller attempt deletes nothing at all. (server addition)
     pub fn delete_code_seller_scoped(&self, code: &str, seller_id: Option<i64>) -> bool {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         // Match first (with the scope predicate), then delete the row and its
@@ -8058,7 +8058,7 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: promo codes + shopping cart (L9)
+// Phase 1: promo codes + shopping cart (core)
 // ---------------------------------------------------------------------------
 
 pub type PromoCodeRow = (
@@ -9498,14 +9498,14 @@ impl Db {
     // ---- Appeals review queue (opaque refs only, never message content) ----
 
     /// Create an appeal. `message_ref` must be an opaque token supplied by the
-    /// bot-side flow (L8); `reason` is the short appeal justification, capped
+    /// bot-side flow (server); `reason` is the short appeal justification, capped
     /// by [`MODERATION_MAX_REASON_LEN`] — neither may carry the filtered body.
     ///
-    /// Atomic dedup (L10 LOW): the unique index on
+    /// Atomic dedup (security LOW): the unique index on
     /// `(seller_id, COALESCE(bot_id, 0), message_ref)` makes concurrent
     /// double-submissions a no-op instead of two rows. `None` is returned on
     /// conflict — the existing `Option<i64>` signature already means "no row
-    /// created", so L8/L7 call sites need no change (the handler's pre-check
+    /// created", so server/web call sites need no change (the handler's pre-check
     /// still reports `AlreadyRequested` in the non-racy case).
     pub fn create_moderation_appeal(
         &self,

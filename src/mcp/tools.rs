@@ -13,7 +13,7 @@
 //!   have used. Generated codes therefore reach the owner's Telegram chat and
 //!   nothing else — never the AI transcript, never `mcp_audit`.
 //!
-//! Identity read tools ([`IDENTITY_TOOLS`], the L10 owner-principal-only
+//! Identity read tools ([`IDENTITY_TOOLS`], the security owner-principal-only
 //! set) are Read-tier but additionally refuse every principal that carries a
 //! seller id: they operate the operator's personal Telegram account, which a
 //! per-seller token never owns.
@@ -46,7 +46,7 @@ pub const MAX_LIST_LIMIT: i64 = 50;
 /// — no oracle either way.
 const EDIT_POST_OWNERSHIP_SCAN_LIMIT: i64 = 500;
 
-/// Identity read tools (owner personal account, L10 map): default page sizes
+/// Identity read tools (owner personal account, security map): default page sizes
 /// and the hard clamp, deliberately separate from the bot-side list caps
 /// above. The personal account is the scarcer resource — sequential reads
 /// ≤30/min are enforced inside the identity actor; these bounds only keep
@@ -477,7 +477,7 @@ pub fn registry() -> &'static [ToolSpec] {
             },
             ToolSpec {
                 name: "broadcast",
-                description: "Send a text message to all known users. High blast radius; \
+                description: "Send a text message to all known users. Wide-reaching impact; \
                               requires owner approval.",
                 tier: Tier::Sensitive,
                 input_schema: json!({
@@ -1327,7 +1327,7 @@ async fn analytics_summary(
 
 // ---- Identity read handlers (owner-principal only; see IDENTITY_TOOLS) ----
 
-/// Defense in depth for the L10 owner-principal floor: `mcp::dispatch`
+/// Defense in depth for the security owner-principal floor: `mcp::dispatch`
 /// refuses principals carrying a seller id before validation even runs; this
 /// repeats the check so the handler itself stays safe if a future call path
 /// ever reaches it directly.
@@ -1348,7 +1348,7 @@ fn identity_limit(args: &Value, default: i64) -> usize {
         .clamp(1, MAX_IDENTITY_LIMIT) as usize
 }
 
-/// The honest tool-result strings the L10 contract fixes for identity reads:
+/// The honest tool-result strings the security contract fixes for identity reads:
 /// retryable limits carry their retry seconds, the terminal auth failure says
 /// re-pair, and state errors say where to fix it. Mapped errors become tool
 /// errors (isError results), never panics or protocol-level faults. None of
@@ -1832,7 +1832,7 @@ async fn exec_create_promo(
 /// judged against the world as it is when approved, not when it was parked:
 /// the channel must still be console-configured AND bound to the personal
 /// identity (`sender_identity = 'user'` — one check covers both, since the
-/// value requires the row), and the L10 T2 "Enable posting" gate must be
+/// value requires the row), and the security owner-approval "Enable posting" gate must be
 /// confirmed. Sends go through the `Sender::User` resolution; the identity
 /// actor enforces the server caps (≤5/hour, ≤15/day) and the flood gates.
 async fn exec_publish_as_user(
@@ -1870,7 +1870,7 @@ async fn exec_publish_as_user(
         return Err("channel is no longer bound to the personal identity".into());
     };
     let text_len = text.chars().count();
-    // L10 gate: this channel-handle form is gated centrally inside
+    // security gate: this channel-handle form is gated centrally inside
     // `UserContext::send_text_to` (identity/mod.rs) before the actor is
     // consulted — owner identity scope 0 / no bot, i.e. global floor only.
     // No second gate here, so the decision is audited exactly once.

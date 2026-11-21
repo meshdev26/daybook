@@ -1,5 +1,5 @@
 //! Compile-time capability selection by the *receiving* bot's `bot_type`
-//! (multibot foundation, L8).
+//! (multibot foundation, server).
 //!
 //! The default build keeps every pre-existing Telegram path byte-identical:
 //! a `shop_bot` resolves to [`InboundHandler::Builtin`] and the dispatcher
@@ -100,7 +100,7 @@ impl ResolveError {
     }
 }
 
-// ---- Feature-gated capability modules (L9 feature names, verbatim) ----
+// ---- Feature-gated capability modules (core feature names, verbatim) ----
 #[cfg(feature = "automation")]
 pub mod automation;
 #[cfg(feature = "file_share")]
@@ -157,7 +157,7 @@ pub fn feature_for(bot_type: &str) -> Option<&'static str> {
 }
 
 /// Select the capability for a bot type. Empty/whitespace types normalize to
-/// the shop default, matching L9's data-layer normalization.
+/// the shop default, matching core's data-layer normalization.
 pub fn resolve(bot_type: &str) -> Result<Descriptor, ResolveError> {
     let normalized = crate::config::normalize_bot_type(bot_type);
     if let Some(d) = descriptor_for(normalized) {
@@ -219,7 +219,7 @@ impl BotCapability {
 
     /// Log the refusal/notice with the context an operator needs. Bot keys
     /// and product types are non-secret config metadata; no message content
-    /// or user presence is logged (L10 moderation floor).
+    /// or user presence is logged (security moderation floor).
     pub fn log(&self, source: &'static str) {
         match &self.selection {
             Ok(d) => tracing::warn!(

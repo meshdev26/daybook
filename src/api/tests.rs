@@ -1177,7 +1177,7 @@ async fn api_unauth_all_protected() {
     }
 }
 
-// ---- L8 additions (2026-10-25): auth_password, codes_delete, /health,
+// ---- Server-side additions (2026-10-25): auth_password, codes_delete, /health,
 // /metrics. Reuse the module's state helpers above.
 
 async fn change_password(app: &Router, token: &str, body: &str) -> axum::response::Response {
@@ -2307,7 +2307,7 @@ async fn api_finance_refunds_requires_paid_invoice() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// ---- Production-blocker regressions (L10 REST audit / L9 ops audit) ----
+// ---- Production-blocker regressions (security REST audit / core ops audit) ----
 
 /// Point the effective bot at a wiremock Bot API so channel/post mutations in
 /// these tests never reach the real Telegram transport. The returned server
@@ -3155,7 +3155,7 @@ async fn reconciliation_endpoints_owner_only_cas_and_resolve() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
-// ---- L10 F1/F2/F5 remediation tests ----
+// ---- security F1/F2/F5 remediation tests ----
 
 /// Create a paid invoice bound to buyer 99 through the REST surface as
 /// `seller`, with an explicit amount (used for full vs partial refunds).

@@ -345,12 +345,12 @@ pub(super) async fn create_post(
     if !may_post_to_channel(&state, &session, &ch) {
         return forbidden_page(&state, "Posts", "Posts");
     }
-    // Sender resolution (L11 decision 1, IDENTITY_SENDER_UX_SPEC §1): the
+    // Sender resolution (architecture decision 1, IDENTITY_SENDER_UX_SPEC §1): the
     // channel binding decides who posts — before any Telegram traffic, with
     // no fallback. A user-bound channel that fails fails as a user-bound
     // send (§3 honesty).
     let sender = state.bots.for_channel_sender(&ch);
-    // Personal-identity posting is owner-only (L10 finding 1): a non-owner
+    // Personal-identity posting is owner-only (security finding 1): a non-owner
     // session whose target resolves to the operator's personal account is
     // refused BEFORE any Telegram traffic — no bot fallback, no send, no
     // log_post row. Fail-closed on every non-owner role.

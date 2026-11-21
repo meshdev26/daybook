@@ -247,7 +247,7 @@ pub(super) async fn broadcast_send(
     if f.text.trim().is_empty() {
         return Redirect::to(&state.url("/broadcast")).into_response();
     }
-    // Outbound moderation (L10 residual gap): a content-bearing broadcast
+    // Outbound moderation (security residual gap): a content-bearing broadcast
     // must be decided BEFORE any Telegram transport call. Scope follows the
     // acting principal — the owner is the global floor (seller 0, no bot),
     // while a seller/admin carries the session seller id and resolved bot id.

@@ -1,4 +1,4 @@
-// Timeout middleware tests (L8). The production ceiling is 30s; the
+// Timeout middleware tests (server). The production ceiling is 30s; the
 // tests exercise the real `run_with_timeout` logic with a short limit so
 // nothing sleeps 30 seconds. No sleep route exists in production code —
 // these live only inside this test module.

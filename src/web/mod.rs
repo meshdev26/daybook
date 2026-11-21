@@ -458,7 +458,7 @@ pub fn mount(base: &str, router: Router) -> Router {
         .route(&trailing, get(move || async move { Redirect::to(&target) }))
 }
 
-// ---- Request timeout (control-plane hardening, L8; zero new deps) ----
+// ---- Request timeout (control-plane hardening, server; zero new deps) ----
 
 /// Production ceiling for any request on the merged router. Generous by
 /// design: dashboard/API/MCP handlers do SQLite writes and awaited Telegram
@@ -729,7 +729,7 @@ fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
             esc(label)
         ));
     }
-    // A11y polish (L6 D1/D2): the Type facet has ONE accessible name — its
+    // A11y polish (design D1/D2): the Type facet has ONE accessible name — its
     // visible label "Product type" — so no competing aria-label. A visually
     // hidden role="status" region announces the resolved product at the moment
     // a scope change is applied, on both the select's `onchange` path and the

@@ -1,5 +1,5 @@
 //! Identity actor: the single owner of the MTProto client and its session
-//! material (ratified user-identity design §3, L11 process shape).
+//! material (ratified user-identity design §3, architecture process shape).
 //!
 //! One task owns the [`MtprotoOps`] implementation; every caller — web
 //! pages, MCP tools, the `Sender` resolution — holds a cloneable
@@ -7,7 +7,7 @@
 //! answers back over `oneshot` channels. Consequences enforced here:
 //!
 //! - **Sequential access.** All requests are processed one at a time from
-//!   the mailbox, so reads are inherently sequential (L10 contract) and the
+//!   the mailbox, so reads are inherently sequential (security contract) and the
 //!   login tokens never leave this task.
 //! - **Read rate cap.** Reads (`History`/`ThreadReplies`/`Search`/
 //!   `UnreadDigest`) pass a sliding-window limiter, ≤30/min; over the cap
@@ -57,24 +57,24 @@ use super::{SendError, SentMessage};
 
 /// Upper bound per read request; the actor clamps, callers never have to.
 pub(crate) const MAX_FETCH_LIMIT: usize = 100;
-/// FloodWait durations above this halt the surface outright (L10: a wait
+/// FloodWait durations above this halt the surface outright (security: a wait
 /// above 30min is not worth gating — the surface is down anyway); at or
 /// below it a scheduled-wake gate applies.
 const MAX_FLOOD_WAIT_SLEEP: u64 = 1800;
-/// Reads per sliding 60s window (L10 contract).
+/// Reads per sliding 60s window (security contract).
 const READS_PER_MINUTE: usize = 30;
 /// How many dialogs `unread_digest` may scan before returning.
 const MAX_DIGEST_SCANNED_DIALOGS: usize = 200;
 /// Backoff ceiling for the reconnect gate.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Rolling window for the flood-halt counter (L10: ≥3 FloodWaits in an
+/// Rolling window for the flood-halt counter (security: ≥3 FloodWaits in an
 /// hour halts the surface).
 const FLOOD_HALT_WINDOW: Duration = Duration::from_secs(3600);
 /// FloodWaits within [`FLOOD_HALT_WINDOW`] that trigger a surface halt.
 const FLOOD_HALT_THRESHOLD: usize = 3;
 
 /// Which rate-limited surface a request belongs to. Flood gates and flood
-/// halts are tracked per surface (L10 flood-halt policy): a read flood never
+/// halts are tracked per surface (security flood-halt policy): a read flood never
 /// blocks sends and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
@@ -534,11 +534,11 @@ impl ReadRateLimiter {
 
 // ---- Send caps -----------------------------------------------------------------
 
-/// Sliding-window cap for the hourly send surface (L10 contract: posts
+/// Sliding-window cap for the hourly send surface (security contract: posts
 /// ≤5/hour AND ≤15/day). Not `Clone`: owned by the actor, so the cap holds
 /// across every handle clone.
 ///
-/// Deliberately IN-MEMORY ONLY: L10 required no cross-restart accounting, so
+/// Deliberately IN-MEMORY ONLY: security required no cross-restart accounting, so
 /// a process restart resets the budget (the flood-halt machinery covers the
 /// restart-resistant failure mode). Also deliberately independent of the
 /// flood gates/halt (`Surface::Sends`): a cap refusal is not a flood event
@@ -551,9 +551,9 @@ pub(crate) struct SendCaps {
 
 const SEND_WINDOW_HOUR: Duration = Duration::from_secs(3600);
 const SEND_WINDOW_DAY: Duration = Duration::from_secs(24 * 3600);
-/// Posts per sliding hour (L10).
+/// Posts per sliding hour (security).
 const SENDS_PER_HOUR: usize = 5;
-/// Posts per sliding day (L10).
+/// Posts per sliding day (security).
 const SENDS_PER_DAY: usize = 15;
 
 impl SendCaps {
@@ -636,7 +636,7 @@ struct IdentityActor<O: MtprotoOps> {
     phone_masked: Option<String>,
     persisted: bool,
     limiter: ReadRateLimiter,
-    /// Sliding-window send caps (L10: posts ≤5/hour, ≤15/day). Independent
+    /// Sliding-window send caps (security: posts ≤5/hour, ≤15/day). Independent
     /// of the flood gates below — both can refuse a send.
     send_caps: SendCaps,
     backoff_until: Option<Instant>,
@@ -1245,7 +1245,7 @@ impl<O: MtprotoOps + 'static> IdentityActor<O> {
             Err(IdentityError::FloodWait(secs)) => return Err(SendError::FloodWait(secs)),
             Err(_) => return Err(SendError::NotAuthorized),
         }
-        // Send caps (L10: posts ≤5/hour, ≤15/day), checked AFTER the
+        // Send caps (security: posts ≤5/hour, ≤15/day), checked AFTER the
         // flood/halt gates: a gated refusal never reaches Telegram and never
         // consumes cap budget. The mechanisms stay independent — a cap
         // refusal is not a flood event and never arms the halt.
@@ -1261,9 +1261,9 @@ impl<O: MtprotoOps + 'static> IdentityActor<O> {
             });
         }
         let result = self.ops.send_text(chat, text).await;
-        // Conservative accounting (L10): every attempt that reached the
+        // Conservative accounting (security): every attempt that reached the
         // MTProto layer — success, flood-wait refusal or failure — charges
-        // the budget. In-memory only: a restart resets it (L10 required no
+        // the budget. In-memory only: a restart resets it (security required no
         // persistence), and an owner wipe/reset does not refill it within
         // the running process (the cap protects the account, not a
         // credential).
@@ -2555,7 +2555,7 @@ mod tests {
         assert!((1..=60).contains(&err));
     }
 
-    // ---- Send caps (L10: posts ≤5/hour, ≤15/day) ----
+    // ---- Send caps (security: posts ≤5/hour, ≤15/day) ----
 
     /// The 6th send within the sliding hour is refused with `CapReached`
     /// (retry_after > 0) and never reaches the ops layer; the first five

@@ -571,7 +571,7 @@ fn finance_state_banners_distinguish_blocking_from_advisory() {
     assert!(late.contains("Blocking:"));
 }
 
-/// L10 F4: the reconciliation count on the finance banner is built from the
+/// security F4: the reconciliation count on the finance banner is built from the
 /// global `all_reconciliation_rows`, but a seller must only ever be shown the
 /// count for their own seller id. The owner/global count stays intact.
 #[tokio::test]

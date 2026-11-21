@@ -313,7 +313,7 @@ async fn settings_multi_bot_token_debug_redacts_value() {
         "test-token-placeholder".to_string(),
     );
     let writes = token_env_updates(&state, &form).expect("compose succeeds");
-    // L3 P3-1: the Debug render is a redaction surface — a future
+    // verification P3-1: the Debug render is a redaction surface — a future
     // `tracing::debug!(?writes)` can never leak the token value.
     let dbg = format!("{:?}", writes);
     assert!(dbg.contains("<redacted>"), "{dbg}");

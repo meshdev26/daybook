@@ -76,8 +76,8 @@ fn mode_glossary(id: &str) -> String {
 
 /// M5: a plain-language configuration-status warning. It describes POLICY
 /// STATE only — never a term, a message body, a username, or any message
-/// presence — so it cannot leak individual moderation events (L10 constraint).
-/// `degraded` is L9's `resolve_effective_policy().enforcement_degraded` flag;
+/// presence — so it cannot leak individual moderation events (security constraint).
+/// `degraded` is core's `resolve_effective_policy().enforcement_degraded` flag;
 /// `floor_empty` is the "no minimum words configured" case, which otherwise
 /// looks identical to healthy enforcement.
 pub(super) fn moderation_notice_html(floor_empty: bool, degraded: bool) -> String {
@@ -197,7 +197,7 @@ fn seller_scope(
     if role.has_level(Role::Owner) {
         Ok(0)
     } else if role.has_level(Role::Admin) && session.seller_id.is_none() {
-        // L10 LOW finding: an admin without a seller binding used to get a
+        // security LOW finding: an admin without a seller binding used to get a
         // 403 here. Admin outranks Seller, so the role gate passes; with no
         // seller id there is no tenant to scope to, so use the owner's 0.
         Ok(0)
@@ -468,7 +468,7 @@ fn allow_words_rows(state: &WebState, seller_id: i64) -> String {
 }
 
 /// Appeal review queue. Owned by the seller scope and populated by the
-/// bot-side flow (L8). Only an opaque request id and the status are shown —
+/// bot-side flow (server). Only an opaque request id and the status are shown —
 /// no filtered message body and no buyer presence.
 fn appeals_section(state: &WebState, seller_id: i64) -> String {
     let appeals = state.db.list_moderation_appeals(seller_id, None);

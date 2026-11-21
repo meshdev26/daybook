@@ -25,7 +25,7 @@ pub async fn callback_handler(
     };
     let chat_id = msg.chat.id;
     if let Some(reference) = crate::handlers::moderation::parse_appeal_callback(data) {
-        // Step 4.4 (L8): the only buyer-facing moderation action. The callback
+        // Step 4.4 (server): the only buyer-facing moderation action. The callback
         // carries the SAME opaque reference the decision audit wrote — no text,
         // username or content is derived here. Answer the press first, then
         // verify the reference against a real blocking decision in this
@@ -100,7 +100,7 @@ pub async fn callback_handler(
         }
         // The inline keyboard travels with the preview message, so anyone who
         // can see the chat could press it. Load the draft and verify the
-        // presser before acting (AUTO_ROUTE.md principle 2: every business
+        // presser before acting (multi-tenancy principle: every business
         // entity is seller-scoped).
         let Some((_id, seller_id, channel, _template, content, _status, _c, _u, _m)) =
             db.get_ai_post_draft(draft_id)
@@ -135,7 +135,7 @@ pub async fn callback_handler(
                     return Ok(());
                 }
                 bot.answer_callback_query(q.id.clone()).await?;
-                // L10 outbound gate BEFORE this raw-Bot publish. The draft's
+                // security outbound gate BEFORE this raw-Bot publish. The draft's
                 // seller id is the authoritative scope (the presser may be an
                 // admin acting on someone else's draft).
                 if crate::handlers::moderation::gate_outbound(
@@ -230,7 +230,7 @@ pub async fn callback_handler(
         _ => "Unknown action.",
     };
     bot.answer_callback_query(q.id.clone()).await?;
-    // L10 outbound gate on this raw-Bot send path (static menu copy, but
+    // security outbound gate on this raw-Bot send path (static menu copy, but
     // listed as a content-bearing surface). Scope to the presser so seller
     // rules apply; the gate already audited with an opaque reference.
     let presser = q.from.id.0 as i64;

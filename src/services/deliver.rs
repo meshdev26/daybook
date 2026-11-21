@@ -34,7 +34,7 @@ pub async fn deliver(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use teloxide::prelude::Requester as _;
     let chat = teloxide::types::ChatId(user_id);
-    // L10 outbound gate: every text DM is a NON-ContentSender, content-bearing
+    // security outbound gate: every text DM is a NON-ContentSender, content-bearing
     // send. The policy decision lives in the central helper; the caller passes
     // the invoice's seller scope so seller rules apply alongside the floor.
     match kind {
