@@ -1,7 +1,7 @@
-# Architecture Fullness & Scale Plan — 2026-10-25 (L11)
+# Architecture Fullness & Scale Plan — 2026-10-25
 
-**Status: T1 proposal — awaiting owner approval. Nothing below is implemented
-except where marked "shipped".** Produced by the L11 fellow-architect dispatch;
+**Status: proposal — awaiting owner approval. Nothing below is implemented
+except where marked "shipped".** Produced by an architecture review;
 evidence cited from the tree as of this date. Companion to
 [`reviews/2026-10-25-architecture.md`](./reviews/2026-10-25-architecture.md).
 
@@ -72,14 +72,14 @@ reference; background job expires stale `held` slots.
 
 | Flow | States | Owner |
 |---|---|---|
-| refund | pending → approved → executed \| rejected | L5 spec · L8 code · L10 audit |
+| refund | pending → approved → executed \| rejected | finance spec · server code · security audit |
 | payout | pending → approved → paid | same |
 
 Execution = new `crypto.rs::transfer` (Crypto Pay transfer API), receipt
 stored; refund-executed also revokes the grant (status `refunded` + channel
 kick). Every transition writes `audit_log`. The current silent status flip
-becomes a flagged manual fallback. First real-value transfers are T2
-(human-in-loop) per AUTO_ROUTE §2.
+becomes a flagged manual fallback. First real-value transfers require owner
+approval (human-in-the-loop).
 
 ## 3. Scale seam contracts (documented; built ONLY on trigger: >1k sellers or DB p99 >50ms)
 
@@ -98,20 +98,20 @@ becomes a flagged manual fallback. First real-value transfers are T2
 **v1.2 — debt, money, products** (exit: a digital product sells, delivers,
 and refunds end-to-end; all four debt items closed):
 
-| # | Item | Size | Rung |
+| # | Item | Size | Team |
 |---|------|------|------|
-| 1 | Debt: `.env` rewrite preserves unknown keys | S | L9 |
-| 2 | Debt: `/edit`-family seller-scope checks | M | L8 |
-| 3 | Debt: plan lookup `(seller,name)`, retire `get_plan_global` | S | L9 |
-| 4 | Debt: docs dedupe (fold docs/ARCHITECTURE.md into root) | S | L4 |
-| 5 | Refunds/payouts real flows (prereq for 6) | M | L5/L8/L10 |
-| 6 | Products + grants + delivery + `services::deliver` | L | L9/L8/L7 |
-| 7 | Tests: product lifecycle property (claim→grant→deliver once) + debt regressions | M | L3 |
+| 1 | Debt: `.env` rewrite preserves unknown keys | S | core |
+| 2 | Debt: `/edit`-family seller-scope checks | M | server |
+| 3 | Debt: plan lookup `(seller,name)`, retire `get_plan_global` | S | core |
+| 4 | Debt: docs dedupe (fold docs/ARCHITECTURE.md into root) | S | docs |
+| 5 | Refunds/payouts real flows (prereq for 6) | M | finance/server/security |
+| 6 | Products + grants + delivery + `services::deliver` | L | core/server/web |
+| 7 | Tests: product lifecycle property (claim→grant→deliver once) + debt regressions | M | verification |
 
 **v1.3 — orders-lite** (entry: v1.2 exit). **v2 — bookings + seams if
 triggered** (entry: v1.3 exit or scale trigger).
 
-## 5. Decisions awaiting owner approval (T1)
+## 5. Decisions awaiting owner approval
 
 1. **digital_file storage** → *recommend:* Telegram `file_id` passthrough
    (Telegram hosts the blob; no new key management/backup surface). Risk:
@@ -133,10 +133,10 @@ seam is built ahead of its measured trigger.
 ## Implementation record — v1.2 (2026-10-25, same day)
 
 **Status: IMPLEMENTED and gated**, per the approved recommendations (1–5
-taken as recommended). Dispatched L9 (schema/db/crypto-transfer), L8
-(services/deliver, bot commands, API money flows), L7 (web env-fix +
-products page); orchestrator integrated (tuple-layout fixes, clippy), L3
-gated. Gates: fmt ✓, clippy -D warnings ✓, **93 lib tests** (incl. new
+taken as recommended). Carried out by core (schema/db/crypto-transfer), server
+(services/deliver, bot commands, API money flows), web (env-fix +
+products page); integration coordinated centrally (tuple-layout fixes, clippy), verification
+recorded. Gates: fmt ✓, clippy -D warnings ✓, **93 lib tests** (incl. new
 product/grant/stock/refund/payout unit tests + the
 `prop_product_grant_exactly_once` lifecycle property) + 9 mount tests ✓,
 routing verifier ✓, release repackaged, live smoke: `/api/v1/shop` 200 on a

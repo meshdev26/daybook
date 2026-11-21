@@ -20,7 +20,7 @@
 - Always verify payment server-side via API before granting access.
 - Invoice status may lag; retry `/paid` if needed.
 
-## Bookings money ruling (L5, 2026-10-27) — governs v1.5
+## Bookings money ruling (finance, 2026-10-27) — governs v1.5
 
 Rules on ARCHITECTURE-V1.4.md §2 Q1 plus adjacent questions. v1.4 ships
 free-confirmation unchanged; everything below gates the v1.5 priced-bookings spec only.

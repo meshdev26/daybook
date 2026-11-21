@@ -1,8 +1,8 @@
 # User Identity — Connect, Unlock & Status — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
-**Status:** v1 spec, from the ratified identity decision record (2026-10-27), including the supervisor + L10 amendment (conditional 2FA step). WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
+**Status:** v1 spec, from the ratified identity decision record (2026-10-27), including the supervisor + security amendment (conditional 2FA step). WCAG 2.1 AA is a release floor and is non-waivable.
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 **Related:** `DESIGN.md` + `assets/app.css` (token contract), `design-system/telegram-agent/MASTER.md`, `BOT_SWITCHING_UX_SPEC.md` (rail group + bot-scope-pinned idiom), `docs/SETUP_MCP_UX_SPEC.md` (door shell, `SECRET_TOGGLE`, shown-once idiom), `docs/BOOKINGS_UX_SPEC.md` (routes/flash vocabulary). Sibling specs: `IDENTITY_SENDER_UX_SPEC.md`, `IDENTITY_MONITOR_UX_SPEC.md`, `IDENTITY_INBOX_UX_SPEC.md`.
 
 ---
@@ -219,7 +219,7 @@ Rendered by `html_page` when: session is owner **and** an identity exists **and*
 - **Verb discipline:** the word is *locked* / *unlock* everywhere — banner, button, flashes, badges, audit strings. Never "sign in", never "log in", never "password" alone. This is a session key for a stored secret, not an authentication flow, and the vocabulary must not blur into the console login.
 - **Focused on render:** the banner container carries `tabindex="-1"` and receives focus on load while present — the operator's first tab stop is the fix for the state they are looking at. No positive tabindex anywhere.
 - **Success:** POST → unlock attempt → PRG back to the Referer's console-local path (the `bot/select` referer discipline) with `?unlocked=1`, which renders `alert-success` / `role="status"` "Identity unlocked." — announced politely. The banner is gone from the returned page.
-- **Failure:** the banner re-renders on the returned page (still locked) with a `role="alert"` line inside it: "That passphrase did not unlock it." The mechanism is honest by construction — the passphrase derives a key, the AEAD authentication tag fails or holds; there is no stored hash to compare against (§7). Attempts sit behind the login throttle (5 / 900 s, the `login_throttle` posture); the trip message is the login page's exact throttle string. **L10 confirms the throttle key (per-account) — flagged, §7.**
+- **Failure:** the banner re-renders on the returned page (still locked) with a `role="alert"` line inside it: "That passphrase did not unlock it." The mechanism is honest by construction — the passphrase derives a key, the AEAD authentication tag fails or holds; there is no stored hash to compare against (§7). Attempts sit behind the login throttle (5 / 900 s, the `login_throttle` posture); the trip message is the login page's exact throttle string. **security confirms the throttle key (per-account) — flagged, §7.**
 - **Server-gated while locked:** the banner is an affordance, not the gate. Every identity-consuming action — wizard completion steps, `/identity/posting`, user-posting binding (`IDENTITY_SENDER` §3), `/monitor` reads, `/inbox` sends — is rejected server-side while locked, each with a flash that points at the banner (`?error=locked`). Enable-posting is gated too: a uniform rule is cheaper to verify than a per-route exception list, and the banner is on the same screen.
 
 ---
@@ -254,39 +254,39 @@ Once accepted, the panel collapses to the record: `badge-success` "posting enabl
 
 ---
 
-## 7. Security & privacy (L10 flags)
+## 7. Security & privacy (security flags)
 
-1. **The 2FA password is transient.** It exists for exactly one POST, is forwarded to Telegram, and is then dropped — never written to the wizard state, the DB, a log line, or an error render. **Owner: L8; L10 verifies the constructors.**
+1. **The 2FA password is transient.** It exists for exactly one POST, is forwarded to Telegram, and is then dropped — never written to the wizard state, the DB, a log line, or an error render. **Owner: server; Security verifies the constructors.**
 2. **The unlock passphrase is never stored** — not hashed, not verifiable by comparison. Unlock = derive key from passphrase → attempt AEAD open of the session blob → tag verifies or the attempt failed. Failure copy says exactly that and nothing more.
-3. **Wizard state is memory-only.** api_id/api_hash/phone/code live in server-side in-memory state keyed to the session until the passphrase step encrypts them at rest. A process restart resets the wizard — the copy on step 2 says storage begins only after the passphrase exists. **Owner: L8/L9.**
+3. **Wizard state is memory-only.** api_id/api_hash/phone/code live in server-side in-memory state keyed to the session until the passphrase step encrypts them at rest. A process restart resets the wizard — the copy on step 2 says storage begins only after the passphrase exists. **Owner: server/core.**
 4. **No secrets in URLs or logs.** All wizard steps are POSTs; audit rows reference action names and ids only; FloodWait renders a time, never the request payload. Sentinel grep test (SETUP_MCP §12 idiom) covers every string in §3.
-5. **AuthKeyDuplicated is all-or-nothing.** That path must leave zero writes — no partial identity row, no wizard residue. The §3.8 banner copy promises it; L3 verifies it.
-6. **Unlock throttle.** Wrong-passphrase attempts share the login throttle; key choice (per-account id) is an L10 call — flagged, not fixed here.
+5. **AuthKeyDuplicated is all-or-nothing.** That path must leave zero writes — no partial identity row, no wizard residue. The §3.8 banner copy promises it; verification confirms it.
+6. **Unlock throttle.** Wrong-passphrase attempts share the login throttle; key choice (per-account id) is a security call — flagged, not fixed here.
 7. **CSRF.** Existing SameSite=Strict cookie posture; no new token scheme.
-8. **Restart-unlock is the feature, not a gap.** The key existing only in memory means a stolen disk or a dumped DB cannot produce a working identity session. L10 should review the banner's inline-field posture (§10, follow-ups) with exactly that threat model.
+8. **Restart-unlock is the feature, not a gap.** The key existing only in memory means a stolen disk or a dumped DB cannot produce a working identity session. Security should review the banner's inline-field posture (§10, follow-ups) with exactly that threat model.
 
 ---
 
-## 8. Backend contracts L7/L8/L9 must satisfy (flags, not fixes)
+## 8. Backend contracts web/server/core must satisfy (flags, not fixes)
 
-1. **Wizard state store** — in-memory, per-session, with the step enum, the pending Telegram code request, and a `password_required` flag set by step 4. **Owner: L8 (shape), L9 (storage posture).**
-2. **Telegram user-account client** (sign-in, 2FA, FloodWait, AuthKeyDuplicated surfacing) — new capability; the bot client does not cover it. Error taxonomy must reach the UI as the §3.8 cases, raw strings never rendered. **Owner: L8.**
-3. **`identity_locked()` helper** consulted by `html_page` (banner render) and by every identity-consuming handler (server gate). **Owner: L7/L8.**
-4. **Audit records** — `identity_tos_accepted`, `identity_posting_enabled`, `identity_unlock` (success; failures logged as attempts without the passphrase). **Owner: L8.**
-5. **Flash plumbing** — the §2.2 and §4 keys on their respective redirect targets. **Owner: L7.**
+1. **Wizard state store** — in-memory, per-session, with the step enum, the pending Telegram code request, and a `password_required` flag set by step 4. **Owner: server (shape), core (storage posture).**
+2. **Telegram user-account client** (sign-in, 2FA, FloodWait, AuthKeyDuplicated surfacing) — new capability; the bot client does not cover it. Error taxonomy must reach the UI as the §3.8 cases, raw strings never rendered. **Owner: server.**
+3. **`identity_locked()` helper** consulted by `html_page` (banner render) and by every identity-consuming handler (server gate). **Owner: web/server.**
+4. **Audit records** — `identity_tos_accepted`, `identity_posting_enabled`, `identity_unlock` (success; failures logged as attempts without the passphrase). **Owner: server.**
+5. **Flash plumbing** — the §2.2 and §4 keys on their respective redirect targets. **Owner: web.**
 
 ---
 
-## 9. Token-contract flags (L6-C)
+## 9. Token-contract flags (design)
 
 1. **New CSS, authorized, one rule block:** `.alert-form` — the unlock banner's inline field row. `.alert` is a flex row and shipped `input { width: 100% }` breaks inside it; the rule keeps one row (flex, wrap allowed, input `flex: 1 1 220px; width: auto` inside the form, min 44px height). This is the only new CSS in this spec; without it the banner needs a modal, which the ratified record excludes.
 2. **Class-name drift, recorded:** the ratified record says "alert-warning"; the shipped class is `alert-warn` (`app.css:427`). Spec follows the shipped token contract. `badge badge-warning` (§1.3, §5) is the real shipped name and is used as written.
-3. **Deliberate deviation from the claim-form idiom:** credential fields use `autocomplete="off"` (ratified verbatim), where `/setup/claim` uses `new-password`/`current-password`. Password managers will not offer to save these fields; that is the intended posture for keys that are never stored. L6-C may revisit — the spec ships `off` until then.
+3. **Deliberate deviation from the claim-form idiom:** credential fields use `autocomplete="off"` (ratified verbatim), where `/setup/claim` uses `new-password`/`current-password`. Password managers will not offer to save these fields; that is the intended posture for keys that are never stored. Design may revisit — the spec ships `off` until then.
 4. **Everything else is existing primitives:** `door`, `panel` (+ `.narrow`), `secret-field`/`SECRET_TOGGLE`, `alert`/`-info`/`-warn`/`-error`/`-success`, `badge` (+ variants), `btn`/`btn-sm`, `help`, `kv`, `mono`, `empty`, `sub`, `sr-only`, `bot-scope-pinned`. No new components, no inline styles, no new color values.
 
 ---
 
-## 10. Acceptance checklist (for L7 / L3 verification)
+## 10. Acceptance checklist (for web / verification)
 
 - [ ] Rail shows the Identity group (Identity / Monitor / Inbox) between Operate and Sell for the owner only; sellers/admins see neither group nor routes (403).
 - [ ] Pinned status line reads Identity + connected / locked / Set up identity, sits under the bot selector, and is absent for non-owners and on door pages.
@@ -306,9 +306,9 @@ Once accepted, the panel collapses to the record: `badge-success` "posting enabl
 
 ## 11. Follow-ups (non-blocking)
 
-1. **Unlock-banner posture — pending L10.** Inline passphrase entry on every console page is convenient but puts a secret field on every screen (shoulder-surf, autofill, screen-share exposure). L10 rules between: (a) this banner as specced, (b) a banner that links to a dedicated door-shell unlock page, (c) banner + shorter memory lifetime. The verb, gating, and focus semantics in §4 are stable under all three.
+1. **Unlock-banner posture — pending security review.** Inline passphrase entry on every console page is convenient but puts a secret field on every screen (shoulder-surf, autofill, screen-share exposure). Security rules between: (a) this banner as specced, (b) a banner that links to a dedicated door-shell unlock page, (c) banner + shorter memory lifetime. The verb, gating, and focus semantics in §4 are stable under all three.
 2. **FloodWait formatting.** §3.8 shows `{YYYY-MM-DD HH:MM UTC} (in {n} minutes)`; the absolute stamp is UTC by rule (the console stores UTC), but a localized rendering pass is deferred. Never render Telegram's raw seconds integer.
-3. **Disconnect / reconnect flow.** Deliberately out of v1 (§2.1): it is destructive (destroys the stored session), T2-adjacent, and deserves its own ratified copy pass.
+3. **Disconnect / reconnect flow.** Deliberately out of v1 (§2.1): it is destructive (destroys the stored session), needs owner approval, and deserves its own ratified copy pass.
 4. **Live-region confirmation of unlock.** The `?unlocked=1` banner announces on the redirected page; if the console later grows client-side fetches, a persistent `role="status"` region becomes worth revisiting (BOT_SWITCHING §7.1 precedent).
 5. **Posting-gate removal.** Once enabled, the gate has no UI path back (§5). If product wants "Disable posting", it needs its own record and copy — not a silent uncheck.
 

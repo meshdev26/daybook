@@ -1,6 +1,6 @@
 # SETTINGS_PER_BOT_TOKEN_SPEC — one token field per bot, honest saves, logout out of the rail
 
-Status: **READY FOR L7/L8** · Owner-mandated (verified 2026-11-01: the Settings
+Status: **READY FOR WEB/SERVER** · Owner-mandated (verified 2026-11-01: the Settings
 "Bot token" field writes a shadowed variable and its success banner lies; the
 rail foot crams three controls).
 Sources of truth: `DESIGN.md` + `assets/app.css`. Format follows
@@ -27,7 +27,7 @@ console never renders a current token, in any mode, on any surface.
 | `TELEGRAM_BOT_TOKEN` is **shadowed** whenever `BOTS_CONFIG`/`BOTS_JSON` parses to ≥1 bot — the file branch returns before the legacy branch is ever read | `src/config.rs:503-535` — BOTS_CONFIG win: `:505-511`; BOTS_JSON: `:514-520`; legacy env read only at `:522-534` |
 | The "Saved. The bot connects on restart." banner is therefore false in multi-bot mode | `src/web/settings.rs:513`; shadow chain above |
 | The field is ambiguous ("which bot?") — badge derives from `cfg.owner_id`, not from any token | badge heuristic `src/web/settings.rs:231-235` (`owner_id == 0`); `SharedConfig::owner_id` is the *primary bot's* owner in multi-bot mode: `src/config.rs:481,496` |
-| L9 prerequisite landed: `BotConfig.token_env: Option<String>` | `src/config.rs:32-46` (field at `:45`); parsed from bots.toml `:629-637`, BOTS_JSON `:576-584`; legacy fallback synthesizes `Some("TELEGRAM_BOT_TOKEN")` `:540-553` (`:551`) |
+| core prerequisite landed: `BotConfig.token_env: Option<String>` | `src/config.rs:32-46` (field at `:45`); parsed from bots.toml `:629-637`, BOTS_JSON `:576-584`; legacy fallback synthesizes `Some("TELEGRAM_BOT_TOKEN")` `:540-553` (`:551`) |
 | **`state.cfg.bots[i].token_env` does not compile today** — `WebState.cfg` is `Config = SharedConfig`, which has no `bots` field | `src/web/mod.rs:143` (`pub cfg: Config`); alias `src/config.rs:56` (`pub type Config = SharedConfig`); struct `src/config.rs:7-30` |
 | `write_env_file` preserves only keys **outside** `SETUP_ENV_KEYS` (16 fixed keys, incl. `TELEGRAM_BOT_TOKEN`, excl. every `BOT_*` var) | writer `src/config.rs:193-198`; preserve loop `:212-222`; key list `:150-167` |
 | Writing a `BOT_*` var through `write_env_file` would **duplicate** an existing line (old line preserved + new line written); dotenvy never overrides an already-set var, so the **stale first line would win at boot** | duplicate mechanism: `src/config.rs:212-222` (old `BOT_*` line lands in `preserved`) + `:225-227` (update written anyway); first-wins: `load_dotenv` doc `src/config.rs:135`, `dotenvy::dotenv()` at `:137` |
@@ -330,7 +330,7 @@ lines, far under its frozen budget (§0).
 the web console has only `GET /logout` (`mod.rs:240` → `auth_pages.rs:374-397`);
 the only POST logout is the REST API's `/api/v1/auth/logout` (`api.rs:344,4474`),
 a different auth surface that must not be reused by the SSR console. The
-web handler is method-agnostic (reads headers only, `auth_pages.rs:374-397`)
+Web handler is method-agnostic (reads headers only, `auth_pages.rs:374-397`)
 and `Redirect::to` is 303 — correct after POST. Prescribed: **add the POST arm
 to the existing route** (one token) and post a form from Management; keep the
 GET arm so `tests/misc.rs:122-129` and any bookmarked link keep working.

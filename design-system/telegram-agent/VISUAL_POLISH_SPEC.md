@@ -1,6 +1,6 @@
 # VISUAL_POLISH_SPEC — console visual quality pass (wave 2)
 
-**Role:** L6 senior-design-ux · **Date:** 2026-10-31 · **Status:** ready for L7
+**Discipline:** design · **Date:** 2026-10-31 · **Status:** ready for web
 **Scope:** visual inconsistency, hierarchy, spacing, alignment, responsive
 behavior, a11y floor. Flow/honesty/copy were fixed in wave 1
 (`SETUP_UX_POLISH_SPEC.md`) and are NOT re-litigated here.
@@ -11,7 +11,7 @@ the real token system). `design-system/telegram-agent/MASTER.md` is
 (`#0F172A`, `#16A34A`, …), Fira Code/Fira Sans via a Google Fonts
 `@import` (MASTER.md lines 40–52). The shipped console uses bundled Plex
 Sans/Plex Mono with the ledger-green token set (app.css lines 16–101; DESIGN.md
-§4). L7 must treat MASTER.md and `design-system/telegram-agent/pages/*.md` as
+§4). Web must treat MASTER.md and `design-system/telegram-agent/pages/*.md` as
 historical reference only; see §D3.
 
 **Evidence convention:** every claim cites `file:line` as of this writing.
@@ -56,7 +56,7 @@ line, then the 21px h1). The "breadcrumb" is flat (no links, no hierarchy).
 **Fix (html.rs:208):** delete the line `<nav aria-label="Breadcrumb">{t}</nav>`
 from the `html_page` template. The `<title>` element keeps the document name.
 No test asserts this markup (grep of `src/web/tests/`, `*_tests.rs` — zero
-matches for "Breadcrumb"). If L7 prefers a zero-DOM-change variant, keep the
+matches for "Breadcrumb"). If the web layer prefers a zero-DOM-change variant, keep the
 nav and add `nav[aria-label="Breadcrumb"] { font-size: 11px; font-weight: 500;
 color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em;
 margin-bottom: 8px; }` — but removal is the prescribed fix; a caption that
@@ -160,7 +160,7 @@ codes.rs:95 `style="width:4em"` → `class="input-num"`;
 settings.rs:166 delete `style="margin-top:1rem"` (A6's details margin +
 `.panel` margin-bottom give the spacing back). Note `.inline-form input` sets
 `margin: 5px 0 2px` via the global input rule; `margin-top: 0` here keeps the
-chip row vertically centered — if L7 finds baseline drift, drop that one
+chip row vertically centered — if web finds baseline drift, drop that one
 declaration.
 
 ### A9. Guard `a.panel` against the global link underline
@@ -212,7 +212,7 @@ Execute = `btn-danger` (finance.rs:315, 325, 440, 450). Every page carrying a
 dozen green chips breaks the "no hover-lift theatre / calm" ledger contract
 (DESIGN.md §3) and flattens the page's real primary action.
 
-**Rule for L7 (instances listed in B):** in tables/lists, neutral row actions
+**Rule for web (instances listed in B):** in tables/lists, neutral row actions
 use `btn btn-secondary btn-sm`; destructive uses `btn btn-danger btn-sm`; the
 **page's** primary CTA (the one create/save button) stays plain `btn`.
 Confirm/primary-pair rows that are THE action of the row (bookings Confirm,
@@ -537,18 +537,18 @@ defect: **never render inputs/buttons directly on `--bg`** (see §D2).
 
 ---
 
-## D. Token contract — L6-C SECOND OPINION REQUIRED
+## D. Token contract — design SECOND OPINION REQUIRED
 
 **D1. Verdict: this wave requires NO token additions or changes.** All new CSS
 in §A is structural (layout/spacing) and reuses existing variables. Nothing in
-§B introduces a color. Do not let L7 "improve" the palette while implementing.
+§B introduces a color. Do not let web "improve" the palette while implementing.
 
 **D2. Latent risk to put on the record (no code change):** `--line-strong` on
 `--bg` is 2.86:1 in light mode — under the 3:1 non-text floor of WCAG 1.4.11.
 Today every control sits on `--surface`/`--surface-2` (3.10:1 — passes). Rule
 for future pages: any input/button drawn directly on the paper background
 would fail; if such a page ever ships, the fix is a `--line-strong` darkening
-pass at that time (token change, L6-C again).
+pass at that time (token change, design again).
 
 **D3. Documentation debt (owner decision, no code):** `MASTER.md` (and
 `design-system/telegram-agent/pages/`) documents a different design system —
@@ -561,7 +561,7 @@ sources of truth.
 
 ---
 
-## E. Constraints for L7
+## E. Constraints for web
 
 1. **No behavior changes**: no route, handler-logic, SQL, or flow edits.
    The only non-CSS/non-class edits this spec authorizes are the shell
@@ -578,7 +578,7 @@ sources of truth.
 4. **`bots_admin.rs` is over budget**: B16 items are report-only.
 5. **Copy edits** appear only where visual inconsistency demands (B8.2,
    B8.6, B9.4, B14.1) and none touch the asserted strings below.
-6. **Quality gates** (AGENTS.md §2) must pass: `cargo test`,
+6. **Quality gates** (AGENT.md §2) must pass: `cargo test`,
    `cargo clippy -- -D warnings`, `cargo fmt --check`.
 
 ### Test-affecting strings (from `src/web/tests/`, `*_tests.rs`) — do not alter
@@ -604,7 +604,7 @@ All prescribed changes avoid every string above (verified by grep on
 
 ---
 
-## F. Flags for the owner (reported, NOT in L7's scope)
+## F. Flags for the owner (reported, NOT in web's scope)
 
 1. **Chart.js CDN** (analytics.rs:224) violates the "served from the binary —
    no CDN" contract (app.css:9) and adds a third-party script to an
@@ -621,7 +621,7 @@ All prescribed changes avoid every string above (verified by grep on
    serialization order. Flow bug from wave 1 territory; reported here because
    it also renders as two competing inputs in one row.
 4. **Empty-cart "Clear cart"** (B10.1) — the render condition is a one-line
-   handler-side `if`; kept in B as a structure move, but if L7 prefers, treat
+   handler-side `if`; kept in B as a structure move, but if the web layer prefers, treat
    as a flag.
 5. **Referrals table has both "Status" and "State" columns** (referrals.rs:53)
    — likely a data-model leftover; needs a product decision.

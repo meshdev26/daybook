@@ -1,8 +1,8 @@
 # Channel Add Redesign — Visibility-Aware Add, Post-Add Reveal, Name vs Address Split
 
-**Status:** Approved, ready for L7 implementation
+**Status:** Approved, ready for web implementation
 **Date:** 2026-11-01
-**Role:** L6 senior-design-ux
+**Discipline:** design
 **Territory of this spec:** the Channels page add form, add flow, row
 actions, and post-add reveal. Code changes land in `src/web/channels.rs`, a
 new `src/web/channels_rows.rs`, `src/web/html.rs` (APP_JS block), a small
@@ -14,7 +14,7 @@ not disturb: `CHANNELS_TITLE_UX_SPEC.md` (label contract, honest add),
 `MANAGEMENT_DISCLOSURE_SPEC.md` §4–§5 (collapsed help, honest banners),
 `IDENTITY_SENDER_UX_SPEC.md` §2 (badge placement).
 **Hard constraints:** `channels.rs` is AT its 800-line cap — step 0 is a
-move-only split (AUTO_ROUTE.md §8, rule at line 159: "At cap: no further
+move-only split (file & module hygiene rule: "At cap: no further
 growth — the next change splits first"). No DB changes (both Db methods this
 spec needs already exist). Exactly one new route. `esc()` everything dynamic.
 
@@ -75,7 +75,7 @@ spec needs already exist). Exactly one new route. `esc()` everything dynamic.
 | House CSS: row list flex, `.row-actions`, `.mono`, `.badge*` | `assets/app.css:406-427` (`.row-actions` `:422`), `:433`, `:469-487` |
 | House CSS: `.alert*`, `details` in rows (precedent for row-level disclosure) | `assets/app.css:491-505`, `:519-533` (`li details` margin fix `:533`) |
 | `.sr-only` exists | `assets/app.css:594`; used in the current Rename form `src/web/channels.rs:359` |
-| Cap rule + move-only split rule | `AUTO_ROUTE.md:159`, `:166-170` (rule 2) |
+| Cap rule + move-only split rule | file & module hygiene rules |
 
 Test files scanned: `src/web/tests/channels.rs` (329 lines) and
 `src/web/tests/misc.rs` (219 lines). **`misc.rs` contains no channel add or
@@ -88,7 +88,7 @@ flows, and dashboard/privacy checks; nothing there is at risk, and its
 ## 2. Step 0 — the split (binding; do this FIRST, separately reviewed)
 
 `src/web/channels.rs` is exactly **800 lines** — at cap. Per
-AUTO_ROUTE.md §8 (line 159) the next change splits first. The boundary is the
+the file & module hygiene rule, the next change splits first. The boundary is the
 row/label rendering family:
 
 ### 2.1 Move list (exact functions, exact line counts)
@@ -124,8 +124,8 @@ Callers in `dashboard.rs`, `content.rs`, `subs.rs`, `admin_console.rs`,
 
 ### 2.2 Move-only discipline + one sanctioned mechanical follow-up
 
-- The move itself changes **no bytes** of any function body (AUTO_ROUTE.md
-  §8 rule 2, `:166-170`: reviewed as a rename). The existing test suite pins
+- The move itself changes **no bytes** of any function body
+  (file & module hygiene rule 2: reviewed as a rename). The existing test suite pins
   row markup, so regressions are caught (`tests/channels.rs:49-50, 98, 149`).
 - `render_global_channel_row` is **128 lines** — already over the 100-line
   function budget (flagged as pre-existing by CHANNELS_TITLE_UX_SPEC §5.6).
@@ -532,7 +532,7 @@ pub(super) async fn channels_name(
 4. **Audit parity:** `bind-sender` writes a `log_action` row
    (`channels.rs:785-792`); a label edit gets the same treatment
    (`"channel_name"` action) — cheap, additive, consistent.
-5. Blast radius: additive handler + one route line; the rename handler and
+5. Impact: additive handler + one route line; the rename handler and
    its pins stay byte-identical.
 
 ---
@@ -559,7 +559,7 @@ pub(super) async fn channels_name(
 
 ---
 
-## 7. Constraints for L7 (non-negotiable)
+## 7. Constraints for web (non-negotiable)
 
 1. **Step 0 first, move-only** (§2): 161 lines out to `channels_rows.rs`,
    `mod.rs` wiring only. The redesign edits ride AFTER the move.

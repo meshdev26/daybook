@@ -19,7 +19,7 @@
 - No secrets in code or logs.
 
 ## CSRF
-- Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future requirement (e.g. L10) demands token-based CSRF, implement hidden-field tokens in all POST forms.
+- Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future security requirement demands token-based CSRF, implement hidden-field tokens in all POST forms.
 - All POST forms are cookie-authenticated; SameSite=Strict prevents cross-site submission in modern browsers.
 
 ## Secrets at rest (planned)

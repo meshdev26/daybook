@@ -1,8 +1,8 @@
 # Subscriptions — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec. WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 **Related:** `DESIGN.md`, `assets/app.css`, `src/web.rs` (channels/settings/ai pages), `src/db.rs` (subscription methods), `src/api.rs` (`/api/v1/subscriptions`), MCP `subs_report`.
 
 ---
@@ -146,7 +146,7 @@ Per row, inside the Actions cell:
 1. **Authentication.** Every route requires a valid session; unauthenticated → 303 `/login`.
 2. **Authorization (server-side).**
    - List/count: seller scope = `Some(seller_id)` for sellers, `None` for owners. Derived from the session, never from a query/form value.
-   - Revoke: owner only. A non-owner POST returns 403 (`forbidden_page`-equivalent for the POST, or redirect to `/subs` with `alert-error`; L7 picks, but the mutation must not occur).
+   - Revoke: owner only. A non-owner POST returns 403 (`forbidden_page`-equivalent for the POST, or redirect to `/subs` with `alert-error`; web picks, but the mutation must not occur).
    - Expire-check: owner only, for the same reason (it iterates all sellers' rows).
 3. **Input validation.** `id` is parsed as `i64`; an invalid or missing value redirects to `/subs` without touching the DB. `status` is allow-listed to the five values; anything else becomes `all`.
 4. **Scoping of mutations.** `set_subscription_status` is called only after the owner check. In v1 owners may revoke any row; if seller revoke is added later, it must first verify `seller_id` ownership.
@@ -222,20 +222,20 @@ No new tables or migrations. Existing methods suffice for the page:
 | Revoke | `set_subscription_status(sub_id, "revoked")` | |
 | Expire-check | `expired_subscriptions()` + `mark_subscription_expired(id)` | Global; owner-gated at the handler |
 
-**Recommendation to L9 (correctness/perf):** add a filtered list method rather than filtering in Rust:
+**Recommendation to core (correctness/perf):** add a filtered list method rather than filtering in Rust:
 
 `list_subscriptions_filtered(seller_scope: Option<i64>, status_opt: Option<&str>, limit: i64) -> Vec<(i64, i64, i64, String, String, String)>`
 
-Rationale: filtering after `LIMIT` (the only option with today's method) can hide matching rows whenever the newest N are not of the requested status, so the filter would be silently wrong. A SQL-level `WHERE status = ?` (when `status_opt` is `Some`) fixes this and keeps the page correct at any data volume. If L9 cannot add it before implementation, L7 must fetch with a much larger limit and filter in Rust, and the spec's 200-row note must become "first 200 of the requested status may be incomplete" — not acceptable for v1, so treat the filtered method as **required**.
+Rationale: filtering after `LIMIT` (the only option with today's method) can hide matching rows whenever the newest N are not of the requested status, so the filter would be silently wrong. A SQL-level `WHERE status = ?` (when `status_opt` is `Some`) fixes this and keeps the page correct at any data volume. If core cannot add it before implementation, the web layer must fetch with a much larger limit and filter in Rust, and the spec's 200-row note must become "first 200 of the requested status may be incomplete" — not acceptable for v1, so treat the filtered method as **required**.
 
-**L8 handler notes:**
+**Server handler notes:**
 - Seller scope derived from `session.seller_id` for sellers, `None` for owners.
 - Revoke handler parses `id`, checks owner, calls `set_subscription_status(id, "revoked")`. Optionally verify the row exists first to distinguish "not found" from "done" (nice-to-have; v1 may simply call and redirect).
 - Expire-check handler iterates `expired_subscriptions()` and calls `mark_subscription_expired(id)` for each, returning the count. It does **not** call `expire_subscriptions` (no bot kick) per §8.
 
 ---
 
-## 10. Token-contract flags (L6-C)
+## 10. Token-contract flags (design)
 
 The following are **not** in today's `assets/app.css` and must be added there (and documented in `DESIGN.md`) before use. Do not inline-style them in `src/web.rs`.
 
@@ -250,7 +250,7 @@ Anything not listed above should be built from existing primitives (`panel`, `ta
 
 ---
 
-## 11. Acceptance checklist (for L3 verification)
+## 11. Acceptance checklist (for verification)
 
 - [ ] `GET /subs` renders for owner and seller; unauthenticated redirects to `/login`.
 - [ ] Nav contains "Subscriptions" between Products and Posts.

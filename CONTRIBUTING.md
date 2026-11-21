@@ -20,31 +20,18 @@ make test            # the full gate suite
 4. **Money paths fail closed** and must be exactly-once — if you touch
    invoices/grants/refunds, extend the property tests that guard them.
 5. **Gates before merge:** `make test` runs fmt, clippy `-D warnings`, all
-   tests, `cargo audit`, `cargo deny`, and the routing-contract check.
-   A PR that doesn't pass them doesn't get reviewed.
+   tests, `cargo audit`, and `cargo deny`. A PR that doesn't pass them doesn't
+   get reviewed.
 
 **Compliance posture:** Terms of Service, Privacy, Refund, and Retention policies and an EAA statement are pending before any paid public launch; contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
 
 ## Finding your way around
 
-- `ARCHITECTURE.md` — system map; every module lists its owning role.
-- `AGENT.md` — coding standards + decision log (the *why* behind the code).
-- `AUTO_ROUTE.md` — how work is routed across role levels L3–L11, and the
-  territory map (which rung owns which files).
+- `ARCHITECTURE.md` — system map: interfaces, core, data flow, and modules.
+- `AGENT.md` — coding standards + decision log (the *why* behind the code);
+  this is the single agent-instruction file for the repository.
 - `docs/ARCHITECTURE-SCALE-PLAN.md` — approved designs and seam contracts;
   don't build a seam ahead of its documented trigger.
-
-## External contributors
-
-The files that steer the automated agents — `AGENT.md`, `AUTO_ROUTE.md`,
-`.opencode/**`, and `scripts/**` — are **internal gate inputs maintained by the
-core team**. External contributors do **not** adopt the L3–L11 role system; it
-is our internal routing model, not a contributor requirement. Do not edit those
-paths without sign-off from the owning rung / core team.
-
-For the gates and scoping rules that affect your change, see
-[AUTO_ROUTE.md](AUTO_ROUTE.md) §2 (authority tiers) and §7 (quality gates);
-you do not need the full ladder.
 
 ## Adding a feature (short version)
 
@@ -60,6 +47,6 @@ you do not need the full ladder.
 
 ## Reporting a security issue
 
-Please do not open a public issue for vulnerabilities — see
-`docs/SECURITY.md` for the current guarantees and contact the maintainer
-directly with details and reproduction steps.
+Please do not open a public issue for vulnerabilities. A private reporting
+channel will be enabled before the public launch; until then, see
+`docs/SECURITY.md` for the current guarantees.

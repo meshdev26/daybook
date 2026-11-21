@@ -5,7 +5,7 @@ one Rust binary, three interfaces (bot + web + MCP), one SQLite database.
 
 **New here?** Read this page top-to-bottom (~5 min), then `docs/EASY_SETUP.md`
 to run your own instance. **Working on the code?** Read `AGENT.md` (standards)
-and `AUTO_ROUTE.md` (who does what) before your first change.
+before your first change.
 
 ## Quick picture
 
@@ -37,23 +37,20 @@ Sensitive — see PLAN.md) and Sensitive tools never execute without an owner's
 
 ## Modules
 
-| Path | Owns | Rung |
-|------|------|------|
-| `src/main.rs` | bootstrap: db, bot task, web task, background jobs | L8 |
-| `src/config.rs` | env config | L9 |
-| `src/db.rs` | SQLite data layer — all persistence | L9 |
-| `src/crypto.rs` | Crypto Pay HTTP client | L9 |
-| `src/util.rs` | helpers | L9 |
-| `src/roles.rs` | role resolution (Owner > Admin > Seller > User) | L8 |
-| `src/dialogue.rs` | conversation state | L8 |
-| `src/api.rs` | API surface | L8 |
-| `src/mcp/` | MCP surface for AI agents — JSON-RPC, tool tiers, approval gate | L8 |
-| `src/ai/` | AI providers (OpenAI/Anthropic), cost, rate limits | L8 |
-| `src/handlers/` | bot commands, messages, callbacks | L8 (callbacks: L7) |
-| `src/web.rs` | axum routes, auth, HTML | L7 |
-
-The Rung column maps each module to its owning role level — see
-[Who builds it](#who-builds-it-role-level-routing) below.
+| Path | Owns |
+|------|------|
+| `src/main.rs` | bootstrap: db, bot task, web task, background jobs |
+| `src/config.rs` | env config |
+| `src/db.rs` | SQLite data layer — all persistence |
+| `src/crypto.rs` | Crypto Pay HTTP client |
+| `src/util.rs` | helpers |
+| `src/roles.rs` | role resolution (Owner > Admin > Seller > User) |
+| `src/dialogue.rs` | conversation state |
+| `src/api.rs` | API surface |
+| `src/mcp/` | MCP surface for AI agents — JSON-RPC, tool tiers, approval gate |
+| `src/ai/` | AI providers (OpenAI/Anthropic), cost, rate limits |
+| `src/handlers/` | bot commands, messages, callbacks |
+| `src/web.rs` | axum routes, auth, HTML |
 
 ## Request flow
 
@@ -73,50 +70,6 @@ Multi-tenant: every business entity carries `seller_id`; superadmin
 (`OWNER_ID`) sees everything. Tables: `sellers`, `config`, `posts`, `invoices`,
 `admins`, `plans`, `subscriptions`, `activation_codes`, `code_redemptions`,
 `users`. Migrations run on startup (`Db::migrate` from `schema.sql`).
-
-## Who builds it: role-level routing
-
-Every change routes to a role level (a **blast-radius contract**, not a title):
-
-| Ask | Rung | Agent |
-|-----|------|-------|
-| "Is this actually true?" | L3 | associate-verification (read-only) |
-| "Write the docs." | L4 | junior-media-writer |
-| "What should this cost?" | L5 | senior-finance (spec; L8 codes) |
-| "Make it feel like one product." | L6 | senior-design-ux (+ L6-C charter) |
-| "Implement it on the surface." | L7 | staff-client-platforms |
-| "Build the bot flow." | L8 | staff-server |
-| "Change data/crypto/build." | L9 | staff-core-systems |
-| "Is this safe?" | L10 | principal-security (blocks; never patches) |
-| "Where do domains meet?" | L11 | fellow-architect |
-
-Full routing table, authority tiers (T0 act / T1 propose / T2 escalate), and
-conflict rules: [`AUTO_ROUTE.md`](./AUTO_ROUTE.md). The ladder is
-**machine-checked**:
-
-```bash
-python3 scripts/verify-agent-tiers.py
-```
-
-## The expanded system map — every rung owns a working subsystem
-
-Each role level doesn't just review code; it owns a shipped, functional
-subsystem. This is what "fully functional per level" means here:
-
-| Rung | Subsystem (owned, shipped) |
-|------|----------------------------|
-| L11 | Architecture itself: this map, `AGENT.md`, `AUTO_ROUTE.md`, deployment profiles, the machine-checked ladder (`scripts/verify-agent-tiers.py`) |
-| L10 | Security floor: role gating, server-side payment verification, hashed session cookies, `.env` 0600, secrets denied to every agent, supply-chain gates (`cargo audit`/`deny`) |
-| L9 | Core platform & distribution: `db`/`crypto`/`config`, migrations, release profile, app icons, `package.sh`, `install.sh`, `doctor.sh`, Docker, 3-platform release CI |
-| L8 | Application services: bot handlers, dialogue wizard, AI service, background jobs (payment verification, scheduled posts), setup-mode bootstrap |
-| L7 | Interfaces: axum dashboard, bot inline surfaces, desktop browser auto-open |
-| L6 (+L6-C) | Experience: `DESIGN.md` token contract, `design-system/`, a11y floors, icon generated from tokens |
-| L5 | Monetization: pricing/billing spec (`docs/CRYPTO_PAY.md`), plans, invoices, activation codes, subscriptions |
-| L4 | Docs & onboarding: README, `docs/` (setup, desktop, deployment profiles, commands), QUICKSTART inside every bundle |
-| L3 | Verification: `make test` gate suite, `doctor.sh` diagnostics, smoke checks, routing-contract checks |
-
-A task "expand level X" means: grow that row, keep the others' contracts
-intact, and prove it with L3 before calling it done.
 
 ## Deployment profiles — the same binary anywhere
 
@@ -172,7 +125,7 @@ One codebase, two deployment shapes:
 - [ ] `restart: unless-stopped` (compose) or systemd unit.
 - [ ] Healthcheck green (`GET /`).
 - [ ] `RUST_LOG=info`; alerts on payment-job errors.
-- [ ] Quality gates green before every deploy (AUTO_ROUTE.md §7).
+- [ ] Quality gates green before every deploy.
 
 ## Scalability
 

@@ -1,8 +1,8 @@
 # Channels Master–Detail — Dedicated Add Page, Read-First Master List, Per-Channel Manage View
 
-**Status:** Approved, ready for L7 implementation
+**Status:** Approved, ready for web implementation
 **Date:** 2026-11-01
-**Role:** L6 senior-design-ux
+**Discipline:** design
 **Territory of this spec:** the Channels page structure — a dedicated
 `GET /channels/add` page, a read-first master list, and a per-channel
 `GET /channels/manage` detail view. Code changes land in
@@ -82,7 +82,7 @@ operator's-ledger calm (borders lead, nothing loud).
 | House CSS: row list flex, `.row-actions`, `.row-added` tint | `assets/app.css:420-440`, `:316` |
 | House CSS: `.btn` = primary (brand fill), `.btn-secondary/-danger/-ghost/-sm` | `assets/app.css:388-416` |
 | House CSS: `.panel`, `.help`, `.help-more`, `.mono`, `.badge*`, `.alert*` | `assets/app.css:228-235`, `:345`, `:348-350`, `:442`, `:478-491`, `:495-511` |
-| Cap rule (target ≤800; at cap the next change splits first) | `AUTO_ROUTE.md:159` |
+| Cap rule (target ≤800; at cap the next change splits first) | file & module hygiene rule |
 | Helpers: `esc`, `js_arg`, `urlencode_query`, `forbidden_page` | `src/web/html.rs:124,128`, `src/web/common_pages.rs:21` |
 
 Test files scanned for pins: `src/web/tests/channels.rs` (682),
@@ -550,7 +550,7 @@ the same pairing `.alert-error` ships, `app.css:511`).
 | `assets/app.css` | 672 | +1 rule (§8) | 673 |
 
 The detail builders live in their own module, not `channels_rows.rs`:
-the row file stays the row-rendering family (its §2.3 charter), and
+the row file stays the row-rendering family (its §2.3 scope), and
 `channels.rs` keeps every POST handler so the mutation surface remains
 greppable in one place. No file crosses the 800 target; no function exceeds
 100 lines.

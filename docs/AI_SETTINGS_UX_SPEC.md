@@ -1,8 +1,8 @@
 # AI Settings — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec. WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 
 ---
 
@@ -12,7 +12,7 @@
 2. **Two panels on one page:** (A) AI provider credentials (form), (B) Usage & cost dashboard. Progressive disclosure: credentials first, dashboard below, so a first-time seller configures then immediately sees (empty) usage.
 3. **Write-only secrets**, reusing the existing badge + blank-keeps-current pattern from `settings_body`.
 4. **Test connection** is an async, non-navigating action with a polite live region; it never writes `.env` and never records usage.
-5. **Usage data is seller-scoped** via the existing `ai_usage_*` methods; the owner page reads the global bucket (`seller_id = 0`) pending L8 confirmation (see §11).
+5. **Usage data is seller-scoped** via the existing `ai_usage_*` methods; the owner page reads the global bucket (`seller_id = 0`) pending server confirmation (see §11).
 
 ---
 
@@ -126,7 +126,7 @@ On any failure, re-render `/ai` with an `alert-error` banner and **no** `.env` w
 
 ## 4. Test-connection UX
 
-### Endpoint contract (for L8)
+### Endpoint contract (for server)
 
 - `POST /ai/test`, owner-only.
 - Accepts the same form fields as `/ai/save` (so an owner can test values they have not saved yet). Missing fields fall back to saved config.
@@ -157,7 +157,7 @@ The Test connection button is a secondary button (`type="button"`) placed beside
 ### Live region (a11y)
 
 - Container: `<div id="ai-test-status" role="status" aria-live="polite" aria-atomic="true" class="help">` holding the result text.
-- On error, additionally set `role="alert"` on the same element for that update so screen readers announce assertively. (L7: toggle the attribute alongside the text.)
+- On error, additionally set `role="alert"` on the same element for that update so screen readers announce assertively. (Web: toggle the attribute alongside the text.)
 - The region is always present in the DOM (empty when idle) so the first announcement is not missed.
 - Do not use `aria-live="assertive"` for loading/success.
 
@@ -184,7 +184,7 @@ Four cards in a 2×2 grid (`.grid-2`), each a `<article class="panel">` or a ded
 | 7-day requests | sum of daily counts | "AI requests, last 7 days" | `ai_usage_summary(seller, 7)` |
 | 7-day estimated cost | `${x.xx}` (2 decimals) | "estimated cost, last 7 days" | new: `ai_usage_cost_total(seller, 7)` (§11) |
 
-- Numbers use `.mono` (Plex Mono) and a larger size (L6-C: see `.stat-value` token in §12).
+- Numbers use `.mono` (Plex Mono) and a larger size (design: see `.stat-value` token in §12).
 - Cost is shown with a tooltip/help: *"Estimated from token counts and rough per-model pricing; not a bill."*
 - If AI is disabled, cards still render with whatever historical data exists (do not hide).
 
@@ -192,7 +192,7 @@ Four cards in a 2×2 grid (`.grid-2`), each a `<article class="panel">` or a ded
 
 Columns (in this order): **Date** · **Tokens** · **Requests**.
 
-- Date formatted `YYYY-MM-DD` (matches stored `substr(created_at,1,10)`); consider a friendlier `Mon 26 Oct`? Keep ISO for sortability and consistency with DB; L7 may format but must remain unambiguous. Recommend ISO + `title` attribute with long form.
+- Date formatted `YYYY-MM-DD` (matches stored `substr(created_at,1,10)`); consider a friendlier `Mon 26 Oct`? Keep ISO for sortability and consistency with DB; the web layer may format but must remain unambiguous. Recommend ISO + `title` attribute with long form.
 - Tokens right-aligned, mono.
 - Requests right-aligned, mono.
 - Empty state: `<p class="empty">No AI usage yet. Usage appears here after the first AI-assisted reply.</p>` in place of the table.
@@ -206,7 +206,7 @@ Below the table, a sub-panel `<article class="panel"><h3>Recent errors</h3>…</
 - Each row: timestamp (mono, small) · provider/model (mono) · error message (ink-2, truncated to 2 lines; full text in `title` and expandable via `<details>`).
 - Max 10 rows, newest first.
 - Empty state: *"No recent errors. AI calls are succeeding."*
-- Error messages are sanitized server-side (no key, no full URL); if a raw message somehow contains a secret pattern, L8 must redact before rendering. L10 reviews.
+- Error messages are sanitized server-side (no key, no full URL); if a raw message somehow contains a secret pattern, the server layer must redact before rendering. Security reviews.
 
 ### Refresh
 
@@ -217,7 +217,7 @@ v1 is server-rendered on page load only (no auto-refresh, no polling) to keep it
 ## 6. A11y requirements (WCAG 2.1 AA)
 
 ### Semantics & landmarks
-- Page uses the existing shell: `<aside class="rail">` (navigation landmark) + `<main class="main">`. Ensure `<main>` has `id="main"` so a skip link can target it (add skip link if missing — L7).
+- Page uses the existing shell: `<aside class="rail">` (navigation landmark) + `<main class="main">`. Ensure `<main>` has `id="main"` so a skip link can target it (add skip link if missing — web).
 - One `h1` per page ("AI"), then `h2`/`h3` for panels and subsections. No skipped heading levels.
 - Panels are `<article>` or `<section aria-labelledby="…">` with a heading. Prefer `<section aria-labelledby>` for the two main panels so screen readers can navigate by landmark.
 
@@ -230,7 +230,7 @@ v1 is server-rendered on page load only (no auto-refresh, no polling) to keep it
 ### Focus management
 - Tab order follows DOM order: header → Panel A fields (enabled, provider, base URL, API key, model, budget) → Save → Test connection → Panel B cards (static, skipped) → table → errors. No positive `tabindex`.
 - Focus ring: rely on global `:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }`. Do not override `outline: none` on inputs without providing an equivalent (the existing input focus style uses box-shadow; keep both — outline + shadow — for AA).
-- After a save that re-renders the page, focus should land on the banner (L7: put `tabindex="-1"` on the banner container and focus it on load when a banner is present, or use `autofocus` on the first field). Recommend: focus the alert banner when present, else the first field.
+- After a save that re-renders the page, focus should land on the banner (Web: put `tabindex="-1"` on the banner container and focus it on load when a banner is present, or use `autofocus` on the first field). Recommend: focus the alert banner when present, else the first field.
 - Test connection does not move focus (result announced via live region).
 
 ### Contrast
@@ -256,19 +256,19 @@ v1 is server-rendered on page load only (no auto-refresh, no polling) to keep it
 - Form validation errors are announced via the alert banner's role (use `role="alert"` on `.alert-error`).
 
 ### Touch targets
-- Buttons and inputs min height 44px on mobile (≥ 375px). Existing padding yields ~36px; L7 should ensure `min-height: 44px` for buttons at ≤480px (or globally) to meet the (advisory) 2.5.5 target. At minimum, never below 24×24 (AA 2.5.5).
+- Buttons and inputs min height 44px on mobile (≥ 375px). Existing padding yields ~36px; the web layer should ensure `min-height: 44px` for buttons at ≤480px (or globally) to meet the (advisory) 2.5.5 target. At minimum, never below 24×24 (AA 2.5.5).
 
 ---
 
 ## 7. Security/privacy UX
 
 - **Write-only secrets.** API key never rendered (§3). Same contract as bot token / Crypto Pay token.
-- **Never in errors.** Test-connection and save errors must not contain the key, base URL credentials, or provider error bodies that echo them. L8 sanitizes; L10 verifies with a test that submits a sentinel key and asserts it is absent from the response body.
+- **Never in errors.** Test-connection and save errors must not contain the key, base URL credentials, or provider error bodies that echo them. server sanitizes; security verifies with a test that submits a sentinel key and asserts it is absent from the response body.
 - **Masked badge.** Only `configured`/`not set` is shown; no partial key, no last-4, no length.
 - **No key in URLs.** Test connection uses POST body, never query string. GET `/ai` never accepts or echoes a key.
-- **No key in logs.** `tracing` calls must not log the API key or the full base URL (host is fine; query/credentials are not). L10 audits.
+- **No key in logs.** `tracing` calls must not log the API key or the full base URL (host is fine; query/credentials are not). Security audits.
 - **Owner-only.** Non-owners get the existing `forbidden_page` (403, no partial content), identical to `/settings`.
-- **CSRF.** Reuse the existing cookie (`SameSite=Strict`, `HttpOnly`) posture; no new token scheme needed for v1. POST forms are same-origin. L10 may require a CSRF token later (out of scope v1 unless L10 blocks).
+- **CSRF.** Reuse the existing cookie (`SameSite=Strict`, `HttpOnly`) posture; no new token scheme needed for v1. POST forms are same-origin. Security may require a CSRF token later (out of scope v1 unless security blocks).
 - **`.env` permissions.** `write_env_file` already sets 0600 on unix; AI keys inherit this. No change.
 - **Restart honesty.** Footer and success banner state that AI settings apply on restart, so an owner is never misled into thinking a saved key is live immediately. Test connection is the only "live" action.
 
@@ -305,7 +305,7 @@ Breakpoints (existing in `app.css`): `≤1100px` stacks `.grid-2`; `≤900px` st
 
 ### Loading states
 - Test connection: button disabled + "Testing…" (§4).
-- Page load: server-rendered; no client loading skeleton needed. If L7 later adds async usage fetch, use skeleton bars (existing `.empty`-adjacent pattern) — not required for v1.
+- Page load: server-rendered; no client loading skeleton needed. If the web layer later adds async usage fetch, use skeleton bars (existing `.empty`-adjacent pattern) — not required for v1.
 
 ---
 
@@ -321,26 +321,26 @@ Breakpoints (existing in `app.css`): `≤1100px` stacks `.grid-2`; `≤900px` st
 - Provider-specific advanced parameters (temperature, max tokens, system prompt) — owned by templates/service, not this page.
 - Multi-key rotation / key versioning.
 - A seller-facing (non-owner) AI settings page.
-- Automated tests for the test-connection JS (L7 may add; not specified here).
+- Automated tests for the test-connection JS (the web layer may add; not specified here).
 - New icon set additions beyond existing inline SVGs.
 
 ---
 
-## 11. Data & backend contracts L7/L8/L9 must satisfy
+## 11. Data & backend contracts web/server/core must satisfy
 
-These are not UX but are required for the spec to be implementable; flagged here so the owning rungs can act.
+These are not UX but are required for the spec to be implementable; flagged here so the owning teams can act.
 
-1. **Env-key ownership.** `SETUP_ENV_KEYS` in `src/config.rs` must include `AI_ENABLED`, `AI_PROVIDER`, `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`, `AI_DAILY_TOKEN_BUDGET` (or a parallel `AI_ENV_KEYS` set consumed by `write_env_file`). Otherwise `write_env_file` treats existing AI lines as foreign and preserves stale values → duplicates. **Owner: L9 (config) + L8.**
-2. **Cost aggregation.** `ai_usage_summary` returns `(date, tokens, count)` but no cost. Add either `ai_usage_cost_total(seller_id, days) -> f64` and (for the table, if cost column is ever added) `ai_usage_cost_summary`. **Owner: L9.**
-3. **Recent errors.** Add `ai_usage_recent_errors(seller_id, limit) -> Vec<(created_at, provider, model, Option<error_message>, status)>`. **Owner: L9.**
-4. **Seller scoping for the owner page.** Confirm which `seller_id` represents platform/global AI usage (likely `0`). If usage is recorded under multiple seller IDs and the owner should see an aggregate, add `ai_usage_today_tokens_global()` / `ai_usage_summary_global(days)`. **Owner: L8/L9. Decision needed before implementation.**
-5. **Test-connection provider build.** Reuse the factory logic in `main.rs`; consider extracting a `build_provider(provider, base_url, api_key) -> Arc<dyn AiProvider>` helper to avoid drift. **Owner: L8.**
-6. **Test-connection timeout.** The provider client timeout is 60s; the test path must use a 10s ceiling (e.g., `tokio::time::timeout`) and return a clean error. **Owner: L8.**
-7. **Error redaction.** L8 implements a redactor that removes the API key and credential-bearing URL components from provider errors before they reach the JSON/HTML. L10 reviews the redactor. **Owner: L8 + L10.**
+1. **Env-key ownership.** `SETUP_ENV_KEYS` in `src/config.rs` must include `AI_ENABLED`, `AI_PROVIDER`, `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`, `AI_DAILY_TOKEN_BUDGET` (or a parallel `AI_ENV_KEYS` set consumed by `write_env_file`). Otherwise `write_env_file` treats existing AI lines as foreign and preserves stale values → duplicates. **Owner: core (config) + server.**
+2. **Cost aggregation.** `ai_usage_summary` returns `(date, tokens, count)` but no cost. Add either `ai_usage_cost_total(seller_id, days) -> f64` and (for the table, if cost column is ever added) `ai_usage_cost_summary`. **Owner: core.**
+3. **Recent errors.** Add `ai_usage_recent_errors(seller_id, limit) -> Vec<(created_at, provider, model, Option<error_message>, status)>`. **Owner: core.**
+4. **Seller scoping for the owner page.** Confirm which `seller_id` represents platform/global AI usage (likely `0`). If usage is recorded under multiple seller IDs and the owner should see an aggregate, add `ai_usage_today_tokens_global()` / `ai_usage_summary_global(days)`. **Owner: server/core. Decision needed before implementation.**
+5. **Test-connection provider build.** Reuse the factory logic in `main.rs`; consider extracting a `build_provider(provider, base_url, api_key) -> Arc<dyn AiProvider>` helper to avoid drift. **Owner: server.**
+6. **Test-connection timeout.** The provider client timeout is 60s; the test path must use a 10s ceiling (e.g., `tokio::time::timeout`) and return a clean error. **Owner: server.**
+7. **Error redaction.** The server layer implements a redactor that removes the API key and credential-bearing URL components from provider errors before they reach the JSON/HTML. Security reviews the redactor. **Owner: server + security.**
 
 ---
 
-## 12. Token-contract implications (for L6-C)
+## 12. Token-contract implications (for design)
 
 The materialized token contract lives in **`assets/app.css`** (served from the binary, no build step). Two implications:
 
@@ -348,7 +348,7 @@ The materialized token contract lives in **`assets/app.css`** (served from the b
    (`--brand: #1E6B52`, paper `#F4F6F3`, Plex Sans/Mono) and the shipped dark
    theme, matching `assets/app.css`. The AI page uses only `assets/app.css` tokens
    and existing classes — no new color values.
-2. **`.stat` / metric card — DECISION: accepted (L6-C).** Add a dedicated `.stat`
+2. **`.stat` / metric card — DECISION: accepted (design).** Add a dedicated `.stat`
    primitive to `assets/app.css` and document it in `DESIGN.md`: `.stat-value`
    (24px, Plex Mono, tabular figures, weight 600) + `.stat-label` (12px, ink-2).
    Container reuses `.panel`. Headline numbers in the AI usage cards, the
@@ -357,12 +357,12 @@ The materialized token contract lives in **`assets/app.css`** (served from the b
    `h3`/`p` is no longer the recommended path. (Implementation of the CSS rule is
    tracked with the AI page work; the contract is settled here.)
 3. **Rail nav entry.** Adding "AI" to `rail_nav` is a markup change in `web.rs`, not a token change. No CSS needed (entries already styled).
-4. **Toggle styling.** Recommend a native `<input type="checkbox">` rather than a custom switch, to avoid a new interactive component and its a11y burden. If L6-C wants a switch visual, it must be a CSS-only skin over the checkbox (no JS, `aria-checked` from native state) and respect reduced motion.
-5. **No dark-mode-specific work.** The existing `[data-theme="dark"]` block already covers all tokens; the AI page inherits. L6-C need not add anything.
+4. **Toggle styling.** Recommend a native `<input type="checkbox">` rather than a custom switch, to avoid a new interactive component and its a11y burden. If design wants a switch visual, it must be a CSS-only skin over the checkbox (no JS, `aria-checked` from native state) and respect reduced motion.
+5. **No dark-mode-specific work.** The existing `[data-theme="dark"]` block already covers all tokens; the AI page inherits. Design need not add anything.
 
 ---
 
-## 13. Acceptance checklist (for L7 / L3 verification)
+## 13. Acceptance checklist (for web / verification)
 
 - [ ] `GET /ai` renders for owner, 403 for seller/other, redirect for anonymous.
 - [ ] API key never appears in HTML/JSON/logs (grep test with sentinel).

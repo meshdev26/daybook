@@ -12,4 +12,4 @@ What problem would this solve?
 What you would like to see.
 
 **Gates impact**
-Does this touch money paths, seller scoping, credentials, or any T2 area (payments/keys/publishing/deletion)? Note which quality gates (AUTO_ROUTE §7) would need updating.
+Does this touch money paths, seller scoping, credentials, or any area requiring owner approval (payments/keys/publishing/deletion)? Note which quality gates would need updating.

@@ -1,8 +1,8 @@
 # Identity Monitor — Read-Only Timeline — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec, from the ratified identity decision record (2026-10-27). WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 **Related:** `IDENTITY_UX_SPEC.md` (unlock banner, identity status line, wizard), `assets/app.css` (`.panel`, `.mono`, `.help`, `.empty`), `BOT_SWITCHING_UX_SPEC.md` (rail idiom), `docs/BOOKINGS_UX_SPEC.md` (routes/flash vocabulary, forgiving-URL rule).
 
 ---
@@ -150,31 +150,31 @@ All three render the full page shell (head, sub, controls where meaningful) with
 
 ## 7. Security & privacy
 
-1. **Read-only by construction.** No POST routes, no mutation handlers — L3 can verify read-onlyness from the route table alone (§1).
+1. **Read-only by construction.** No POST routes, no mutation handlers — tests can confirm read-onlyness from the route table alone (§1).
 2. **Owner-only.** The personal account's channel history is the most sensitive surface in the product; role re-derived server-side on every request, never from the UI.
 3. **Locked = no fetch.** The data fetch sits behind the same `identity_locked()` gate as every identity action (IDENTITY_UX §4) — a locked identity must not silently render from a stale cache either: the locked state panel is the whole content.
-4. **No channel content in logs or URLs beyond the cursor** — `?q=` rides the query string by design (GET search); it must be excluded from request logging (same posture as SETUP_MCP §6.8). **L10 verifies.**
+4. **No channel content in logs or URLs beyond the cursor** — `?q=` rides the query string by design (GET search); it must be excluded from request logging (same posture as SETUP_MCP §6.8). **Security verifies.**
 5. **Escaping.** Every message body, sender name, and channel name passes `esc()`; badge/h3 strings are fixed templates.
 6. **No media fetches.** §3.1's one-line media descriptions keep the page from pulling attachments (bandwidth, NSFW-on-screen, and cache side effects all avoided).
 
 ---
 
-## 8. Token-contract flags (L6-C)
+## 8. Token-contract flags (design)
 
 **One new CSS rule block, authorized:** `.timeline` (§3.2) — list reset + ledger dividers + one nesting indent, existing tokens only. Rationale and the no-CSS alternative (browser-default `<ol>` inside a panel) documented in §3.2; the alternative fails the ledger look and buys nothing. Everything else — `panel`, `mono`, `help`, `empty`, `btn-secondary btn-sm`, `inline-form`, `alert-warn`, sr-only — is shipped. No new components, no inline styles, no new color values.
 
 ---
 
-## 9. Backend contracts L7/L8/L9 must satisfy (flags, not fixes)
+## 9. Backend contracts web/server/core must satisfy (flags, not fixes)
 
-1. **Synced channel history per identity** — a read model the page can page through (message id, date, sender, body, reply-to). **Owner: L9 (storage), L8 (sync).**
-2. **`?before` pushdown spike.** Whether Telegram's API can page server-side by message id, or the console pages its own synced cache. The §4.1 link shape assumes pushdown; if the spike fails, the URL semantics change before ship — decided, not drifted. **Owner: L8, with L6 on the URL shape.**
+1. **Synced channel history per identity** — a read model the page can page through (message id, date, sender, body, reply-to). **Owner: core (storage), server (sync).**
+2. **`?before` pushdown spike.** Whether Telegram's API can page server-side by message id, or the console pages its own synced cache. The §4.1 link shape assumes pushdown; if the spike fails, the URL semantics change before ship — decided, not drifted. **Owner: server, with design on the URL shape.**
 3. **Search source** (the carried follow-up): Telegram-side search vs search over the synced cache. Same spike, same decision discipline (§10.1).
-4. **Read lock check** — the fetch is behind `identity_locked()`; the locked render is server-side, not a client-side courtesy. **Owner: L7/L8.**
+4. **Read lock check** — the fetch is behind `identity_locked()`; the locked render is server-side, not a client-side courtesy. **Owner: web/server.**
 
 ---
 
-## 10. Acceptance checklist (for L7 / L3 verification)
+## 10. Acceptance checklist (for web / verification)
 
 - [ ] `/monitor` is owner-only; not-connected and locked renders show the §5 state panels and perform no data fetch.
 - [ ] The page contains exactly two forms (picker, search), both GET to `/monitor`; zero buttons that POST anywhere.

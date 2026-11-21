@@ -1,11 +1,11 @@
 # Multibot / Multi-Surface IA — Bounded Amendment Spec
 
-**Status:** Proposed amendment — ready for L7 / L8 / L9 implementation after owner approval
+**Status:** Proposed amendment — ready for web / server / core implementation after owner approval
 **Date:** 2026-11-18
-**Role:** L6 senior-design-ux (owner of this spec); extends the approved `IA_REDESIGN_SPEC.md`
+**Discipline:** design (owner of this spec); extends the approved `IA_REDESIGN_SPEC.md`
 **Amends:** `design-system/telegram-agent/IA_REDESIGN_SPEC.md` (approved six-group + Utilities console IA)
 **Territory:** the console navigation projection, the rail scope control, and the moderation configuration surfaces. No existing page path changes; no new auth; no token values change.
-**Sources of truth:** `DESIGN.md` §1 / §3 / §4 and `assets/app.css`; `IA_REDESIGN_SPEC.md`; `BOT_SWITCHING_UX_SPEC.md` (shipped selector semantics); `AUTO_ROUTE.md` (routing, floors, quality gates).
+**Sources of truth:** `DESIGN.md` §1 / §3 / §4 and `assets/app.css`; `IA_REDESIGN_SPEC.md`; `BOT_SWITCHING_UX_SPEC.md` (shipped selector semantics); the repository quality gates.
 **Hard constraints:** the six groups and Utilities stay as approved; no seventh group; no per-product consoles; no new route for an existing page; WCAG 2.2 AA is the single accessibility floor; tokens are unchanged (Radix 12-step role semantics over the `DESIGN.md` §4 ledger-green values).
 
 ---
@@ -44,7 +44,7 @@ Fitting these into the current IA by adding a nav group per product would explod
 - No new role tier, no new auth model, no new session cookie or credential flow.
 - No new color value, theme, or token; no change to the Radix role semantics in `DESIGN.md` §4.
 - No dynamic `.so` / plugin loading (deferred non-goal, as recorded in `AGENT.md`).
-- No end-user appeal interface in the web console — the end-user appeal flow is bot-side and belongs to L8 (§4).
+- No end-user appeal interface in the web console — the end-user appeal flow is bot-side and belongs to server (§4).
 - No migration of stored business data beyond the additive `bot_type` metadata field (§6, §11).
 
 ---
@@ -126,7 +126,7 @@ Inside the existing `/bots` Edit form's Advanced disclosure, a per-bot moderatio
 - **Appeal state:** appealed items appear in a review list with a **Request review** action, a reason field, and a status shown as a dot-before-word badge (Pending / Approved / Upheld). Status is conveyed in text, never by color alone.
 - **Allow-list for false positives:** a separate "Always allow" list on the seller page holds terms exempt from filtering; it takes precedence over Blocked words for that seller while remaining above the global floor. It is managed with the same one-primary-action pattern ("Add an allowed word").
 
-**Boundary:** the end-user appeal — a buyer contesting a hidden or warned message in the bot — is **bot-side and belongs to L8** (`src/handlers/**`, dialogue). The web console surfaces only the seller / owner review queue and its status; it does not implement the buyer-facing appeal conversation. Any console surface that would expose appeal message content or user presence is routed to L10 first (§11).
+**Boundary:** the end-user appeal — a buyer contesting a hidden or warned message in the bot — is **bot-side and belongs to the server layer** (`src/handlers/**`, dialogue). The web console surfaces only the seller / owner review queue and its status; it does not implement the buyer-facing appeal conversation. Any console surface that would expose appeal message content or user presence is routed to security first (§11).
 
 ---
 
@@ -135,7 +135,7 @@ Inside the existing `/bots` Edit form's Advanced disclosure, a per-bot moderatio
 Capabilities are selected at compile time and gate **registration, navigation visibility, and which bot types are accepted at runtime** — they do not trim dependencies or binary size:
 
 - Each nav item in the declarative table carries an optional `feature: &'static str` and an optional `product_types` set. `rail_nav` filters items by compile-time `#[cfg(feature = "...")]` and, at runtime, by the selected product's `type` metadata.
-- A **movie-only install** enables the `movie_bot` capability and **registers** only that capability's nav item, config fields, and handler module; other types are absent from nav/type facet and bots of those types are explicitly refused (`capability_uncompiled`). **All Cargo dependencies remain compiled and linked** (`cargo tree --depth 1` identical to default; binary not smaller); omission requires L7+L8 module gating then L9 `Cargo.toml` optional/dep mappings — a deferred cross-rung follow-up outside this foundation's scope.
+- A **movie-only install** enables the `movie_bot` capability and **registers** only that capability's nav item, config fields, and handler module; other types are absent from nav/type facet and bots of those types are explicitly refused (`capability_uncompiled`). **All Cargo dependencies remain compiled and linked** (`cargo tree --depth 1` identical to default; binary not smaller); omission requires web+server module gating then core `Cargo.toml` optional/dep mappings — a deferred cross-team follow-up outside this foundation's scope.
 - The **default build** keeps every path in `IA_REDESIGN_SPEC.md` §2 registered and byte-identical. Feature gating changes nav visibility and which capability modules are registered — it never renames, moves, or removes an existing path, and it introduces no new route for an existing page.
 - The runtime type filter is a view filter only: hiding an item for a product type does not change a page gate or a write authorization. This mirrors the shipped selector rule that scoping narrows what is read, not what is permitted.
 - Capability pages introduced by this amendment (Blocked words, Content policy, Automation) follow the same rule: their own routes are registered only when their capability is compiled in; no existing route is altered.
@@ -163,7 +163,7 @@ Capabilities are selected at compile time and gate **registration, navigation vi
 |---|---|
 | Seller "Blocked words" page | New seller-wide page in Offerings; plain language, one "Add a word" action, hide / warn / review modes, empty / error / appeal states, allow-list (§4.2, §4.4). |
 | Owner "Content policy" page | New Workspace item beside **AI**; non-overridable global floor (§4.1). |
-| Generalized selector + `bot_type` field | Selector gains the type facet and product metadata; an additive `bot_type` field is introduced by L9 (§3, §11). |
+| Generalized selector + `bot_type` field | Selector gains the type facet and product metadata; an additive `bot_type` field is introduced by core (§3, §11). |
 | Automation | Promoted to a first-class nav item in Workspace with its own capability page, gated by feature flag; no seventh group (§5). |
 
 ---
@@ -173,7 +173,7 @@ Capabilities are selected at compile time and gate **registration, navigation vi
 - **Role tiers are reused.** The nav table keeps the existing tiers — `all`, `owner`, `seller_admin_owner` — and the same page gates as `IA_REDESIGN_SPEC.md` §6. No new role enum, no new gate on any existing page. The three new pages carry their own gates: Content policy owner-only; Blocked words seller / admin / owner; Automation per its capability gate and role set.
 - **Tenancy.** Every business record added here — blocked words, allow-list entries, per-bot overrides, appeal queue items, automation rules — is scoped by `seller_id`. Per-bot overrides are scoped by both `bot_id` and `seller_id`. An owner sees the global floor plus all sellers through the existing global visibility; a seller or admin sees only their own seller's records.
 - **Selector state.** Scope persists only as the selected product id on the session row, as shipped. The type facet is client-side and stores nothing. Forged product ids, type values, or seller ids are rejected server-side (403, `forbidden_page`); the selector only narrows reads, never widens permission.
-- **No new auth.** No new cookie, token, login surface, or session credential is introduced. Buyers see no scope control and no moderation configuration. This preserves the multi-tenant and owner/admin-gating invariants in `AGENT.md` and `AUTO_ROUTE.md`.
+- **No new auth.** No new cookie, token, login surface, or session credential is introduced. Buyers see no scope control and no moderation configuration. This preserves the multi-tenant and owner/admin-gating invariants in `AGENT.md`.
 
 ---
 
@@ -206,27 +206,27 @@ Capabilities are selected at compile time and gate **registration, navigation vi
 - [ ] Active nav state is id-keyed with `aria-current="page"`; no title-based comparison remains; skip link retained.
 - [ ] Native labeled selects, `aria-label` pinned label, `<details>` semantics, `role="status"` feedback, visible focus, ≥44px targets, reduced motion, and one primary action per screen verified at 375 / 768 / 1024 / 1440px.
 - [ ] No new token or color value; all pairs from `DESIGN.md` §4 verified ≥4.5:1 in both themes.
-- [ ] `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`, `cargo deny check`, and `python3 scripts/verify-agent-tiers.py` pass; L3 verification recorded before completion.
+- [ ] `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`, `cargo deny check` pass; verification recorded before completion.
 
 ---
 
 ## 10. Risks / rollout
 
 - **Rail complexity / seventh-group pressure.** Adding many surfaces tempts one-group-per-product. Mitigated by the type-facet metadata model (§3) and the explicit no-seventh-group non-goal; the rail item count stays fixed.
-- **Scope creep into auth and tenancy.** The selector must remain a read-filter. Mitigated by reusing the session-row persistence and 403 rejection from `BOT_SWITCHING_UX_SPEC.md`; L10 reviews any change that touches scope validation.
+- **Scope creep into auth and tenancy.** The selector must remain a read-filter. Mitigated by reusing the session-row persistence and 403 rejection from `BOT_SWITCHING_UX_SPEC.md`; security reviews any change that touches scope validation.
 - **Moderation false positives and abuse.** Blocked words can over-match. Mitigated by the "Always allow" allow-list, the three explicit modes, the appeal review state, and the non-overridable owner floor.
-- **Feature-flag drift.** A nav item could appear for a capability not compiled, or a path could change in a gated build. Mitigated by tying nav items to `cfg(feature)` and the type set, and by an L3 check that the default build's route table is byte-identical.
-- **Accessibility regression.** New controls and states can break the floor. Mitigated by §8 invariants and L3 verification at four viewports including 375px.
-- **Rollout.** Ship as a bounded amendment in rung-owned changes: L7 (nav + selector + capability pages), L8 (bot-side appeal), L9 (`bot_type` field), then L3 verification. Capability pages are feature-gated and opt-in; the default build is behavior-compatible with the approved IA. Rollback is a revert of each rung's change; no data migration to unwind beyond the additive `bot_type` field.
+- **Feature-flag drift.** A nav item could appear for a capability not compiled, or a path could change in a gated build. Mitigated by tying nav items to `cfg(feature)` and the type set, and by a verification check that the default build's route table is byte-identical.
+- **Accessibility regression.** New controls and states can break the floor. Mitigated by §8 invariants and verification at four viewports including 375px.
+- **Rollout.** Ship as a bounded amendment in team-owned changes: web (nav + selector + capability pages), server (bot-side appeal), core (`bot_type` field), then verification. Capability pages are feature-gated and opt-in; the default build is behavior-compatible with the approved IA. Rollback is a revert of each team's change; no data migration to unwind beyond the additive `bot_type` field.
 
 ---
 
 ## 11. Ownership
 
-- **Spec owner:** L6 (this document).
-- **L7 — Staff Client Platforms:** nav projection, scope selector + type facet, capability-gated nav items, and the three web configuration surfaces (Blocked words, Content policy, Automation) in `src/web/**`.
-- **L8 — Staff Server:** the bot-side end-user appeal flow and any handler / dialogue work that feeds the appeal queue (`src/handlers/**`, `src/dialogue.rs`).
-- **L9 — Staff Core Systems:** the additive `bot_type` field and any data-layer / config support in `src/db.rs`, `src/config.rs`, or `Cargo.toml` for feature packaging.
-- **L3 — Associate Verification:** mandatory before any completion claim — full gate set, §9 acceptance criteria, and confirmation that no existing path or gate changed.
-- **L10 — Principal Security:** engaged on any content-policy capability that would expose message content or user presence; a security finding is a floor, not a peer, and escalation follows `AUTO_ROUTE.md` §5.
-- **L6-C coherence sign-off:** not triggered — no token value or brand token changes in this amendment.
+- **Spec owner:** this document.
+- **Web:** nav projection, scope selector + type facet, capability-gated nav items, and the three web configuration surfaces (Blocked words, Content policy, Automation) in `src/web/**`.
+- **Server:** the bot-side end-user appeal flow and any handler / dialogue work that feeds the appeal queue (`src/handlers/**`, `src/dialogue.rs`).
+- **Core:** the additive `bot_type` field and any data-layer / config support in `src/db.rs`, `src/config.rs`, or `Cargo.toml` for feature packaging.
+- **Verification:** mandatory before any completion claim — full gate set, §9 acceptance criteria, and confirmation that no existing path or gate changed.
+- **Security:** engaged on any content-policy capability that would expose message content or user presence; a security finding is a floor, not a peer, and escalation follows the conflict rules.
+- **Design coherence sign-off:** not triggered — no token value or brand token changes in this amendment.

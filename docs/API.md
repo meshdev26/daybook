@@ -173,7 +173,7 @@ Auth: session cookie (web) or `Authorization: Bearer <api-key>` where noted; JSO
 
 ## Finance (added v1.2)
 
-Money movement is owner-approved (T2) and audited (`audit_log`).
+Money movement is owner-approved and audited (`audit_log`).
 
 | Method & path | Role | Description |
 |---|---|---|

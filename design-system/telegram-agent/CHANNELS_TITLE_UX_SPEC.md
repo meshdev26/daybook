@@ -1,8 +1,8 @@
 # Channel Title UX — Titleless Rows, Honest Add, One Label Everywhere
 
-**Status:** Approved (3-item fix), ready for L7 implementation
+**Status:** Approved (3-item fix), ready for web implementation
 **Date:** 2026-10-31
-**Role:** L6 senior-design-ux
+**Discipline:** design
 **Territory of this spec:** console display of channel identifiers only. No
 new routes, no schema, no bot-side changes.
 **Sources of truth:** `DESIGN.md` + `assets/app.css` (MASTER.md is
@@ -194,7 +194,7 @@ Rename would fail with "channel not found (or not yours to rename)". Pointing
 a seller at a dead action violates the honesty bar; the seller hint states
 the fact and stops. (Owner-side remedy is a §8 follow-up, not this pass.)
 
-**Uniformity note for L7:** the hint fires on EVERY titleless row, including
+**Uniformity note for web:** the hint fires on EVERY titleless row, including
 rows whose identifier is an `@handle`. That is intentional — the condition is
 "no title", not "looks like a bare ID" (one rule, no heuristics). On an
 `@handle` row the hint is muted 12px `--ink-3` and reads as "the Telegram
@@ -389,7 +389,7 @@ are unchanged.
 
 ---
 
-## 5. Constraints for L7 (non-negotiable)
+## 5. Constraints for web (non-negotiable)
 
 1. **No new routes.** `mod.rs` route table untouched.
 2. **No handler-logic changes** beyond the §3.3 flag + §3.2 banner in the add
@@ -433,7 +433,7 @@ are unchanged.
 | `src/web/smoke_tests.rs:166-181, 261-283` | `/channels` 200, `/channels/add` redirect | SAFE — status-only; `?added=1&notitle=1` still passes `is_redirection()`. No test asserts a `Location` containing `added=1` |
 | `src/web/smoke_tests.rs:498-503` | `/channels/title` route | Untouched — that route is out of scope |
 
-Additive test suggestions (L7): (1) owner add with unresolved title → redirect
+Additive test suggestions (Web): (1) owner add with unresolved title → redirect
 query contains `notitle=1` and GET `/channels` contains both
 `alert alert-info` and `no title yet — use Rename to name it`; (2) `?added=1`
 alone still renders `Channel added.`; (3) titled row renders

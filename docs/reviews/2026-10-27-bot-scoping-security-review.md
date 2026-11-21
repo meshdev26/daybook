@@ -1,8 +1,8 @@
-# Security Review — Web Bot Scoping + Sidebar Bot Dropdown (L7)
+# Security Review — Web Bot Scoping + Sidebar Bot Dropdown
 
-**Reviewer:** L10 (principal-security) — inline run of the role (sub-agent dispatch unavailable this session; territory discipline preserved: read-only review, remediation by owning rungs).
+**Reviewer:** Security discipline — inline review (read-only, with remediation by the owning teams).
 **Date:** 2026-10-27
-**Scope:** uncommitted tree implementing `~/.commandcode/plans/web-bot-scoping-plan.md` — `src/web.rs` (bot_select, bots_page/bots_save, bot_scope_control, bot_scope_sellers/in_bot_scope, effective_bot send adoption, page scoping), `src/auth.rs` (session extraction incl. `selected_bot_id`), `src/db.rs` bot helpers, `src/bots.rs`, `assets/app.css`, UX spec.
+**Scope:** uncommitted tree implementing the web bot-scoping plan — `src/web.rs` (bot_select, bots_page/bots_save, bot_scope_control, bot_scope_sellers/in_bot_scope, effective_bot send adoption, page scoping), `src/auth.rs` (session extraction incl. `selected_bot_id`), `src/db.rs` bot helpers, `src/bots.rs`, `assets/app.css`, UX spec.
 **Verdict:** **No blockers. Ship-allowed for pilot.** Three accepted notes, two follow-ups (one already tracked in the UX spec §7).
 
 ## Plan-mandated checks
@@ -46,4 +46,4 @@
 
 ## Verification performed
 - Read all touched handlers and helpers end-to-end (no rubber-stamping of the pre-existing plumbing: `effective_bot`'s pinned resolution was read line-by-line — seller→`for_seller`, admin→`admins.bot_id`→fallback primary, owner→selection→fallback primary).
-- Gated by 8 new tests in `src/web.rs` (5 × L8 surface, 3 × L7 shell/resolution/scoping) plus the restored `Session` struct's downstream suite: **357 lib tests, 0 failures** at review time.
+- Gated by 8 new tests in `src/web.rs` (5 × server surface, 3 × web shell/resolution/scoping) plus the restored `Session` struct's downstream suite: **357 lib tests, 0 failures** at review time.

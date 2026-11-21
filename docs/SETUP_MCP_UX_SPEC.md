@@ -1,9 +1,9 @@
 # Setup Links & MCP Tokens — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec. WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
-**Related:** `ARCHITECTURE-V1.4.md` §3 (D6) and §4 (D7) — binding contracts, `assets/app.css`, `src/web.rs` (`claim_form_html` / `SECRET_TOGGLE` / `sign_in_form_html` idioms, `settings_password` password floor + session invalidation, `keys_body` shown-once pattern, `login_throttle`), `docs/API.md` (see §8.3 — the MCP section must exist for §7 copy to point at), `docs/EASY_SETUP.md` (L4 notes the flow).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
+**Related:** `ARCHITECTURE-V1.4.md` §3 (D6) and §4 (D7) — binding contracts, `assets/app.css`, `src/web.rs` (`claim_form_html` / `SECRET_TOGGLE` / `sign_in_form_html` idioms, `settings_password` password floor + session invalidation, `keys_body` shown-once pattern, `login_throttle`), `docs/API.md` (see §8.3 — the MCP section must exist for §7 copy to point at), `docs/EASY_SETUP.md` (docs notes the flow).
 
 ---
 
@@ -44,7 +44,7 @@ The link lets you choose a password and signs you in. It works once — if it ex
 ```
 
 - `{setup_url}` = `Config::web_url()` base + `/setup/claim?token={raw}`. `{username}` is the derived account name (Telegram username or `seller_{user_id}`).
-- **No password appears anywhere in the message** (L3 greps the message constructors — architecture test invariant 4). The placeholder `gen_token(12)` password is still written to the account row but never displayed.
+- **No password appears anywhere in the message** (verification greps the message constructors — architecture test invariant 4). The placeholder `gen_token(12)` password is still written to the account row but never displayed.
 - Failure path unchanged: `Seller created, but web account failed: {e}` (no link minted if the account write failed).
 
 ### 1.3 `/becomeseller` (account already exists)
@@ -171,7 +171,7 @@ Same `.door` + `.panel.narrow` shell, no form (there is nothing to submit):
 
 1. **Labels.** Both password fields use explicit `<label for>` (the `claim_form_html` pattern) — not `aria-label`-only; `required` + `aria-required="true"`.
 2. **Secret toggle.** `SECRET_TOGGLE` ships `aria-label="Show password"` + `aria-pressed` state and the JS binds per-field; nothing new to build.
-3. **Errors announced.** Every `alert-error` carries `role="alert"` (assertive announcement); the success flash on `/dashboard` carries `role="status"`. On a failed re-render, focus lands on the alert (L7: `tabindex="-1"` on the banner, focused on load).
+3. **Errors announced.** Every `alert-error` carries `role="alert"` (assertive announcement); the success flash on `/dashboard` carries `role="status"`. On a failed re-render, focus lands on the alert (web: `tabindex="-1"` on the banner, focused on load).
 4. **Help text associated.** The shared help line and the strength hint get ids referenced by `aria-describedby` from the confirm field (and the strength hint from the password field).
 5. **Focus visibility.** Global `:focus-visible` ring; the toggle keeps its shipped styles. Tab order: password → toggle → confirm → toggle → submit. No positive `tabindex`.
 6. **Contrast & color.** Existing tokens only (verified pairs in `app.css` header); the strength hint is `.help` (ink-3 on surface, the shipped pair); no color-only meaning anywhere.
@@ -183,14 +183,14 @@ Same `.door` + `.panel.narrow` shell, no form (there is nothing to submit):
 
 ## 6. Security & privacy
 
-1. **No password in any DM** — the architecture's L3 invariant; L10 reviews the message constructors (§1).
+1. **No password in any DM** — the architecture's verification invariant; security reviews the message constructors (§1).
 2. **Single-use is atomic.** `consume_pending_token` is a DELETE…RETURNING claim — exactly one concurrent caller wins; the loser gets the generic page. Replay fails closed.
-3. **Throttle is login-class.** The POST shares the sign-in throttle; token guessing is password-guessing. Key choice (token vs IP) is an L7/L8 call — see §10.4.
+3. **Throttle is login-class.** The POST shares the sign-in throttle; token guessing is password-guessing. Key choice (token vs IP) is a web/server call — see §10.4.
 4. **Other sessions invalidated on success** (mirror `settings_password`), so a stale session of a possibly-compromised account does not survive a password reset. The new session survives, obviously.
 5. **No account-existence oracle.** All failure modes render the §4.1 page; the form never confirms a username or account id.
-6. **No banned-password list in v1.4** (none exists in the codebase; the floor is 6 chars server-side). Out of scope here; if L10 requires one, it belongs in a shared util used by `settings_password`, `claim`, and this page — one rule, three surfaces, not three rules.
-7. **TOTP bypass flag (for L10).** A successful claim creates a session without a TOTP challenge, even for a TOTP-enabled account — the architecture's "success ⇒ create session" reading. The bot-chat link is the recovery channel by design; L10 should confirm this is the intended posture. **Flagged, not fixed here.**
-8. **URL-borne credential.** The token rides in the query string (that is the design); servers must not log it (no `tracing` of raw query strings on these routes) and `WEB_URL` must be HTTPS in production docs. L10 verifies.
+6. **No banned-password list in v1.4** (none exists in the codebase; the floor is 6 chars server-side). Out of scope here; if security requires one, it belongs in a shared util used by `settings_password`, `claim`, and this page — one rule, three surfaces, not three rules.
+7. **TOTP bypass flag (for security).** A successful claim creates a session without a TOTP challenge, even for a TOTP-enabled account — the architecture's "success ⇒ create session" reading. The bot-chat link is the recovery channel by design; security should confirm this is the intended posture. **Flagged, not fixed here.**
+8. **URL-borne credential.** The token rides in the query string (that is the design); servers must not log it (no `tracing` of raw query strings on these routes) and `WEB_URL` must be HTTPS in production docs. Security verifies.
 9. **CSRF.** Public POST with a bearer-equivalent hidden field; SameSite=Strict cookie posture unchanged. No new token scheme.
 
 ---
@@ -257,42 +257,42 @@ Your MCP tokens (id | prefix | name | created | expires | last used):
 
 ### 8.1 Bot
 
-The `/mcptoken` no-args reply (§7.1) is the canonical explainer, and `/help`'s token line (L4, `docs/COMMANDS.md`) mirrors it in one line: `/mcptoken — manage MCP API tokens (create / list / revoke).`
+The `/mcptoken` no-args reply (§7.1) is the canonical explainer, and `/help`'s token line (docs, `docs/COMMANDS.md`) mirrors it in one line: `/mcptoken — manage MCP API tokens (create / list / revoke).`
 
 ### 8.2 Console `/keys` (optional, one line)
 
-Below the existing help line ("Keys for the REST API — see docs/API.md."), add: `MCP tokens for the booking/catalog MCP tools are managed in the bot: /mcptoken.` — a pointer, not a surface. If L7 prefers zero changes outside the contracted routes, omitting this line is acceptable; it is a nice-to-have, flagged as such.
+Below the existing help line ("Keys for the REST API — see docs/API.md."), add: `MCP tokens for the booking/catalog MCP tools are managed in the bot: /mcptoken.` — a pointer, not a surface. If the web layer prefers zero changes outside the contracted routes, omitting this line is acceptable; it is a nice-to-have, flagged as such.
 
 ### 8.3 docs/API.md gap (must be closed for §7 to ship)
 
-`docs/API.md` has **no MCP section today** (the only MCP mention in `docs/` is `SECURITY.md`'s "MCP tokens (v2, planned)", now stale — D6 wires them in v1.4). The §7 copy points at "docs/API.md → MCP section", so that section must exist before the copy ships: endpoint path, auth header format (`Authorization: Bearer mcp_…`), per-seller scoping, the 10-token cap, and the bot lifecycle commands. **Owner: L8 writes the endpoint contract; L4 lands the doc.** Flagged, not fixed here.
+`docs/API.md` has **no MCP section today** (the only MCP mention in `docs/` is `SECURITY.md`'s "MCP tokens (v2, planned)", now stale — D6 wires them in v1.4). The §7 copy points at "docs/API.md → MCP section", so that section must exist before the copy ships: endpoint path, auth header format (`Authorization: Bearer mcp_…`), per-seller scoping, the 10-token cap, and the bot lifecycle commands. **Owner: server writes the endpoint contract; docs lands the doc.** Flagged, not fixed here.
 
 ---
 
 ## 9. Responsive behavior
 
-The claim page is a single narrow form: `.door` centers it, `.panel.narrow` (max-width 420px) already fits 320px-wide viewports; fields are full-width, the submit button full-width at ≤480px, both fields ≥44px tall. Nothing to build — listed so L7 verifies at 375px rather than assumes. Bot copy is plain text and wraps naturally.
+The claim page is a single narrow form: `.door` centers it, `.panel.narrow` (max-width 420px) already fits 320px-wide viewports; fields are full-width, the submit button full-width at ≤480px, both fields ≥44px tall. Nothing to build — listed so web verifies at 375px rather than assumes. Bot copy is plain text and wraps naturally.
 
 ---
 
-## 10. Backend contracts L7/L8/L9 must satisfy (flags, not fixes)
+## 10. Backend contracts web/server/core must satisfy (flags, not fixes)
 
-1. **Route naming.** The working brief called this page `/setup-password?token=…`; the ratified contract in `ARCHITECTURE-V1.4.md` §4 is `/setup/claim?token=…` (GET validate, POST consume). **This spec follows the architecture doc.** Flagged for the coordinator so the brief and the contract stop diverging — drift here is an L3 defect either way.
-2. **Password-set method name drift.** The arch contract names `set_web_password_by_id` (async); `update_web_password_by_id` already exists in `src/db.rs:3537` with the same shape (async, bcrypt, by id). L9 should land the arch-named method or ratify the existing name in the doc — one of the two, before L8 wires the bot. **Owner: L9.**
-3. **Session invalidation on claim success.** The arch says "set password, create session" and is silent on other sessions. This spec requires the `settings_password` semantics (other sessions deleted, this one kept) because the flow is functionally a password reset. **Owner: L8/L9.**
-4. **Throttle key choice.** The shared `login_throttle` is string-keyed; for `/setup/claim` the key should be the token hash (per-credential) or the peer IP (per-network) — L7/L8 pick one; both are defensible, IP-keying also throttles token *spray* across many fabricated tokens, which per-token keying does not. **Owner: L7 + L10.**
-5. **`/dashboard?welcome=1`** is a new flash param on an existing page — the only change to `/dashboard` itself. **Owner: L7.**
-6. **MCP token name length** (≤ 64 chars) and `days` parsing live in the handler (L8); the Db cap of 10 active tokens and the prefix/hash storage are already in the L9 contract.
-
----
-
-## 11. Token-contract flags (L6-C)
-
-**None.** Everything reuses shipped primitives: `door`, `panel` (+ `.narrow`), `secret-field`/`secret-toggle`/`SECRET_TOGGLE`, `help`, `btn`, `alert`/`alert-error`/`alert-success`, `code.copyable` (if L7 later renders a token in a console context — not required in v1.4), `badge` (not needed here). No new classes, no inline styles, no new color values, no new components.
+1. **Route naming.** The working brief called this page `/setup-password?token=…`; the ratified contract in `ARCHITECTURE-V1.4.md` §4 is `/setup/claim?token=…` (GET validate, POST consume). **This spec follows the architecture doc.** Flagged for the owner so the brief and the contract stop diverging — drift here is a verification defect either way.
+2. **Password-set method name drift.** The arch contract names `set_web_password_by_id` (async); `update_web_password_by_id` already exists in `src/db.rs:3537` with the same shape (async, bcrypt, by id). core should land the arch-named method or ratify the existing name in the doc — one of the two, before server wires the bot. **Owner: core.**
+3. **Session invalidation on claim success.** The arch says "set password, create session" and is silent on other sessions. This spec requires the `settings_password` semantics (other sessions deleted, this one kept) because the flow is functionally a password reset. **Owner: server/core.**
+4. **Throttle key choice.** The shared `login_throttle` is string-keyed; for `/setup/claim` the key should be the token hash (per-credential) or the peer IP (per-network) — web/server pick one; both are defensible, IP-keying also throttles token *spray* across many fabricated tokens, which per-token keying does not. **Owner: web + security.**
+5. **`/dashboard?welcome=1`** is a new flash param on an existing page — the only change to `/dashboard` itself. **Owner: web.**
+6. **MCP token name length** (≤ 64 chars) and `days` parsing live in the handler (server); the Db cap of 10 active tokens and the prefix/hash storage are already in the core contract.
 
 ---
 
-## 12. Acceptance checklist (for L7 / L3 verification)
+## 11. Token-contract flags (design)
+
+**None.** Everything reuses shipped primitives: `door`, `panel` (+ `.narrow`), `secret-field`/`secret-toggle`/`SECRET_TOGGLE`, `help`, `btn`, `alert`/`alert-error`/`alert-success`, `code.copyable` (if web later renders a token in a console context — not required in v1.4), `badge` (not needed here). No new classes, no inline styles, no new color values, no new components.
+
+---
+
+## 12. Acceptance checklist (for web / verification)
 
 Setup links (Area C):
 
@@ -318,10 +318,10 @@ MCP tokens (Area B):
 
 ---
 
-## 13. Open questions for L6-C
+## 13. Open questions for design
 
 1. **Token contract: none.** §11 stands — no new tokens or components; the claim page is the existing claim-form vocabulary, and the MCP flow is bot-text only.
-2. **Non-token, for the record (no response needed unless overridden):** the strength hint is static text rather than a JS meter (§2.3). If L6-C wants a meter, it must be a no-JS-safe enhancement and would be the first script on a public page — the recommended default is static.
+2. **Non-token, for the record (no response needed unless overridden):** the strength hint is static text rather than a JS meter (§2.3). If design wants a meter, it must be a no-JS-safe enhancement and would be the first script on a public page — the recommended default is static.
 
 ---
 

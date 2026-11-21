@@ -1,9 +1,9 @@
 # Bookings — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec. WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
-**Related:** `ARCHITECTURE-V1.4.md` §2 (D1–D5, D8 — binding contracts), `assets/app.css`, `src/web.rs` (`orders_page` scope/filter/table idiom, `subs_page` banner idiom, `keys_body` confirm idiom), `schema.sql` (`services`/`slots`/`bookings`), `docs/COMMANDS.md` (L4 updates the command list).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
+**Related:** `ARCHITECTURE-V1.4.md` §2 (D1–D5, D8 — binding contracts), `assets/app.css`, `src/web.rs` (`orders_page` scope/filter/table idiom, `subs_page` banner idiom, `keys_body` confirm idiom), `schema.sql` (`services`/`slots`/`bookings`), `docs/COMMANDS.md` (docs updates the command list).
 
 ---
 
@@ -13,7 +13,7 @@
 2. **Scoping mirrors `orders_page`.** Sellers see their own bookings (scope from `session.seller_id`, never a query value); admin/owner see all. The gate is server-side, not UI-only.
 3. **Actions follow the D3 state machine.** `held` → Confirm/Decline (the seller-response pair); `expired` → Confirm (resurrection, may lose the slot race) / Decline; `confirmed` → Cancel. Terminal rows (`declined`, `cancelled`) carry no actions. Decline and Cancel are destructive and use the existing confirm-first idiom (`confirm()`); Confirm is not destructive and must stay friction-free — it is the time-critical action.
 4. **Read-only services panel** below the table (D8): name, price, duration, available-slot count, with pointers to `/serviceadd` and `/slotadd`. Services CRUD stays bot-only in v1.4.
-5. **All bot copy lives in one place (§4)** — the exact strings for `/book` (fixed to say *requested*), `/mybookings`, `/cancelbooking`, `/bookingconfirm`, `/bookingdecline`, the sweeper DM, and the seller DMs — so L8, L4 and this page speak one vocabulary.
+5. **All bot copy lives in one place (§4)** — the exact strings for `/book` (fixed to say *requested*), `/mybookings`, `/cancelbooking`, `/bookingconfirm`, `/bookingdecline`, the sweeper DM, and the seller DMs — so the server layer, docs and this page speak one vocabulary.
 6. **No new tokens.** The page is buildable entirely from existing primitives (`panel`, `stat`, `table-wrap`, `badge`, `btn*`, `inline-form`, `empty`, `mono`, `help`, `sub`) — see §11.
 
 ---
@@ -97,7 +97,7 @@ Columns, in this order:
 | 2 | Seller | `seller_id` | **admin/owner view only**; omitted entirely for sellers (not an empty column) — `SUBS_UX_SPEC` §3.3 precedent |
 | 3 | Buyer | `user_id` | mono; full value (operator needs it for support; masking is an export-time rule per `SUBS_UX_SPEC` §5.5, not a v1 HTML rule) |
 | 4 | Service | service name via `service_id` JOIN | `esc()`'d free text |
-| 5 | Slot | `slots.starts_at` JOIN | mono; stored value rendered verbatim (RFC3339 after D4 validation; add `title` with a long form if L7 formats it). `—` when `slot_id` is NULL (legacy rows) |
+| 5 | Slot | `slots.starts_at` JOIN | mono; stored value rendered verbatim (RFC3339 after D4 validation; add `title` with a long form if the web layer formats it). `—` when `slot_id` is NULL (legacy rows) |
 | 6 | Status | `status` | badge per §3.4; text is the status word, never color alone |
 | 7 | Expires | `expires_at` | mono; the seller-response deadline (D3). `—` when NULL. For non-held rows it is history, not urgency |
 | 8 | Actions | — | per-status controls (§3.5) |
@@ -160,7 +160,7 @@ Below the table, an `<article class="panel">` — `h3 Services` + one-line help 
 
 ## 4. Bot copy (exact strings)
 
-Every buyer/seller-facing string for the v1.4 booking loop, in one place. `{placeholders}` are values; L8 sends them verbatim (plain text, no Markdown forced). L4 mirrors the command summaries in `docs/COMMANDS.md`.
+Every buyer/seller-facing string for the v1.4 booking loop, in one place. `{placeholders}` are values; server sends them verbatim (plain text, no Markdown forced). Docs mirrors the command summaries in `docs/COMMANDS.md`.
 
 ### 4.1 `/book <service_name>` (fixes the "confirmed" lie — D3/D8)
 
@@ -255,7 +255,7 @@ You can book again: /book {service_name}
 3. **Status is never color-only.** Badges carry the status word (the leading dot is decorative). Count cards pair the number with a text label.
 4. **Table semantics.** `<table aria-label="Bookings">`, `scope="col"` on every `<th>`, sr-only `<caption>` (§3.3).
 5. **Action buttons.** Every button's accessible name includes the booking id (§3.5). Destructive actions confirm via native `confirm()` — keyboard and screen-reader accessible; no custom modal in v1.
-6. **Alerts.** Success banners use `role="status" aria-live="polite"`; error banners use `role="alert" aria-live="polite"` — the exact markup vocabulary of `subs_page:3291-3357`. On a banner-bearing render, focus lands on the banner (L7: `tabindex="-1"` on the banner container, focused on load when present).
+6. **Alerts.** Success banners use `role="status" aria-live="polite"`; error banners use `role="alert" aria-live="polite"` — the exact markup vocabulary of `subs_page:3291-3357`. On a banner-bearing render, focus lands on the banner (Web: `tabindex="-1"` on the banner container, focused on load when present).
 7. **Touch targets.** Row-action buttons ≥ 44×44px on touch devices (§3.5); chips keep ≥ 44px tap height when wrapped.
 8. **Focus visibility.** Global `:focus-visible` ring (2px brand outline); no `outline: none` on any new element. No positive `tabindex`.
 9. **Contrast.** Existing tokens only (verified ≥ 4.5:1 in `app.css`); badge/alert pairings are the shipped ones. No new color values.
@@ -267,7 +267,7 @@ You can book again: /book {service_name}
 ## 6. Security & privacy
 
 1. **Authentication.** Every route requires a valid session; unauthenticated → 303 `/login`.
-2. **Authorization (server-side).** Scope derived from the session (seller → own; admin/owner → any), enforced inside the Db methods (`seller_scope`), not the handler. A seller POSTing another seller's `booking_id` must not mutate: respond with the `error=forbidden` flash (or 403 — L7 picks one and applies it to all three POSTs), mirroring `SUBS_UX_SPEC` §5.2.
+2. **Authorization (server-side).** Scope derived from the session (seller → own; admin/owner → any), enforced inside the Db methods (`seller_scope`), not the handler. A seller POSTing another seller's `booking_id` must not mutate: respond with the `error=forbidden` flash (or 403 — the web layer picks one and applies it to all three POSTs), mirroring `SUBS_UX_SPEC` §5.2.
 3. **Input validation.** `booking_id` is allow-listed to the scoped row set by the Db call itself; a missing/invalid id redirects with `error=invalid` and touches nothing.
 4. **No PII in URLs.** The only params are `status` and the booking token (an 8-char random token — a capability reference, not an identity).
 5. **No PII in logs.** Trace/audit lines reference `booking_id` only, never `user_id`.
@@ -305,7 +305,7 @@ Built exactly like `subs_page:3287-3363` (banners collect into a list; all pre-e
 | `error=slot&b={id}` | `Could not confirm booking {id}: the slot is no longer available.` | `alert-error` / `role="alert"` |
 | `error=state&b={id}` | `Booking {id} can no longer be changed.` | `alert-error` / `role="alert"` |
 
-Banner copy claims only what the console did — it never promises a DM was sent (the arch contracts DMs on the bot paths; console-side DMs are an L8 decision, §10.3).
+Banner copy claims only what the console did — it never promises a DM was sent (the arch contracts DMs on the bot paths; console-side DMs are a server decision, §10.3).
 
 ### 8.2 Empty states
 
@@ -324,7 +324,7 @@ Banner copy claims only what the console did — it never promises a DM was sent
 
 ## 9. Out of scope (v1.4, per the architecture doc)
 
-- Priced bookings / Crypto Pay invoice per booking (v1.5, pending the L5 ruling Q1) — `services.price` stays display-only in the services panel.
+- Priced bookings / Crypto Pay invoice per booking (v1.5, pending the finance ruling Q1) — `services.price` stays display-only in the services panel.
 - Class capacity (N seats) — D1 defers to v1.5.
 - Console services CRUD — read-only panel only (D8); `/serviceadd`/`/slotadd` remain bot-only.
 - Buyer console — buyers act via the bot (`/mybookings`, `/cancelbooking`); the console is a seller/admin surface.
@@ -336,27 +336,27 @@ Banner copy claims only what the console did — it never promises a DM was sent
 
 ---
 
-## 10. Backend contracts L7/L8/L9 must satisfy (flags, not fixes)
+## 10. Backend contracts web/server/core must satisfy (flags, not fixes)
 
-These are required for the spec to be implementable; flagged so the owning rungs act. Deviation from `ARCHITECTURE-V1.4.md` signatures is an L3 defect — so are gaps in it.
+These are required for the spec to be implementable; flagged so the owning teams act. Deviation from `ARCHITECTURE-V1.4.md` signatures is a verification defect — so are gaps in it.
 
 1. **Console list method is missing from the contract (gap).** `list_bookings(seller_scope)` has no slot time and no service name; `list_bookings_for_user(user_id)` is buyer-scoped. The D8 table needs both. Required: a console list, recommended signature
-   `list_bookings_filtered(seller_scope: Option<i64>, status_opt: Option<&str>, limit: i64) -> Vec<BookingConsoleRow>` (booking_id, seller_id, user_id, service_name, status, slot_starts_at, expires_at, created_at; JOIN services + slots). SQL-level `WHERE status = ?` is required — filter-after-LIMIT silently hides matching rows (same rationale as `SUBS_UX_SPEC` §9). **Owner: L9.**
-2. **Console cancel has no Db method (contract mismatch).** The route table says `POST /bookings/cancel … seller own / admin any`, but the Db contract only lists buyer-scoped `cancel_booking(user_id, booking_id)`. The console needs a seller/admin-scoped cancel accepting `held|confirmed` (state machine: `confirmed → cancelled` via console; `held → cancelled` stays legal). Recommend `cancel_booking_scoped(seller_scope: Option<i64>, booking_id: &str)`. **Owner: L9 + L8.**
-3. **Console-side DMs are unspecified.** The arch contracts DMs on the bot paths (`confirm_booking` returns `(seller_id, buyer_user_id)` *for DMs*). Recommendation: the three POST handlers best-effort DM the counterpart using the §4 strings (buyer on confirm/decline/cancel; nobody on expiry). If skipped, §8.1 copy stays truthful as written. **Owner: L8.**
-4. **Available-slot counts for the services panel.** No aggregate exists today (`list_slots` is per service). Recommend `available_slot_counts(seller_scope) -> Vec<(service_id, i64)>` (slots `status='available'` and future), or compute per service in the handler for v1.4 volumes. **Owner: L9.**
-5. **Row cap.** Fetch limit 200 with footer note "Showing the first 200 bookings." when more exist — never silently truncate. Counts (§3.2) derive from the unscoped-by-limit query. **Owner: L7.**
-6. **`log_action` detail.** Detail is the `booking_id` token only. **Owner: L8/L7.**
+   `list_bookings_filtered(seller_scope: Option<i64>, status_opt: Option<&str>, limit: i64) -> Vec<BookingConsoleRow>` (booking_id, seller_id, user_id, service_name, status, slot_starts_at, expires_at, created_at; JOIN services + slots). SQL-level `WHERE status = ?` is required — filter-after-LIMIT silently hides matching rows (same rationale as `SUBS_UX_SPEC` §9). **Owner: core.**
+2. **Console cancel has no Db method (contract mismatch).** The route table says `POST /bookings/cancel … seller own / admin any`, but the Db contract only lists buyer-scoped `cancel_booking(user_id, booking_id)`. The console needs a seller/admin-scoped cancel accepting `held|confirmed` (state machine: `confirmed → cancelled` via console; `held → cancelled` stays legal). Recommend `cancel_booking_scoped(seller_scope: Option<i64>, booking_id: &str)`. **Owner: core + server.**
+3. **Console-side DMs are unspecified.** The arch contracts DMs on the bot paths (`confirm_booking` returns `(seller_id, buyer_user_id)` *for DMs*). Recommendation: the three POST handlers best-effort DM the counterpart using the §4 strings (buyer on confirm/decline/cancel; nobody on expiry). If skipped, §8.1 copy stays truthful as written. **Owner: server.**
+4. **Available-slot counts for the services panel.** No aggregate exists today (`list_slots` is per service). Recommend `available_slot_counts(seller_scope) -> Vec<(service_id, i64)>` (slots `status='available'` and future), or compute per service in the handler for v1.4 volumes. **Owner: core.**
+5. **Row cap.** Fetch limit 200 with footer note "Showing the first 200 bookings." when more exist — never silently truncate. Counts (§3.2) derive from the unscoped-by-limit query. **Owner: web.**
+6. **`log_action` detail.** Detail is the `booking_id` token only. **Owner: server/web.**
 
 ---
 
-## 11. Token-contract flags (L6-C)
+## 11. Token-contract flags (design)
 
 **None.** The page is buildable from existing primitives only: `panel`, `stat`/`stat-value`/`stat-label` (already accepted and shipped, `app.css:338-347`), `table-wrap`, `badge` (+ the three variants), `btn`/`btn-secondary`/`btn-danger`/`btn-ghost`/`btn-sm`, `inline-form`, `empty`, `mono`, `help`, `sub`, `grid-2`, `alert*`. The rail entry is a markup change in `web.rs`, no CSS. Confirm-first reuses the native `confirm()` precedent from `keys_body`. No new classes, no inline styles, no new color tokens.
 
 ---
 
-## 12. Acceptance checklist (for L7 / L3 verification)
+## 12. Acceptance checklist (for web / verification)
 
 - [ ] `GET /bookings` renders for seller (own rows) and admin/owner (all rows); unauthenticated redirects to `/login`.
 - [ ] Nav contains "Bookings" between Subscriptions and Analytics.
@@ -378,10 +378,10 @@ These are required for the spec to be implementable; flagged so the owning rungs
 
 ---
 
-## 13. Open questions for L6-C
+## 13. Open questions for design
 
 1. **Token contract: none.** §11 stands — no new tokens are needed; the page reuses the accepted `.stat` primitive and the existing badge/button/panel vocabulary.
-2. **Non-token, for the record (no response needed unless overridden):** held rows present Decline rather than Cancel (§3.5). If L6-C wants both affordances on `held`, the server already permits it — it is a one-markup change, but the recommended default is the single verb.
+2. **Non-token, for the record (no response needed unless overridden):** held rows present Decline rather than Cancel (§3.5). If design wants both affordances on `held`, the server already permits it — it is a one-markup change, but the recommended default is the single verb.
 
 ---
 

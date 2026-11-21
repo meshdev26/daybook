@@ -101,7 +101,7 @@ Capabilities are chosen at build time with Cargo features: `shop_bot`,
 registered and which bot types are accepted at runtime — a movie-only build
 registers only the movie capability and refuses other types. They do **not**
 omit dependencies or shrink the binary (all crates stay compiled); dropping
-unused dependencies is a deferred cross-rung follow-up. A movie-only install
+unused dependencies is a deferred follow-up. A movie-only install
 builds with `cargo build --no-default-features --features movie_bot`; changing
 capabilities means rebuilding and redeploying.
 
@@ -204,8 +204,8 @@ See `docs/` and root MD files:
 - `docs/DEPLOYMENT.md` — deployment guide.
 - `docs/DEPLOY_PROFILES.md` — same app anywhere: desktop / new / existing server, Docker, ARM.
 - `docs/DESKTOP.md` — desktop app distribution (.exe / .app).
-- `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan (L11/L8/L10 dispatch).
-- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (T1, awaiting approval).
+- `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan.
+- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (awaiting approval).
 - `docs/COMMANDS.md` — full command reference.
 - `docs/SETUP.md` — step-by-step setup.
 - `docs/ARCHITECTURE.md` — code structure.

@@ -1,8 +1,8 @@
 # Setup & Management UX — Polish Spec
 
-**Owner:** L6 (Senior UX Designer). Status: v1 spec (2026-10-29), polish pass — no new routes, no
-schema changes, no security-model changes. L7 implements in `src/web/**`.
-**Audience:** L7 (implementation), L8 (data), L10 (security review).
+**Owner:** design. Status: v1 spec (2026-10-29), polish pass — no new routes, no
+schema changes, no security-model changes. The web layer implements in `src/web/**`.
+**Audience:** web implementation, server data, security review.
 **Problem:** the owner says setup and management are "a bit complicated to set up."
 **Goal:** time-to-first-value < 10 min on a phone, for a non-technical business owner.
 **Floor:** WCAG 2.1 AA is non-waivable (§5). House tokens: `assets/app.css` + `DESIGN.md`;
@@ -200,7 +200,7 @@ to the token itself.
 - `Default channel ID` (numeric) → **drop from the form.** Two channel fields for one concept is
   a proven confusion; `default_channel_value()` in this file already prefers
   `default_channel` and falls back to `default_channel_id`, so a single field suffices. (No
-  handler-signature change required to accept one of them empty; if L7 prefers zero handler
+  handler-signature change required to accept one of them empty; if the web layer prefers zero handler
   churn, hide the second field with a `.help` note instead: `You almost never need this — use the field above.`)
 - `Token env var` → label `Where the token will be stored` — help: `The setting name in your config file that will hold this bot's token, for example BOT_TOKEN_MAIN. The console never stores the token itself — you paste the actual token into .env (or your bot config file) yourself.`
   Pre-suggest a value: `BOT_{KEY uppercased with - and _ folded to _}` (e.g. key `main` →
@@ -354,7 +354,7 @@ says "Optional —" and where to add it later.
 
 ---
 
-## 4. Implementation checklist for L7 (ordered; execute top to bottom)
+## 4. Implementation checklist for web (ordered; execute top to bottom)
 
 No new routes, no `schema.sql`/`Db` signature changes, no security-model changes. Each item
 compiles and passes `cargo clippy -- -D warnings` independently.
@@ -389,10 +389,10 @@ compiles and passes `cargo clippy -- -D warnings` independently.
 11. **`src/web/admin_console.rs` — `bots_disable` / `bots_delete`.** Set `restart_required`; key-
     addressed banners (alert-warn); confirm() copy naming `{key}` (F3.5).
 12. **`assets/app.css` — expected: no changes.** All prescriptions reuse existing classes
-    (`alert`, `help`, `secret-field`, `code.copyable`, `empty`, `badge`). If L7 finds a genuine
+    (`alert`, `help`, `secret-field`, `code.copyable`, `empty`, `badge`). If web finds a genuine
     token gap (e.g. the snippet `<code class="copyable">` inside a `details` needing no extra
-    chrome), stop and file it back to L6 — do not add component CSS unilaterally.
+    chrome), stop and file it back to design — do not add component CSS unilaterally.
 
-**Review gate (L6):** after items 1–11, run the manual smoke from `AGENTS.md` §6 on a phone-width
+**Review gate (design):** after items 1–11, run the manual smoke from `AGENT.md` §6 on a phone-width
 viewport plus a keyboard-only pass: tab order reaches every field, each error re-render announces
 itself, every success banner names its restart consequence.

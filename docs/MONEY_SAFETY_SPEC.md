@@ -1,15 +1,15 @@
-# Money Safety Spec — Approved Safety Batch (T1)
+# Money Safety Spec — Approved Safety Batch
 
-**Status:** T1 proposal. Owner-approved scope is L11 recommendation B: **implement
+**Status:** proposal. Owner-approved scope is the architecture recommendation B: **implement
 Decisions 1–5; defer Decisions 6–12 behind the explicit guards in §6.**
 This document specifies money *semantics* only. It contains no implementation
-claim: every "MUST" below is a requirement for L8/L9/L7, not a statement that
+claim: every "MUST" below is a requirement for server/core/web, not a statement that
 the code already satisfies it.
 
-**Branch:** `feature/multibot-foundation`. **Owning rung:** L5 (Senior Finance)
-decides the numbers/state semantics; L9 owns schema, L8 owns logic, L7 owns the
-Finance page if the UI needs changes, L10 holds a blocking review, L3 runs the
-gate set (§7). Human T2 gates are listed in §7.
+**Branch:** `feature/multibot-foundation`. **Owning team:** finance
+decides the numbers/state semantics; core owns schema, server owns logic, web owns the
+Finance page if the UI needs changes, security holds a blocking review, verification runs the
+gate set (§7). Human approval gates are listed in §7.
 
 **Evidence baseline (exact locations in this tree):**
 - `schema.sql:28-42` invoices (`amount`/`asset` TEXT, `status`, `attempts`);
@@ -56,7 +56,7 @@ gate set (§7). Human T2 gates are listed in §7.
 break re-issue after a definite failure, and fail to open any legacy DB that
 already holds more than one refund for an invoice.
 
-### 1.1 Exact SQL-level invariants (L9)
+### 1.1 Exact SQL-level invariants (core)
 
 ```sql
 -- (a) At most ONE in-flight refund per invoice. Terminal rows do not block a
@@ -144,7 +144,7 @@ what serializes two concurrent creators so both cannot pass the cap):
 
 - **Do not add `UNIQUE(refunds.invoice_id)`; do not delete or merge legacy
   refund rows.** Auditability requires every historical money movement stay
-  reconstructable (`docs/SECURITY.md:46`, L5 charter), which is exactly the
+  reconstructable (`docs/SECURITY.md:46`, finance scope), which is exactly the
   pattern already used for appeal dedup at the tail of `schema.sql` — except
   that the dedup cleanup there DELETEs rows, which is **forbidden for money**.
 - Migration preflight: if any `invoice_id` has >1 row in the in-flight status
@@ -333,7 +333,7 @@ audited exit path. On CAS entry, stamp `executing_since` (UTC).
    row ids in the audit metadata. An empty digest still writes an audit row
    (proof the job ran); a failed/locked digest run alerts the owner rather than
    being silent.
-5. Timers MUST be driven by an injectable clock so L3 can test 30 min / 24 h /
+5. Timers MUST be driven by an injectable clock so tests can verify 30 min / 24 h /
    72 h boundaries without sleeping. These are internal operational targets,
    not SLA commitments (G7).
 
@@ -342,7 +342,7 @@ audited exit path. On CAS entry, stamp `executing_since` (UTC).
 ## 6. Deferred guards (Decisions 6–12) — explicit, enforceable constraints
 
 Decisions 6–12 are **not implemented in this batch**. Each is replaced by a
-guard that MUST hold on every release until the decision is lifted by L5.
+guard that MUST hold on every release until the decision is lifted by finance.
 Verification is per-release and is a release gate, not a one-time check.
 
 | ID | Guard (enforceable constraint) | Per-release verification |
@@ -360,24 +360,24 @@ Verification is per-release and is a release gate, not a one-time check.
 
 ## 7. Ownership and gates
 
-| Rung / gate | Responsibility in this batch | Deliverable |
+| Team / gate | Responsibility in this batch | Deliverable |
 |---|---|---|
-| L11 Fellow Architect | Owns the rec-B scope boundary and defers 6–12; arbitrates any proposed guard relaxation. | Written scope decision; no code. |
-| L9 Staff Core Systems | Schema + `Db::migrate` only: §1.1 indexes/triggers/columns, §3 `paid_ungranted` + guard, §4 `transfer_attempts`, §5 clock columns. No logic. | Migration + schema diff; legacy-DB migration test. |
-| L8 Staff Server | All logic: §1.2 cap transaction, §2 gating + audits, §3 sweepers/alerts, §4 spend-id helper + shared classifier, §5 state machine + digest; REST/bot/web parity. | Code + unit/integration/property tests. |
-| L7 Staff Client Platforms | **If needed**: Finance page owner-only actions, creator hiding, `needs_reconciliation` resolution form with reason, banners, digest rendering. No new money semantics in the UI. | Web changes only where the UI cannot express §2/§5. |
-| L10 Principal Security | **Blocking review** of fail-closed classification, separation of duties, spend-id idempotency, trigger correctness, no money-row deletion, audit completeness. May block release; findings fixed by the owning rung, not by L10. | Sign-off or blocking defect list. |
-| L3 Associate Verification | Gate set: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`, `cargo deny check`, `python3 scripts/verify-agent-tiers.py`, plus this spec's property/fuzz/migration/clock tests. Verifies; never fixes. | Green gate report. |
-| Human T2 — first real-value transfer | Owner present; first live refund/payout executed for a **small amount** and the Crypto Pay receipt checked before any larger transfer is enabled. | Signed owner confirmation + receipt reference. |
-| Human T2 — keys | Crypto Pay token and owner credentials rotated/scoped and confirmed not logged before transfers are enabled. | Owner confirmation. |
-| Human T2 — publishing | Owner approves the corrected docs (`SECURITY.md`, `API.md`, `COMMANDS.md`, `CRYPTO_PAY.md`) and release notes. | Owner approval. |
-| Human T2 — deletion | **None in scope** (G8 forbids money-row deletion). | No gate. |
+| Architecture | Owns the rec-B scope boundary and defers 6–12; arbitrates any proposed guard relaxation. | Written scope decision; no code. |
+| Core | Schema + `Db::migrate` only: §1.1 indexes/triggers/columns, §3 `paid_ungranted` + guard, §4 `transfer_attempts`, §5 clock columns. No logic. | Migration + schema diff; legacy-DB migration test. |
+| Server | All logic: §1.2 cap transaction, §2 gating + audits, §3 sweepers/alerts, §4 spend-id helper + shared classifier, §5 state machine + digest; REST/bot/web parity. | Code + unit/integration/property tests. |
+| Web | **If needed**: Finance page owner-only actions, creator hiding, `needs_reconciliation` resolution form with reason, banners, digest rendering. No new money semantics in the UI. | Web changes only where the UI cannot express §2/§5. |
+| Security | **Blocking review** of fail-closed classification, separation of duties, spend-id idempotency, trigger correctness, no money-row deletion, audit completeness. May block release; findings fixed by the owning team, not by security. | Sign-off or blocking defect list. |
+| Verification | Gate set: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`, `cargo deny check`, plus this spec's property/fuzz/migration/clock tests. Verifies; never fixes. | Green gate report. |
+| Owner approval — first real-value transfer | Owner present; first live refund/payout executed for a **small amount** and the Crypto Pay receipt checked before any larger transfer is enabled. | Signed owner confirmation + receipt reference. |
+| Owner approval — keys | Crypto Pay token and owner credentials rotated/scoped and confirmed not logged before transfers are enabled. | Owner confirmation. |
+| Owner approval — publishing | Owner approves the corrected docs (`SECURITY.md`, `API.md`, `COMMANDS.md`, `CRYPTO_PAY.md`) and release notes. | Owner approval. |
+| Owner approval — deletion | **None in scope** (G8 forbids money-row deletion). | No gate. |
 
 ---
 
 ## 8. Acceptance criteria
 
-**Implementation (L9/L8/L7, as assigned above)**
+**Implementation (core/server/web, as assigned above)**
 - [ ] I1 — §1.1: both partial unique indexes, the asset-match and immutability
       triggers, and all new columns exist; no blanket `UNIQUE(invoice_id)`.
 - [ ] I2 — §1.2: refund creation runs inside one `BEGIN IMMEDIATE` with decimal
@@ -398,7 +398,7 @@ Verification is per-release and is a release gate, not a one-time check.
       audited resolutions, 09:00 UTC daily digest, injectable clock.
 - [ ] I9 — §6: all guards G1–G8 hold; no deferred feature is wired into money.
 
-**Verification (L3 + L10 + humans)**
+**Verification (automated checks + security review + owner gates)**
 - [ ] V1 — Property tests: cap monotonicity (sum never exceeds invoice);
       classifier fuzz (any unrecognized string ⇒ `Ambiguous`); idem-key replay
       creates exactly one row; no `paid → failed` path.
@@ -409,11 +409,11 @@ Verification is per-release and is a release gate, not a one-time check.
       30 min / 24 h boundaries; concurrent creators cannot both pass the cap;
       concurrent executors still lose the CAS (existing tests extended).
 - [ ] V4 — Grep/assertion guards G1–G8 executed in CI or the release checklist.
-- [ ] V5 — Full L3 gate set green (§7) and L10 blocking review signed.
-- [ ] V6 — Human T2 gates: small-amount first transfer + receipt, keys, docs/
+- [ ] V5 — Full gate set green (§7) and security blocking review signed.
+- [ ] V6 — Human approval gates: small-amount first transfer + receipt, keys, docs/
       publishing approval; deletion gate confirmed as "none in scope".
 
 **Out of scope / non-goals for this batch:** no new money product, no REAL money
 column, no AI charges, no promo/referral/bonus/credit value, no fees, no
 entitlement/proration, no SLA/export/retention promise, no data deletion, no
-implementation work performed by this T1 document.
+implementation work performed by this proposal.
