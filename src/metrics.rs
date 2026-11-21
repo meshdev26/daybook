@@ -269,7 +269,7 @@ pub fn mcp_tool(tool: Option<&'static str>, tier: &'static str, ok: bool) {
 ///
 /// Wired only at the send sites in `main.rs` (background granter + scheduled
 /// posts); the per-handler send sites in `handlers/` are intentionally not
-/// instrumented yet (other rung's territory).
+/// instrumented yet (another area).
 pub fn bot_sent() {
     global().bot.fetch_add(1, Ordering::Relaxed);
 }

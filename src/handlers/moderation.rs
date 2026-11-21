@@ -53,7 +53,7 @@ use crate::db::{Db, EffectiveModerationPolicy, moderation_mode_severity};
 
 /// Fixed error text used when the outbound gate holds content. `SendError`
 /// has no dedicated variant and its exhaustive match lives outside this
-/// rung's territory, so the hold rides in the existing `Transport(String)`
+/// area, so the hold rides in the existing `Transport(String)`
 /// arm with a stable, content-free marker that callers/tests can identify.
 pub const OUTBOUND_HOLD_ERROR: &str = "outbound content held by content policy (moderation_hold)";
 
