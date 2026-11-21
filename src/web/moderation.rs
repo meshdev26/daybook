@@ -275,14 +275,14 @@ fn content_policy_body(
   <h3>Add a floor word</h3>
   <form method="post" action="{add_url}" class="form-row mod-form">
     <label for="policy-term">Word or phrase
-      <input id="policy-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off">
-      <span class="help">One word or phrase. Matching ignores case.</span>
+      <input id="policy-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off" aria-describedby="policy-term-help">
     </label>
     <label for="policy-mode">How to handle it
       <select id="policy-mode" name="mode" aria-describedby="policy-mode-help">{mode_options}</select>
     </label>
     <button type="submit" class="btn">{button_label}</button>
   </form>
+  <p class="help" id="policy-term-help">One word or phrase. Matching ignores case.</p>
   {glossary}
 </article>
 <article class="panel"><h3>Floor words</h3><ul class="rows">{rows}</ul></article>"#,
@@ -543,14 +543,14 @@ fn blocked_words_body(
   <h3>Add a word</h3>
   <form method="post" action="{add_url}" class="form-row mod-form">
     <label for="blocked-term">Word or phrase
-      <input id="blocked-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off">
-      <span class="help">One word or phrase. Matching ignores case.</span>
+      <input id="blocked-term" type="text" name="term" value="{term}" maxlength="{max_len}" required autocomplete="off" aria-describedby="blocked-term-help">
     </label>
     <label for="blocked-mode-new">How to handle it
       <select id="blocked-mode-new" name="mode" aria-describedby="blocked-mode-help">{mode_options}</select>
     </label>
     <button type="submit" class="btn">{button_label}</button>
   </form>
+  <p class="help" id="blocked-term-help">One word or phrase. Matching ignores case.</p>
   {glossary}
 </article>
 <article class="panel"><h3>Your blocked words</h3><ul class="rows">{rows}</ul></article>

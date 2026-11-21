@@ -571,8 +571,10 @@ td.actions { text-align: right; }
 li.empty { text-align: left; padding: 14px 2px; }
 li.empty b { display: inline; margin-right: 8px; }
 /* Two-line empty states: headline, then detail on its own line with breathing
- * room (the inline <b> above must not run into the explanation). */
-.empty .empty-detail { display: block; margin-top: 4px; }
+ * room. li.empty is a flex row, so `display:block` alone does NOT wrap the
+ * detail onto a new line — flex-basis:100% forces the break at every viewport
+ * (desktop and 375px alike). */
+.empty .empty-detail { display: block; flex: 0 0 100%; width: 100%; margin-top: 4px; }
 
 /* ---- setup steps --------------------------------------------------------------------- */
 details { border: 1px solid var(--line); border-radius: var(--radius-ctl); background: var(--surface-2); }
@@ -611,12 +613,18 @@ details > article.panel {
   margin-bottom: 16px;
 }
 .grid-stats .panel { margin-bottom: 0; }
-/* Shared inline controls: one gap between fields, one gap between a caption
- * and its input. Existing cart/subs/codes/nav forms keep their flex behaviour;
+/* Shared inline controls: INLINE-level so multiple forms (web-users Actions
+ * cell) and a trailing help span (channel Identity/Default) stay on one line.
+ * Block-level `flex` here stacked them vertically. One gap between fields, one
+ * gap between a caption and its input. .filter-bar / .mod-form are flex
+ * containers themselves (children blockified), so their spacing is unaffected;
  * .alert-form reasserts its tighter 8px gap further down. */
-.inline-form { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.inline-form { display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; vertical-align: middle; }
 .inline-form label { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 .inline-form input:not([type="hidden"]) { width: auto; min-width: 10rem; }
+/* td.actions is text-align:right; explicit flex-end keeps action forms hugged
+ * right (subs extend/revoke, finance approve/execute, referrals approve). */
+td.actions .inline-form { justify-content: flex-end; }
 /* ---- bot cards (Bot management v2) ---------------------------------------- */
 /* Collapsed accordion cards (MANAGEMENT_DISCLOSURE_SPEC §2): the summary is
    the card header; form + actions live in the expanded body. */
@@ -750,11 +758,13 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
 .mod-form .mod-field { flex: 1 1 220px; }
 .mod-form .mod-field select { flex: 1 1 180px; }
 .mod-row-form, .moderation-override .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-/* Shared word/appeal row: term | mode form | actions. The .panel ul li ledger
- * rule above is why the selector carries a class on the `ul` child token —
- * grid must win over the generic flex row. Actions always occupy column 3,
- * even on two-cell rows (allowed words), so they line up down the list. */
-ul.moderation-row, .panel ul.moderation-row {
+/* Shared word/appeal row: term | mode form | actions. The class is on the <li>
+ * and every such row lives in <ul class="rows">, so the selector must target
+ * `li.moderation-row` / `.rows li.moderation-row`. The `.rows li` form outranks
+ * the generic `.panel ul li` flex ledger rule above (grid must win over flex).
+ * Actions always occupy column 3, even on two-cell rows (allowed words), so
+ * they line up down the list. */
+li.moderation-row, .rows li.moderation-row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center; gap: 12px;
 }
@@ -776,7 +786,7 @@ ul.moderation-row, .panel ul.moderation-row {
   }
   .moderation-override .btn { width: 100%; }
   /* Stack the row grid cleanly: no side-by-side select/actions, no overflow. */
-  ul.moderation-row, .panel ul.moderation-row {
+  li.moderation-row, .rows li.moderation-row {
     grid-template-columns: 1fr; justify-items: stretch; gap: 8px;
   }
   .moderation-row > .row-actions { grid-column: auto; justify-content: flex-start; }

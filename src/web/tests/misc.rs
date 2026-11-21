@@ -42,23 +42,33 @@ proptest! {
 #[tracing::instrument(skip_all)]
 async fn console_alignment_utilities_are_served_globally() {
     let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    state.db.add_blocked_word(0, "gridcheck", "warn", true);
     let app = router(state);
-    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let css = body_string(resp).await;
     for selector in [
-        ".inline-form { display: flex; align-items: center; gap: 12px",
+        // inline-level again so the web-users Actions forms and the channel
+        // trailing help flow horizontally; td.actions hugs them to the right.
+        ".inline-form { display: inline-flex; align-items: center; gap: 12px",
         ".inline-form label { display: inline-flex; align-items: center; gap: 8px",
+        "td.actions .inline-form { justify-content: flex-end",
         ".form-row { display: flex; align-items: flex-end; gap: 12px",
         ".form-row > label { display: flex; flex-direction: column; gap: 6px",
         "min-height: 40px",
         "grid-template-columns: repeat(2, minmax(0, 1fr))",
         "ul.recovery-codes > li",
-        "ul.moderation-row, .panel ul.moderation-row {",
+        "li.moderation-row, .rows li.moderation-row {",
         "grid-template-columns: minmax(0, 1fr) auto auto",
         ".moderation-row > .row-actions",
         ".filter-bar { display: flex; flex-direction: column; gap: 12px",
-        ".empty .empty-detail { display: block",
+        // flex-basis:100% is what actually wraps the detail in a flex <li>.
+        ".empty .empty-detail { display: block; flex: 0 0 100%",
     ] {
         assert!(css.contains(selector), "missing `{selector}` in app.css");
     }
@@ -70,6 +80,23 @@ async fn console_alignment_utilities_are_served_globally() {
     assert!(
         css.contains(".moderation-row button { min-height: 44px"),
         "{css}"
+    );
+    // The grid selector must be a real selector for the markup the server
+    // emits: class on the <li>, parent <ul class="rows"> — not just strings.
+    assert!(
+        css.contains("li.moderation-row, .rows li.moderation-row {")
+            && css.contains("grid-template-columns: minmax(0, 1fr) auto auto"),
+        "grid rule missing: {css}"
+    );
+    let resp = app
+        .oneshot(authed_req("/blocked-words", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(
+        html.contains(r#"<ul class="rows"><li class="moderation-row">"#),
+        "grid selector `li.moderation-row, .rows li.moderation-row` must match rendered markup: {html}"
     );
 }
 

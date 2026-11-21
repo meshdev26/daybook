@@ -830,8 +830,8 @@ async fn empty_floor_warning_is_rendered_on_both_moderation_pages() {
 }
 
 /// Alignment fixes: add forms share the `.form-row` label-above-field row,
-/// word rows share the `.moderation-row` grid (actions in column 3), and the
-/// request-review empty state is two lines instead of a run-on sentence.
+/// word rows use the `<li class="moderation-row">` grid (actions in column 3),
+/// and the request-review empty state is two lines instead of a run-on sentence.
 #[cfg(feature = "moderation")]
 #[tokio::test]
 async fn blocked_words_uses_shared_alignment_utilities() {
@@ -839,22 +839,98 @@ async fn blocked_words_uses_shared_alignment_utilities() {
     let owner = owner_session(&state).await;
     state.db.add_blocked_word(0, "spamword", "warn", true);
     let app = router(state);
+    // The CSS selector must name the element that actually carries the class,
+    // and that exact element must appear in the rendered ledger (not just a
+    // loose class-name string).
+    let css_resp = app
+        .clone()
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(css_resp.status(), StatusCode::OK);
+    let css = body_string(css_resp).await;
+    assert!(
+        css.contains("li.moderation-row, .rows li.moderation-row {")
+            && css.contains("grid-template-columns: minmax(0, 1fr) auto auto"),
+        "{css}"
+    );
+    assert!(
+        css.contains(".empty .empty-detail { display: block; flex: 0 0 100%"),
+        "{css}"
+    );
     let resp = app
         .oneshot(authed_req("/blocked-words", &owner))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
-    assert!(body.contains(r#"class="form-row mod-form""#), "{body}");
-    assert!(body.contains(r#"class="moderation-row""#), "{body}");
-    assert!(body.contains(r#"class="row-actions""#), "{body}");
-    assert!(body.contains("No review requests yet."), "{body}");
     assert!(
-        body.contains(r#"<span class="empty-detail">Requests from your bots"#),
+        body.contains(
+            r#"<form method="post" action="/blocked-words/add" class="form-row mod-form">"#
+        ),
         "{body}"
     );
-    assert!(!body.contains(r#"class="mod-row""#), "{body}");
-    // The mode select keeps its accessible name and Update stay in one form.
+    assert!(
+        body.contains(r#"<ul class="rows"><li class="moderation-row">"#),
+        "grid selector must match a real rendered row: {body}"
+    );
+    assert!(body.contains(r#"<div class="row-actions">"#), "{body}");
+    assert!(
+        body.contains(
+            r#"<li class="empty"><b>No review requests yet.</b><span class="empty-detail">Requests from your bots"#
+        ),
+        "{body}"
+    );
+    assert!(!body.contains(r#"<li class="mod-row""#), "{body}");
+    // Term help is now a described-by paragraph OUTSIDE the <label>, so the
+    // input and select bottom-align and the help no longer pollutes the name.
+    assert!(
+        body.contains(r#"aria-describedby="blocked-term-help""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            r#"<p class="help" id="blocked-term-help">One word or phrase. Matching ignores case.</p>"#
+        ),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="help">One word or phrase"#),
+        "term help must live outside the <label>: {body}"
+    );
+    // The mode select keeps its accessible name and Update stays in one form.
     assert!(body.contains("How to handle spamword"), "{body}");
     assert!(body.contains("blocked-mode-help"), "{body}");
+}
+
+/// All four moderation empty states put the detail in a wrapping
+/// `<span class="empty-detail">` inside `<li class="empty">`, and the CSS has
+/// the flex-basis rule that actually breaks it onto its own line.
+#[cfg(feature = "moderation")]
+#[tokio::test]
+async fn moderation_empty_states_wrap_detail_on_its_own_line() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let app = router(state);
+    for (path, token, headline) in [
+        ("/content-policy", &owner, "No floor terms yet."),
+        ("/blocked-words", &owner, "No blocked words yet."),
+        ("/blocked-words", &owner, "No allowed words yet."),
+        ("/blocked-words", &owner, "No review requests yet."),
+    ] {
+        let resp = app.clone().oneshot(authed_req(path, token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_string(resp).await;
+        assert!(
+            body.contains(&format!(
+                r#"<li class="empty"><b>{headline}</b><span class="empty-detail">"#
+            )),
+            "{path}: empty state must wrap its detail: {body}"
+        );
+    }
+    let css = body_string(app.oneshot(get_req("/assets/app.css")).await.unwrap()).await;
+    assert!(
+        css.contains(".empty .empty-detail { display: block; flex: 0 0 100%"),
+        "empty-detail must have flex-basis:100%: {css}"
+    );
 }
