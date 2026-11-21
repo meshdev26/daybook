@@ -728,3 +728,54 @@ async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
     }
     assert!(links >= 5, "expected seller nav links, got {links}: {nav}");
 }
+
+/// Scroll memory (full-navigation console): the 5th APP_JS IIFE saves and
+/// restores the scroll offset per URL in sessionStorage, but leaves back/
+/// forward native and never touches focus management or scrollRestoration.
+#[tokio::test]
+async fn nav_scroll_memory_js_and_shell_markup_unchanged() {
+    let js = super::super::html::APP_JS;
+    for needle in [
+        "tg.scroll.v1",
+        "sessionStorage",
+        "location.pathname + location.search",
+        "pagehide",
+        "beforeunload",
+        "performance.getEntriesByType('navigation')",
+        "back_forward",
+        "requestAnimationFrame",
+        "window.scrollTo(0, y)",
+    ] {
+        assert!(js.contains(needle), "missing `{needle}` in APP_JS");
+    }
+    // NOTE: the L6-mandated snippet mentions `scrollRestoration` in a comment,
+    // so a literal `!js.contains("scrollRestoration")` cannot pass. Assert the
+    // actual invariant instead: the property is never read or assigned, so
+    // back/forward scroll stays native.
+    assert!(
+        !js.contains("history.scrollRestoration")
+            && !js.contains("scrollRestoration =")
+            && !js.contains("scrollRestoration=")
+            && js.matches("scrollRestoration").count() == 1,
+        "back/forward scroll must stay native (no scrollRestoration access)"
+    );
+    // The existing focus-on-load / skip-link behavior is untouched.
+    assert!(js.contains("[data-focus-on-load]"), "{js}");
+
+    let (state, _dir) = make_state().await;
+    let body = html_page(&state, None, "Dashboard", "<p>x</p>");
+    assert!(
+        body.contains(r#"<a class="skip-link" href='#main'>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<main class="main" id="main">"#), "{body}");
+    // No tabindex was added to the skip link or the main landmark.
+    assert!(
+        !body.contains(r#"class="skip-link" href='#main' tabindex"#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<main class="main" id="main" tabindex"#),
+        "{body}"
+    );
+}

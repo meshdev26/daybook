@@ -177,6 +177,42 @@ pub(super) const APP_JS: &str = r#"(function () {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncThemeButtons);
   else syncThemeButtons();
 })();
+(function () {
+  'use strict';
+  // Server-rendered console: full navigations are by design. Remember the
+  // scroll offset per URL so returning to a page (or a same-URL reload/PRG)
+  // resumes where the user left off. Never impose a stored offset on a page
+  // not yet visited; back/forward stays native (scrollRestoration untouched).
+  var KEY = 'tg.scroll.v1';
+  var navType = (function () {
+    try {
+      var e = performance.getEntriesByType('navigation')[0];
+      return e && e.type ? e.type : 'navigate';
+    } catch (_) { return 'navigate'; }
+  })();
+  function urlKey() { return location.pathname + location.search; }
+  function read() {
+    try {
+      var m = JSON.parse(sessionStorage.getItem(KEY) || '{}');
+      return m && typeof m === 'object' ? m : {};
+    } catch (_) { return {}; }
+  }
+  function save() {
+    try {
+      var m = read();
+      m[urlKey()] = window.scrollY || window.pageYOffset || 0;
+      sessionStorage.setItem(KEY, JSON.stringify(m));
+    } catch (_) { /* storage blocked — enhancement only */ }
+  }
+  if (navType !== 'back_forward') {
+    var y = read()[urlKey()];
+    if (typeof y === 'number' && y > 0) {
+      requestAnimationFrame(function () { window.scrollTo(0, y); });
+    }
+  }
+  window.addEventListener('pagehide', save);
+  window.addEventListener('beforeunload', save);
+})();
 "#;
 
 const PLANE_SVG: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 3.5 3.8 10.2c-.8.3-.8 1.4 0 1.7l4.9 1.8 1.8 4.9c.3.8 1.4.8 1.7 0L19 5.5"/><path d="M10.5 13.7 21 3.5"/></svg>"#;

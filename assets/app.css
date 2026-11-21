@@ -350,6 +350,11 @@ input:focus, select:focus, textarea:focus {
 }
 textarea { min-height: 96px; resize: vertical; }
 form button[type="submit"] { margin-top: 16px; }
+/* Horizontal forms share one control baseline with their inputs. Descendant
+ * (not `>`) also catches a submit wrapped in a div; specificity (0,2,1) beats
+ * the base (0,1,2). Stacked forms keep their 16px gap. */
+.inline-form button[type="submit"],
+.form-row button[type="submit"] { margin-top: 0; }
 .help { font-size: 12px; color: var(--ink-3); margin: 2px 0 0; }
 
 /* Collapsed long-form help (MANAGEMENT_DISCLOSURE_SPEC §4) */
@@ -622,6 +627,8 @@ details > article.panel {
 .inline-form { display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; vertical-align: middle; }
 .inline-form label { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 .inline-form input:not([type="hidden"]) { width: auto; min-width: 10rem; }
+.inline-form input:not([type="hidden"]),
+.inline-form select { margin-top: 0; margin-bottom: 0; }
 /* td.actions is text-align:right; explicit flex-end keeps action forms hugged
  * right (subs extend/revoke, finance approve/execute, referrals approve). */
 td.actions .inline-form { justify-content: flex-end; }

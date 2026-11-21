@@ -52,6 +52,16 @@ async fn console_alignment_utilities_are_served_globally() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let css = body_string(resp).await;
+    // The base rule is byte-identical: the alignment fix is purely additive
+    // and must never become a global `button { margin-top: 0 }` override.
+    assert!(
+        css.contains("form button[type=\"submit\"] { margin-top: 16px; }"),
+        "base submit margin changed: {css}"
+    );
+    assert!(
+        !css.contains("button { margin-top: 0"),
+        "no global destructive button margin override allowed: {css}"
+    );
     for selector in [
         // inline-level again so the web-users Actions forms and the channel
         // trailing help flow horizontally; td.actions hugs them to the right.
@@ -60,6 +70,11 @@ async fn console_alignment_utilities_are_served_globally() {
         "td.actions .inline-form { justify-content: flex-end",
         ".form-row { display: flex; align-items: flex-end; gap: 12px",
         ".form-row > label { display: flex; flex-direction: column; gap: 6px",
+        // Submit buttons in horizontal forms share their input's baseline;
+        // stacked forms keep the base 16px gap below.
+        ".inline-form button[type=\"submit\"],",
+        ".form-row button[type=\"submit\"] { margin-top: 0; }",
+        ".inline-form input:not([type=\"hidden\"]),",
         "min-height: 40px",
         "grid-template-columns: repeat(2, minmax(0, 1fr))",
         "ul.recovery-codes > li",
