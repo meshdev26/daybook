@@ -1,12 +1,8 @@
-//! Cross-cutting moderation configuration surfaces (IA amendment §4).
+//! Cross-cutting moderation configuration surfaces.
 //!
-//! Three levels, one vocabulary: an owner-only global floor that nobody can
-//! override, a seller-scoped Blocked words page, and the per-bot override that
-//! lives inside the existing `/bots` Advanced disclosure. Every record is
-//! read and written through `Db` methods that bind `seller_id` (and `bot_id`
-//! for overrides) — this module never builds SQL and never trusts a seller id
-//! supplied by a request. Feature-gated: all of its routes are registered only
-//! when `moderation` is compiled in.
+//! Three levels, one vocabulary: an owner-only global floor, a seller-scoped
+//! Blocked words page, and a per-bot override inside `/bots`. All reads/writes
+//! go through `Db` methods that bind `seller_id` (and `bot_id`); no raw SQL.
 
 use super::*;
 use crate::db::MODERATION_MAX_TERM_LEN;
@@ -74,12 +70,8 @@ fn mode_glossary(id: &str) -> String {
     )
 }
 
-/// M5: a plain-language configuration-status warning. It describes POLICY
-/// STATE only — never a term, a message body, a username, or any message
-/// presence — so it cannot leak individual moderation events (security constraint).
-/// `degraded` is core's `resolve_effective_policy().enforcement_degraded` flag;
-/// `floor_empty` is the "no minimum words configured" case, which otherwise
-/// looks identical to healthy enforcement.
+/// Plain-language policy-status warning. Describes policy state only — never
+/// terms, message bodies or users — so it cannot leak moderation events.
 pub(super) fn moderation_notice_html(floor_empty: bool, degraded: bool) -> String {
     if !floor_empty && !degraded {
         return String::new();
@@ -174,16 +166,8 @@ fn owner_gate(state: &WebState, session: &Session) -> Result<(), Response> {
     }
 }
 
-/// Resolve the seller scope for a Blocked words read/write.
-///
-/// The web session is the ONLY source of seller identity. A request that
-/// carries a `seller_id` field is a forged-scope attempt (the shipped forms
-/// never emit one) and is refused with 403. Owners act in the primary shop
-/// namespace (0), the same convention the rest of the console uses for
-/// owner-authored business rows. An admin provisioned without a seller id is
-/// treated the same as an owner (global scope 0); an admin WITH a seller id,
-/// like a seller, is scoped to that id. A seller without one, or any lower
-/// role, fails closed.
+/// Resolve the seller scope for a Blocked words read/write. The web session
+/// is the only source of identity; any request-supplied seller id is refused.
 #[allow(clippy::result_large_err)]
 fn seller_scope(
     state: &WebState,
@@ -197,9 +181,7 @@ fn seller_scope(
     if role.has_level(Role::Owner) {
         Ok(0)
     } else if role.has_level(Role::Admin) && session.seller_id.is_none() {
-        // security LOW finding: an admin without a seller binding used to get a
-        // 403 here. Admin outranks Seller, so the role gate passes; with no
-        // seller id there is no tenant to scope to, so use the owner's 0.
+        // No seller binding: fall back to the global namespace.
         Ok(0)
     } else if role.has_level(Role::Seller) {
         session

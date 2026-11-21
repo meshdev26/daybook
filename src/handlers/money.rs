@@ -1,45 +1,30 @@
-//! Shared money-safety primitives (MONEY_SAFETY_SPEC decisions 3/4/5).
+//! Shared money-safety primitives.
 //!
-//! This module is the SINGLE source of truth for:
-//!   * the fail-closed transfer error classifier (§4.2) — REST, bot and web
-//!     must all branch on the same enum, never on a boolean with an inverted
-//!     default;
-//!   * the persist-then-call transfer helper (§4.1) — no Crypto Pay transfer
-//!     may be issued outside it, so a spend_id is always recorded first;
-//!   * pure clock/cutoff helpers (§3/§5) so the sweepers in `main.rs` can be
-//!     tested at 30s/24h/72h and 30min/24h boundaries without sleeping.
-//!
-//! No money semantics live here beyond the spec's; no secret or message
-//! content is ever logged or placed in a digest.
+//! Single source of truth for the fail-closed transfer classifier, the
+//! persist-then-call transfer helper, and injected-clock helpers for sweepers.
+//! Nothing money-related is logged or placed in a digest.
 
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::Value;
 
-/// §4.2: the two outcomes of a Crypto Pay transfer attempt. `DefiniteRejected`
-/// means the API positively received and refused the request (no money moved);
-/// `Ambiguous` means the money state is unknown and the row must stay
-/// `executing` for operator reconciliation.
+/// Two outcomes of a transfer attempt. `DefiniteRejected` means no money moved;
+/// `Ambiguous` keeps the row `executing` for operator reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferOutcome {
     DefiniteRejected,
     Ambiguous,
 }
 
-/// Fail-closed classifier: ONLY positively recognized API refusals are
-/// `DefiniteRejected`. Everything else — 5xx, 408, timeouts, connect/reset/
-/// broken pipe, decode/build errors, empty strings and any unrecognized or
-/// future error shape — is `Ambiguous`. A novel error must never be treated
-/// as definite, because reverting an executed transfer causes a double payout.
+/// Fail-closed: only recognized refusals are definite; a novel error stays
+/// `Ambiguous`, since reverting an executed transfer would double-pay.
 pub fn classify_transfer_error(err: &str) -> TransferOutcome {
     let e = err.trim();
     if e.is_empty() {
         return TransferOutcome::Ambiguous;
     }
 
-    // `CryptoPay::call` renders non-2xx responses as "HTTP {status} - {body}";
-    // the status token is authoritative. Only 4xx other than 408 is a
-    // definite server-side refusal. 408/5xx are unknowable (the API may have
-    // committed before the response failed).
+    // Only 4xx other than 408 is a definite refusal; 408/5xx may have
+    // committed before the response failed, so stay ambiguous.
     if let Some(rest) = e.strip_prefix("HTTP ") {
         let token: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(code) = token.parse::<u16>() {
@@ -52,11 +37,8 @@ pub fn classify_transfer_error(err: &str) -> TransferOutcome {
         return TransferOutcome::Ambiguous;
     }
 
-    // `ok:false` business rejections arrive from crypto.rs as the bare error
-    // string. Recognize a conservative allowlist of documented refusals;
-    // normalize spaces/hyphens so "insufficient funds" and
-    // "INSUFFICIENT_FUNDS" classify identically. An unknown token falls
-    // through to Ambiguous — that is the whole point of the shared classifier.
+    // Recognize a conservative allowlist of documented `ok:false` refusals,
+    // normalizing case/spacing; anything unknown falls through to Ambiguous.
     let normalized = e.to_ascii_uppercase().replace([' ', '-'], "_");
     const DEFINITE_TOKENS: &[&str] = &[
         "TRANSFER_FAILED",
@@ -124,12 +106,8 @@ fn fresh_spend_id(row_type: &str, row_id: i64) -> Result<String, String> {
     Ok(format!("{row_type}-{row_id}-{}", fresh_key_nonce()?))
 }
 
-/// Execute a transfer with the §4.1 discipline: persist the attempt BEFORE
-/// the call, pass the persisted spend_id to the transport, and audit the
-/// outcome. `reuse_spend_id = Some(sid)` reuses an already-persisted attempt
-/// (ambiguous reconciliation); `None` mints a fresh attempt/spend_id (first
-/// try or a definite-rejected retry). This helper is the ONLY sanctioned
-/// place to invoke a Crypto Pay transfer from REST/bot logic.
+/// Persist the transfer attempt BEFORE the call, then audit the outcome. This
+/// is the only sanctioned place REST/bot logic invokes a Crypto Pay transfer.
 pub async fn execute_guarded_transfer<F, Fut>(
     db: &crate::db::Db,
     row_type: &str,
@@ -190,7 +168,7 @@ where
     }
 }
 
-// ---- Injected-clock helpers (§3 / §5) ----
+// ---- Injected-clock helpers ----
 
 /// Cutoff for the 30-second `paid_ungranted` grant retry (§3.3).
 pub fn paid_ungranted_retry_cutoff(now: DateTime<Utc>) -> String {
@@ -230,11 +208,8 @@ pub fn should_run_digest(now: DateTime<Utc>) -> bool {
     now.hour() == 9 && now.minute() == 0
 }
 
-/// Complete owner view: core's `reconciliation_rows` returns overdue-relevant
-/// rows by injected cutoff; this also folds in every `needs_reconciliation`
-/// refund/payout still inside its 24h window so the owner list and the daily
-/// digest never hide a row simply because it is young. Dedup is by
-/// `(row_type, id)`; no money state is changed here.
+/// Every executing/reconciling row, including young `needs_reconciliation`
+/// rows, deduped by `(row_type, id)`. Never changes money state.
 pub fn all_reconciliation_rows(
     db: &crate::db::Db,
     due: &str,
@@ -354,9 +329,8 @@ fn minor_units(value: &str) -> Option<i128> {
         .checked_add(frac_units)
 }
 
-/// §1.3: a full refund (counted refunds reach the invoiced amount, exact
-/// minor-unit equality) flips the invoice to `refunded` and revokes the
-/// grant; a partial refund leaves it `paid`. Read-only decision helper.
+/// A full refund flips the invoice to `refunded` and revokes the grant;
+/// a partial one leaves it `paid`. Read-only decision helper.
 pub fn is_full_refund(db: &crate::db::Db, invoice_id: &str) -> bool {
     let Some(inv) = db.get_invoice(invoice_id) else {
         return false;
@@ -399,18 +373,8 @@ pub fn has_audit_action(
 const LEGACY_CREATOR_ID: i64 = -1;
 const LEGACY_CREATOR_ROLE: &str = "unknown";
 
-/// Resolve a refund's human creator (§2 separation of duties).
-///
-/// The authoritative source is the persisted `created_by`/`created_role`
-/// columns written by `Db::create_refund_guarded` (core). Unlike a `refund_create`
-/// audit event these never age out of the audit window on a mature database,
-/// so a creator cannot escape the separation check simply by waiting long
-/// enough. AUDIT FALLBACK is deliberately narrow: it applies only to legacy
-/// rows whose persisted creator is the `-1` / `"unknown"` sentinel (created
-/// before the columns existed, or never backfilled because they had no audit
-/// event). A missing refund row returns `None` — there is no row to gate.
-/// System-created refunds carry the sentinel and are exempt from the creator
-/// check (they still require an Owner approver).
+/// Resolve a refund's human creator from persisted columns, falling back to
+/// the audit log only for legacy `-1`/`"unknown"` sentinel rows.
 pub fn refund_creator(db: &crate::db::Db, id: i64) -> Option<(i64, String)> {
     match db.refund_creator(id) {
         Some((creator, role)) if creator != LEGACY_CREATOR_ID && role != LEGACY_CREATOR_ROLE => {
@@ -438,12 +402,8 @@ fn refund_creator_from_audit(db: &crate::db::Db, id: i64) -> Option<(i64, String
         .map(|(_, actor_id, actor_role, _, _, _, _, _)| (actor_id, actor_role))
 }
 
-/// §2 separation of duties, shared by the REST and web surfaces: `true` when
-/// `account_id` is the human that created `refund_id`. Both the REST
-/// reconciliation-resolve gate and the web `creator_owns_refund` gate call
-/// this single helper so the two paths cannot drift. System-created refunds
-/// have no attributable creator and therefore return `false` (they are still
-/// Owner-gated by the callers).
+/// Shared creator-separation check for REST and web: `true` when `account_id`
+/// created `refund_id`. System-created refunds have no creator (false).
 pub fn creator_owns_refund(db: &crate::db::Db, account_id: i64, refund_id: i64) -> bool {
     refund_creator(db, refund_id).is_some_and(|(creator, _)| creator == account_id)
 }

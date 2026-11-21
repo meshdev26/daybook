@@ -1,15 +1,6 @@
 /* Telegram Business — operator console design system.
- *
- * The materialized token contract DESIGN.md specifies: calm, confident,
- * helpful — never loud. One idea carries the identity: the operator's
- * ledger — a commerce back-office set like a well-kept financial book.
- * Borders lead, shadows whisper, figures sit in mono, status is a dot
- * before a word. No hover-lift theatre, no gradient washes.
- *
- * Served from the binary (include_str!) — no CDN, no build step.
- * WCAG 2.2 AA: every text pair below is >= 4.5:1 on its surface
- * (checked: ink/surface 12.9:1, ink-2/surface 5.6:1, brand-ink/brand 5.1:1,
- * on dark: ink/surface 11.2:1, ink-2/surface 6.1:1).
+ * Calm, confident, helpful: borders lead, shadows whisper, figures sit in
+ * mono, status is a dot before a word. Served from the binary, no CDN.
  */
 
 /* ---- fonts (bundled, latin subset; Plex Sans ships as a variable file) -- */
@@ -183,7 +174,7 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail .bot-scope select { width: 100%; font-size: 13px; }
 .rail .bot-scope .btn { align-self: flex-start; }
 .rail .bot-scope-pinned span.mono { font-size: 13px; color: var(--ink); }
-/* Product scope + Type facet (IA amendment §3): native controls, no new tokens. */
+/* Product scope + Type facet: native controls, no new tokens. */
 .rail .product-scope { align-items: stretch; }
 .rail .product-scope select { min-height: 44px; }
 .rail .product-scope .btn { align-self: stretch; min-height: 44px; }
@@ -355,28 +346,24 @@ input:focus, select:focus, textarea:focus {
 }
 textarea { min-height: 96px; resize: vertical; }
 form button[type="submit"] { margin-top: 16px; }
-/* Horizontal forms share one control baseline with their inputs. Descendant
- * (not `>`) also catches a submit wrapped in a div; specificity (0,2,1) beats
- * the base (0,1,2). Stacked forms keep their 16px gap. */
+/* Horizontal forms share one baseline with their inputs; a submit wrapped in
+ * a div must not reclaim the stacked-form gap. */
 .inline-form button[type="submit"],
 .form-row button[type="submit"] { margin-top: 0; }
 .help { font-size: 12px; color: var(--ink-3); margin: 2px 0 0; }
 
-/* Collapsed long-form help (MANAGEMENT_DISCLOSURE_SPEC §4) */
+/* Collapsed long-form help */
 .help-more { margin: 2px 0 0; }
 .help-more summary { padding: 2px 0; font-size: 12px; font-weight: 500; color: var(--ink-3); }
 .help-more[open] summary { margin-bottom: 4px; }
-/* Shared label-above-field row: fields align on their bottom edges and the
- * action sits with them instead of floating on its own line. Legacy two-column
- * grids (setup, AI settings) use direct <div> children — flex:1 keeps their
- * equal-width rhythm; a direct <label> stacks its caption over the control. */
+/* Label-above-field rows align on their bottom edges; legacy two-column
+ * grids keep equal widths via flex:1. */
 .form-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
 .form-row > div { flex: 1 1 240px; min-width: 0; }
 .form-row > label { display: flex; flex-direction: column; gap: 6px; flex: 1 1 220px; min-width: 0; margin: 0; }
 .form-row > button[type="submit"] { margin-top: 0; }
-/* One control-height baseline for inline + stacked forms. Checkboxes, radios
- * and hidden inputs keep intrinsic sizing; :where() keeps this weaker than the
- * shipped 44px touch-target rules (alert-form, moderation, product scope). */
+/* One control-height baseline for inline + stacked forms; :where() keeps it
+ * below the shipped 44px touch-target rules. */
 input:where(:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])),
 select,
 .form-row input:where(:not([type="checkbox"])),
@@ -388,11 +375,8 @@ select,
 .input-num { width: 4.5em; min-width: 4.5em; margin-top: 0; }
 
 /* ---- secret fields: password/token inputs with a reveal toggle -------------
- * Wrapper follows the field's <label> as a sibling (the toggle button must
- * never nest inside a label) and is absolutely positioned over the input's
- * right edge, so nothing shifts when it appears and the input keeps its
- * full-width rhythm. Icons swap on the button's aria-pressed state;
- * behavior lives in /assets/app.js (one shared script, no inline handlers). */
+ * The toggle sits over the input's right edge and never nests inside its
+ * label; behavior lives in /assets/app.js. */
 .secret-field { position: relative; display: block; }
 .secret-field input { padding-right: 46px; } /* text never runs under the button */
 .secret-toggle {
@@ -403,7 +387,7 @@ select,
   width: 40px;
   padding: 0;
   background: transparent;
-  color: var(--ink-3);    /* >= 3:1 on both themes (WCAG 1.4.11 non-text) */
+  color: var(--ink-3);    /* meets non-text contrast on both themes */
   border: none;
   border-left: 1px solid var(--line);
   border-radius: 0 var(--radius-ctl) var(--radius-ctl) 0;
@@ -640,8 +624,8 @@ details > article.panel {
  * right (subs extend/revoke, finance approve/execute, referrals approve). */
 td.actions .inline-form { justify-content: flex-end; }
 /* ---- bot cards (Bot management v2) ---------------------------------------- */
-/* Collapsed accordion cards (MANAGEMENT_DISCLOSURE_SPEC §2): the summary is
-   the card header; form + actions live in the expanded body. */
+/* Collapsed accordion cards: the summary is the header; the body holds the
+   form and actions. */
 details.bot-card { display: block; padding: 0; } /* .panel surface, padding moves to summary/body */
 details.bot-card > summary {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -682,7 +666,7 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 /* Skip link: off-canvas until keyboard-focused, then the first stop on every
- * console page (2.4.1 Bypass Blocks). Focus ring comes from :focus-visible. */
+ * console page. Focus ring comes from :focus-visible. */
 .skip-link { position: absolute; left: -9999px; }
 .skip-link:focus {
   left: 12px; top: 12px;
@@ -731,8 +715,8 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   }
   .rail .bot-scope select { flex: 1 1 auto; width: auto; min-width: 8rem; }
   .rail .bot-scope .btn { align-self: center; }
-  /* IA amendment §3.5: stacked Type / Product label+select and a full-width
-     Switch at 375px — no side-by-side selects, no horizontal scroll. */
+  /* Stack Type / Product selects and the Switch at 375px; no horizontal
+     scroll. */
   .rail .product-scope {
     flex-direction: column; align-items: stretch;
     flex: 1 1 100%; gap: 6px; padding: 4px 0 10px;
@@ -747,24 +731,20 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   html { scroll-behavior: auto; }
 }
 
-/* ---- Identity: unlock-banner inline form (IDENTITY_UX_SPEC §9) -----------
- * .alert is a flex row and the shipped `input { width: 100% }` breaks inside
- * it; this keeps the banner's field row inline (wrap allowed, input flexes,
- * 44px height). The only new CSS the Identity spec authorizes. */
+/* ---- Identity: unlock-banner inline form ---------------------------------
+ * Keep the banner's field row inline (wrap allowed, input flexes, 44px). */
 .alert-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; }
 .alert-form input { flex: 1 1 220px; width: auto; min-height: 44px; }
 
-/* ---- Identity Monitor: read-only timeline (IDENTITY_MONITOR_UX_SPEC §3.2) -
- * Global CSS resets ul but not ol; without this block the timeline renders
- * with browser-default numbering and no ledger dividers. */
+/* ---- Identity Monitor: read-only timeline --------------------------------
+ * Reset ol explicitly: the global ul reset does not reach it. */
 .timeline { margin: 4px 0 0; padding-left: 20px; }
 .timeline li { border-bottom: 1px solid var(--line); padding: 10px 0; }
 .timeline li:last-child { border-bottom: none; }
 .timeline .timeline, .timeline ol { margin-top: 6px; padding-left: 18px; }
 
-/* ---- Moderation configuration surfaces (IA amendment §4/§8) --------------
- * Layout and touch targets only. Every colour, border and type value comes
- * from the shipped token contract above; status is a dot before a WORD. */
+/* ---- Moderation configuration surfaces -----------------------------------
+ * Layout and touch targets only; all values come from the token contract. */
 .moderation-override { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
 .moderation-override h4 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 4px; }
 .moderation-state { text-align: left; padding: 10px 2px; }
@@ -773,12 +753,8 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
 .mod-form .mod-field { flex: 1 1 220px; }
 .mod-form .mod-field select { flex: 1 1 180px; }
 .mod-row-form, .moderation-override .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-/* Shared word/appeal row: term | mode form | actions. The class is on the <li>
- * and every such row lives in <ul class="rows">, so the selector must target
- * `li.moderation-row` / `.rows li.moderation-row`. The `.rows li` form outranks
- * the generic `.panel ul li` flex ledger rule above (grid must win over flex).
- * Actions always occupy column 3, even on two-cell rows (allowed words), so
- * they line up down the list. */
+/* Shared word/appeal row: term | mode form | actions, with actions always in
+ * column 3 so they line up on two-cell rows too. */
 li.moderation-row, .rows li.moderation-row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center; gap: 12px;
@@ -788,8 +764,8 @@ li.moderation-row, .rows li.moderation-row {
   justify-content: flex-end; margin-left: 0;
 }
 .moderation-row select { width: auto; min-width: 8rem; max-width: 100%; }
-/* ≥44px targets at every viewport (spec §8), including mode selects and the
- * single primary action on each moderation screen. */
+/* ≥44px targets at every viewport, including mode selects and the single
+ * primary action on each moderation screen. */
 .mod-form input[type="text"], .mod-form select, .mod-form button,
 .mod-row select, .mod-row button, .moderation-override input[type="text"],
 .moderation-override select, .moderation-override button,

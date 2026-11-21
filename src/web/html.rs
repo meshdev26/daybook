@@ -29,10 +29,8 @@ pub(super) const APP_JS: &str = r#"(function () {
         this.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
       });
     }
-    // Visibility-aware add form (CHANNEL_ADD_REDESIGN_SPEC §3.3): the radio
-    // swaps the identifier placeholder, the visible help line, and the
-    // aria-describedby target. Enhancement only — without JS the public help
-    // shows by default and the omnibus details still carries both rules.
+    // Radio-only enhancement: swap the identifier help and aria-describedby.
+    // Without JS the public help and omnibus rules still render.
     var vform = document.querySelector('[data-visibility-form]');
     if (vform && !vform.dataset.visBound) {
       vform.dataset.visBound = '1';
@@ -49,9 +47,8 @@ pub(super) const APP_JS: &str = r#"(function () {
         });
       });
     }
-    // Focus-on-render for the standing unlock banner and for error alerts
-    // that re-render after a failed POST (IDENTITY_UX_SPEC §3.8/§4.2). The
-    // containers carry tabindex="-1"; without JS the page still works.
+    // Focus the unlock banner or a re-rendered error alert; the containers
+    // carry tabindex="-1", and the page still works without JS.
     var banner = document.querySelector('.unlock-banner');
     if (banner && typeof banner.focus === 'function') { banner.focus(); return; }
     var alertEl = document.querySelector('[data-focus-on-load]');
@@ -81,11 +78,8 @@ pub(super) const APP_JS: &str = r#"(function () {
     return el.getAttribute('data-group');
   }
   function setGroup(group, open) {
-    // At <=900px CSS flattens every group (`.nav-group-panel { display:contents }`)
-    // and hides the toggle. A non-current group must still be fully navigable:
-    // marking its visible links inert/aria-hidden strands touch + keyboard
-    // users (WCAG 2.2 AA 2.1.1 / 2.4.3 / 4.1.2 / 1.3.1). Force every group
-    // open on mobile; desktop keeps its stored, collapsible behaviour + ARIA.
+    // Mobile flattens groups and hides the toggle; force them open so visible
+    // links stay navigable. Desktop keeps its stored ARIA state.
     if (isMobile()) open = true;
     var el = document.querySelector('.nav-group[data-nav-group="' + group + '"]') || document.querySelector('.nav-group[data-group="' + group + '"]');
     if (!el) return;
@@ -134,9 +128,8 @@ pub(super) const APP_JS: &str = r#"(function () {
 })();
 (function () {
   'use strict';
-  // Product scope Type facet (IA amendment §3.2): a client-side aid only.
-  // It has no `name`, never submits and never persists; with JS unavailable
-  // every product is still present and grouped by type in the Product select.
+  // Client-only product filter: no `name`, no submit, no persistence.
+  // Without JS every product stays grouped by type in the Product select.
   function init() {
     var typeSel = document.getElementById('scope-type');
     var prodSel = document.getElementById('scope-product');
@@ -179,10 +172,8 @@ pub(super) const APP_JS: &str = r#"(function () {
 })();
 (function () {
   'use strict';
-  // Server-rendered console: full navigations are by design. Remember the
-  // scroll offset per URL so returning to a page (or a same-URL reload/PRG)
-  // resumes where the user left off. Never impose a stored offset on a page
-  // not yet visited; back/forward stays native (scrollRestoration untouched).
+  // Remember scroll offset per URL across full navigations; back/forward and
+  // never-visited pages stay native (scrollRestoration untouched).
   var KEY = 'tg.scroll.v1';
   var navType = (function () {
     try {
@@ -215,11 +206,8 @@ pub(super) const APP_JS: &str = r#"(function () {
 })();
 (function () {
   'use strict';
-  // The rail is a sticky, independently scrolling column on desktop only;
-  // on mobile it is a wrapping header. Remember its scrollTop across full
-  // navigations so a long nav list resumes where the operator left it.
-  // Desktop + actually-scrollable only: a short nav never pins a stale
-  // offset, and the mobile rail is never forced to scroll. No-JS: top.
+  // Remember the desktop rail's scrollTop across navigations so a long nav
+  // resumes; mobile and short rails stay untouched. No-JS: top.
   var KEY = 'tg.rail.scroll.v1';
   function isDesktop() { return window.matchMedia('(min-width: 901px)').matches; }
   function rail() { return document.querySelector('.rail'); }
@@ -749,10 +737,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
     },
 ];
 
-/// Capability items are kept OUT of `NAV_ITEMS` so the shipped 27 group rows
-/// and their `feature: None` contract stay byte-identical. `rail_nav` injects
-/// them after their anchor row only when the capability is compiled in (IA
-/// amendment §5). A view filter only — the page handlers carry their own gate.
+/// Capability items are injected into `rail_nav` after their anchor row only
+/// when the capability is compiled in; page handlers carry their own gate.
 pub(super) const FEATURE_NAV_ITEMS: &[NavItem] = &[
     NavItem {
         id: "blocked-words",
@@ -839,8 +825,8 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
         .map(|s| super::effective_sidebar_prefs(state, s));
 
     let active_id = active_nav_id(title);
-    // The compile-time capability set and the runtime product type are view
-    // filters only (IA amendment §5); neither touches a route or page gate.
+    // The capability set and product type are view filters only; neither
+    // touches a route or page gate.
     let product_type = selected_product_type(state, session);
 
     // Group order per spec.
