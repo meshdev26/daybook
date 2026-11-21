@@ -14,20 +14,7 @@
 !.env.example
 /docs/plans
 
-# Local agent tooling — internal workflow, not published. EXCEPTION: the
-# agent charters under agents/ ARE published — verify-agent-tiers.py (part
-# of `make test`) machine-checks the ladder against them, so they travel
-# with the repo.
-/.opencode/*
-!/.opencode/agents
-/.commandcode
-/.mimosa
-
-# Internal AI-agent workflow artifacts — local tooling only, never published.
-# These leak absolute developer paths, session IDs and secret-location names.
-/.agents/
-/.qoder/
-/scripts/.mimosa/
+# Local bot registry — machine-specific configuration, not published.
 /bots.toml
 
 # Vendored dependency sources — only the PATCHED crates are tracked (see

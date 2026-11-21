@@ -1,9 +1,9 @@
 # CI — the project gate, on every push and pull request.
 #
 # WHY THIS EXISTS: the quality gate has always lived in `make test` (fmt,
-# clippy -D warnings, the test suite, cargo audit, cargo deny, the role-level
-# routing contract). Before this repository was public that gate ran only on
-# the author's machine; nothing stopped an unvetted pull request from landing.
+# clippy -D warnings, the test suite, cargo audit, cargo deny). Before this
+# repository was public that gate ran only on the author's machine; nothing
+# stopped an unvetted pull request from landing.
 # CI runs THE SAME Makefile target — not a copy of it — so the two can never
 # drift: if the gate changes, CI follows the Makefile automatically.
 #
@@ -34,7 +34,7 @@ env:
 
 jobs:
   gate:
-    name: Gate (fmt, clippy, test, audit, deny, routing contract)
+    name: Gate (fmt, clippy, test, audit, deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

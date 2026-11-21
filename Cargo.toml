@@ -19,12 +19,12 @@ license = "MIT"
 #   service    - AI service surface.
 #   automation - automation rules (Workspace).
 #
-# L9 feature-optionalization investigation (complete, verified — do not
-# re-litigate without a cross-rung gate change): these are still INERT
+# Feature-optionalization investigation (complete, verified — do not
+# re-litigate without a gate-sanctioned change): these are still INERT
 # MARKERS. `cargo tree --depth 1` for `default` and for
 # `--no-default-features --features movie_bot` yield the SAME direct
-# dependency set. No `[dependencies]` entry is optionalizable from L9
-# territory: every crate is referenced by at least one module that compiles
+# dependency set. No `[dependencies]` entry is optionalizable from a core
+# systems perspective: every crate is referenced by at least one module that compiles
 # for every feature set —
 #   reqwest/serde/tokio/tracing/chrono/sha2/getrandom/cookie/bcrypt -> web/**,
 #     api.rs, auth.rs, embed.rs, mcp/**, bots.rs, services/**;
@@ -36,7 +36,7 @@ license = "MIT"
 # `Descriptor` constants: they pull no dependency beyond teloxide's prelude,
 # already required by the dispatcher. There is thus no capability-only dep to
 # mark `optional = true` / `dep:`-map, and no crate-root module in src/lib.rs
-# is purely capability-specific. Prerequisite for real removal (L7/L8-owned):
+# is purely capability-specific. Prerequisite for real removal (server-side):
 # gate the web/api/auth/embed, ai/crypto, identity and shop command-tree
 # modules behind these features, then add `dep:` mappings here. Keeping deps
 # non-optional preserves a byte-identical default build and a green
