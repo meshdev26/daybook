@@ -692,16 +692,6 @@ async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
         "{css}"
     );
 
-    // APP_JS: force open on mobile, re-apply when the breakpoint is crossed,
-    // and refuse a phantom collapse from an invisible toggle.
-    let js = super::super::html::APP_JS;
-    assert!(js.contains("if (isMobile()) open = true;"), "{js}");
-    assert!(
-        js.contains("mq.addEventListener('change', applyStored)"),
-        "{js}"
-    );
-    assert!(js.contains("if (isMobile()) return;"), "{js}");
-
     // DOM-equivalent assertion on the markup the mobile JS enhances: no panel
     // or link carries inert / aria-hidden="true", and every panel link is a
     // native, focusable <a href> (no tabindex="-1").
@@ -729,41 +719,11 @@ async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
     assert!(links >= 5, "expected seller nav links, got {links}: {nav}");
 }
 
-/// Scroll memory (full-navigation console): the 5th APP_JS IIFE saves and
-/// restores the scroll offset per URL in sessionStorage, but leaves back/
-/// forward native and never touches focus management or scrollRestoration.
+/// Scroll memory is covered by the checked `assets/app.js` and its jsdom
+/// harness. This test pins only the shell markup that enhancement relies on:
+/// the skip link, the main landmark, and no extra tabindex on either.
 #[tokio::test]
-async fn nav_scroll_memory_js_and_shell_markup_unchanged() {
-    let js = super::super::html::APP_JS;
-    for needle in [
-        "tg.scroll.v1",
-        "sessionStorage",
-        "location.pathname + location.search",
-        "pagehide",
-        "beforeunload",
-        "performance.getEntriesByType('navigation')",
-        "back_forward",
-        "requestAnimationFrame",
-        // Window restore is now an instant scrollTo (the rail has its own
-        // memory test below); the old `window.scrollTo(0, y)` form is gone.
-        "window.scrollTo({ top: y, behavior: 'instant' })",
-    ] {
-        assert!(js.contains(needle), "missing `{needle}` in APP_JS");
-    }
-    // NOTE: the mandated snippet mentions `scrollRestoration` in a comment,
-    // so a literal `!js.contains("scrollRestoration")` cannot pass. Assert the
-    // actual invariant instead: the property is never read or assigned, so
-    // back/forward scroll stays native.
-    assert!(
-        !js.contains("history.scrollRestoration")
-            && !js.contains("scrollRestoration =")
-            && !js.contains("scrollRestoration=")
-            && js.matches("scrollRestoration").count() == 1,
-        "back/forward scroll must stay native (no scrollRestoration access)"
-    );
-    // The existing focus-on-load / skip-link behavior is untouched.
-    assert!(js.contains("[data-focus-on-load]"), "{js}");
-
+async fn nav_shell_markup_unchanged() {
     let (state, _dir) = make_state().await;
     let body = html_page(&state, None, "Dashboard", "<p>x</p>");
     assert!(
@@ -842,105 +802,27 @@ async fn rail_is_a_scoped_desktop_scroll_container() {
     );
 }
 
-/// The sixth APP_JS IIFE remembers the rail's scrollTop per desktop session
-/// across full navigations, but never touches history.scrollRestoration and
-/// never forces a scroll on the mobile rail. The window scroll restoration
-/// (existing `tg.scroll.v1` IIFE) must be `instant`, not smooth, so a reload
-/// does not animate from the top.
+/// The checked client asset is served from the same source TypeScript and
+/// jsdom validate: `include_str!` supplies APP_JS and the route must return
+/// those exact bytes with a JavaScript content type.
 #[tokio::test]
-async fn rail_scroll_memory_is_desktop_only_and_native_history_is_untouched() {
-    let js = super::super::html::APP_JS;
-    for needle in [
-        "tg.rail.scroll.v1",
-        "sessionStorage",
-        "scrollTop",
-        "matchMedia('(min-width: 901px)')",
-        "pagehide",
-        "beforeunload",
-    ] {
-        assert!(js.contains(needle), "missing `{needle}` in APP_JS");
-    }
-    let compact: String = js.chars().filter(|c| !c.is_whitespace()).collect();
+async fn app_js_asset_route_serves_checked_source() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.js")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     assert!(
-        compact.contains("behavior:'instant'"),
-        "scroll restore must be instant: {js}"
+        content_type.starts_with("application/javascript"),
+        "unexpected content-type: {content_type}"
     );
-    assert!(
-        compact.contains("scrollTo({top:y,behavior:'instant'})"),
-        "window restore must use instant scrollTo: {js}"
-    );
-
-    let rail = js
-        .split("var KEY = 'tg.rail.scroll.v1';")
-        .nth(1)
-        .expect("rail scroll IIFE exists");
-    assert!(
-        rail.contains("scrollTop"),
-        "rail offset must be saved: {rail}"
-    );
-    assert!(
-        rail.contains("sessionStorage"),
-        "rail offset must be session-scoped, not shared across tabs: {rail}"
-    );
-    assert!(
-        rail.contains("getItem") && rail.contains("setItem"),
-        "rail offset must round-trip through Web Storage: {rail}"
-    );
-    // `< 901px` returns early on save and restore: the flat mobile header is
-    // never pinned to a stale desktop offset.
-    assert!(
-        rail.contains("isDesktop()"),
-        "rail memory must be gated on desktop: {rail}"
-    );
-    assert!(
-        !js.contains("history.scrollRestoration")
-            && !js.contains("scrollRestoration =")
-            && !js.contains("scrollRestoration="),
-        "back/forward scroll must stay native (no scrollRestoration access)"
-    );
-}
-
-/// Regression: an <optgroup> has no `.options` property (only <select> does).
-/// Iterating `g.options` threw inside the top-level product-filter IIFE and
-/// aborted the whole deferred script, silently preventing the later theme,
-/// per-URL window-scroll and rail-scroll IIFEs from ever running — which is why
-/// sidebar scroll memory never worked. Pin the valid option collection and the
-/// presence of all six top-level IIFEs so a future crash cannot drop them.
-#[test]
-fn app_js_optgroup_iteration_does_not_abort_later_iifes() {
-    let js = super::super::html::APP_JS;
-
-    // The optgroup loop must enumerate real <option> elements, never the
-    // nonexistent `.options` collection on HTMLOptGroupElement.
-    assert!(
-        js.contains("g.querySelectorAll('option')") || js.contains("g.children"),
-        "optgroup loop must use querySelectorAll('option') or g.children: {js}"
-    );
-    assert!(
-        !js.contains("forEach.call(g.options"),
-        "optgroup loop must never iterate g.options (optgroups have no such property): {js}"
-    );
-
-    // All six APP_JS IIFEs must ship. Losing any of the later ones was the
-    // silent consequence of the top-level throw above.
-    for marker in [
-        ".secret-toggle",       // IIFE 1: secret reveal + focus-on-load
-        "tg.sidebar.groups.v1", // IIFE 2: sidebar group open/closed state
-        "scope-type",           // IIFE 3: product/type facet (the fixed loop)
-        "theme-toggle",         // IIFE 4: mirror resolved theme onto controls
-        "tg.scroll.v1",         // IIFE 5: per-URL window scroll memory
-        "tg.rail.scroll.v1",    // IIFE 6: desktop rail scroll memory
-    ] {
-        assert!(js.contains(marker), "missing APP_JS IIFE marker `{marker}`");
-    }
-    // Six top-level IIFEs (a nested navigation-type probe is indented). New
-    // IIFEs are fine; dropping one is not.
-    let top_level = js
-        .lines()
-        .filter(|line| line.starts_with("(function () {"))
-        .count();
-    assert!(
-        top_level >= 6,
-        "expected all six APP_JS IIFEs, got {top_level}"
-    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), super::super::html::APP_JS.as_bytes());
 }
