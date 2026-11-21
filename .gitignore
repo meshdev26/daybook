@@ -5,6 +5,9 @@
 /fuzz/corpus
 /fuzz/artifacts
 
+# Dev-only Node tooling (never committed, never shipped)
+/assets/node_modules/
+
 # Live data — never commit business state or secrets
 /data
 /backups

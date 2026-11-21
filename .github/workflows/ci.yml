@@ -59,6 +59,23 @@ jobs:
       - name: Run the project gate
         run: make test
 
+  client-check:
+    name: Client JS type check (required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        # Pinned: a drifting Node would make this status non-reproducible.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: 'npm'
+          cache-dependency-path: assets/package-lock.json
+
+      - name: Type-check and test client JS
+        run: npm ci --prefix assets && npm run --prefix assets check && npm test --prefix assets
+
   linux-x64:
     name: Compile check (linux-x64)
     runs-on: ubuntu-latest

@@ -143,6 +143,10 @@ cargo deny check
   /setup/claim links reusing web_pending_mfa (purpose='setup_link'); console
   /bookings page (bookings actions + read-only services). Trust pack: CHANGELOG.md
   (Keep a Changelog), docs/RELEASING.md, Cargo 0.N.0 tracks milestone vN.
+- Dev-only checked-client-JS boundary: `assets/` carries a Node toolchain
+  (typescript/jsdom) wired to `assets/app.js` via `tsconfig.json` (DOM lib);
+  `make js-check` and required CI job `client-check` gate it. `make test` stays
+  Rust-only; no Node/npm at runtime. No cross-project refs (§3).
 
 ## 12. Contacts
 - Maintainer: repository owner.

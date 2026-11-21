@@ -41,6 +41,10 @@ test: ## Full gate suite: fmt, clippy, test, audit, deny
 	cargo audit
 	cargo deny check
 
+.PHONY: js-check
+js-check: ## Dev-only: type-check + test dashboard client JS (Node required)
+	npm ci --prefix assets && npm run --prefix assets check && npm test --prefix assets
+
 .PHONY: fmt
 fmt: ## Format all Rust code
 	cargo fmt

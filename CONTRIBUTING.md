@@ -23,6 +23,12 @@ make test            # the full gate suite
    tests, `cargo audit`, and `cargo deny`. A PR that doesn't pass them doesn't
    get reviewed.
 
+**Client JS:** `make js-check` type-checks `assets/app.js` against the DOM
+(typescript) and runs its jsdom test. It is dev-only — Node is required and it
+is deliberately outside `make test`, which stays Rust-only. The CI
+`client-check` job runs the same commands; it is a required status and must be
+green before merge.
+
 **Compliance posture:** Terms of Service, Privacy, Refund, and Retention policies and an EAA statement are pending before any paid public launch; contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
 
 ## Finding your way around

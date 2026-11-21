@@ -6,6 +6,8 @@ COPY rust-toolchain.toml ./
 COPY vendor ./vendor
 COPY src ./src
 COPY schema.sql ./
+# Required by include_str!/include_bytes! in src/web/html.rs (app.css, fonts).
+COPY assets ./assets
 RUN cargo build --release
 
 # Runtime stage
