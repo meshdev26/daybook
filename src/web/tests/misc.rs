@@ -628,3 +628,119 @@ async fn bookings_alert_is_not_a_redundant_live_region() {
     );
     assert!(!body.contains(r#"role="alert" aria-live"#), "{body}");
 }
+
+// ---- Action placement / detail alignment regression contracts ------------
+
+/// The action column stays right-aligned in tables, inline action forms hug
+/// the right edge, the shared `.row-actions` cluster keeps its own rules, and
+/// charts no longer escape their panel. Flex rows must not let a long label
+/// squeeze the action affordances; on mobile the cluster drops the auto
+/// margin so it can wrap under the text instead of overflowing.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn action_placement_and_detail_alignment_css_contract() {
+    let (state, _dir) = make_state().await;
+    let resp = router(state)
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    for needle in [
+        "td.actions { text-align: right; }",
+        "td.actions .inline-form { justify-content: flex-end; }",
+        ".row-actions {",
+        ".panel canvas { display: block; width: 100%;",
+        ".rows li .row-action, .row-actions { flex: 0 0 auto; }",
+    ] {
+        assert!(css.contains(needle), "missing `{needle}` in app.css");
+    }
+    let compact: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("li.row-action,.row-actions{margin-left:0;}"),
+        "mobile detail alignment override missing: {css}"
+    );
+}
+
+/// Every console table with an Actions header must render its row actions in
+/// the right-aligned cell (`td class="actions"`), not in a plain `<td>`.
+/// Fixtures are minimal: one row per page is enough to exercise the row
+/// template; the empty-state row never carries an action cell.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn console_tables_render_actions_in_dedicated_cells() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let (account_id, _, _, _, _) = state
+        .db
+        .get_web_account_by_username("owner")
+        .expect("owner account exists");
+
+    state
+        .db
+        .create_order(7, 1, account_id, "inv-actions-ui")
+        .unwrap();
+    state
+        .db
+        .create_promo_code(
+            1,
+            "UIACTIONS",
+            "percent",
+            10.0,
+            None,
+            None,
+            0.0,
+            "all",
+            None,
+            None,
+        )
+        .unwrap();
+    state.db.create_code(1, None, Some(30), 1, None, 12);
+    let service = state
+        .db
+        .create_service(1, "consult", "10", "USDT", 60, None)
+        .expect("service created");
+    let slot = state.db.create_slot(
+        service,
+        1,
+        &(chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
+        1,
+    );
+    assert!(
+        state
+            .db
+            .create_booking(service, slot, account_id)
+            .unwrap()
+            .is_some(),
+        "booking fixture claimed the slot"
+    );
+    let _ = state.db.create_api_key(account_id, Some("ui-actions"));
+    state
+        .db
+        .cart_add_item(account_id, 1, "product", 7, 1)
+        .unwrap();
+
+    let app = router(state);
+    for path in [
+        "/orders",
+        "/promos",
+        "/codes",
+        "/bookings",
+        "/webusers",
+        "/keys",
+        "/cart",
+    ] {
+        let resp = app.clone().oneshot(authed_req(path, &owner)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_string(resp).await;
+        let rows = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|chunk| chunk.split("</tbody>").next())
+            .unwrap_or_else(|| panic!("{path} has no table body: {body}"));
+        assert!(
+            rows.contains(r#"<td class="actions""#),
+            "{path} row actions must live in a right-aligned cell: {rows}"
+        );
+    }
+}

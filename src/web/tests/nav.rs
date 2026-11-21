@@ -744,7 +744,9 @@ async fn nav_scroll_memory_js_and_shell_markup_unchanged() {
         "performance.getEntriesByType('navigation')",
         "back_forward",
         "requestAnimationFrame",
-        "window.scrollTo(0, y)",
+        // Window restore is now an instant scrollTo (the rail has its own
+        // memory test below); the old `window.scrollTo(0, y)` form is gone.
+        "window.scrollTo({ top: y, behavior: 'instant' })",
     ] {
         assert!(js.contains(needle), "missing `{needle}` in APP_JS");
     }
@@ -777,5 +779,119 @@ async fn nav_scroll_memory_js_and_shell_markup_unchanged() {
     assert!(
         !body.contains(r#"<main class="main" id="main" tabindex"#),
         "{body}"
+    );
+}
+
+/// Rail-scroll CSS contract (screenshot fix): on desktop the rail is its own
+/// scroll container — never the page — and it carries a stable scrollbar
+/// gutter so the nav does not jump horizontally when it starts to overflow.
+/// At the drawer breakpoint the same rail must hand scrolling back to the
+/// document (`overflow-y: visible`), or a wrapping header becomes a second,
+/// unreachable scroll area.
+#[tokio::test]
+async fn rail_is_a_scoped_desktop_scroll_container() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+
+    let start = css.find(".rail {").expect("the base .rail rule is served");
+    let end = css[start..]
+        .find('}')
+        .map(|i| start + i)
+        .unwrap_or(css.len());
+    let base = &css[start..end];
+    for needle in [
+        "overflow-y: auto",
+        "overscroll-behavior-y: contain",
+        "scrollbar-gutter: stable",
+    ] {
+        assert!(base.contains(needle), "missing `{needle}` in .rail: {base}");
+    }
+
+    // Whitespace-tolerant media-query assertions: the contract is the
+    // desktop-only `flex-shrink:0` pin and the mobile `overflow-y:visible`
+    // override inside a `@media (max-width: 900px)` block.
+    let compact: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("@media(min-width:901px){.rail>*{flex-shrink:0;}}"),
+        "desktop-only rail child pin missing: {css}"
+    );
+    let mobile_override = css
+        .match_indices("@media (max-width: 900px) {")
+        .any(|(i, _)| {
+            let mq = &css[i..];
+            let end = mq.find("\n}").unwrap_or(mq.len());
+            let mq = &mq[..end];
+            mq.split(".rail {").skip(1).any(|chunk| {
+                chunk
+                    .split('}')
+                    .next()
+                    .unwrap_or("")
+                    .contains("overflow-y: visible")
+            })
+        });
+    assert!(
+        mobile_override,
+        "mobile .rail must restore document scrolling: {css}"
+    );
+}
+
+/// The sixth APP_JS IIFE remembers the rail's scrollTop per desktop session
+/// across full navigations, but never touches history.scrollRestoration and
+/// never forces a scroll on the mobile rail. The window scroll restoration
+/// (existing `tg.scroll.v1` IIFE) must be `instant`, not smooth, so a reload
+/// does not animate from the top.
+#[tokio::test]
+async fn rail_scroll_memory_is_desktop_only_and_native_history_is_untouched() {
+    let js = super::super::html::APP_JS;
+    for needle in [
+        "tg.rail.scroll.v1",
+        "sessionStorage",
+        "scrollTop",
+        "matchMedia('(min-width: 901px)')",
+        "pagehide",
+        "beforeunload",
+    ] {
+        assert!(js.contains(needle), "missing `{needle}` in APP_JS");
+    }
+    let compact: String = js.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("behavior:'instant'"),
+        "scroll restore must be instant: {js}"
+    );
+    assert!(
+        compact.contains("scrollTo({top:y,behavior:'instant'})"),
+        "window restore must use instant scrollTo: {js}"
+    );
+
+    let rail = js
+        .split("var KEY = 'tg.rail.scroll.v1';")
+        .nth(1)
+        .expect("rail scroll IIFE exists");
+    assert!(
+        rail.contains("scrollTop"),
+        "rail offset must be saved: {rail}"
+    );
+    assert!(
+        rail.contains("getItem") && rail.contains("setItem"),
+        "rail offset must round-trip through Web Storage: {rail}"
+    );
+    // `< 901px` returns early on save and restore: the flat mobile header is
+    // never pinned to a stale desktop offset.
+    assert!(
+        rail.contains("isDesktop()"),
+        "rail memory must be gated on desktop: {rail}"
+    );
+    assert!(
+        !js.contains("history.scrollRestoration")
+            && !js.contains("scrollRestoration =")
+            && !js.contains("scrollRestoration="),
+        "back/forward scroll must stay native (no scrollRestoration access)"
     );
 }
