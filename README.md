@@ -191,6 +191,7 @@ see [docs/DEPLOY_PROFILES.md](docs/DEPLOY_PROFILES.md).
 
 ## Documentation
 See `docs/` and root MD files:
+- `CONTRIBUTING.md` — contributor guide: setup, rules, and how to propose a change.
 - `PLAN.md` — product vision & roadmap.
 - `ARCHITECTURE.md` — system design.
 - `docs/COMMANDS.md` — command reference.

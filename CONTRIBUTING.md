@@ -23,6 +23,8 @@ make test            # the full gate suite
    tests, `cargo audit`, `cargo deny`, and the routing-contract check.
    A PR that doesn't pass them doesn't get reviewed.
 
+**Compliance posture:** Terms of Service, Privacy, Refund, and Retention policies and an EAA statement are pending before any paid public launch; contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
+
 ## Finding your way around
 
 - `ARCHITECTURE.md` — system map; every module lists its owning role.
@@ -31,6 +33,18 @@ make test            # the full gate suite
   territory map (which rung owns which files).
 - `docs/ARCHITECTURE-SCALE-PLAN.md` — approved designs and seam contracts;
   don't build a seam ahead of its documented trigger.
+
+## External contributors
+
+The files that steer the automated agents — `AGENT.md`, `AUTO_ROUTE.md`,
+`.opencode/**`, and `scripts/**` — are **internal gate inputs maintained by the
+core team**. External contributors do **not** adopt the L3–L11 role system; it
+is our internal routing model, not a contributor requirement. Do not edit those
+paths without sign-off from the owning rung / core team.
+
+For the gates and scoping rules that affect your change, see
+[AUTO_ROUTE.md](AUTO_ROUTE.md) §2 (authority tiers) and §7 (quality gates);
+you do not need the full ladder.
 
 ## Adding a feature (short version)
 
