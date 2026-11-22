@@ -194,6 +194,7 @@ see [docs/DEPLOY_PROFILES.md](docs/DEPLOY_PROFILES.md).
 See `docs/` and root MD files:
 - `CONTRIBUTING.md` — contributor guide: setup, rules, and how to propose a change.
 - `docs/COMMUNITY.md` — updates-channel decision, platform, and charter.
+- `docs/LEGAL.md` — pre-publication legal/compliance checklist.
 - `PLAN.md` — product vision & roadmap.
 - `ARCHITECTURE.md` — system design.
 - `docs/COMMANDS.md` — command reference.
