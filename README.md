@@ -2,6 +2,8 @@
 
 Daybook — the calm back-office ledger for your Telegram commerce.
 
+Updates channel: https://t.me/daybook26
+
 An **owner-only** Telegram bot that:
 - Posts and manages a target Telegram channel **only on your command**.
 - Sells subscriptions and grants channel access via **Crypto Pay** or **activation codes**.
