@@ -9,7 +9,7 @@ release news.
 Telegram: the audience is mobile-first Telegram sellers and the product is
 Telegram-native. Announcement-only; no support or feature requests.
 
-Channel: https://t.me/daybook26 (owner-created; not published by this repo).
+Channel: https://t.me/daybook26
 
 ## Triggers (all required before creating)
 - Publishing T2 approved by the owner; version aligned (`0.N.0` ↔ milestone vN).
