@@ -32,6 +32,7 @@ An **owner-only** Telegram bot that:
 - `/channel`, `/info` — show channel info.
 - `/post <text>`, `/postphoto`, `/edit`, `/delete`, `/pin`, `/unpin`, `/unpinmsg`, `/invite`.
 - `/settitle`, `/setdesc`.
+- `/schedule [@channel] <YYYY-MM-DD HH:MM> | <text>` schedules a post (UTC); `/scheduled` lists pending ones, `/cancelpost <id>` cancels one.
 
 ### Subscriptions & auto-selling
 - `/plans` — list plans.

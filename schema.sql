@@ -307,7 +307,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at TEXT
 );
 
--- Scheduled posts
+-- Scheduled posts. status is free text with DEFAULT 'pending'; the lifecycle
+-- is 'pending' -> 'posted' | 'failed' (terminal, retry cap) | 'cancelled'
+-- (/cancelpost). scheduled_at is an RFC3339 UTC string; the due queue
+-- compares it lexicographically, so non-RFC3339 values are swept to
+-- 'failed' by the sender loop.
 CREATE TABLE IF NOT EXISTS scheduled_posts (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id        INTEGER NOT NULL,

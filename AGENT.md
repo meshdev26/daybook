@@ -2,6 +2,9 @@
 
 > This is the single AI-agent instruction file for this repository.
 
+AI-agent quick start: `.agents/skills/telegram-agent/SKILL.md` (routing
+table, non-negotiables, gates). Start there; it points back here.
+
 ## 0. Mission
 This repository is a **multi-tenant Telegram business platform**. Any change must preserve:
 - Multi-tenancy (seller_id scoping).

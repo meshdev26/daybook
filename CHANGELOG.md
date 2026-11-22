@@ -56,9 +56,20 @@ and the setup & management UX polish
 - Owner-only `bot_key`/`bot_id` selectors on the MCP `publish_post`,
   `broadcast` and `ai_publish_post` tools; per-seller MCP tokens ignore them
   and act through their own seller's bot.
-- MCP `publish_post`/`edit_post` accept an optional `parse_mode` (`"html"` 
+- MCP `publish_post`/`edit_post` accept an optional `parse_mode` (`"html"`
   only): the send carries Telegram HTML entities; absent keeps the
   historical plain-text path with zero drift for scripted callers.
+- Scheduled-post management from the bot: `/scheduled` lists pending posts
+  (id, scheduled UTC time, text preview) with the `/orders` scoping
+  convention (sellers see their own, admins/owner all), and
+  `/cancelpost <id>` cancels one before it fires (accepts `#id`; scoped to
+  the caller, unknown/already-sent ids share one refusal). Cancellation is
+  a new `cancelled` status; the due loop and the console's post pages are
+  unaffected.
+- Startup delivery self-check: each started bot DMs its owner once at boot
+  ("connected and polling — DM delivery works") after resolving its own
+  username via `get_me`. A failed DM or `get_me` is logged loudly — "the
+  bot can't DM me" is now diagnosable at boot — and never aborts startup.
 
 ### Removed
 - Removed the separate AI-agent workflow layer; AGENT.md is now the only agent instruction file.
@@ -114,6 +125,30 @@ and the setup & management UX polish
   bot deaf on high-latency routes. Pinned by a loopback black-hole test.
 
 ### Fixed
+- Unauthorized bot commands no longer fall into a silent `return` — the bot
+  answers with one short neutral line ("This account isn't authorized for
+  management commands on this bot.") and leaks no role names; all role
+  logic is unchanged.
+- Bots skipped at startup (unset/empty token env var, `owner_id` 0, or
+  console-disabled) are now logged per bot — key plus `token_env` name,
+  never the token — and a zero-bot boot logs one loud configured-vs-started
+  summary instead of silently polling nothing.
+- Scheduled posts with an unparseable `scheduled_at` (e.g. a web-submitted
+  raw string) can no longer sit pending forever: the due loop compares the
+  stored string lexicographically, so such a row either fired at the wrong
+  time or never fired; a per-cycle sweep now logs the row id and raw value
+  at error and routes it into the bounded retry → terminal-failed path.
+- `/schedule` refuses a datetime it cannot parse ("use YYYY-MM-DD HH:MM;
+  times are UTC") and stores nothing, instead of writing the raw string as
+  a row that never fires. The lenient formats are unchanged.
+- Broadcast failures are visible: each undeliverable recipient is logged at
+  warn (user id + error, no payload) with an attempted/sent/failed summary
+  at info; the expiry sweeper logs failed kick/unban calls at debug
+  (previously fully swallowed), and failed `/approvals`, `/approve`, `/deny`
+  replies log the approval id at warn.
+- The bot's owner gets one discoverability tip when sending plain text in
+  an idle chat (`/post` publishes, `/schedule` queues, UTC); buyers, other
+  roles and non-text updates stay silent as before.
 - Invoice claim/release lifecycle covers products (previously invoices only):
   every failure path releases the claim; stale invoices requeue after 5 minutes
   instead of granting.

@@ -35,3 +35,8 @@
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Local AI-tooling artifacts (not part of the product)
+/.commandcode/
+/.mimosa/
+/.opencode/

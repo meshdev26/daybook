@@ -50,6 +50,10 @@ pub enum Command {
     Post(String),
     /// Schedule a post: /schedule <@channel> <datetime> | <text>.
     Schedule(String),
+    /// List pending scheduled posts: /scheduled
+    Scheduled,
+    /// Cancel a scheduled post: /cancelpost <id>
+    CancelPost(String),
     /// Post a photo (send photo next). /postphoto [caption].
     PostPhoto(String),
     /// Edit a posted message: /edit <msg_id> | <new text>.
@@ -302,6 +306,8 @@ pub async fn cmd_handler(
             | Command::SetChannel(_)
             | Command::Post(_)
             | Command::Schedule(_)
+            | Command::Scheduled
+            | Command::CancelPost(_)
             | Command::PostPhoto(_)
             | Command::Edit(_)
             | Command::Delete(_)
@@ -373,7 +379,14 @@ pub async fn cmd_handler(
         || (is_admin && admin_cmd)
         || (role == roles::Role::Owner && owner_cmd);
     if !allowed {
-        // silent ignore for unauthorized commands
+        // Was a silent drop — the bot looked dead to anyone it refused. One
+        // short neutral reply instead; deliberately role-name-free so a
+        // stranger learns nothing about who IS authorized.
+        bot.send_message(
+            msg.chat.id,
+            "This account isn't authorized for management commands on this bot.",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -536,14 +549,85 @@ pub async fn cmd_handler(
                     bot.send_message(chat_id, "Usage: /schedule [@channel] <datetime> | <text>")
                         .await?;
                 } else {
-                    let scheduled_at =
-                        parse_schedule_datetime(dt_str).unwrap_or_else(|| dt_str.to_string());
-                    let id = db.create_scheduled_post(user_id, &ch, &text, "text", &scheduled_at);
-                    bot.send_message(
-                        chat_id,
-                        format!("Scheduled post #{} for {}.", id, scheduled_at),
-                    )
+                    // Parse + create is one checked helper (A7): a total parse
+                    // failure used to store the raw string — a row the due
+                    // queue can never fire correctly (lexicographic compare).
+                    // Refuse with the fix-naming error instead; nothing is
+                    // stored. parse_schedule_datetime keeps its leniency
+                    // (date-only coerces to UTC midnight).
+                    match create_schedule_checked(&db, user_id, &ch, &text, dt_str) {
+                        Ok((id, scheduled_at)) => {
+                            bot.send_message(
+                                chat_id,
+                                format!("Scheduled post #{} for {}.", id, scheduled_at),
+                            )
+                            .await?;
+                        }
+                        Err(m) => {
+                            bot.send_message(chat_id, m).await?;
+                        }
+                    }
+                }
+            }
+        }
+        Command::Scheduled => {
+            // Pending scheduled posts for the caller: sellers see only their
+            // own rows (the bot writes seller_id = the caller's user id),
+            // admin/owner see all — the /orders scoping convention.
+            let rows = db.list_pending_scheduled_posts(if is_admin { None } else { Some(user_id) });
+            if rows.is_empty() {
+                bot.send_message(chat_id, "No pending scheduled posts.")
                     .await?;
+            } else {
+                let mut out =
+                    String::from("Pending scheduled posts (id — scheduled UTC — text):\n");
+                for (
+                    id,
+                    _seller,
+                    _chat,
+                    content,
+                    _kind,
+                    scheduled_at,
+                    _status,
+                    _created,
+                    _posted,
+                ) in rows.iter().take(20)
+                {
+                    let when = chrono::DateTime::parse_from_rfc3339(scheduled_at)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|_| scheduled_at.clone());
+                    let preview = text_preview(&content.clone().unwrap_or_default(), 40);
+                    out.push_str(&format!("#{} — {} — {}\n", id, when, preview));
+                }
+                if rows.len() > 20 {
+                    out.push_str(&format!("…and {} more.\n", rows.len() - 20));
+                }
+                bot.send_message(chat_id, out).await?;
+            }
+        }
+        Command::CancelPost(arg) => {
+            // /cancelpost <id>: cancel one pending scheduled post before it
+            // fires. Sellers may cancel only their own rows; admin/owner any
+            // row. Unknown id and already-sent rows share one refusal (no
+            // state oracle). Accepts the integer id or `#id`, like
+            // /cancelbooking.
+            match arg.trim().trim_start_matches('#').parse::<i64>() {
+                Ok(id) => {
+                    let scope = if is_admin { None } else { Some(user_id) };
+                    if db.cancel_scheduled_post(id, scope) {
+                        bot.send_message(chat_id, format!("Scheduled post #{} cancelled.", id))
+                            .await?;
+                    } else {
+                        bot.send_message(
+                            chat_id,
+                            format!("Scheduled post #{} not found or already sent.", id),
+                        )
+                        .await?;
+                    }
+                }
+                Err(_) => {
+                    bot.send_message(chat_id, "Usage: /cancelpost <id> — see /scheduled for ids.")
+                        .await?;
                 }
             }
         }
@@ -4170,6 +4254,41 @@ fn parse_schedule_datetime(input: &str) -> Option<String> {
     None
 }
 
+/// Parse + create for /schedule (A7): a total parse failure stores nothing —
+/// the raw string used to be written as `scheduled_at`, a row the due queue
+/// can never fire correctly (it compares the stored string lexicographically).
+/// `parse_schedule_datetime` stays lenient (date-only coerces to UTC midnight);
+/// only an unparseable value is refused, with the fix-naming error the caller
+/// sends back. Ok carries the row id and the normalized RFC3339 timestamp.
+fn create_schedule_checked(
+    db: &Db,
+    seller_id: i64,
+    chat: &str,
+    text: &str,
+    dt_str: &str,
+) -> Result<(i64, String), String> {
+    let Some(scheduled_at) = parse_schedule_datetime(dt_str) else {
+        return Err(format!(
+            "Couldn't parse schedule '{}' — use YYYY-MM-DD HH:MM; times are UTC.",
+            dt_str
+        ));
+    };
+    Ok((
+        db.create_scheduled_post(seller_id, chat, text, "text", &scheduled_at),
+        scheduled_at,
+    ))
+}
+
+/// First `max_chars` characters of `text` for the /scheduled listing, with a
+/// trailing ellipsis when truncated (char-boundary safe).
+fn text_preview(text: &str, max_chars: usize) -> String {
+    let mut preview: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
+
 /// Strict slot-time validation (D4, v1.4): RFC3339, or the bot-friendly
 /// "YYYY-MM-DD HH:MM" read as UTC — normalized to RFC3339 either way, since
 /// `create_booking` parses the stored value with RFC3339 only. Unlike
@@ -4973,6 +5092,8 @@ async fn setup_bot_profile(bot: &Bot) -> HandlerResult {
         BotCommand::new("channel", "Show target channel"),
         BotCommand::new("setchannel", "Set target channel"),
         BotCommand::new("post", "Post text to channel"),
+        BotCommand::new("scheduled", "List scheduled posts"),
+        BotCommand::new("cancelpost", "Cancel a scheduled post"),
         BotCommand::new("postphoto", "Post a photo"),
         BotCommand::new("edit", "Edit posted message"),
         BotCommand::new("delete", "Delete posted message"),

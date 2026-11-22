@@ -1838,6 +1838,112 @@ fn test_scheduled_post_attempts_cap_terminal() {
 }
 
 #[test]
+fn test_scheduled_post_cancel_scoped() {
+    // /cancelpost semantics: only the owning seller (or admin/owner with no
+    // scope) cancels; scoped to 'pending', so posted/failed rows are never
+    // overwritten; a cancelled row leaves the due queue and a second cancel
+    // is the same refusal; unknown ids read as the same refusal (no oracle).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sched_cancel.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let mine = db.create_scheduled_post(1, "chat", "a", "text", &past);
+    let other = db.create_scheduled_post(2, "chat", "b", "text", &past);
+
+    // Wrong scope: another seller's row is not cancelled.
+    assert!(!db.cancel_scheduled_post(mine, Some(2)));
+    assert!(!db.cancel_scheduled_post(other, Some(1)));
+    assert_eq!(db.list_due_scheduled().len(), 2, "refusals store nothing");
+
+    // Right scope: the owner cancels their own pending row.
+    assert!(db.cancel_scheduled_post(mine, Some(1)));
+    assert!(db.list_due_scheduled().iter().all(|r| r.0 != mine));
+    assert_eq!(db.list_due_scheduled().len(), 1);
+    let all = db.list_scheduled_posts(Some(1));
+    assert_eq!(
+        all.iter().find(|r| r.0 == mine).map(|r| r.6.as_str()),
+        Some("cancelled")
+    );
+
+    // Already cancelled and unknown ids: the same refusal.
+    assert!(!db.cancel_scheduled_post(mine, Some(1)));
+    assert!(!db.cancel_scheduled_post(9999, None));
+
+    // Admin/owner (no scope) cancels any pending row — never a posted one.
+    assert!(db.cancel_scheduled_post(other, None));
+    let posted = db.create_scheduled_post(2, "chat", "c", "text", &past);
+    db.mark_scheduled_posted(posted, 1).unwrap();
+    assert!(!db.cancel_scheduled_post(posted, None));
+    assert_eq!(
+        db.list_scheduled_posts(Some(2))
+            .iter()
+            .find(|r| r.0 == posted)
+            .map(|r| r.6.as_str()),
+        Some("posted")
+    );
+}
+
+#[test]
+fn test_pending_scheduled_posts_scoping() {
+    // /scheduled listing: pending rows only (cancelled/posted/failed never
+    // appear), seller-scoped when a scope is given, all for admin/owner,
+    // soonest first.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sched_pending.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let soon = chrono::Utc::now().to_rfc3339();
+    let later = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+    let s1_late = db.create_scheduled_post(1, "chat", "late", "text", &later);
+    let s1_soon = db.create_scheduled_post(1, "chat", "soon", "text", &soon);
+    let s2 = db.create_scheduled_post(2, "chat", "other", "text", &soon);
+    // Non-pending rows of seller 1 must not come back.
+    assert!(db.cancel_scheduled_post(s1_late, Some(1)));
+    let s1_done = db.create_scheduled_post(1, "chat", "done", "text", &soon);
+    db.mark_scheduled_posted(s1_done, 5).unwrap();
+
+    let scoped = db.list_pending_scheduled_posts(Some(1));
+    assert_eq!(
+        scoped.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![s1_soon]
+    );
+    assert_eq!(scoped[0].1, 1, "rows stay seller-tagged");
+    let everyone = db.list_pending_scheduled_posts(None);
+    assert_eq!(
+        everyone.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![s1_soon, s2],
+        "same scheduled_at ties break by id"
+    );
+}
+
+#[test]
+fn test_scheduled_post_unparseable_detected() {
+    // The A6 poison sweep: pending rows whose scheduled_at is not RFC3339 are
+    // reported with their raw stored string — both the never-due kind
+    // ("tomorrow" sorts above every RFC3339 timestamp) and the always-due
+    // kind ("01/02/2026" sorts below). Parseable rows never appear, and a
+    // cancelled poison row stops being reported (pending only).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sched_poison.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let good = db.create_scheduled_post(1, "chat", "ok", "text", &past);
+    let late_poison = db.create_scheduled_post(1, "chat", "never", "text", "tomorrow");
+    let early_poison = db.create_scheduled_post(1, "chat", "early", "text", "01/02/2026");
+    let mut poison = db.list_pending_scheduled_unparseable();
+    poison.sort();
+    assert_eq!(poison.len(), 2, "parseable rows are not poison: {poison:?}");
+    assert_eq!(poison[0].0, late_poison);
+    assert_eq!(poison[0].1, "tomorrow");
+    assert_eq!(poison[1].0, early_poison);
+    assert_eq!(poison[1].1, "01/02/2026");
+    let _ = good;
+    // Pending-only: once cancelled, a poison row stops being reported.
+    assert!(db.cancel_scheduled_post(early_poison, Some(1)));
+    let poison2 = db.list_pending_scheduled_unparseable();
+    assert_eq!(poison2, vec![(late_poison, "tomorrow".to_string())]);
+}
+
+#[test]
 fn test_invoice_attempts_bump_and_terminal_state() {
     // The verification-attempts counter advances only via
     // bump_invoice_attempts (the "not settled yet" release path never

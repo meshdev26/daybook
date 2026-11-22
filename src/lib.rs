@@ -92,12 +92,21 @@ pub async fn expire_subscriptions(
     for (id, seller_id, uid, ch) in db.expired_subscriptions() {
         let bot = bots.for_seller(seller_id).bot.clone();
         let cid = util::to_chat_id(&ch);
-        let _ = bot
+        // The kick/unban used to be fully swallowed (`let _ =`); a failing
+        // moderation call was undiagnosable. Debug-level: the expiry result is
+        // what matters, the kick is the mechanism.
+        if let Err(e) = bot
             .ban_chat_member(cid.clone(), teloxide::types::UserId(uid as u64))
-            .await;
-        let _ = bot
+            .await
+        {
+            tracing::debug!("expiry: kick (ban) of user {} in {} failed: {}", uid, ch, e);
+        }
+        if let Err(e) = bot
             .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
-            .await;
+            .await
+        {
+            tracing::debug!("expiry: unban of user {} in {} failed: {}", uid, ch, e);
+        }
         db.mark_subscription_expired(id);
         expired.push((id, seller_id, uid, ch));
     }
@@ -110,16 +119,30 @@ pub async fn expire_subscriptions(
 /// Returns the number of users the message was delivered to.
 pub async fn broadcast_to_users(bot: &Bot, users: &[i64], text: &str) -> usize {
     let mut sent = 0;
+    let mut failed = 0;
     for uid in users {
-        if bot
+        match bot
             .send_message(teloxide::types::ChatId(*uid), text.to_string())
             .await
-            .is_ok()
         {
-            metrics::bot_sent();
-            sent += 1;
+            Ok(_) => {
+                metrics::bot_sent();
+                sent += 1;
+            }
+            // Per-recipient failure used to vanish (`is_ok()`); log the user
+            // id and the error — never the payload text.
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("broadcast: send to user {} failed: {}", uid, e);
+            }
         }
     }
+    tracing::info!(
+        "broadcast: attempted {} recipients, sent {}, failed {}",
+        users.len(),
+        sent,
+        failed
+    );
     sent
 }
 

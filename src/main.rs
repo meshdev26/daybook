@@ -194,6 +194,35 @@ async fn retry_ungranted_grant(
     db.subscription_exists_for_invoice(inv_id)
 }
 
+/// Route one scheduled post whose stored `scheduled_at` cannot parse as
+/// RFC3339 into the existing bounded terminal-failed path. The due queue
+/// compares the column lexicographically, so such a row either fires at the
+/// wrong time (the string sorts below an RFC3339 timestamp) or sits pending
+/// forever (it sorts above — e.g. "tomorrow" > any "2026-…"). The condition
+/// is permanent (not transient), so every attempt logs at error with the row
+/// id and the raw stored string; at the cap the row goes terminal-failed and
+/// leaves the pending queue for good.
+fn bump_unparseable_scheduled(db: &Db, id: i64, raw: &str) {
+    let attempts = db.bump_scheduled_attempts(id);
+    if attempts >= POST_ATTEMPT_CAP {
+        db.mark_scheduled_failed(id);
+        tracing::error!(
+            "scheduled post {} failed terminally: stored scheduled_at {:?} is not RFC3339 and can never fire reliably ({} attempts); reschedule the post",
+            id,
+            raw,
+            attempts
+        );
+    } else {
+        tracing::error!(
+            "scheduled post {} cannot fire: stored scheduled_at {:?} is not RFC3339 (attempt {}/{}); will terminal-fail at the cap",
+            id,
+            raw,
+            attempts,
+            POST_ATTEMPT_CAP
+        );
+    }
+}
+
 /// Security headers on every response of the merged router (security). All values
 /// are static, so `HeaderValue::from_static` is valid for each. Applied
 /// outside the request-timeout layer so aborted requests still carry them;
@@ -495,13 +524,37 @@ async fn run() {
     let bot_http = bots::bot_http_client();
     let mut bot_contexts: Vec<Arc<bots::BotContext>> = Vec::new();
     for bc in &app_cfg.bots {
-        if bc.token.trim().is_empty() || bc.owner_id == 0 {
+        // A skip must never be silent: an operator with a dead bot otherwise
+        // sees a running process that simply never polls. The env-var NAME is
+        // logged (non-secret config metadata); never the token value.
+        if bc.token.trim().is_empty() {
+            tracing::error!(
+                bot = %bc.key,
+                token_env = ?bc.token_env,
+                "bot '{}' skipped at startup: token env var {} is unset or empty — that bot will not poll until it is set (restart required)",
+                bc.key,
+                bc.token_env.as_deref().unwrap_or("<inline token entry>")
+            );
+            continue;
+        }
+        if bc.owner_id == 0 {
+            tracing::error!(
+                bot = %bc.key,
+                token_env = ?bc.token_env,
+                "bot '{}' skipped at startup: owner_id is unset (0) — set owner_id in the bot config and restart",
+                bc.key
+            );
             continue;
         }
         let bot_id = db.create_bot(&bc.key, bc.owner_id, None, bc.name.trim());
         if let Some(rec) = db.get_bot(bot_id)
             && !rec.enabled
         {
+            tracing::warn!(
+                bot = %bc.key,
+                "bot '{}' skipped at startup: disabled in the console (enable it on the Bots page and restart)",
+                bc.key
+            );
             continue;
         }
         let ctx = Arc::new(bots::BotContext {
@@ -513,6 +566,12 @@ async fn run() {
             db: db.clone(),
         });
         bot_contexts.push(ctx);
+    }
+    if bot_contexts.is_empty() {
+        tracing::error!(
+            "no bots started: {} configured, 0 started — every bot was skipped (missing token env var, unset owner_id, or disabled); bot polling is DEAD until fixed and the process restarted",
+            app_cfg.bots.len()
+        );
     }
 
     let primary_ctx: Arc<bots::BotContext> = if let Some(first) = bot_contexts.first().cloned() {
@@ -872,6 +931,16 @@ async fn run() {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                // Unparseable scheduled_at sweep: the due query compares the
+                // stored string lexicographically, so a non-RFC3339 value
+                // either fires early or sits pending forever. Every pending
+                // poison row goes through the bounded terminal-failed path
+                // (bump → cap → 'failed') and is skipped below — never sent.
+                let mut poison_ids = std::collections::HashSet::new();
+                for (id, raw) in db_bg.list_pending_scheduled_unparseable() {
+                    bump_unparseable_scheduled(&db_bg, id, &raw);
+                    poison_ids.insert(id);
+                }
                 let due = db_bg.list_due_scheduled();
                 for (
                     id,
@@ -885,6 +954,18 @@ async fn run() {
                     _posted,
                 ) in due
                 {
+                    // Poison rows were already routed toward terminal-failed
+                    // by the sweep above (bumped once this cycle); skip them
+                    // silently here so they are never sent. The parse check
+                    // covers a poison row inserted after the sweep ran.
+                    if poison_ids.contains(&id)
+                        || chrono::DateTime::parse_from_rfc3339(&_scheduled_at).is_err()
+                    {
+                        if !poison_ids.contains(&id) {
+                            bump_unparseable_scheduled(&db_bg, id, &_scheduled_at);
+                        }
+                        continue;
+                    }
                     let text = content.clone().unwrap_or_default();
                     // Resolve the sender from the authoritative target channel
                     // (channels.bot_id, then the channel's seller, then
@@ -1298,6 +1379,7 @@ async fn run() {
     let cfg_ai_edit = cfg.clone();
     let db_cb = db.clone();
     let cfg_cb = cfg.clone();
+    let db_idle = db.clone();
 
     // Plugin commands registered at startup (see handlers::registry). The
     // binary registers only the MCP approval commands (/approvals, /approve,
@@ -1499,7 +1581,18 @@ async fn run() {
                                 },
                             ),
                         )
-                        .branch(dptree::endpoint(non_command_handler)),
+                        // Idle plain-text fall-through (B2): fires ONLY here —
+                        // commands and plugin commands match the branches above,
+                        // and every other dialogue state (AwaitingPhoto/
+                        // AiPostConfirm/AiPostEdit/CryptoInvoice) is handled by
+                        // its own branch below — so buyers mid-dialogue and
+                        // non-text updates never reach it.
+                        .branch(dptree::endpoint(
+                            move |bot: Bot, msg: Message, owner_id: i64| {
+                                let db = db_idle.clone();
+                                async move { non_command_handler(bot, msg, db, owner_id).await }
+                            },
+                        )),
                 )
                 .branch(dptree::case![State::AwaitingPhoto].endpoint(
                     move |bot: Bot,
@@ -1714,6 +1807,42 @@ async fn run() {
                 }),
             ));
         }
+        // Startup delivery self-check (one DM per started bot, once per boot
+        // — not per reconnect): get_me() for the username, then DM the bot's
+        // owner. A failed DM is logged loudly (that is the "bot can't DM me"
+        // diagnosis at boot) and never aborts startup; fire-and-forget — the
+        // dispatchers below start regardless of the outcome.
+        for ctx in bot_contexts.clone() {
+            tokio::spawn(async move {
+                let chat = teloxide::types::ChatId(ctx.owner_id);
+                match ctx.bot.get_me().await {
+                    Ok(me) => {
+                        let username = me.username.as_deref().unwrap_or("<no username>");
+                        let notice = format!(
+                            "✅ Bot @{username} is connected and polling — DM delivery to you works."
+                        );
+                        match ctx.bot.send_message(chat, notice).await {
+                            Ok(_) => metrics::bot_sent(),
+                            Err(e) => tracing::error!(
+                                bot = %ctx.key,
+                                "startup self-check: bot {} could not DM its owner ({}): {}",
+                                ctx.key,
+                                chat.0,
+                                e
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            bot = %ctx.key,
+                            "startup self-check: bot {} get_me failed — the token is likely invalid: {}",
+                            ctx.key,
+                            e
+                        );
+                    }
+                }
+            });
+        }
         Some(tokio::spawn(async move {
             // A dispatcher task must never die silently: that is the deaf-bot
             // state (process alive, web serving, no poller) that restart
@@ -1802,11 +1931,37 @@ async fn run() {
     // (tasks are dropped on select exit; nothing further to do)
 }
 
-async fn non_command_handler(
-    _bot: Bot,
-    _msg: Message,
-    _dialogue: Dialogue<State, teloxide::dispatching::dialogue::ErasedStorage<State>>,
-) -> HandlerResult {
+/// Idle plain-text fall-through (B2). The dptree placement (inside
+/// `case![State::Idle]`, after the command and plugin-command branches) means
+/// this fires only for Idle updates that are neither — photos and other
+/// non-text updates, unknown `/commands` and every buyer DM stay silent,
+/// unchanged. The one exception: the bot's owner, who gets a single
+/// discoverability tip for /post and /schedule (sellers/admins keep the
+/// documented help surface; noise stays off their DMs too).
+async fn non_command_handler(bot: Bot, msg: Message, db: Arc<Db>, owner_id: i64) -> HandlerResult {
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    // Unknown commands (text starting with '/') fall through here too; they
+    // keep the silent treatment — replying to a mistyped command with the tip
+    // would be noise, not help.
+    if text.trim_start().starts_with('/') {
+        return Ok(());
+    }
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let user_id = from.id.0 as i64;
+    // Strict Owner only: role_of short-circuits on the owner id, so this
+    // costs buyers nothing but two small lookups (is_admin, get_seller).
+    if roles::role_of(&db, user_id, owner_id) != roles::Role::Owner {
+        return Ok(());
+    }
+    bot.send_message(
+        msg.chat.id,
+        "Tip: /post <text> publishes to the channel — /schedule <YYYY-MM-DD HH:MM> <text> schedules it (UTC).",
+    )
+    .await?;
     Ok(())
 }
 

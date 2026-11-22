@@ -610,7 +610,16 @@ pub fn register_commands(reg: &mut CommandRegistry, state: WebState) {
                 Box::pin(async move {
                     let reply = cmd_approvals(&st);
                     let chat = ctx.msg.chat.id;
-                    let _ = ctx.bot.send_message(chat, reply).await;
+                    // The send used to be fully swallowed; a failed reply is
+                    // now diagnosable. Logged, never propagated — the approval
+                    // flow itself must not die on a send error.
+                    if let Err(e) = ctx.bot.send_message(chat, reply).await {
+                        tracing::warn!(
+                            "MCP /approvals: failed to deliver reply to chat {}: {}",
+                            chat.0,
+                            e
+                        );
+                    }
                     Ok(())
                 })
             })
@@ -629,7 +638,15 @@ pub fn register_commands(reg: &mut CommandRegistry, state: WebState) {
                 Box::pin(async move {
                     let reply = cmd_approve(&st, &ctx.args).await;
                     let chat = ctx.msg.chat.id;
-                    let _ = ctx.bot.send_message(chat, reply).await;
+                    // Swallowed sends made a lost /approve outcome
+                    // undiagnosable; log the approval id with the error.
+                    if let Err(e) = ctx.bot.send_message(chat, reply).await {
+                        tracing::warn!(
+                            "MCP /approve (id {}): failed to deliver reply: {}",
+                            ctx.args.trim(),
+                            e
+                        );
+                    }
                     Ok(())
                 })
             })
@@ -648,7 +665,15 @@ pub fn register_commands(reg: &mut CommandRegistry, state: WebState) {
                 Box::pin(async move {
                     let reply = cmd_deny(&st, &ctx.args).await;
                     let chat = ctx.msg.chat.id;
-                    let _ = ctx.bot.send_message(chat, reply).await;
+                    // Swallowed sends made a lost /deny outcome
+                    // undiagnosable; log the approval id with the error.
+                    if let Err(e) = ctx.bot.send_message(chat, reply).await {
+                        tracing::warn!(
+                            "MCP /deny (id {}): failed to deliver reply: {}",
+                            ctx.args.trim(),
+                            e
+                        );
+                    }
                     Ok(())
                 })
             })

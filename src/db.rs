@@ -2093,6 +2093,106 @@ impl Db {
         }
     }
 
+    /// Pending scheduled posts, optionally scoped to one seller (None = all —
+    /// the admin/owner view). Soonest-first for the bot's /scheduled listing;
+    /// 'cancelled'/'posted'/'failed' rows never appear (status='pending' only).
+    pub fn list_pending_scheduled_posts(&self, seller_scope: Option<i64>) -> Vec<ScheduledPostRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(sid) =
+            seller_scope
+        {
+            (
+                "SELECT id,seller_id,chat_id,content,kind,scheduled_at,status,created_at,posted_message_id FROM scheduled_posts WHERE status='pending' AND seller_id=?1 ORDER BY scheduled_at, id"
+                    .to_string(),
+                vec![Box::new(sid)],
+            )
+        } else {
+            (
+                "SELECT id,seller_id,chat_id,content,kind,scheduled_at,status,created_at,posted_message_id FROM scheduled_posts WHERE status='pending' ORDER BY scheduled_at, id"
+                    .to_string(),
+                vec![],
+            )
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Cancel one pending scheduled post. `seller_scope = Some(sid)` cancels
+    /// only that seller's row (a seller can never cancel another seller's
+    /// post); `None` (admin/owner) cancels any pending row. Returns false for
+    /// unknown ids and rows already posted/failed/cancelled — the caller
+    /// answers one refusal for both, so there is no state oracle. Scoped to
+    /// status='pending' like mark_scheduled_failed: a concurrently-posted row
+    /// is never overwritten.
+    pub fn cancel_scheduled_post(&self, id: i64, seller_scope: Option<i64>) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE scheduled_posts SET status='cancelled' WHERE id=?1 AND status='pending' AND (?2 IS NULL OR seller_id=?2)",
+            params![id, seller_scope],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Pending scheduled posts whose stored `scheduled_at` cannot parse as
+    /// RFC3339. The due queue compares the column lexicographically, so such
+    /// rows either fire at the wrong time (a string sorting below an RFC3339
+    /// timestamp) or sit pending forever (one sorting above). The sender loop
+    /// sweeps both into the bounded terminal-failed path; parsing happens in
+    /// Rust so the check matches exactly what the sender can honor.
+    pub fn list_pending_scheduled_unparseable(&self) -> Vec<(i64, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn
+            .prepare("SELECT id, scheduled_at FROM scheduled_posts WHERE status='pending'")
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .ok();
+        match rows {
+            Some(iter) => iter
+                .filter_map(|r| r.ok())
+                .filter(|(_, s)| chrono::DateTime::parse_from_rfc3339(s).is_err())
+                .collect(),
+            None => vec![],
+        }
+    }
+
     pub fn list_scheduled_posts(&self, seller_scope: Option<i64>) -> Vec<ScheduledPostRow> {
         let conn = self
             .conn

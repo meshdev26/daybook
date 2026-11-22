@@ -128,6 +128,73 @@ fn schedule_datetime_formats() {
     assert_eq!(parse_schedule_datetime("tomorrow"), None);
 }
 
+// ---- /schedule parse+create checked (A7): refuse without storing ----
+
+#[test]
+fn schedule_checked_refuses_unparseable_without_storing() {
+    // A total parse failure returns the fix-naming error AND stores no row:
+    // the raw string used to land in scheduled_posts, where the due queue
+    // could never fire it correctly (lexicographic compare) — the A6 poison.
+    let (_d, db) = chan_db();
+    for bad in ["tomorrow", "next friday", "2026/01/02 03:04", ""] {
+        let err = create_schedule_checked(&db, 7, "@mine", "hello", bad)
+            .expect_err("unparseable dates must be refused");
+        assert!(err.contains(bad), "error names the raw input: {err}");
+        assert!(
+            err.contains("YYYY-MM-DD HH:MM"),
+            "error names the format: {err}"
+        );
+        assert!(
+            db.list_scheduled_posts(Some(7)).is_empty(),
+            "a refused schedule must not store a row"
+        );
+    }
+}
+
+#[test]
+fn schedule_checked_stores_lenient_parses() {
+    // The leniency is unchanged: RFC3339, 'T'-separated, 'YYYY-MM-DD HH:MM'
+    // and date-only (UTC midnight) all store one row with a normalized
+    // RFC3339 scheduled_at.
+    let (_d, db) = chan_db();
+    for (input, want) in [
+        ("2026-01-02T03:04:05Z", "2026-01-02T03:04:05+00:00"),
+        ("2026-01-02 03:04", "2026-01-02T03:04:00+00:00"),
+        ("2026-01-02", "2026-01-02T00:00:00+00:00"),
+    ] {
+        let (id, stored) = create_schedule_checked(&db, 7, "@mine", "hello", input)
+            .unwrap_or_else(|e| panic!("'{input}' must parse: {e}"));
+        assert!(id > 0);
+        assert_eq!(stored, want);
+    }
+    let rows = db.list_scheduled_posts(Some(7));
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.6 == "pending"));
+}
+
+// ---- /scheduled + /cancelpost parsing and listing helpers ----
+
+#[test]
+fn parse_scheduled_and_cancelpost() {
+    let c = Command::parse("/scheduled", "bot").unwrap();
+    assert!(matches!(c, Command::Scheduled));
+    let c = Command::parse("/cancelpost 12", "bot").unwrap();
+    assert!(matches!(c, Command::CancelPost(ref s) if s == "12"));
+}
+
+#[test]
+fn text_preview_truncates_at_char_boundary() {
+    assert_eq!(text_preview("short", 40), "short");
+    let long = "x".repeat(41);
+    assert_eq!(text_preview(&long, 40), format!("{}…", "x".repeat(40)));
+    // Exactly 40 chars: no ellipsis.
+    let edge = "y".repeat(40);
+    assert_eq!(text_preview(&edge, 40), edge);
+    // Multi-byte chars count as chars, never split mid-glyph.
+    let uni = "é".repeat(41);
+    assert_eq!(text_preview(&uni, 40), format!("{}…", "é".repeat(40)));
+}
+
 // ---- resolve_target_channel: seller tenancy on channel-scoped commands ----
 
 fn chan_cfg() -> SharedConfig {

@@ -111,7 +111,9 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/aipost [@channel] <template> [| key=val ...]` — generate an AI post draft, preview with Publish/Edit/Cancel buttons. Edit sends new text; publish posts to the channel. MCP tool `ai_publish_post` (sensitive, approval-gated) publishes a stored draft by `draft_id`.
 
 ## Scheduling (v1.3.x)
-- `/schedule [@channel] <datetime> | <text>` — schedule a text post for later delivery. Datetime formats: RFC3339, `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD`.
+- `/schedule [@channel] <datetime> | <text>` — schedule a text post for later delivery. Datetime formats: RFC3339, `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD` (UTC; date-only means midnight UTC). An unparseable datetime is refused with the format spelled out and nothing is stored.
+- `/scheduled` — list pending scheduled posts, one line each (id, scheduled UTC time, first ~40 chars of text). Sellers see their own; admins/owner see all.
+- `/cancelpost <id>` — cancel one pending scheduled post before it fires (accepts `id` or `#id`). Sellers can cancel only their own; admins/owner any. An unknown id and an already-sent row get the same refusal ("scheduled post #N not found or already sent"); cancelled posts never fire and disappear from `/scheduled`.
 
 ## MCP approvals (owner-only, v1.3.x)
 - `/approvals` — list pending MCP tool approvals (oldest first).
