@@ -152,6 +152,9 @@ cargo deny check
   Rust-only; no Node/npm at runtime. No cross-project refs (§3).
 - Public Daybook updates channel deferred until release gates close; Telegram,
   announcement-only, human T2 to create. Charter in `docs/COMMUNITY.md`.
+- Daybook is a free MIT library, not a hosted or sold service. The maintainer
+  owes no ToS/refund/EAA; self-hosters own their legal docs (see `docs/LEGAL.md`,
+  templates in `docs/*_DRAFT.md`).
 
 ## 12. Contacts
 - Maintainer: repository owner.

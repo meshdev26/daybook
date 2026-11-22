@@ -1,22 +1,25 @@
-# Legal & compliance — pending artifacts
+# Legal & compliance
 
-Daybook is pre-release. The documents below are **not written yet**; they must
-exist before a public launch or any paid real-money operation. This file is a
-checklist, not a substitute for the documents. Human owner signs off on each;
-rungs supply input as noted.
+Daybook is a free, MIT-licensed library for people who work with Telegram. It
+is not sold as a service and the maintainer does not operate an instance or
+collect user data. Legal obligations fall to whoever self-hosts an instance.
 
-- [x] **LICENSE holder** — MIT, `Copyright (c) 2026 meshdev26`.
-- [ ] **Terms of Service** — draft in `docs/TERMS_DRAFT.md`; scope, acceptable
-      use, operator responsibilities. Needs legal review.
-- [ ] **Privacy policy** — draft in `docs/PRIVACY_DRAFT.md`; Telegram identity,
-      Crypto Pay data, external AI API calls, moderation audit data (message
-      text is not stored). Needs legal review.
-- [x] **Refund policy draft** — `docs/REFUND_POLICY_DRAFT.md` (owner-only, full
-      vs partial, no SLA). Needs L5 + legal review.
-- [x] **Data retention draft** — `docs/RETENTION_DRAFT.md` (proposed 7 years for
-      money records, 12 months moderation). Owner must confirm the figures.
-- [x] **Accessibility statement draft** — `docs/ACCESSIBILITY_DRAFT.md`
-      (WCAG 2.2 AA, known gaps). Needs legal review.
+## Maintainer obligations
+- [x] **LICENSE** — MIT, `Copyright (c) 2026 meshdev26`.
+- [x] **No service terms** — no ToS, refund policy, or EAA statement is needed
+      from the maintainer; there is no sale and no hosted service.
 
-Prerequisite decisions still open (see `AGENT.md` §11): publishing T2, version
-alignment, and channel creation (`docs/COMMUNITY.md`).
+## Operator templates (not maintainer policies)
+Each person running a Daybook instance is responsible for their own legal
+documents. The drafts below are starting points, not published policy:
+- `docs/TERMS_DRAFT.md` — service terms for the operator's users.
+- `docs/PRIVACY_DRAFT.md` — describes data the software stores/sends.
+- `docs/REFUND_POLICY_DRAFT.md` — matches the implemented owner-only flow.
+- `docs/RETENTION_DRAFT.md` — proposed periods; operator must confirm.
+- `docs/ACCESSIBILITY_DRAFT.md` — WCAG 2.2 AA statement template.
+
+Operators should have these reviewed for their own jurisdiction and use case.
+
+## Release prerequisites
+Publishing and channel announcement are human T2 actions — see
+`docs/RELEASING.md` and `docs/COMMUNITY.md`.
