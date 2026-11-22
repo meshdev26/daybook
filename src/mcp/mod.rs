@@ -932,14 +932,39 @@ mod tests {
             names.insert(t["name"].as_str().unwrap().to_string());
             let annotations = &t["annotations"];
             match t["name"].as_str().unwrap() {
-                "list_channels" | "list_plans" | "list_posts" | "subs_report" | "list_codes"
-                | "list_promos" | "analytics_summary" | "list_customers" | "list_referrals"
-                | "referral_stats" | "read_channel" | "read_thread" | "search_messages"
-                | "unread_digest" => {
+                "list_channels"
+                | "list_plans"
+                | "list_posts"
+                | "subs_report"
+                | "list_codes"
+                | "list_promos"
+                | "analytics_summary"
+                | "list_customers"
+                | "list_referrals"
+                | "referral_stats"
+                | "read_channel"
+                | "read_thread"
+                | "search_messages"
+                | "unread_digest"
+                | "list_bookings"
+                | "list_subscriptions"
+                | "list_bots"
+                | "finance_summary"
+                | "finance_revenue_by_seller"
+                | "finance_refunds_list"
+                | "finance_payouts_list"
+                | "finance_reconciliation_list"
+                | "moderation_blocked_words"
+                | "moderation_global_floor" => {
                     assert_eq!(annotations["readOnlyHint"], true, "{}", t["name"]);
                 }
-                "publish_post" | "edit_post" | "customer_note" => {
+                "publish_post" | "edit_post" | "customer_note" | "booking_set_status" => {
                     assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
+                }
+                "finance_refund_create" | "finance_payout_create" => {
+                    assert_eq!(annotations["readOnlyHint"], false, "{}", t["name"]);
+                    assert_eq!(annotations["destructiveHint"], false, "{}", t["name"]);
+                    assert_eq!(annotations["x-approval-required"], true, "{}", t["name"]);
                 }
                 "gen_codes" | "create_promo" | "delete_post" | "broadcast" | "ai_publish_post"
                 | "export_buyer_data" | "delete_buyer_data" | "publish_as_user" => {
@@ -976,6 +1001,19 @@ mod tests {
             "export_buyer_data",
             "delete_buyer_data",
             "publish_as_user",
+            "list_bookings",
+            "list_subscriptions",
+            "list_bots",
+            "finance_summary",
+            "finance_revenue_by_seller",
+            "finance_refunds_list",
+            "finance_payouts_list",
+            "finance_reconciliation_list",
+            "moderation_blocked_words",
+            "moderation_global_floor",
+            "booking_set_status",
+            "finance_refund_create",
+            "finance_payout_create",
         ] {
             assert!(names.contains(expected), "missing tool {expected}");
         }

@@ -264,6 +264,137 @@ pub fn registry() -> &'static [ToolSpec] {
                  validate: validate_list_customers,
                  handler: h(list_customers),
              },
+             ToolSpec {
+                 name: "list_bookings",
+                 description: "List booking rows for the caller's seller scope (owner: all sellers). \
+                               Buyer user ids are omitted.",
+                 tier: Tier::Read,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT,
+                                   "description": format!("How many bookings to return (default {DEFAULT_LIST_LIMIT}).")}
+                     }
+                 }),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_limit,
+                 handler: h(list_bookings),
+             },
+             ToolSpec {
+                 name: "list_subscriptions",
+                 description: "List subscription rows for the caller's seller scope (owner: all sellers). \
+                               Subscriber user ids are omitted; use subs_report for aggregates.",
+                 tier: Tier::Read,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT,
+                                   "description": format!("How many subscriptions to return (default {DEFAULT_LIST_LIMIT}).")}
+                     }
+                 }),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_limit,
+                 handler: h(list_subscriptions),
+             },
+             ToolSpec {
+                 name: "list_bots",
+                 description: "Owner-only list of configured bots: key, username, name, enabled flag \
+                               and type. Credentials and tokens are never returned.",
+                 tier: Tier::Read,
+                 input_schema: json!({"type": "object", "properties": {}}),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_empty,
+                 handler: h(list_bots),
+             },
+             ToolSpec {
+                 name: "finance_summary",
+                 description: "Paid revenue and invoice counts for the caller's seller scope \
+                               (owner: all sellers). Aggregated; no PII.",
+                 tier: Tier::Read,
+                 input_schema: json!({"type": "object", "properties": {}}),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_empty,
+                 handler: h(finance_summary),
+             },
+             ToolSpec {
+                 name: "finance_revenue_by_seller",
+                 description: "Paid revenue per seller. The owner sees every seller; a seller token \
+                               sees only its own total.",
+                 tier: Tier::Read,
+                 input_schema: json!({"type": "object", "properties": {}}),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_empty,
+                 handler: h(finance_revenue_by_seller),
+             },
+             ToolSpec {
+                 name: "finance_refunds_list",
+                 description: "List refund requests in the caller's seller scope (owner: all sellers). \
+                               Buyer ids and free-text reasons are omitted.",
+                 tier: Tier::Read,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT,
+                                   "description": format!("How many refunds to return (default {DEFAULT_LIST_LIMIT}).")}
+                     }
+                 }),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_limit,
+                 handler: h(finance_refunds_list),
+             },
+             ToolSpec {
+                 name: "finance_payouts_list",
+                 description: "List payout requests in the caller's seller scope (owner: all sellers). \
+                               Destinations are omitted.",
+                 tier: Tier::Read,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT,
+                                   "description": format!("How many payouts to return (default {DEFAULT_LIST_LIMIT}).")}
+                     }
+                 }),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_limit,
+                 handler: h(finance_payouts_list),
+             },
+             ToolSpec {
+                 name: "finance_reconciliation_list",
+                 description: "Read-only list of money rows awaiting reconciliation, scoped to the \
+                               caller's seller (owner: all sellers). Spend ids are omitted; \
+                               resolution stays WEB-ONLY.",
+                 tier: Tier::Read,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT,
+                                   "description": format!("How many rows to return (default {DEFAULT_LIST_LIMIT}).")}
+                     }
+                 }),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_limit,
+                 handler: h(finance_reconciliation_list),
+             },
+             ToolSpec {
+                 name: "moderation_blocked_words",
+                 description: "List the seller's blocked moderation terms (term, mode, enabled) in \
+                               scope (owner: all sellers). No message content is returned.",
+                 tier: Tier::Read,
+                 input_schema: json!({"type": "object", "properties": {}}),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_empty,
+                 handler: h(moderation_blocked_words),
+             },
+             ToolSpec {
+                 name: "moderation_global_floor",
+                 description: "List owner-enforced global moderation floor terms. No message \
+                               content is returned; editing the floor stays WEB-ONLY.",
+                 tier: Tier::Read,
+                 input_schema: json!({"type": "object", "properties": {}}),
+                 annotations: json!({"readOnlyHint": true}),
+                 validate: validate_empty,
+                 handler: h(moderation_global_floor),
+             },
             // ---- Identity reads (Tier: Read, owner-principal ONLY) ----
             // The per-seller refusal lives in mcp::dispatch (pre-validation)
             // and is repeated inside every handler; these specs only declare
@@ -409,6 +540,24 @@ pub fn registry() -> &'static [ToolSpec] {
                  annotations: json!({"readOnlyHint": false}),
                  validate: validate_customer_note,
                  handler: h(customer_note),
+             },
+             ToolSpec {
+                 name: "booking_set_status",
+                 description: "Set a booking to 'confirmed', 'declined' or 'cancelled'. A seller \
+                               token can only change its own bookings. Executes immediately.",
+                 tier: Tier::Write,
+                 input_schema: json!({
+                     "type": "object",
+                     "properties": {
+                         "booking_id": {"type": "integer", "minimum": 1},
+                         "status": {"type": "string",
+                                    "enum": ["confirmed", "declined", "cancelled"]}
+                     },
+                     "required": ["booking_id", "status"]
+                 }),
+                 annotations: json!({"readOnlyHint": false}),
+                 validate: validate_booking_set_status,
+                 handler: h(booking_set_status),
              },
              // ---- Tier: Sensitive (approval-gated; the call path never executes) ----
             ToolSpec {
@@ -575,6 +724,55 @@ pub fn registry() -> &'static [ToolSpec] {
                                     "x-approval-required": true}),
                 validate: validate_publish_as_user,
                 handler: park_fn("publish_as_user"),
+            },
+            ToolSpec {
+                name: "finance_refund_create",
+                description: "Park a request to create a PENDING refund from one paid invoice; \
+                              requires owner approval. Only the request is created: approve, \
+                              process, execute and refund-move tools stay WEB-ONLY (two-person \
+                              rule) and are never exposed over MCP. No transfer is made here.",
+                tier: Tier::Sensitive,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "invoice_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                                       "pattern": "^[A-Za-z0-9_.:-]+$",
+                                       "description": "Paid invoice to refund."},
+                        "amount": {"type": "string", "maxLength": 32,
+                                   "description": "Positive decimal, clamped to the invoice amount; defaults to the invoice amount."},
+                        "asset": {"type": "string", "pattern": "^[A-Z0-9]{2,10}$",
+                                  "description": "Uppercase ticker; must match the invoice asset."}
+                    },
+                    "required": ["invoice_id"]
+                }),
+                annotations: json!({"readOnlyHint": false, "destructiveHint": false,
+                                    "x-approval-required": true}),
+                validate: validate_finance_refund_create,
+                handler: park_fn("finance_refund_create"),
+            },
+            ToolSpec {
+                name: "finance_payout_create",
+                description: "Park a request to create a PENDING payout; requires owner approval. \
+                              Only the request is created: approve, process, execute and \
+                              payout-move tools stay WEB-ONLY (two-person rule) and are never \
+                              exposed over MCP. Owner calls are recorded under the global scope.",
+                tier: Tier::Sensitive,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "string", "minLength": 1, "maxLength": 32,
+                                   "description": "Positive decimal amount."},
+                        "asset": {"type": "string", "pattern": "^[A-Z0-9]{2,10}$",
+                                  "description": "Uppercase ticker, e.g. USDT."},
+                        "destination": {"type": "integer", "minimum": 1,
+                                        "description": "Optional Telegram user id to pay."}
+                    },
+                    "required": ["amount", "asset"]
+                }),
+                annotations: json!({"readOnlyHint": false, "destructiveHint": false,
+                                    "x-approval-required": true}),
+                validate: validate_finance_payout_create,
+                handler: park_fn("finance_payout_create"),
             },
         ]
     })
@@ -824,6 +1022,111 @@ fn validate_delete_buyer_data(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_booking_set_status(args: &Value) -> Result<(), String> {
+    let Some(v) = get_int(args, "booking_id")? else {
+        return Err("missing required integer argument 'booking_id'".into());
+    };
+    if v.as_i64().unwrap_or(0) < 1 {
+        return Err("'booking_id' must be >= 1".into());
+    }
+    match args.get("status") {
+        Some(Value::String(s)) if matches!(s.as_str(), "confirmed" | "declined" | "cancelled") => {
+            Ok(())
+        }
+        Some(Value::String(_)) => Err("'status' must be confirmed, declined or cancelled".into()),
+        Some(_) => Err("'status' must be a string".into()),
+        None => Err("missing required argument 'status'".into()),
+    }
+}
+
+fn validate_id_token(
+    args: &Value,
+    key: &str,
+    max_len: usize,
+    required: bool,
+) -> Result<(), String> {
+    match args.get(key) {
+        None | Some(Value::Null) if required => Err(format!("missing required argument '{key}'")),
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() || t.len() > max_len {
+                return Err(format!("'{key}' must be 1..={max_len} characters"));
+            }
+            if !t
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+            {
+                return Err(format!("'{key}' has unsupported characters"));
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn validate_asset(args: &Value, key: &str, required: bool) -> Result<(), String> {
+    match args.get(key) {
+        None | Some(Value::Null) if required => Err(format!("missing required argument '{key}'")),
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if !(2..=10).contains(&t.len())
+                || !t
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                return Err(format!(
+                    "'{key}' must be a 2..=10 character uppercase ticker"
+                ));
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn validate_money_string(args: &Value, key: &str, required: bool) -> Result<(), String> {
+    match args.get(key) {
+        None | Some(Value::Null) if required => Err(format!("missing required argument '{key}'")),
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() || t.len() > 32 {
+                return Err(format!("'{key}' must be 1..=32 characters"));
+            }
+            if !t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                return Err(format!("'{key}' must be a decimal number"));
+            }
+            let n = t
+                .parse::<f64>()
+                .map_err(|_| format!("'{key}' must be a number"))?;
+            if !n.is_finite() || n <= 0.0 {
+                return Err(format!("'{key}' must be positive"));
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn validate_finance_refund_create(args: &Value) -> Result<(), String> {
+    validate_id_token(args, "invoice_id", 128, true)?;
+    validate_money_string(args, "amount", false)?;
+    validate_asset(args, "asset", false)
+}
+
+fn validate_finance_payout_create(args: &Value) -> Result<(), String> {
+    validate_money_string(args, "amount", true)?;
+    validate_asset(args, "asset", true)?;
+    if let Some(v) = get_int(args, "destination")?
+        && v.as_i64().unwrap_or(0) < 1
+    {
+        return Err("'destination' must be >= 1".into());
+    }
+    Ok(())
+}
+
 /// Shared tail of the identity-read validators: optional `before` cursor
 /// (a message id, so >= 1) and optional `limit` (1..=MAX_IDENTITY_LIMIT).
 fn validate_identity_paging(args: &Value) -> Result<(), String> {
@@ -931,6 +1234,13 @@ fn list_limit(args: &Value) -> i64 {
         .and_then(|v| v.as_i64())
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .clamp(1, MAX_LIST_LIMIT)
+}
+
+fn owner_only(principal: &Principal) -> Result<(), String> {
+    if principal.seller_id.is_some() {
+        return Err("owner credential required".into());
+    }
+    Ok(())
 }
 
 /// Park a sensitive call: nothing executes here, the args are stored verbatim
@@ -1129,6 +1439,24 @@ async fn customer_note(
     Ok(json!({"ok": ok, "seller_id": seller_id, "user_id": user_id}))
 }
 
+async fn booking_set_status(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let booking_id = args.get("booking_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let scope = principal.seller_id;
+    let ok = match status {
+        "cancelled" => state.db.cancel_booking_scoped(booking_id, scope),
+        other => state.db.set_booking_status(booking_id, scope, other),
+    };
+    if !ok {
+        return Err("booking not found, not yours, or status cannot change".into());
+    }
+    Ok(json!({"ok": true, "booking_id": booking_id, "status": status}))
+}
+
 async fn list_codes(state: WebState, principal: Principal, args: Value) -> Result<Value, String> {
     let items: Vec<Value> = state
         .db
@@ -1323,6 +1651,191 @@ async fn analytics_summary(
         "customer_count": customer_count,
         "masked": true
     }))
+}
+
+async fn list_bookings(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let items: Vec<Value> = state
+        .db
+        .list_bookings_filtered(principal.seller_id, None, list_limit(&args))
+        .into_iter()
+        .map(|b| {
+            json!({
+                "id": b.0, "booking_id": b.1, "service": b.3, "starts_at": b.4,
+                "ends_at": b.5, "status": b.6, "expires_at": b.7, "seller_id": b.8,
+            })
+        })
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn list_subscriptions(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let items: Vec<Value> = state
+        .db
+        .list_subscriptions(principal.seller_id, list_limit(&args))
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.0, "seller_id": s.1, "channel_id": s.3,
+                "status": s.4, "expires_at": s.5,
+            })
+        })
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn list_bots(state: WebState, principal: Principal, _args: Value) -> Result<Value, String> {
+    owner_only(&principal)?;
+    let items: Vec<Value> = state
+        .db
+        .list_bots()
+        .into_iter()
+        .map(|b| {
+            json!({
+                "id": b.id, "key": b.key, "username": b.username, "name": b.name,
+                "enabled": b.enabled, "type": b.bot_type,
+            })
+        })
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn finance_summary(
+    state: WebState,
+    principal: Principal,
+    _args: Value,
+) -> Result<Value, String> {
+    let scope = principal.seller_id;
+    let invoices = state.db.list_invoices(scope, 1000);
+    let paid = invoices.iter().filter(|i| i.3 == "paid").count();
+    Ok(json!({
+        "seller_id": scope,
+        "revenue_total": state.db.revenue_total(scope),
+        "invoices_total": invoices.len(),
+        "invoices_paid": paid,
+    }))
+}
+
+async fn finance_revenue_by_seller(
+    state: WebState,
+    principal: Principal,
+    _args: Value,
+) -> Result<Value, String> {
+    let totals: Vec<(i64, f64)> = if let Some(sid) = principal.seller_id {
+        vec![(sid, state.db.revenue_total(Some(sid)))]
+    } else {
+        state.db.revenue_by_seller()
+    };
+    let items: Vec<Value> = totals
+        .into_iter()
+        .map(|(sid, total)| json!({"seller_id": sid, "revenue_total": total}))
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn finance_refunds_list(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let items: Vec<Value> = state
+        .db
+        .list_refunds(principal.seller_id)
+        .into_iter()
+        .take(list_limit(&args) as usize)
+        .map(|r| {
+            json!({
+                "id": r.0, "seller_id": r.1, "invoice_id": r.2,
+                "amount": r.4, "asset": r.5, "status": r.7,
+            })
+        })
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn finance_payouts_list(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let items: Vec<Value> = state
+        .db
+        .list_payouts(principal.seller_id)
+        .into_iter()
+        .take(list_limit(&args) as usize)
+        .map(|p| {
+            json!({
+                "id": p.0, "seller_id": p.1, "amount": p.2, "asset": p.3, "status": p.5,
+            })
+        })
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn finance_reconciliation_list(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let (due, overdue) = crate::handlers::money::reconciliation_cutoffs(chrono::Utc::now());
+    let items: Vec<Value> =
+        crate::handlers::money::all_reconciliation_rows(&state.db, &due, &overdue)
+            .into_iter()
+            .filter(|r| principal.seller_id.is_none_or(|sid| r.seller_id == sid))
+            .take(list_limit(&args) as usize)
+            .map(|r| {
+                json!({
+                    "row_type": r.row_type, "id": r.id, "seller_id": r.seller_id,
+                    "amount": r.amount, "asset": r.asset, "status": r.status,
+                    "since": r.since, "overdue": r.overdue,
+                })
+            })
+            .collect();
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn moderation_blocked_words(
+    state: WebState,
+    principal: Principal,
+    _args: Value,
+) -> Result<Value, String> {
+    let scopes: Vec<i64> = if let Some(sid) = principal.seller_id {
+        vec![sid]
+    } else {
+        let mut ids = state.db.list_sellers();
+        ids.push(0);
+        ids
+    };
+    let mut items = Vec::new();
+    for sid in scopes {
+        for w in state.db.list_blocked_words(sid) {
+            items.push(json!({
+                "seller_id": w.seller_id, "term": w.term, "mode": w.mode, "enabled": w.enabled,
+            }));
+        }
+    }
+    Ok(json!({"items": items, "total": items.len()}))
+}
+
+async fn moderation_global_floor(
+    state: WebState,
+    _principal: Principal,
+    _args: Value,
+) -> Result<Value, String> {
+    let items: Vec<Value> = state
+        .db
+        .list_moderation_global_floor()
+        .into_iter()
+        .map(|t| json!({"id": t.id, "term": t.term, "mode": t.mode}))
+        .collect();
+    Ok(json!({"items": items, "total": items.len()}))
 }
 
 // ---- Identity read handlers (owner-principal only; see IDENTITY_TOOLS) ----
@@ -1910,6 +2423,135 @@ async fn exec_publish_as_user(
     }
 }
 
+fn refund_create_error(e: crate::db::RefundCreateError) -> String {
+    use crate::db::RefundCreateError as E;
+    match e {
+        E::InvoiceNotFound => "invoice not found".into(),
+        E::InvoiceNotPaid => "only paid invoices can be refunded".into(),
+        E::AssetMismatch => "refund asset must match the invoice asset".into(),
+        E::UnquantizableLegacy => "stored amount cannot be quantized".into(),
+        E::CapExceeded => "cumulative refunds would exceed the invoice amount".into(),
+        E::InFlight => "another refund is in flight for this invoice".into(),
+        E::Database(_) => "refund request failed".into(),
+    }
+}
+
+async fn exec_finance_refund_create(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let invoice_id = args
+        .get("invoice_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let (inv_amount, inv_asset, _status, _desc, _plan, inv_user, inv_seller) = state
+        .db
+        .get_invoice(&invoice_id)
+        .ok_or_else(|| "invoice not found".to_string())?;
+    let amount = match args.get("amount").and_then(|v| v.as_str()).map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            let requested = raw.parse::<f64>().unwrap_or(f64::NAN);
+            let inv_f = inv_amount.parse::<f64>().unwrap_or(f64::NAN);
+            if inv_f.is_nan() || requested > inv_f {
+                inv_amount.clone()
+            } else {
+                raw.to_string()
+            }
+        }
+        _ => inv_amount.clone(),
+    };
+    let asset = args
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(&inv_asset)
+        .to_string();
+    let seller_id = principal.seller_id.unwrap_or(inv_seller);
+    let idem_key = crate::handlers::money::fresh_idem_key("mcp")?;
+    let creation = state
+        .db
+        .create_refund_guarded(crate::db::RefundInput {
+            seller_id,
+            invoice_id: Some(&invoice_id),
+            user_id: inv_user,
+            amount: &amount,
+            asset: &asset,
+            reason: None,
+            idem_key: &idem_key,
+            created_by: -1,
+            created_role: "owner",
+        })
+        .map_err(refund_create_error)?;
+    state.db.log_action(
+        -1,
+        "owner",
+        "refund_request_mcp",
+        "refund",
+        creation.id,
+        Some(&format!(
+            "invoice_id={invoice_id} seller_id={seller_id} amount={amount} asset={asset}"
+        )),
+    );
+    Ok(json!({
+        "ok": true, "id": creation.id, "created": creation.created_new,
+        "seller_id": seller_id,
+        "note": "request only; approval and any transfer stay in the web console",
+    }))
+}
+
+async fn exec_finance_payout_create(
+    state: WebState,
+    principal: Principal,
+    args: Value,
+) -> Result<Value, String> {
+    let amount = args
+        .get("amount")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let asset = args
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let destination = args
+        .get("destination")
+        .and_then(|v| v.as_i64())
+        .map(|n| n.to_string());
+    let seller_id = principal.seller_id.unwrap_or(0);
+    let cutoff = crate::handlers::money::paid_ungranted_escalation_cutoff(chrono::Utc::now());
+    if !state
+        .db
+        .unresolved_ungranted_invoices(seller_id, &cutoff)
+        .is_empty()
+    {
+        return Err("unresolved ungranted liability: resolve the outstanding refund first".into());
+    }
+    let id = state
+        .db
+        .create_payout(seller_id, &amount, &asset, destination.as_deref());
+    state.db.log_action(
+        -1,
+        "owner",
+        "payout_request_mcp",
+        "payout",
+        id,
+        Some(&format!(
+            "seller_id={seller_id} amount={amount} asset={asset}"
+        )),
+    );
+    Ok(json!({
+        "ok": true, "id": id, "seller_id": seller_id,
+        "note": "request only; approval and any transfer stay in the web console",
+    }))
+}
+
 /// Execute an approved sensitive tool. This is the ONLY path that runs the
 /// sensitive executors, and it re-runs the tool's own validator first so the
 /// approval replay can never drift from what the call path would have done.
@@ -1933,6 +2575,8 @@ pub async fn execute_sensitive(
         "export_buyer_data" => exec_export_buyer_data(state, principal.clone(), args).await,
         "delete_buyer_data" => exec_delete_buyer_data(state, principal.clone(), args).await,
         "publish_as_user" => exec_publish_as_user(state, principal.clone(), args).await,
+        "finance_refund_create" => exec_finance_refund_create(state, principal.clone(), args).await,
+        "finance_payout_create" => exec_finance_payout_create(state, principal.clone(), args).await,
         other => Err(format!("no executor for tool '{other}'")),
     }
 }
@@ -1967,8 +2611,11 @@ mod tests {
                 ),
                 Tier::Write => assert_eq!(t.annotations["readOnlyHint"], false),
                 Tier::Sensitive => {
-                    assert_eq!(t.annotations["destructiveHint"], true, "{}", t.name);
+                    assert_eq!(t.annotations["readOnlyHint"], false, "{}", t.name);
                     assert_eq!(t.annotations["x-approval-required"], true, "{}", t.name);
+                    if !matches!(t.name, "finance_refund_create" | "finance_payout_create") {
+                        assert_eq!(t.annotations["destructiveHint"], true, "{}", t.name);
+                    }
                 }
             }
         }
@@ -2362,5 +3009,401 @@ mod tests {
         )
         .await
         .expect("other seller passes");
+    }
+
+    fn seller(sid: i64) -> Principal {
+        Principal {
+            role: roles::Role::Seller,
+            seller_id: Some(sid),
+        }
+    }
+
+    fn assert_tool(name: &str, tier: Tier, read_only: bool) -> &'static ToolSpec {
+        let spec = find_tool(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(spec.tier, tier, "{name}");
+        assert_eq!(spec.annotations["readOnlyHint"], read_only, "{name}");
+        assert!(spec.input_schema["properties"].is_object(), "{name}");
+        spec
+    }
+
+    #[tokio::test]
+    async fn list_bookings_registered_and_seller_scoped() {
+        assert_tool("list_bookings", Tier::Read, true);
+        assert!(validate_limit(&json!({"limit": 0})).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let s7 = state
+            .db
+            .create_service(7, "Consult", "10", "USDT", 30, None)
+            .unwrap();
+        let sl7 = state.db.create_slot(s7, 7, &future, 1);
+        state.db.create_booking(s7, sl7, 991).unwrap().unwrap();
+        let s8 = state
+            .db
+            .create_service(8, "Other", "10", "USDT", 30, None)
+            .unwrap();
+        let sl8 = state.db.create_slot(s8, 8, &future, 1);
+        state.db.create_booking(s8, sl8, 992).unwrap().unwrap();
+        let out = list_bookings(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["seller_id"], 7);
+        assert!(out["items"][0].get("user_id").is_none());
+        let out = list_bookings(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn list_subscriptions_registered_and_seller_scoped() {
+        assert_tool("list_subscriptions", Tier::Read, true);
+        assert!(validate_limit(&json!({"limit": 51})).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state
+            .db
+            .create_subscription(7, 991, None, "@c", 30, None, None);
+        state
+            .db
+            .create_subscription(8, 992, None, "@c", 30, None, None);
+        let out = list_subscriptions(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert!(out["items"][0].get("user_id").is_none());
+        let out = list_subscriptions(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn list_bots_is_owner_only_and_token_free() {
+        assert_tool("list_bots", Tier::Read, true);
+        assert!(validate_empty(&json!([])).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state
+            .db
+            .create_bot_with_type("key-one", 1, None, "Main", "shop_bot");
+        assert!(
+            list_bots(state.clone(), seller(7), json!({}))
+                .await
+                .is_err()
+        );
+        let out = list_bots(state, Principal::OWNER, json!({})).await.unwrap();
+        let items = out["items"].as_array().unwrap();
+        assert!(items.iter().any(|i| i["key"] == "key-one"));
+        assert!(!out.to_string().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn finance_summary_scopes_totals() {
+        assert_tool("finance_summary", Tier::Read, true);
+        assert!(validate_empty(&json!([])).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state.db.save_invoice(
+            "inv-a", 7, "10", "USDT", None, "paid", None, None, None, None,
+        );
+        state.db.save_invoice(
+            "inv-b", 8, "20", "USDT", None, "paid", None, None, None, None,
+        );
+        state.db.save_invoice(
+            "inv-c", 7, "5", "USDT", None, "pending", None, None, None, None,
+        );
+        let out = finance_summary(state.clone(), Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["revenue_total"], 30.0);
+        assert_eq!(out["invoices_total"], 3);
+        assert_eq!(out["invoices_paid"], 2);
+        let out = finance_summary(state, seller(7), json!({})).await.unwrap();
+        assert_eq!(out["revenue_total"], 10.0);
+        assert_eq!(out["invoices_paid"], 1);
+    }
+
+    #[tokio::test]
+    async fn finance_revenue_by_seller_scopes_rows() {
+        assert_tool("finance_revenue_by_seller", Tier::Read, true);
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state.db.upsert_seller(7, None, None);
+        state.db.upsert_seller(8, None, None);
+        state.db.save_invoice(
+            "inv-a", 7, "10", "USDT", None, "paid", None, None, None, None,
+        );
+        state.db.save_invoice(
+            "inv-b", 8, "20", "USDT", None, "paid", None, None, None, None,
+        );
+        let out = finance_revenue_by_seller(state.clone(), Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 2);
+        let out = finance_revenue_by_seller(state, seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["seller_id"], 7);
+        assert_eq!(out["items"][0]["revenue_total"], 10.0);
+    }
+
+    #[tokio::test]
+    async fn finance_refunds_list_omits_buyer_and_scopes() {
+        assert_tool("finance_refunds_list", Tier::Read, true);
+        assert!(validate_limit(&json!({"limit": -1})).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        for (inv, sid, uid) in [("inv-r7", 7, 991), ("inv-r8", 8, 992)] {
+            state.db.save_invoice(
+                inv,
+                sid,
+                "10",
+                "USDT",
+                None,
+                "paid",
+                None,
+                None,
+                Some(uid),
+                None,
+            );
+            state.db.create_refund(
+                sid,
+                Some(inv),
+                Some(uid),
+                "1",
+                "USDT",
+                Some("private reason"),
+            );
+        }
+        let out = finance_refunds_list(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["asset"], "USDT");
+        assert!(out["items"][0].get("user_id").is_none());
+        assert!(out["items"][0].get("reason").is_none());
+        assert!(!out.to_string().contains("private reason"));
+        let out = finance_refunds_list(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn finance_payouts_list_omits_destination_and_scopes() {
+        assert_tool("finance_payouts_list", Tier::Read, true);
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state.db.create_payout(7, "5", "USDT", Some("991"));
+        state.db.create_payout(8, "6", "USDT", Some("992"));
+        let out = finance_payouts_list(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["amount"], "5");
+        assert!(out["items"][0].get("destination").is_none());
+        let out = finance_payouts_list(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn finance_reconciliation_list_scopes_and_hides_spend_ids() {
+        assert_tool("finance_reconciliation_list", Tier::Read, true);
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        let p7 = state.db.create_payout(7, "5", "USDT", None);
+        state.db.update_payout_status(p7, "needs_reconciliation");
+        let out = finance_reconciliation_list(state.clone(), seller(8), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 0);
+        let out = finance_reconciliation_list(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["row_type"], "payout");
+        assert!(out["items"][0].get("spend_id").is_none());
+        let out = finance_reconciliation_list(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn moderation_blocked_words_scopes_terms() {
+        assert_tool("moderation_blocked_words", Tier::Read, true);
+        assert!(validate_empty(&json!([])).is_err());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state.db.upsert_seller(7, None, None);
+        state.db.upsert_seller(8, None, None);
+        state.db.add_blocked_word(7, "term7", "hide", true);
+        state.db.add_blocked_word(8, "term8", "review", true);
+        let out = moderation_blocked_words(state.clone(), seller(7), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["term"], "term7");
+        let out = moderation_blocked_words(state, Principal::OWNER, json!({}))
+            .await
+            .unwrap();
+        assert!(out["total"].as_u64().unwrap() >= 2);
+        assert!(!out.to_string().contains("message"));
+    }
+
+    #[tokio::test]
+    async fn moderation_global_floor_reads_terms() {
+        assert_tool("moderation_global_floor", Tier::Read, true);
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        state
+            .db
+            .add_moderation_global_floor_term("floorterm", "hide");
+        for principal in [seller(7), Principal::OWNER] {
+            let out = moderation_global_floor(state.clone(), principal, json!({}))
+                .await
+                .unwrap();
+            assert!(out["total"].as_u64().unwrap() >= 1);
+            assert!(!out.to_string().contains("message"));
+        }
+    }
+
+    #[tokio::test]
+    async fn booking_set_status_validates_and_is_scoped() {
+        let spec = assert_tool("booking_set_status", Tier::Write, false);
+        assert!((spec.validate)(&json!({"booking_id": 1})).is_err());
+        assert!((spec.validate)(&json!({"booking_id": 1, "status": "pending"})).is_err());
+        assert!((spec.validate)(&json!({"booking_id": 0, "status": "confirmed"})).is_err());
+        assert!((spec.validate)(&json!({"booking_id": 1, "status": "cancelled"})).is_ok());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let s7 = state
+            .db
+            .create_service(7, "Consult", "10", "USDT", 30, None)
+            .unwrap();
+        let sl7 = state.db.create_slot(s7, 7, &future, 1);
+        let own_id = state.db.create_booking(s7, sl7, 991).unwrap().unwrap();
+        let s8 = state
+            .db
+            .create_service(8, "Other", "10", "USDT", 30, None)
+            .unwrap();
+        let sl8 = state.db.create_slot(s8, 8, &future, 1);
+        let foreign_id = state.db.create_booking(s8, sl8, 992).unwrap().unwrap();
+        assert!(
+            booking_set_status(
+                state.clone(),
+                seller(8),
+                json!({"booking_id": own_id, "status": "confirmed"}),
+            )
+            .await
+            .is_err()
+        );
+        let out = booking_set_status(
+            state.clone(),
+            seller(7),
+            json!({"booking_id": own_id, "status": "confirmed"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        let rows = state.db.list_bookings_filtered(Some(7), None, 10);
+        assert_eq!(rows.iter().find(|b| b.0 == own_id).unwrap().6, "confirmed");
+        let out = booking_set_status(
+            state,
+            Principal::OWNER,
+            json!({"booking_id": foreign_id, "status": "cancelled"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn finance_refund_create_parks_and_only_creates_a_request() {
+        let spec = assert_tool("finance_refund_create", Tier::Sensitive, false);
+        assert_eq!(spec.annotations["destructiveHint"], false);
+        assert_eq!(spec.annotations["x-approval-required"], true);
+        assert!(spec.description.contains("WEB-ONLY"));
+        assert!((spec.validate)(&json!({})).is_err());
+        assert!((spec.validate)(&json!({"invoice_id": "bad id"})).is_err());
+        assert!((spec.validate)(&json!({"invoice_id": "inv-1", "amount": "0"})).is_err());
+        assert!((spec.validate)(&json!({"invoice_id": "inv-1", "asset": "usdt"})).is_err());
+        assert!((spec.validate)(&json!({"invoice_id": "inv-1"})).is_ok());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        let out = (spec.handler)(state.clone(), seller(7), json!({"invoice_id": "inv-1"}))
+            .await
+            .unwrap();
+        assert_eq!(out["requires_approval"], true);
+        assert!(state.db.list_refunds(None).is_empty());
+        state.db.save_invoice(
+            "inv-1",
+            7,
+            "10",
+            "USDT",
+            None,
+            "paid",
+            None,
+            None,
+            Some(991),
+            None,
+        );
+        let out = execute_sensitive(
+            state.clone(),
+            &Principal::OWNER,
+            "finance_refund_create",
+            json!({"invoice_id": "inv-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        let rows = state.db.list_refunds(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 7);
+        assert_eq!(rows[0].7, "pending");
+        assert!(
+            state
+                .db
+                .latest_transfer_attempt("refund", rows[0].0)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn finance_payout_create_parks_and_only_creates_a_request() {
+        let spec = assert_tool("finance_payout_create", Tier::Sensitive, false);
+        assert_eq!(spec.annotations["destructiveHint"], false);
+        assert_eq!(spec.annotations["x-approval-required"], true);
+        assert!(spec.description.contains("WEB-ONLY"));
+        assert!((spec.validate)(&json!({})).is_err());
+        assert!((spec.validate)(&json!({"amount": "1"})).is_err());
+        assert!((spec.validate)(&json!({"amount": "1", "asset": "usdt"})).is_err());
+        assert!(
+            (spec.validate)(&json!({"amount": "1", "asset": "USDT", "destination": 0})).is_err()
+        );
+        assert!((spec.validate)(&json!({"amount": "1", "asset": "USDT"})).is_ok());
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        let out = (spec.handler)(
+            state.clone(),
+            seller(7),
+            json!({"amount": "1", "asset": "USDT"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["requires_approval"], true);
+        assert!(state.db.list_payouts(None).is_empty());
+        let out = execute_sensitive(
+            state.clone(),
+            &Principal::OWNER,
+            "finance_payout_create",
+            json!({"amount": "1", "asset": "USDT", "destination": 991}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        let rows = state.db.list_payouts(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].5, "pending");
+        assert!(
+            state
+                .db
+                .latest_transfer_attempt("payout", rows[0].0)
+                .is_none()
+        );
     }
 }
