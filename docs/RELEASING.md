@@ -4,6 +4,17 @@ The flow: gates → version bump → changelog → tag → release CI → artifa
 → post-release checks. Everything except the pushes can be prepared by an
 agent; the pushes are human work (see the two-person rule at the bottom).
 
+## Pre-flight checklist
+
+Before any release, confirm in order:
+- [ ] Gates green (below), clean tree, version aligned (`0.N.0` ↔ milestone vN).
+- [ ] LICENSE holder named (`LICENSE`).
+- [ ] Every item in `docs/LEGAL.md` reviewed and signed off by the owner;
+      policy drafts in `docs/*_DRAFT.md` published or explicitly deferred.
+- [ ] Data-retention figures confirmed (`docs/RETENTION_DRAFT.md`).
+- [ ] Channel ready for the announcement (`docs/COMMUNITY.md`). Publishing and
+      channel posts are human T2 actions.
+
 ## Pre-release gates
 
 All of these must pass. Not most of them. All.
