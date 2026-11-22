@@ -5,7 +5,7 @@ exist before a public launch or any paid real-money operation. This file is a
 checklist, not a substitute for the documents. Human owner signs off on each;
 rungs supply input as noted.
 
-- [ ] **LICENSE holder** — `LICENSE` is MIT but has no named copyright holder.
+- [x] **LICENSE holder** — MIT, `Copyright (c) 2026 meshdev26`.
 - [ ] **Terms of Service** — draft in `docs/TERMS_DRAFT.md`; scope, acceptable
       use, operator responsibilities. Needs legal review.
 - [ ] **Privacy policy** — draft in `docs/PRIVACY_DRAFT.md`; Telegram identity,
