@@ -6,9 +6,11 @@ checklist, not a substitute for the documents. Human owner signs off on each;
 rungs supply input as noted.
 
 - [ ] **LICENSE holder** — `LICENSE` is MIT but has no named copyright holder.
-- [ ] **Terms of Service** — scope, acceptable use, operator responsibilities.
-- [ ] **Privacy policy** — Telegram identity, Crypto Pay data, external AI API
-      calls, moderation audit data (message text is not stored).
+- [ ] **Terms of Service** — draft in `docs/TERMS_DRAFT.md`; scope, acceptable
+      use, operator responsibilities. Needs legal review.
+- [ ] **Privacy policy** — draft in `docs/PRIVACY_DRAFT.md`; Telegram identity,
+      Crypto Pay data, external AI API calls, moderation audit data (message
+      text is not stored). Needs legal review.
 - [ ] **Refund policy** — must match implemented behavior: owner-only approval,
       full vs partial refund, no fee/proration. L5 rules; L8 enforces.
 - [ ] **Data retention** — money rows append-only; no self-service deletion;
