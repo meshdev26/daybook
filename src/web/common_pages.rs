@@ -55,7 +55,7 @@ pub(super) async fn privacy_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return forbidden_page(&state, "Privacy", "Buyer data export and deletion");
     }
     let seller_val = q.seller_id.clone().unwrap_or_default();
@@ -108,7 +108,7 @@ pub(super) async fn privacy_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return forbidden_page(&state, "Privacy", "Buyer data export").into_response();
     }
     let seller_id: i64 = match q.seller_id.trim().parse() {
@@ -159,7 +159,7 @@ pub(super) async fn privacy_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Privacy", "Buyer data deletion");
     }
     if f.confirm.as_deref() != Some("DELETE") {

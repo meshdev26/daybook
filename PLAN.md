@@ -17,14 +17,13 @@ release CI for win/mac/linux x64+arm64), existing-server installer with
 hardened systemd unit, Docker, subpath mounting (`WEB_BASE_PATH`), embeddable
 (`embed::AgentAppBuilder`), compile-time command registry for extensions.
 
-**Engineering:** role-level architecture (L3–L11) machine-checked by
-`scripts/verify-agent-tiers.py`; security floor remediated same-day (CSPRNG,
+**Engineering:** security floor remediated same-day (CSPRNG,
 atomic + fail-closed payment claims, setup gating, XSS, throttling); 348 tests
 incl. property invariants + libFuzzer; WAL-safe `make backup`; `make doctor`
 diagnostics; full gate suite in `make test`.
 
-Docs: `ARCHITECTURE.md` (system map), `AGENT.md` (handbook + decision log),
-`AUTO_ROUTE.md` (routing), `docs/ARCHITECTURE-SCALE-PLAN.md` (fullness audit,
+Docs: `ARCHITECTURE.md` (system map), `AGENT.md` (handbook + decision log — the
+single agent-instruction file), `docs/ARCHITECTURE-SCALE-PLAN.md` (fullness audit,
 gap designs, scale seam contracts), `docs/DEPLOY_PROFILES.md`, `docs/DESKTOP.md`.
 
 **2026-10-27 addenda:** `/refundapprove` and `/payoutapprove` bot commands
@@ -42,10 +41,9 @@ the console (contrast tokens, labelled controls, skip link).
 
 ## Refactor roadmap — module split
 
-Enforces `AUTO_ROUTE.md` §8 (file & module hygiene). Owner: **L11** plans,
-**L7/L8/L9** execute, **L3** verifies every wave. Two phases, deliberately
+Keeps file and module sizes reviewable. Two phases, deliberately
 separated: Phase A is mechanical and safe today; Phase B is a design change and
-needs its own permission-map expansion first.
+needs its own module-split plan first.
 
 ### Current size debt (tracked, not assumed)
 
@@ -53,14 +51,14 @@ Refreshed 2026-10-30 (verified `wc -l` on the working tree, after the web
 module split and the setup/management UX polish wave; test modules live in
 sibling `tests.rs`/`tests/` files per Phase A).
 
-| File | Owner | Prod lines | Status |
-|------|-------|------------|--------|
-| `src/db.rs` | L9 | 7,512 | over hard cap — Phase B domain split pending |
-| `src/handlers/commands.rs` | L8 | 5,013 | over hard cap — Phase B domain split pending |
-| `src/api.rs` | L8 | 4,638 | over hard cap — Phase B domain split pending |
-| `src/web/mfa_users.rs` | L7 | 863 | over 800 target, under cap — split `web_users.rs`/`mfa_claim.rs` on next touch (2026-10-31 edit-flow wave; function bodies all ≤100) |
-| `src/web/bots_admin.rs` | L7 | 568 | over 800 target resolved 2026-10-31 (bots_add.rs split); now under target |
-| `src/web.rs` | L7 | — | RESOLVED: split into `src/web/`; every other surface ≤ 800 target |
+| File | Prod lines | Status |
+|------|------------|--------|
+| `src/db.rs` | 7,512 | over hard cap — Phase B domain split pending |
+| `src/handlers/commands.rs` | 5,013 | over hard cap — Phase B domain split pending |
+| `src/api.rs` | 4,638 | over hard cap — Phase B domain split pending |
+| `src/web/mfa_users.rs` | 863 | over 800 target, under cap — split `web_users.rs`/`mfa_claim.rs` on next touch (2026-10-31 edit-flow wave; function bodies all ≤100) |
+| `src/web/bots_admin.rs` | 568 | over 800 target resolved 2026-10-31 (bots_add.rs split); now under target |
+| `src/web.rs` | — | RESOLVED: split into `src/web/`; every other surface ≤ 800 target |
 
 None of these grow further; each is reduced when next touched (boy-scout rule).
 
@@ -76,18 +74,7 @@ unchanged via `use super::*;`.
 | `src/api.rs` → `#[cfg(test)] mod tests;` | `src/api/tests.rs` | lines 4,101–6,798 |
 | `src/handlers/commands.rs` → `#[cfg(test)] mod tests;` | `src/handlers/commands/tests.rs` | lines 5,012–5,409 |
 
-Permission-map globs required **before** the move lands (orchestrator expands
-`.opencode/agents/*.md` and `.qoder/agents/*.md`; L11 cannot):
-
-- L7 (`staff-client-platforms`): add `src/web/**`.
-- L9 (`staff-core-systems`): add `src/db/**`.
-- L8 (`staff-server`): add `src/api/**` and `src/handlers/commands/**`.
-
-Note: `src/web/tests.rs` and `src/db/tests.rs` need those same globs even though
-the parent file stays in the existing allowlist — without them the owning rung
-cannot create the new file.
-
-### Phase B — production split (deferred; per-module map expansion)
+### Phase B — production split (deferred; per-module split plan)
 
 Each parent becomes a façade (`pub use` re-exports, unchanged public paths);
 each target file carries `impl` blocks for the same type. Group by domain, not
@@ -115,15 +102,14 @@ by line count.
 2. The 469 lib tests still pass; test count unchanged.
 3. `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt
    --check`, `cargo audit`, `cargo deny check` green.
-4. `python3 scripts/verify-agent-tiers.py` green.
-5. Public API unchanged from outside the crate (façade `pub use` keeps every
+4. Public API unchanged from outside the crate (façade `pub use` keeps every
    existing path resolving).
 
 ### Sequencing
 
-Phase A → **L3 verify** → Phase B wave 1 (`src/web.rs` + `src/db.rs`, disjoint)
-→ **L3** → Phase B wave 2 (`src/api.rs` + `src/handlers/commands.rs`, disjoint)
-→ **L3**. Waves are disjoint file sets, so they can run in parallel within a
+Phase A → **verify** → Phase B wave 1 (`src/web.rs` + `src/db.rs`, disjoint)
+→ **verify** → Phase B wave 2 (`src/api.rs` + `src/handlers/commands.rs`, disjoint)
+→ **verify**. Waves are disjoint file sets, so they can run in parallel within a
 wave; never two waves at once.
 
 ### Risk — read before starting Phase B
@@ -175,7 +161,7 @@ prepare alongside but should also land on a clean tree before Phase B begins.
     - *Write* (direct, audited): publish_post, edit_post.
     - *Sensitive* (`destructiveHint`, **server-side approval gate**):
       gen_codes (returns secrets), delete_post (destructive), broadcast
-      (high blast radius). Calling one creates a pending row and returns
+      (high impact). Calling one creates a pending row and returns
       `requires_approval` — nothing executes. The OWNER approves via the
       bot (`/approvals`, `/approve <id>`, `/deny <id>`, owner-only,
       15-minute expiry); execution happens on approval, and secrets
@@ -211,8 +197,8 @@ prepare alongside but should also land on a clean tree before Phase B begins.
      (`get_config("channel")` call sites) resolve through the table with
      legacy-config fallback. The dashboard Post form gets a channel
      dropdown instead of a free-text guess.
-  - Orchestration: L9 core/data (semantics, claim code, channels store,
-    env-writer extraction) + L7 web (skip, claim UI, settings, channels
+  - Work split: core/data (semantics, claim code, channels store,
+    env-writer extraction) + web (skip, claim UI, settings, channels
     manager); bot command surface unchanged in v1.
 
 ### v1.3.x shipped addenda
@@ -230,7 +216,7 @@ prepare alongside but should also land on a clean tree before Phase B begins.
   with its own owner, default channel, and (via the existing seller model) its
   own channels/plans/products/services — sharing one SQLite DB and one web
   console. Implemented as the smallest viable step:
-  - **Schema (L9):** `bots` table + nullable `bot_id` on `sellers`,
+  - **Schema:** `bots` table + nullable `bot_id` on `sellers`,
     `channels`, `admins`, `web_sessions.selected_bot_id`, `mcp_audit.bot_id`.
     No rebuilds; legacy single-bot installs backfill to a synthesized
     "primary" bot (byte-identical behavior).
@@ -249,10 +235,10 @@ prepare alongside but should also land on a clean tree before Phase B begins.
     via seller; optional `bot` arg on Telegram-acting tools (spoof-resistant).
   - **Jobs:** per-bot invoice-grant sweeper; other sweepers on primary with
     TODO for full per-bot migration.
-  - **Remaining (L8/L7/L3):** handler `bot_ctx` injection, web bot selector +
+  - **Remaining:** handler `bot_ctx` injection, web bot selector +
     scoped pages, MCP bot arg handling, per-bot sweepers for all jobs, and
     multi-bot integration tests.
-- **Design doc:** `docs/` (mirrored at `~/.commandcode/plans/multi-bot-design.md`).
+- **Design doc:** `docs/`.
 
 ### v2 (trigger-driven)
 - Bookings: services/slots/bookings reusing the invoice pipeline.
@@ -261,7 +247,7 @@ prepare alongside but should also land on a clean tree before Phase B begins.
   split, connection pooling. Contracts pre-documented in the scale plan.
 
 ### Owner decisions (business, not code)
-1. Go-live with real transfers (T2 — small test amount first).
+1. Go-live with real transfers (owner approval required — small test amount first).
 2. Code-signing certificates (SmartScreen/Gatekeeper).
 3. Hosted/SaaS offering for non-technical sellers.
 

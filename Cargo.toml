@@ -4,6 +4,55 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+# ---- Compile-time capability registry (multibot foundation) ----
+# A feature selects which product capabilities are compiled in. The default
+# set is behavior-neutral: today's shop bot plus the cross-cutting moderation
+# floor, so every existing path and dependency stays byte-identical.
+#   shop_bot   - AI shop bot (payments, products, AI drafts) — existing default.
+#   moderation - owner/seller/per-bot word policy floor — existing default
+#                (the runtime floor in handlers/moderation.rs also compiles
+#                unconditionally; the FEATURE is off in a no-default build).
+#   movie_bot  - movie catalog bot; a movie-only install enables this alone.
+#   reply_bot  - admin reply bot.
+#   file_share - file-sharing product type.
+#   web_app    - public (non-bot) Web app surface.
+#   service    - AI service surface.
+#   automation - automation rules (Workspace).
+#
+# Feature-optionalization investigation (complete, verified — do not
+# re-litigate without a gate-sanctioned change): these are still INERT
+# MARKERS. `cargo tree --depth 1` for `default` and for
+# `--no-default-features --features movie_bot` yield the SAME direct
+# dependency set. No `[dependencies]` entry is optionalizable from a core
+# systems perspective: every crate is referenced by at least one module that compiles
+# for every feature set —
+#   reqwest/serde/tokio/tracing/chrono/sha2/getrandom/cookie/bcrypt -> web/**,
+#     api.rs, auth.rs, embed.rs, mcp/**, bots.rs, services/**;
+#   grammers-client/grammers-session/aes-gcm/pbkdf2/zeroize/thiserror ->
+#     identity/** (wired into WebState by web/identity.rs et al.);
+#   async-trait -> ai/** + identity/**;  tower-http -> web/mod.rs;
+#   toml -> config.rs + web/bots_*.rs;  rusqlite -> db.rs.
+# The eight capability modules under handlers/capabilities are stub
+# `Descriptor` constants: they pull no dependency beyond teloxide's prelude,
+# already required by the dispatcher. There is thus no capability-only dep to
+# mark `optional = true` / `dep:`-map, and no crate-root module in src/lib.rs
+# is purely capability-specific. Prerequisite for real removal (server-side):
+# gate the web/api/auth/embed, ai/crypto, identity and shop command-tree
+# modules behind these features, then add `dep:` mappings here. Keeping deps
+# non-optional preserves a byte-identical default build and a green
+# movie-only build. Advisory pins (rusqlite 0.41, libsqlite3-sys 0.39.1 and
+# the vendored-teloxide sqlx bump) are unchanged.
+[features]
+default = ["shop_bot", "moderation"]
+shop_bot = []
+moderation = []
+movie_bot = []
+reply_bot = []
+file_share = []
+web_app = []
+service = []
+automation = []
+
 # Smaller, self-contained release binaries for desktop distribution (.exe/.app/tar.gz).
 [profile.release]
 lto = "thin"

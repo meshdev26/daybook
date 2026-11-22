@@ -36,6 +36,120 @@ proptest! {
     }
 }
 
+// ---- UI alignment: global CSS + markup contract (owner screenshot fixes) --
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn console_alignment_utilities_are_served_globally() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    state.db.add_blocked_word(0, "gridcheck", "warn", true);
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    // The base rule is byte-identical: the alignment fix is purely additive
+    // and must never become a global `button { margin-top: 0 }` override.
+    assert!(
+        css.contains("form button[type=\"submit\"] { margin-top: 16px; }"),
+        "base submit margin changed: {css}"
+    );
+    assert!(
+        !css.contains("button { margin-top: 0"),
+        "no global destructive button margin override allowed: {css}"
+    );
+    for selector in [
+        // inline-level again so the web-users Actions forms and the channel
+        // trailing help flow horizontally; td.actions hugs them to the right.
+        ".inline-form { display: inline-flex; align-items: center; gap: 12px",
+        ".inline-form label { display: inline-flex; align-items: center; gap: 8px",
+        "td.actions .inline-form { justify-content: flex-end",
+        ".form-row { display: flex; align-items: flex-end; gap: 12px",
+        ".form-row > label { display: flex; flex-direction: column; gap: 6px",
+        // Submit buttons in horizontal forms share their input's baseline;
+        // stacked forms keep the base 16px gap below.
+        ".inline-form button[type=\"submit\"],",
+        ".form-row button[type=\"submit\"] { margin-top: 0; }",
+        ".inline-form input:not([type=\"hidden\"]),",
+        "min-height: 40px",
+        "grid-template-columns: repeat(2, minmax(0, 1fr))",
+        "ul.recovery-codes > li",
+        "li.moderation-row, .rows li.moderation-row {",
+        "grid-template-columns: minmax(0, 1fr) auto auto",
+        ".moderation-row > .row-actions",
+        ".filter-bar { display: flex; flex-direction: column; gap: 12px",
+        // flex-basis:100% is what actually wraps the detail in a flex <li>.
+        ".empty .empty-detail { display: block; flex: 0 0 100%",
+    ] {
+        assert!(css.contains(selector), "missing `{selector}` in app.css");
+    }
+    // Mobile: grids stack; ≥44px moderation targets stay intact.
+    assert!(
+        css.contains("grid-template-columns: 1fr; justify-items: stretch"),
+        "{css}"
+    );
+    assert!(
+        css.contains(".moderation-row button { min-height: 44px"),
+        "{css}"
+    );
+    // The grid selector must be a real selector for the markup the server
+    // emits: class on the <li>, parent <ul class="rows"> — not just strings.
+    assert!(
+        css.contains("li.moderation-row, .rows li.moderation-row {")
+            && css.contains("grid-template-columns: minmax(0, 1fr) auto auto"),
+        "grid rule missing: {css}"
+    );
+    let resp = app
+        .oneshot(authed_req("/blocked-words", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(
+        html.contains(r#"<ul class="rows"><li class="moderation-row">"#),
+        "grid selector `li.moderation-row, .rows li.moderation-row` must match rendered markup: {html}"
+    );
+}
+
+#[test]
+fn recovery_codes_render_as_escaped_compact_chips() {
+    let codes = vec!["AB12-CD34".to_owned(), "<b>&\"x".to_owned()];
+    let html = super::super::mfa_users::recovery_codes_html(&codes);
+    assert_eq!(html.matches("<li><code class=\"copyable\">").count(), 2);
+    assert!(html.contains("AB12-CD34"), "{html}");
+    assert!(html.contains("&lt;b&gt;&amp;&quot;x"), "{html}");
+    assert!(!html.contains("<b>"), "{html}");
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn customers_filter_form_uses_spaced_inline_utilities() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/customers", &owner)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains(r#"<div class="filter-bar">"#), "{body}");
+    assert!(
+        body.contains(r#"<form method="get" action="/customers" class="inline-form">"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<label for="customer-tag">Tag"#), "{body}");
+    assert!(
+        body.contains(r#"<label for="customer-search">Search"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<nav aria-label="Filter customers by status" class="inline-form">"#),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 #[tracing::instrument(skip_all)]
 async fn unauth_dashboard_redirects_to_login() {
@@ -218,7 +332,7 @@ async fn broadcast_fails_closed_for_non_owner_without_seller_scope() {
     );
 }
 
-// ---- EDIT_FLOW_SPEC L7 pass: additive pins for the flow-break fixes ----
+// ---- EDIT_FLOW_SPEC web pass: additive pins for the flow-break fixes ----
 
 /// E2: POST /product/activate flips an inactive row back on and redirects
 /// with the `activated=1` flash (the Deactivate dead-end's counterpart).
@@ -438,4 +552,195 @@ async fn broadcast_single_custom_segment_input() {
         .find(r#"<input type="text" name="segment""#)
         .expect("the custom input exists");
     assert!(input_pos > details_pos, "the custom input lives in details");
+}
+
+/// M4: the inline status select must preselect the row's current status so
+/// saving tracking (a separate form) cannot silently reset delivered→pending.
+/// m1: the two Save buttons in a row carry distinct accessible names.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn orders_status_select_preselects_current_and_save_buttons_are_labeled() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let oid = state.db.create_order(7, 1, 999, "inv-orders-ui").unwrap();
+    assert!(state.db.set_order_status(7, &oid, "delivered"));
+
+    let resp = router(state)
+        .oneshot(authed_req("/orders", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"<option value="delivered" selected>delivered</option>"#),
+        "current status must be selected: {body}"
+    );
+    assert!(
+        !body.contains("Change status…"),
+        "delivered is offered, no placeholder needed: {body}"
+    );
+    assert!(
+        body.contains(&format!(r#"aria-label="Save status for order {oid}""#)),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(r#"aria-label="Save tracking for order {oid}""#)),
+        "{body}"
+    );
+
+    // A state we deliberately do not offer (`refunded`) falls back to a
+    // neutral, disabled prompt rather than silently submitting `pending`.
+    let (state2, _dir2) = make_state().await;
+    let owner2 = owner_session(&state2).await;
+    let oid2 = state2
+        .db
+        .create_order(7, 1, 999, "inv-orders-ui-2")
+        .unwrap();
+    assert!(state2.db.set_order_status(7, &oid2, "refunded"));
+    let resp2 = router(state2)
+        .oneshot(authed_req("/orders", &owner2))
+        .await
+        .unwrap();
+    let body2 = body_string(resp2).await;
+    assert!(
+        body2.contains(r#"<option value="" selected disabled>Change status…</option>"#),
+        "{body2}"
+    );
+}
+
+/// m2: `role="alert"` is already an assertive live region; duplicating
+/// `aria-live="polite"` on the same element gives screen readers conflicting
+/// instructions.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn bookings_alert_is_not_a_redundant_live_region() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let resp = router(state)
+        .oneshot(authed_req("/bookings?error=invalid", &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(r#"<div class="alert alert-error" role="alert">Invalid booking id.</div>"#),
+        "{body}"
+    );
+    assert!(!body.contains(r#"role="alert" aria-live"#), "{body}");
+}
+
+// ---- Action placement / detail alignment regression contracts ------------
+
+/// The action column stays right-aligned in tables, inline action forms hug
+/// the right edge, the shared `.row-actions` cluster keeps its own rules, and
+/// charts no longer escape their panel. Flex rows must not let a long label
+/// squeeze the action affordances; on mobile the cluster drops the auto
+/// margin so it can wrap under the text instead of overflowing.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn action_placement_and_detail_alignment_css_contract() {
+    let (state, _dir) = make_state().await;
+    let resp = router(state)
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    for needle in [
+        "td.actions { text-align: right; }",
+        "td.actions .inline-form { justify-content: flex-end; }",
+        ".row-actions {",
+        ".panel canvas { display: block; width: 100%;",
+        ".rows li .row-action, .row-actions { flex: 0 0 auto; }",
+    ] {
+        assert!(css.contains(needle), "missing `{needle}` in app.css");
+    }
+    let compact: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("li.row-action,.row-actions{margin-left:0;}"),
+        "mobile detail alignment override missing: {css}"
+    );
+}
+
+/// Every console table with an Actions header must render its row actions in
+/// the right-aligned cell (`td class="actions"`), not in a plain `<td>`.
+/// Fixtures are minimal: one row per page is enough to exercise the row
+/// template; the empty-state row never carries an action cell.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn console_tables_render_actions_in_dedicated_cells() {
+    let (state, _dir) = make_state().await;
+    let owner = owner_session(&state).await;
+    let (account_id, _, _, _, _) = state
+        .db
+        .get_web_account_by_username("owner")
+        .expect("owner account exists");
+
+    state
+        .db
+        .create_order(7, 1, account_id, "inv-actions-ui")
+        .unwrap();
+    state
+        .db
+        .create_promo_code(
+            1,
+            "UIACTIONS",
+            "percent",
+            10.0,
+            None,
+            None,
+            0.0,
+            "all",
+            None,
+            None,
+        )
+        .unwrap();
+    state.db.create_code(1, None, Some(30), 1, None, 12);
+    let service = state
+        .db
+        .create_service(1, "consult", "10", "USDT", 60, None)
+        .expect("service created");
+    let slot = state.db.create_slot(
+        service,
+        1,
+        &(chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
+        1,
+    );
+    assert!(
+        state
+            .db
+            .create_booking(service, slot, account_id)
+            .unwrap()
+            .is_some(),
+        "booking fixture claimed the slot"
+    );
+    let _ = state.db.create_api_key(account_id, Some("ui-actions"));
+    state
+        .db
+        .cart_add_item(account_id, 1, "product", 7, 1)
+        .unwrap();
+
+    let app = router(state);
+    for path in [
+        "/orders",
+        "/promos",
+        "/codes",
+        "/bookings",
+        "/webusers",
+        "/keys",
+        "/cart",
+    ] {
+        let resp = app.clone().oneshot(authed_req(path, &owner)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_string(resp).await;
+        let rows = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|chunk| chunk.split("</tbody>").next())
+            .unwrap_or_else(|| panic!("{path} has no table body: {body}"));
+        assert!(
+            rows.contains(r#"<td class="actions""#),
+            "{path} row actions must live in a right-aligned cell: {rows}"
+        );
+    }
 }

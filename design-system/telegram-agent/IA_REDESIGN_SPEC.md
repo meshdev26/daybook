@@ -1,8 +1,8 @@
 # Web Console Information Architecture Redesign — Goal-Based Grouping, Six Groups + Utilities
 
-**Status:** Approved, ready for L7 implementation
+**Status:** Approved, ready for web implementation
 **Date:** 2026-11-18
-**Role:** L6 senior-design-ux (owner of this spec); L6-C sign-off required on token/brand coherence
+**Discipline:** design (owner of this spec); design sign-off required on token/brand coherence
 **Territory of this spec:** the console navigation only — `src/web/html.rs` (`rail_nav`, `nav_link`, `nav_links`, the `html_page` footer), plus a documentation note on the sidebar-toggle remap in `src/web/settings.rs`. No route, schema, or DB changes; no new auth logic; no new pages.
 **Sources of truth:** `DESIGN.md` + `assets/app.css` (MASTER.md is deprecated 2026-10-31 and must not be used).
 **Hard constraints:** every URL path stays byte-identical (no route changes); every page gate stays as-is (no new auth logic); no DB or schema changes; all existing hrefs/actions continue to go through `state.url()` (base-path safe); the skip link stays.
@@ -38,7 +38,7 @@ The answer is a **relabel and regroup**, not a rebuild: the same routes, the sam
 | Seller/admin abandoned-carts page | `src/web/cart.rs:149` (`carts_page`, title "Carts") |
 | Sidebar prefs struct + toggles | `src/web/settings.rs:4-47`, `/settings/sidebar` (`settings_sidebar`) |
 | Owner sidebar management panel | `src/web/settings.rs:354-397` |
-| Accessibility floor (resolved 2026-11-18) | WCAG 2.2 AA — single floor per `AUTO_ROUTE.md` §5 and this document §8 (L11 ruling) |
+| Accessibility floor (resolved 2026-11-18) | WCAG 2.2 AA — single floor per this document §8 (architecture ruling) |
 
 Current groups and items (verbatim, in render order):
 
@@ -139,11 +139,11 @@ Every current item is accounted for; no item is dropped, no item is added.
 - **Cart / Carts renamed by audience.** `/cart` is the buyer's own basket → "My cart"; `/carts` is the seller/admin abandoned-carts report → "Abandoned carts". The audience cue removes the ambiguity that two near-identical labels created.
 - **Settings promoted from footer to Utilities.** The footer link (`src/web/html.rs:225`) was the only entry point and was easy to miss; promoting it to an always-visible Utilities strip makes account/console settings discoverable on every screen.
 - **Bare links eliminated.** API keys and Carts were rendered as loose links outside any group (`src/web/html.rs:470-475`). They now live inside Workspace and Sales respectively, so every item has a home and a consistent affordance.
-- **Bots → Offerings.** Bots are a posting target alongside Channels/Products/Plans, not an operate-level switch. (Documentation drift: `src/web/tests/bots.rs:652-653` and `BOT_SWITCHING_UX_SPEC.md` prose say "Bots rides in the Operate rail group for the owner only" — both become stale and must be updated by L7 during implementation. The test itself only asserts `href="/bots"` presence/absence and survives; only the comment drifts.)
+- **Bots → Offerings.** Bots are a posting target alongside Channels/Products/Plans, not an operate-level switch. (Documentation drift: `src/web/tests/bots.rs:652-653` and `BOT_SWITCHING_UX_SPEC.md` prose say "Bots rides in the Operate rail group for the owner only" — both become stale and must be updated by web during implementation. The test itself only asserts `href="/bots"` presence/absence and survives; only the comment drifts.)
 
 ---
 
-## 5. Navigation mechanics (L7 implements in `src/web/html.rs`)
+## 5. Navigation mechanics (implemented in `src/web/html.rs`)
 
 1. **One declarative NavItem table.** Replace the scattered `nav_link`/`nav_links` calls in `rail_nav` with a single table of structs, each carrying at minimum: `id` (stable, never a label), `label`, `path`, `group`, `roles` (the role set that may see it). `rail_nav` becomes a pure projection of that table filtered by the session's role. No second source of truth.
 2. **Active state keys off `id`, not the page title.** The handler passes the page's nav `id` (or the router resolves it from the path) instead of a display title; `nav_link`'s `title.eq_ignore_ascii_case(label)` comparison at `src/web/html.rs:277` is removed. This closes the silent-loss-of-highlight bug.
@@ -158,7 +158,7 @@ Every current item is accounted for; no item is dropped, no item is added.
 
 ## 6. Role visibility (reuses existing page gates)
 
-The nav must never show a link whose page would return `forbidden_page`. Filtering is by the role sets in §2, which are derived from the existing handlers (e.g. `bots_page` owner-only at `src/web/bots_admin.rs:388-389`; `crypto_page` owner-only at `src/web/admin_console.rs:276`; `keys_page` seller/admin/owner at `src/web/mod.rs:351` and `is_admin_role`; `finance_page` seller/admin/owner at `src/web/finance.rs:213`; `settings_page` owner-only at `src/web/settings.rs:84-85`). Settings is the concrete case the owner-only filter enforces: it appears in Utilities only for owners. L7 must not add or remove a gate; if a page's gate changes later, the nav table's `roles` field is updated in the same change.
+The nav must never show a link whose page would return `forbidden_page`. Filtering is by the role sets in §2, which are derived from the existing handlers (e.g. `bots_page` owner-only at `src/web/bots_admin.rs:388-389`; `crypto_page` owner-only at `src/web/admin_console.rs:276`; `keys_page` seller/admin/owner at `src/web/mod.rs:351` and `is_admin_role`; `finance_page` seller/admin/owner at `src/web/finance.rs:213`; `settings_page` owner-only at `src/web/settings.rs:84-85`). Settings is the concrete case the owner-only filter enforces: it appears in Utilities only for owners. Web must not add or remove a gate; if a page's gate changes later, the nav table's `roles` field is updated in the same change.
 
 ---
 
@@ -167,9 +167,9 @@ The nav must never show a link whose page would return `forbidden_page`. Filteri
 1. **No route, schema, or DB changes.** All paths in §2 already exist in `src/web/mod.rs:229-403`. No migration of stored data.
 2. **Sidebar toggles remap to Workspace.** The five owner toggles in `src/web/settings.rs:5-47` (ai, crypto, admins, sellers, webusers) and the management panel at `src/web/settings.rs:354-397` keep their storage keys and POST route (`/settings/sidebar`); only their *grouping* changes — they now control visibility inside the Workspace group instead of a standalone Manage group. The `SidebarPrefs` struct, `effective_sidebar_prefs`, and `settings_sidebar` handler are unchanged in shape; only labels/help text may be updated to say "Workspace". No DB key migration.
 3. **Label-based nav tests must be updated; path-based tests untouched.** Any test that asserts a nav group label string (e.g. "Operate", "Sell", "Insights", "Manage", "Identity") or a nav item label ("Cart", "Carts", "API keys" as bare link) needs its expected string updated to the new labels/groups. Tests that assert only paths, hrefs, or page presence (e.g. `src/web/tests/bots.rs:633-664` asserts `href="/bots"` presence/absence) survive unchanged. Specifically:
-   - `src/web/tests/bots.rs:633-664` (`shell_shows_bot_selector_for_owner_and_pinned_label_for_seller`) survives on path; its comment at `:652-653` becomes stale and must be corrected by L7.
+   - `src/web/tests/bots.rs:633-664` (`shell_shows_bot_selector_for_owner_and_pinned_label_for_seller`) survives on path; its comment at `:652-653` becomes stale and must be corrected by web.
    - `src/web/tests/subs.rs:17` (asserts body contains "Subscriptions") survives — label unchanged.
-   - `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by L7 during implementation.
+   - `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by web during implementation.
 4. **No data migration, no env changes.** `WEB_BASE_PATH`, cookies, and redirects are unaffected.
 
 ---
@@ -184,7 +184,7 @@ The nav must never show a link whose page would return `forbidden_page`. Filteri
 
 ### Accessibility floor — resolved 2026-11-18
 
-The single accessibility release floor for this console is **WCAG 2.2 Level AA** (L11 ruling). The token pairs are already measured against this floor in `VISUAL_POLISH_SPEC.md` §C1 and pass in both themes; this redesign changes no color values. The remaining accessibility work is the structural item set in `VISUAL_POLISH_SPEC.md` §C2, tracked separately.
+The single accessibility release floor for this console is **WCAG 2.2 Level AA** (architecture ruling). The token pairs are already measured against this floor in `VISUAL_POLISH_SPEC.md` §C1 and pass in both themes; this redesign changes no color values. The remaining accessibility work is the structural item set in `VISUAL_POLISH_SPEC.md` §C2, tracked separately.
 
 There is no AAA floor and no third theme. The token contract follows Radix 12-step role semantics over the existing ledger palette (`DESIGN.md` §4). All markup in this change is verified against WCAG 2.2 AA.
 
@@ -192,10 +192,10 @@ There is no AAA floor and no third theme. The token contract follows Radix 12-st
 
 ## 9. Ownership & verification
 
-- **Spec owner:** L6 (this document).
-- **Design-system / token / brand coherence sign-off:** L6-C (Chief Design Officer), because this changes cross-surface grouping and labels.
-- **Implementation owner:** L7 (Staff Client Platforms), in `src/web/html.rs`. `src/web/settings.rs` receives label/help-text edits only.
-- **Verification:** L3 (Associate Verification) — mandatory before completion. L3 runs the full gate set and the test plan in §11 and confirms no path changed.
+- **Spec owner:** this document.
+- **Design-system / token / brand coherence sign-off:** design, because this changes cross-surface grouping and labels.
+- **Implementation owner:** the web layer, in `src/web/html.rs`. `src/web/settings.rs` receives label/help-text edits only.
+- **Verification:** mandatory before completion. Verification runs the full gate set and the test plan in §11 and confirms no path changed.
 
 ---
 
@@ -212,7 +212,7 @@ There is no AAA floor and no third theme. The token contract follows Radix 12-st
 - [ ] Settings appears in Utilities for owner sessions only (owner-only page gate, `src/web/settings.rs:84-85`).
 - [ ] Owner sidebar toggles still function and now describe Workspace items.
 - [ ] `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` pass.
-- [ ] L3 verification recorded before completion.
+- [ ] Verification recorded before completion.
 
 ---
 
@@ -224,14 +224,14 @@ There is no AAA floor and no third theme. The token contract follows Radix 12-st
 
 **Screen reader (manual):** group toggle announces label + expanded state; collapsed panel is not announced; active page announced; Utilities items announced.
 
-**Automated:** update label-based nav assertions to the new labels/groups; path-based assertions (e.g. `src/web/tests/bots.rs:633-664`) remain unchanged; add a smoke check that each role sees exactly its expected item set. L3 verifies the full suite.
+**Automated:** update label-based nav assertions to the new labels/groups; path-based assertions (e.g. `src/web/tests/bots.rs:633-664`) remain unchanged; add a smoke check that each role sees exactly its expected item set. Verification runs the full suite.
 
 ---
 
 ## 12. Risks & rollout
 
-- **Label drift in tests.** Mitigated by §7.3: L7 updates label-based assertions in the same change; L3 confirms path-based ones are untouched.
-- **Documentation drift.** `src/web/tests/bots.rs:652-653` comment and `BOT_SWITCHING_UX_SPEC.md` prose become stale (Bots no longer in Operate). Recorded here as an L7 fix item during implementation; not blocking.
-- **Active-state regression.** Mitigated by id-keyed state and L3 verification of highlight on every page.
+- **Label drift in tests.** Mitigated by §7.3: the web layer updates label-based assertions in the same change; verification confirms path-based ones are untouched.
+- **Documentation drift.** `src/web/tests/bots.rs:652-653` comment and `BOT_SWITCHING_UX_SPEC.md` prose become stale (Bots no longer in Operate). Recorded here as a web fix item during implementation; not blocking.
+- **Active-state regression.** Mitigated by id-keyed state and verification of highlight on every page.
 - **Accessibility floor ambiguity.** Resolved 2026-11-18: WCAG 2.2 AA is the single floor (§8); no AAA upgrade and no color changes.
 - **Rollout.** Single PR, no feature flag, no DB migration. Rollback is a revert of the nav projection change.

@@ -1,9 +1,9 @@
 # CI — the project gate, on every push and pull request.
 #
 # WHY THIS EXISTS: the quality gate has always lived in `make test` (fmt,
-# clippy -D warnings, the test suite, cargo audit, cargo deny, the role-level
-# routing contract). Before this repository was public that gate ran only on
-# the author's machine; nothing stopped an unvetted pull request from landing.
+# clippy -D warnings, the test suite, cargo audit, cargo deny). Before this
+# repository was public that gate ran only on the author's machine; nothing
+# stopped an unvetted pull request from landing.
 # CI runs THE SAME Makefile target — not a copy of it — so the two can never
 # drift: if the gate changes, CI follows the Makefile automatically.
 #
@@ -34,7 +34,7 @@ env:
 
 jobs:
   gate:
-    name: Gate (fmt, clippy, test, audit, deny, routing contract)
+    name: Gate (fmt, clippy, test, audit, deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +51,30 @@ jobs:
 
       - name: Install cargo-audit & cargo-deny
         # Tool passed as an input, never parsed from the @ref — the ref form
-        # can silently install nothing (observed on shadowmesh, 2026-10-23).
+        # can silently install nothing (observed during earlier tool setup, 2026-10-23).
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
 
       - name: Run the project gate
         run: make test
+
+  client-check:
+    name: Client JS type check (required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        # Pinned: a drifting Node would make this status non-reproducible.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: 'npm'
+          cache-dependency-path: assets/package-lock.json
+
+      - name: Type-check and test client JS
+        run: npm ci --prefix assets && npm run --prefix assets check && npm test --prefix assets
 
   linux-x64:
     name: Compile check (linux-x64)

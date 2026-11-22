@@ -1,9 +1,9 @@
 # Bot Switching — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec of record for the shipped surface; L7 implemented in `src/web.rs`.
+**Owner:** design — spec of record for the shipped surface; the web layer implemented it in `src/web.rs`.
 **Status:** v1.1 spec (2026-10-28): remaining console pages scoped per N1; no new controls. WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L10 (security review), L6-C (token contract).
-**Related:** `design-system/telegram-agent/MASTER.md` (token contract), `assets/app.css` (`.rail .bot-scope`), `src/web.rs` (`html_page` shell, `bot_scope_control`, `bot_select`, `bots_page`/`bots_save`, `effective_bot`), `AUTO_ROUTE.md` L7 plan (`web-bot-scoping-plan.md`).
+**Audience:** web (implementation), server (handlers/data), security (security review), design (token contract).
+**Related:** `design-system/telegram-agent/MASTER.md` (token contract), `assets/app.css` (`.rail .bot-scope`), `src/web.rs` (`html_page` shell, `bot_scope_control`, `bot_select`, `bots_page`/`bots_save`, `effective_bot`), the web bot-scoping plan (`web-bot-scoping-plan.md`).
 
 ---
 
@@ -59,7 +59,7 @@ The PRG target re-renders with the new preselection — that is the v1 acknowled
 - **Read-only table** (`.table-wrap` region): ID · Key · Username · Owner · Default channel · Enabled. Empty state points to `BOTS_CONFIG`/`BOTS_JSON` + restart.
 - **One "Edit bot" form** (`.panel`): bot `<select>` (all bots), owner user ID (number, required), default channel ID (number, optional), enabled checkbox (pre-checked), Save → POST `{base}/bots`.
 - Unknown bot id → styled 404 page, never a silent redirect (honest feedback).
-- Token editing is **out of scope by design**; the help copy under the form title says so and names the config path. No password-style field may be added here (L10 floor).
+- Token editing is **out of scope by design**; the help copy under the form title says so and names the config path. No password-style field may be added here (security floor).
 - Rail entry lives in the **Offerings** group.
 
 ---

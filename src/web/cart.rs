@@ -34,7 +34,7 @@ pub(super) async fn cart_page(
             continue;
         }
         rows.push_str(&format!(
-            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td><form method="post" action="{}" class="inline-form"><input type="hidden" name="seller_id" value="{}"><input type="hidden" name="item_type" value="{}"><input type="hidden" name="item_id" value="{}"><button type="submit" class="btn btn-danger btn-sm">Remove</button></form></td></tr>"#,
+            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td class="actions"><form method="post" action="{}" class="inline-form"><input type="hidden" name="seller_id" value="{}"><input type="hidden" name="item_type" value="{}"><input type="hidden" name="item_id" value="{}"><button type="submit" class="btn btn-danger btn-sm">Remove</button></form></td></tr>"#,
             esc(item_type),
             item_id,
             qty,
@@ -154,10 +154,12 @@ pub(super) async fn carts_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if !(session.role == "seller" || is_admin_role(&session.role)) {
+    if !(Role::from_role_str(&session.role) == Role::Seller
+        || Role::from_role_str(&session.role).has_level(Role::Admin))
+    {
         return forbidden_page(&state, "Carts", "Active carts").into_response();
     }
-    let seller_filter = if session.role == "seller" {
+    let seller_filter = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

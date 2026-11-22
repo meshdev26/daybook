@@ -1,7 +1,8 @@
 #![allow(clippy::type_complexity)]
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Stored post row. Field positions (index access is load-bearing in
 /// api.rs/web.rs/mcp::tools): 0 id, 1 seller_id, 2 chat_id, 3 message_id,
@@ -43,7 +44,7 @@ type InvoiceRow = (
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
 
-/// Booking row for the console table and `/mybookings` (L7/L8), adjusted to
+/// Booking row for the console table and `/mybookings` (web/server), adjusted to
 /// the real columns of schema.sql: (bookings.id, bookings.booking_id public
 /// token, buyer user_id, service name, slot starts_at, slot ends_at, status,
 /// expires_at, service seller_id). starts_at/ends_at are None for legacy rows
@@ -70,15 +71,151 @@ pub type BookingListRow = (
 const WEDGED_GRANT_STALE_MINUTES: i64 = 5;
 /// D3 (ARCHITECTURE-V1.4 §2): the booking hold IS the seller-response window —
 /// `expires_at = min(now + BOOKING_HOLD_MINUTES, slot start)`. Single tuning
-/// point for the whole booking state machine; pub so the bot copy (L8) and
-/// console copy (L7) quote the same number instead of a hardcoded string.
+/// point for the whole booking state machine; pub so the bot copy (server) and
+/// console copy (web) quote the same number instead of a hardcoded string.
 pub const BOOKING_HOLD_MINUTES: i64 = 60;
 /// TTL in minutes for one-time console setup links (D7): the DM'd link dies
 /// unclaimed after this long.
 pub const SETUP_LINK_TTL_MINUTES: i64 = 15;
 /// Purpose tag one-time setup links carry in `web_pending_mfa.purpose` (D7);
-/// pub because the claim routes (L7) validate the same string on GET/POST.
+/// pub because the claim routes (web) validate the same string on GET/POST.
 pub const SETUP_LINK_PURPOSE: &str = "setup_link";
+
+// ---- Money Safety Spec (approved batch, decisions 1/3/4/5) ----
+// Internal operational timers, NOT customer SLAs (spec §3/§5, G7). Kept in
+// the data layer as constants so the server's injectable-clock sweeper and verification's
+// boundary tests quote the same numbers.
+/// §5.1: executing rows older than this move to `needs_reconciliation`.
+pub const RECONCILIATION_DUE_MINUTES: i64 = 30;
+/// §5.2: needs-reconciliation rows older than this raise the blocking alert.
+pub const RECONCILIATION_OVERDUE_HOURS: i64 = 24;
+/// §3.3: retry cadence for `paid_ungranted` grant claims.
+pub const PAID_UNGRANTED_RETRY_SECONDS: i64 = 30;
+/// §3.4: paid-but-ungranted rows older than this queue an auto-refund.
+pub const PAID_UNGRANTED_AUTO_REFUND_HOURS: i64 = 24;
+/// §3.5: paid-but-ungranted rows older than this block new seller payouts.
+pub const PAID_UNGRANTED_ESCALATION_HOURS: i64 = 72;
+/// §1.2: all money amounts are base-10 decimals in integer minor units at
+/// this scale (10^8). No f64, no `CAST(... AS REAL)` (CRYPTO_PAY.md:57-59).
+const MONEY_MINOR_SCALE: u32 = 8;
+
+/// Creation input for the guarded refund path (§1.2). Every new refund is
+/// seller-scoped and carries an actor and an idempotency key; the server passes the
+/// real actor, the legacy `create_refund` wrapper passes sentinels.
+#[derive(Debug, Clone, Copy)]
+pub struct RefundInput<'a> {
+    pub seller_id: i64,
+    pub invoice_id: Option<&'a str>,
+    pub user_id: Option<i64>,
+    pub amount: &'a str,
+    pub asset: &'a str,
+    pub reason: Option<&'a str>,
+    pub idem_key: &'a str,
+    pub created_by: i64,
+    pub created_role: &'a str,
+}
+
+/// Outcome of a guarded refund creation. `Existing` is an idempotent replay
+/// of the same `(invoice_id, idem_key)` and MUST NOT emit a second money
+/// audit event (§1.2 step 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundCreation {
+    pub id: i64,
+    pub created_new: bool,
+}
+
+/// Fail-closed creation errors. The HTTP/UX mapping is the server's; the variants
+/// carry the spec's stable error codes in their doc comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefundCreateError {
+    /// 404 — no such invoice.
+    InvoiceNotFound,
+    /// 400 — invoice is not `paid`/`paid_ungranted`.
+    InvoiceNotPaid,
+    /// 400 — refund asset differs from the invoiced asset (§1.1 trigger).
+    AssetMismatch,
+    /// 409 `unquantifiable_legacy_refund` — a stored amount is negative,
+    /// non-finite or not a base-10 decimal at scale 8.
+    UnquantizableLegacy,
+    /// 409 `refund_cap_exceeded` — cumulative counted refunds + request exceed
+    /// the invoiced amount.
+    CapExceeded,
+    /// 409 `refund_in_flight` — a distinct key tried while another refund is
+    /// pending/approved/executing/needs_reconciliation for the same invoice.
+    InFlight,
+    /// Any rusqlite failure (including a uniqueness-race loser).
+    Database(String),
+}
+
+/// The three owner reconciliation outcomes (§5.3). The resulting row status
+/// is the persisted outcome token: executed / approved / void. `resolution`
+/// stores the human reason; `resolved_by`/`resolved_at` the auditor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconciliationOutcome {
+    Executed,
+    RevertedToApproved,
+    Void,
+}
+
+impl ReconciliationOutcome {
+    fn status_for(self, row_type: &str) -> &'static str {
+        match self {
+            Self::Executed if row_type == "refund" => "executed",
+            Self::Executed => "paid",
+            Self::RevertedToApproved => "approved",
+            Self::Void => "void",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileError {
+    NotFound,
+    /// Row is not `needs_reconciliation` (only that state may be resolved).
+    NotDue,
+    /// Append-only: a resolution was already recorded.
+    AlreadyResolved,
+    /// Owner must supply a non-empty reason (audited by server).
+    ReasonRequired,
+    Database(String),
+}
+
+/// One row in the §5.4 daily digest / §5.1-5.2 sweeps. `spend_id` is the
+/// latest persisted attempt for the row (None only for a pre-spend-id legacy
+/// row that never had an attempt recorded).
+#[derive(Debug, Clone)]
+pub struct ReconciliationRow {
+    pub row_type: String,
+    pub id: i64,
+    pub seller_id: i64,
+    pub amount: String,
+    pub asset: String,
+    pub status: String,
+    pub since: String,
+    pub spend_id: Option<String>,
+    pub overdue: bool,
+}
+
+/// One append-only transfer attempt (§4.1).
+#[derive(Debug, Clone)]
+pub struct TransferAttemptRow {
+    pub id: i64,
+    pub row_type: String,
+    pub row_id: i64,
+    pub attempt_no: i64,
+    pub spend_id: String,
+    pub created_at: String,
+    pub outcome: Option<String>,
+    pub resolved_at: Option<String>,
+    pub seller_id: i64,
+}
+
+// Legacy `create_refund` callers (api.rs / web finance) predate the idem-key
+// contract; the wrapper synthesizes a unique sentinel key so the DB layer
+// can still enforce in-flight uniqueness for them. The server replaces those callers
+// with `create_refund_guarded` carrying the real actor/key.
+static REFUND_IDEM_SEQ: AtomicU64 = AtomicU64::new(0);
+
 // Named-field row (not a tuple alias) — a new public surface consumed by the
 // web channels manager; seller_id 0 = global namespace, is_default flags the
 // single global default.
@@ -171,6 +308,244 @@ type McpApprovalRow = (
 );
 type McpAuditRow = (i64, String, String, bool, Option<String>, String);
 
+// ---- Cross-cutting moderation (multibot foundation, Step 4 storage) ----
+
+/// Longest accepted policy term / opaque reference. Over-long values are
+/// refused at write time (the console also validates) so stored rows stay
+/// minimal and the audit trail cannot be used as a message dump.
+pub const MODERATION_MAX_TERM_LEN: usize = 200;
+/// Longest stored appeal justification / decision reason code. This is NEVER
+/// the filtered message body — it is a short reason string or machine code.
+pub const MODERATION_MAX_REASON_LEN: usize = 280;
+
+/// FALLBACK DEFAULTS for the owner content-policy floor — NOT the shipped
+/// floor. The live floor is the persistent `moderation_global_floor` table,
+/// which the owner writes through the (owner-gated) console. These constants
+/// are used ONLY when that table cannot be read (e.g. an older schema or a
+/// runtime read failure): the loosest global clamp and an empty baseline term
+/// set, so the fallback leaves existing seller rules unchanged. Once the table
+/// is available the persistent terms replace this empty baseline entirely.
+///
+/// The floor is NON-OVERRIDABLE: seller and per-bot rules may only raise
+/// severity, and a floor term can never be removed or weakened by the
+/// allow-list. `MODERATION_FLOOR_MODE` is the global minimum clamp applied to
+/// every term; each persistent floor term additionally carries its own mode
+/// (clamped to at least this value).
+pub const MODERATION_FLOOR_MODE: &str = "warn";
+pub const MODERATION_FLOOR_TERMS: &[&str] = &[];
+
+/// Enforcement severity, loosest (1) to strictest (3). This is the single
+/// ordering used by precedence resolution. An unknown stored value maps to
+/// the loosest tier so a bad value can never silently escalate a decision.
+pub fn moderation_mode_severity(mode: &str) -> u8 {
+    match mode {
+        "hide" => 3,
+        "review" => 2,
+        "warn" => 1,
+        _ => 1,
+    }
+}
+fn moderation_mode_from_severity(severity: u8) -> &'static str {
+    match severity {
+        3 => "hide",
+        2 => "review",
+        _ => "warn",
+    }
+}
+fn is_moderation_mode(mode: &str) -> bool {
+    matches!(mode, "hide" | "warn" | "review")
+}
+fn is_moderation_appeal_status(status: &str) -> bool {
+    matches!(status, "pending" | "approved" | "upheld")
+}
+/// Trim + validate a policy term. SQL metacharacters are kept as literal DATA
+/// (parameterized statements make them inert); NUL bytes, empty and
+/// over-long terms are refused. This is "injection refusal" at the storage
+/// boundary: the term can never break out of its bind parameter.
+fn normalize_moderation_term(term: &str) -> Option<String> {
+    let t = term.trim();
+    if t.is_empty() || t.len() > MODERATION_MAX_TERM_LEN || t.contains('\0') {
+        return None;
+    }
+    Some(t.to_owned())
+}
+fn normalize_moderation_ref(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.len() > MODERATION_MAX_TERM_LEN || v.contains('\0') {
+        return None;
+    }
+    Some(v.to_owned())
+}
+fn trim_moderation_reason(reason: Option<&str>) -> Option<String> {
+    reason.and_then(|r| {
+        let cleaned: String = r
+            .chars()
+            .filter(|c| *c != '\0')
+            .take(MODERATION_MAX_REASON_LEN)
+            .collect();
+        let cleaned = cleaned.trim().to_owned();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    })
+}
+
+/// One seller/override rule feeding precedence resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationTermInput {
+    pub term: String,
+    pub mode: String,
+}
+/// One effective term after floor + seller + bot precedence + allow-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveModerationTerm {
+    pub term: String,
+    pub mode: String,
+}
+/// The resolved policy a caller (server hook) evaluates a message against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveModerationPolicy {
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    /// Non-overridable minimum enforcement mode (owner floor).
+    pub floor_mode: String,
+    /// Effective blocked terms, each with its resolved mode; sorted by term
+    /// for deterministic matching and diffing.
+    pub terms: Vec<EffectiveModerationTerm>,
+    /// True when the bot uses "Custom rules for this bot"; false when it is
+    /// inheriting the seller's rules.
+    pub bot_override_active: bool,
+    /// Fail-closed signal. True when moderation storage was not ready at
+    /// startup (a DDL failure) or the persistent floor could not be read, so
+    /// this policy is incomplete. server hooks MUST treat true as "hold the
+    /// message for review" rather than evaluating against a partial/empty
+    /// policy — an empty policy here means enforcement is unavailable, not
+    /// that the message is safe.
+    pub enforcement_degraded: bool,
+}
+
+/// One owner-enforced global floor term. Unlike the seller-scoped structs,
+/// this has NO `seller_id`: the floor applies to every seller and bot and is
+/// writable only through explicit owner-gated `Db` methods below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationGlobalFloorTerm {
+    pub id: i64,
+    pub term: String,
+    pub mode: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationBlockedWord {
+    pub id: i64,
+    pub seller_id: i64,
+    pub term: String,
+    pub mode: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationAllowWord {
+    pub id: i64,
+    pub seller_id: i64,
+    pub term: String,
+    pub created_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationBotOverrideTerm {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: i64,
+    pub term: String,
+    pub mode: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationAppeal {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    pub decision_id: Option<i64>,
+    pub message_ref: String,
+    pub reason: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModerationDecision {
+    pub id: i64,
+    pub seller_id: i64,
+    pub bot_id: Option<i64>,
+    pub term: Option<String>,
+    pub action: String,
+    pub reason: Option<String>,
+    pub message_ref: Option<String>,
+    pub created_at: String,
+}
+
+/// Pure precedence resolver. The floor is passed in by the caller so the
+/// ladder can be unit-tested against a non-empty floor without changing
+/// shipped data. Production passes the persistent `moderation_global_floor`
+/// rows as `floor_terms` (falling back to the compile-time defaults when the
+/// table is unavailable).
+///
+/// Rules, in order:
+/// 1. Each floor term starts at its own owner-set mode, clamped to at least
+///    `floor_mode` (the global minimum), and is non-removable.
+/// 2. Seller terms are added; a repeated term takes the STRICTER mode
+///    (`max`), never a looser one, and nothing drops below the floor.
+/// 3. Per-bot terms follow the same stricter-only rule (the caller passes an
+///    empty slice when the bot inherits).
+/// 4. Allow-list terms are removed from the effective set — EXCEPT floor
+///    terms, which "stay above the floor" by construction. A seller rule that
+///    happens to equal a floor term can raise it further but never weaken it.
+pub fn apply_moderation_precedence(
+    floor_mode: &str,
+    floor_terms: &[ModerationTermInput],
+    seller_terms: &[ModerationTermInput],
+    bot_terms: &[ModerationTermInput],
+    allow_terms: &[String],
+) -> Vec<EffectiveModerationTerm> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let floor_sev = moderation_mode_severity(floor_mode);
+    let mut effective: BTreeMap<String, u8> = BTreeMap::new();
+    let floor_set: BTreeSet<String> = floor_terms.iter().map(|t| t.term.clone()).collect();
+    for rule in floor_terms {
+        let sev = moderation_mode_severity(&rule.mode).max(floor_sev);
+        effective.insert(rule.term.clone(), sev);
+    }
+    let mut raise = |terms: &[ModerationTermInput]| {
+        for rule in terms {
+            let sev = moderation_mode_severity(&rule.mode).max(floor_sev);
+            effective
+                .entry(rule.term.clone())
+                .and_modify(|current| *current = (*current).max(sev))
+                .or_insert(sev);
+        }
+    };
+    raise(seller_terms);
+    raise(bot_terms);
+    for allowed in allow_terms {
+        if !floor_set.contains(allowed) {
+            effective.remove(allowed);
+        }
+    }
+    effective
+        .into_iter()
+        .map(|(term, sev)| EffectiveModerationTerm {
+            term,
+            mode: moderation_mode_from_severity(sev).to_owned(),
+        })
+        .collect()
+}
+
 /// SHA-256 hex digest of `input` — the one-time-credential storage recipe:
 /// api_keys.key_hash, web_sessions.token_hash, web_pending_mfa.token_hash and
 /// mcp_tokens.token_hash all store the hex digest, never the raw secret.
@@ -201,10 +576,35 @@ pub struct BotRecord {
     pub created_at: String,
     /// Console display name; '' means "show the key instead".
     pub name: String,
+    /// Product/capability type (multibot foundation). Defaults to
+    /// `shop_bot` so every legacy row keeps its existing behavior.
+    pub bot_type: String,
+}
+
+/// Single mapping for every `bots` SELECT, so a new column only has to be
+/// added to the column lists (and here) once. Column order is shared by
+/// `get_bot`, `get_bot_by_key`, `list_bots`, and the typed listing methods.
+fn bot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRecord> {
+    Ok(BotRecord {
+        id: r.get(0)?,
+        key: r.get(1)?,
+        username: r.get(2)?,
+        owner_user_id: r.get(3)?,
+        default_channel_id: r.get(4)?,
+        enabled: r.get::<_, i64>(5)? != 0,
+        created_at: r.get(6)?,
+        name: r.get(7)?,
+        bot_type: r.get(8)?,
+    })
 }
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Starts false (fail closed) and is flipped true only after every
+    /// moderation DDL statement in `migrate()` succeeds. A DDL failure leaves
+    /// it false so `resolve_effective_policy` can surface `enforcement_degraded`
+    /// instead of silently returning an empty, permissive policy.
+    moderation_storage_ready: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -221,9 +621,20 @@ impl Db {
         );
         let db = Self {
             conn: Mutex::new(conn),
+            moderation_storage_ready: AtomicBool::new(false),
         };
         db.init_schema()?;
+        // Migration remains best-effort overall so legacy databases still open
+        // (see `migrate`). Moderation DDL failures are logged and recorded in
+        // `moderation_storage_ready`; they never panic here.
         let _ = db.migrate();
+        // Money-safety DDL is deliberately NOT best-effort. A legacy DB that
+        // already holds two in-flight refunds for one invoice fails closed
+        // here with the offending invoice ids (spec §1.4) until an owner voids
+        // the duplicates through the audited resolution path. Clean legacy
+        // and fresh DBs are unchanged: every statement is additive and
+        // idempotent.
+        db.migrate_money_safety()?;
         Ok(db)
     }
 
@@ -440,6 +851,24 @@ impl Db {
         // errors out (ignored) once the column exists.
         let _ = conn.execute(
             "ALTER TABLE bots ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Multibot foundation (v2): product/capability type on each bot.
+        // Additive + idempotent, exactly like `name` above: SQLite fills
+        // existing rows with the NOT NULL DEFAULT on ALTER, so legacy bots
+        // are backfilled to 'shop_bot' without a destructive rewrite. The
+        // defensive UPDATE normalizes NULL/'' values a partially-migrated
+        // writer could have left, and the index serves typed listing.
+        let _ = conn.execute(
+            "ALTER TABLE bots ADD COLUMN bot_type TEXT NOT NULL DEFAULT 'shop_bot'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE bots SET bot_type = 'shop_bot' WHERE bot_type IS NULL OR TRIM(bot_type) = ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bots_type ON bots(bot_type)",
             [],
         );
         let _ = conn.execute("ALTER TABLE sellers ADD COLUMN bot_id INTEGER", []);
@@ -764,6 +1193,354 @@ impl Db {
                 }
             }
         }
+
+        // Cross-cutting moderation (multibot foundation Step 4). Purely
+        // additive: CREATE TABLE/INDEX IF NOT EXISTS never rewrites existing
+        // rows, so a legacy install keeps all data and gains empty policy
+        // tables. schema.sql declares the same shapes for fresh databases;
+        // these statements cover databases created before this feature.
+        // Declared after `bots` (above) so the bot_id FKs resolve.
+        //
+        // Unlike the other best-effort statements in this migration, a
+        // moderation DDL failure is NOT silent: the helper logs the failing
+        // object + error and we record readiness so policy resolution fails
+        // closed instead of returning an empty, permissive policy.
+        match Self::migrate_moderation_tables(&conn) {
+            Ok(()) => self.moderation_storage_ready.store(true, Ordering::Relaxed),
+            Err(()) => self
+                .moderation_storage_ready
+                .store(false, Ordering::Relaxed),
+        }
+        Ok(())
+    }
+
+    /// Money-safety additive migration (spec §1.1/§1.4, §3, §4, §5).
+    ///
+    /// Unlike `migrate` this is fallible and `Db::new` propagates the error:
+    /// a legacy DB holding more than one in-flight refund for an invoice
+    /// fails closed, listing the invoice ids, until an owner voids the
+    /// duplicates through the audited Decision-5 path. No money row is ever
+    /// deleted or merged (G8). Everything else is `IF NOT EXISTS` /
+    /// probe-then-ALTER, so a second open is byte-identical.
+    fn migrate_money_safety(&self) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 1. Additive columns. Fresh DBs already declare these in schema.sql;
+        //    the probe keeps the fresh path free of redundant ALTERs. The
+        //    DEFAULT only exists so SQLite can add NOT NULL columns to a
+        //    legacy table that already holds rows (§1.1).
+        const COLUMN_DDLS: &[(&str, &str, &str)] = &[
+            (
+                "refunds",
+                "idem_key",
+                "ALTER TABLE refunds ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "refunds",
+                "created_by",
+                "ALTER TABLE refunds ADD COLUMN created_by INTEGER NOT NULL DEFAULT -1",
+            ),
+            (
+                "refunds",
+                "created_role",
+                "ALTER TABLE refunds ADD COLUMN created_role TEXT NOT NULL DEFAULT 'unknown'",
+            ),
+            (
+                "refunds",
+                "executing_since",
+                "ALTER TABLE refunds ADD COLUMN executing_since TEXT",
+            ),
+            (
+                "refunds",
+                "reconciliation_since",
+                "ALTER TABLE refunds ADD COLUMN reconciliation_since TEXT",
+            ),
+            (
+                "refunds",
+                "resolution",
+                "ALTER TABLE refunds ADD COLUMN resolution TEXT",
+            ),
+            (
+                "refunds",
+                "resolved_by",
+                "ALTER TABLE refunds ADD COLUMN resolved_by INTEGER",
+            ),
+            (
+                "refunds",
+                "resolved_at",
+                "ALTER TABLE refunds ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "payouts",
+                "executing_since",
+                "ALTER TABLE payouts ADD COLUMN executing_since TEXT",
+            ),
+            (
+                "payouts",
+                "reconciliation_since",
+                "ALTER TABLE payouts ADD COLUMN reconciliation_since TEXT",
+            ),
+            (
+                "payouts",
+                "resolution",
+                "ALTER TABLE payouts ADD COLUMN resolution TEXT",
+            ),
+            (
+                "payouts",
+                "resolved_by",
+                "ALTER TABLE payouts ADD COLUMN resolved_by INTEGER",
+            ),
+            (
+                "payouts",
+                "resolved_at",
+                "ALTER TABLE payouts ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "invoices",
+                "paid_ungranted_at",
+                "ALTER TABLE invoices ADD COLUMN paid_ungranted_at TEXT",
+            ),
+        ];
+        for (table, column, ddl) in COLUMN_DDLS {
+            // `table` comes from the static table above, never from user input.
+            let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1");
+            let exists = conn
+                .query_row(&probe, params![column], |_| Ok::<_, rusqlite::Error>(1))
+                .optional()?;
+            if exists.is_none() {
+                conn.execute(ddl, [])?;
+            }
+        }
+
+        // 2. Backfill legacy rows. `idem_key = 'legacy:' || id` is unique by
+        //    PK (§1.4); actors come from the refund_create audit row when one
+        //    exists, otherwise the documented -1/'unknown' sentinels — never
+        //    guessed. Fresh rows never match these predicates.
+        conn.execute_batch(
+            "UPDATE refunds SET idem_key = 'legacy:' || id
+              WHERE idem_key IS NULL OR idem_key = '';
+             UPDATE refunds SET created_by = (
+                SELECT a.actor_id FROM audit_log a
+                WHERE a.action='refund_create' AND a.target_type='refund'
+                  AND a.target_id = CAST(refunds.id AS TEXT)
+                ORDER BY a.id LIMIT 1
+             )
+              WHERE (created_by IS NULL OR created_by = -1)
+                AND EXISTS (
+                   SELECT 1 FROM audit_log a
+                   WHERE a.action='refund_create' AND a.target_type='refund'
+                     AND a.target_id = CAST(refunds.id AS TEXT)
+                     AND a.actor_id IS NOT NULL AND a.actor_id <> -1
+                );
+             UPDATE refunds SET created_role = (
+                SELECT a.actor_role FROM audit_log a
+                WHERE a.action='refund_create' AND a.target_type='refund'
+                  AND a.target_id = CAST(refunds.id AS TEXT)
+                ORDER BY a.id LIMIT 1
+             )
+              WHERE (created_role IS NULL OR created_role = 'unknown')
+                AND EXISTS (
+                   SELECT 1 FROM audit_log a
+                   WHERE a.action='refund_create' AND a.target_type='refund'
+                     AND a.target_id = CAST(refunds.id AS TEXT)
+                     AND a.actor_role IS NOT NULL AND a.actor_role <> 'unknown'
+                );",
+        )?;
+
+        // 3. Migration preflight (§1.4): fail closed on duplicate in-flight
+        //    refunds. NEVER delete or merge money rows to make the index fit.
+        let duplicates: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT invoice_id, COUNT(*) AS n FROM refunds
+                 WHERE status IN ('pending','approved','executing','needs_reconciliation')
+                   AND invoice_id IS NOT NULL
+                 GROUP BY invoice_id HAVING n > 1 ORDER BY invoice_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!(
+                    "{} ({} in-flight rows)",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?
+                ))
+            })?;
+            let mut found = Vec::new();
+            for row in rows {
+                found.push(row?);
+            }
+            found
+        };
+        if !duplicates.is_empty() {
+            return Err(Self::sqlite_fail(format!(
+                "money-safety migration refused: multiple in-flight refunds for invoice(s): {}; \
+                 resolve each to a single survivor via the audited Decision-5 void path, then reopen",
+                duplicates.join(", ")
+            )));
+        }
+
+        // 4. Invariants. Declared here (not in schema.sql) because the
+        //    indexes/triggers reference columns a legacy DB only gains above;
+        //    init_schema runs before this method.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_refunds_invoice_inflight
+                ON refunds(invoice_id)
+                WHERE status IN ('pending','approved','executing','needs_reconciliation');
+             CREATE UNIQUE INDEX IF NOT EXISTS uq_refunds_invoice_idem
+                ON refunds(invoice_id, idem_key);
+             CREATE TRIGGER IF NOT EXISTS trg_refund_asset_matches_invoice
+             BEFORE INSERT ON refunds
+             WHEN NEW.invoice_id IS NOT NULL
+              AND NEW.asset IS NOT (SELECT asset FROM invoices WHERE invoice_id = NEW.invoice_id)
+             BEGIN SELECT RAISE(ABORT, 'refund_asset_mismatch'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_refund_money_immutable
+             BEFORE UPDATE ON refunds
+             WHEN OLD.seller_id   IS NOT NEW.seller_id
+               OR OLD.invoice_id  IS NOT NEW.invoice_id
+               OR OLD.user_id     IS NOT NEW.user_id
+               OR OLD.amount      IS NOT NEW.amount
+               OR OLD.asset       IS NOT NEW.asset
+               OR OLD.reason      IS NOT NEW.reason
+               OR OLD.idem_key    IS NOT NEW.idem_key
+               OR OLD.created_by  IS NOT NEW.created_by
+               OR OLD.created_role IS NOT NEW.created_role
+             BEGIN SELECT RAISE(ABORT, 'refund_row_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_payout_money_immutable
+             BEFORE UPDATE ON payouts
+             WHEN OLD.seller_id   IS NOT NEW.seller_id
+               OR OLD.amount      IS NOT NEW.amount
+               OR OLD.asset       IS NOT NEW.asset
+               OR OLD.destination IS NOT NEW.destination
+             BEGIN SELECT RAISE(ABORT, 'payout_row_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_refund_resolution_append_only
+             BEFORE UPDATE ON refunds
+             WHEN OLD.resolution IS NOT NULL AND NEW.resolution IS NOT OLD.resolution
+             BEGIN SELECT RAISE(ABORT, 'refund_resolution_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_payout_resolution_append_only
+             BEFORE UPDATE ON payouts
+             WHEN OLD.resolution IS NOT NULL AND NEW.resolution IS NOT OLD.resolution
+             BEGIN SELECT RAISE(ABORT, 'payout_resolution_immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_invoice_no_failed_after_paid
+             BEFORE UPDATE ON invoices
+             FOR EACH ROW
+             WHEN OLD.status IN ('paid','paid_ungranted') AND NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'invoice_failed_after_paid_blocked'); END;",
+        )?;
+        Ok(())
+    }
+
+    /// Create every moderation table/index for databases predating the
+    /// feature. Each statement is `IF NOT EXISTS`, so this is idempotent and
+    /// additive. Any failure is logged with the object name and error (no
+    /// secret is logged — these are static DDL statements) and short-circuits
+    /// with `Err(())`; the caller flips `moderation_storage_ready` to false so
+    /// enforcement fails closed rather than silently yielding an empty policy.
+    fn migrate_moderation_tables(conn: &Connection) -> Result<(), ()> {
+        const STATEMENTS: &[(&str, &str)] = &[
+            (
+                "moderation_global_floor",
+                "CREATE TABLE IF NOT EXISTS moderation_global_floor (id INTEGER PRIMARY KEY AUTOINCREMENT, term TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN ('hide','warn','review')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            ),
+            (
+                "moderation_blocked_words",
+                "CREATE TABLE IF NOT EXISTS moderation_blocked_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            ),
+            (
+                "idx_mod_blocked_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id)",
+            ),
+            (
+                "moderation_allow_words",
+                "CREATE TABLE IF NOT EXISTS moderation_allow_words (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, term TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (seller_id, term))",
+            ),
+            (
+                "idx_mod_allow_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id)",
+            ),
+            (
+                "moderation_bot_overrides",
+                "CREATE TABLE IF NOT EXISTS moderation_bot_overrides (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE, term TEXT NOT NULL DEFAULT '', mode TEXT CHECK (mode IN ('hide','warn','review')), inherits INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (seller_id, bot_id, term), CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL)))",
+            ),
+            (
+                "idx_mod_bot_override_scope",
+                "CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id)",
+            ),
+            (
+                "moderation_decisions",
+                "CREATE TABLE IF NOT EXISTS moderation_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, term TEXT, action TEXT NOT NULL, reason TEXT, message_ref TEXT, created_at TEXT NOT NULL)",
+            ),
+            (
+                "idx_mod_decisions_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at)",
+            ),
+            (
+                "idx_mod_decisions_bot",
+                "CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id)",
+            ),
+            (
+                "moderation_appeals",
+                "CREATE TABLE IF NOT EXISTS moderation_appeals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER REFERENCES bots(id) ON DELETE SET NULL, decision_id INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL, message_ref TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            ),
+            (
+                "idx_mod_appeals_seller",
+                "CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status)",
+            ),
+            (
+                "idx_mod_appeals_bot",
+                "CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id)",
+            ),
+        ];
+        for (name, sql) in STATEMENTS {
+            if let Err(e) = conn.execute(sql, []) {
+                tracing::warn!("moderation DDL failed for {}: {}", name, e);
+                return Err(());
+            }
+        }
+
+        // security LOW: make appeal submission idempotent in storage rather than
+        // relying on the handler's check-then-insert. Collapse any legacy
+        // duplicate tuples *before* the unique index is created, keeping the
+        // oldest row per (seller, bot, ref). This mirrors the cleanup in
+        // schema.sql (which runs earlier in init_schema) so an upgrade of a
+        // DB already holding duplicates never fails to open; the second pass
+        // here is idempotent and also covers an index-less DB.
+        if let Err(e) = Self::dedup_moderation_appeals(conn) {
+            tracing::warn!("moderation appeal dedup failed: {}", e);
+            return Err(());
+        }
+        if let Err(e) = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_appeals_dedup
+             ON moderation_appeals(seller_id, COALESCE(bot_id, 0), message_ref)",
+            [],
+        ) {
+            tracing::warn!("moderation DDL failed for idx_mod_appeals_dedup: {}", e);
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Delete later duplicates of the same appeal tuple, keeping the oldest
+    /// (lowest `id`) row. `COALESCE(bot_id, 0)` matches the unique index so
+    /// non-null and bot-less submissions are deduped by the same rule; bot ids
+    /// are AUTOINCREMENT, so 0 is never a real bot. Purely additive/idempotent:
+    /// a second run deletes nothing. Parameterized SQL only, no data loss of
+    /// distinct (seller, bot, ref) tuples, and no message text is read/logged.
+    fn dedup_moderation_appeals(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute(
+            "DELETE FROM moderation_appeals
+             WHERE id IN (
+                 SELECT d.id FROM moderation_appeals AS d
+                 WHERE EXISTS (
+                     SELECT 1 FROM moderation_appeals AS k
+                     WHERE k.seller_id = d.seller_id
+                       AND COALESCE(k.bot_id, 0) = COALESCE(d.bot_id, 0)
+                       AND k.message_ref = d.message_ref
+                       AND k.id < d.id
+                 )
+             )",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1547,6 +2324,123 @@ impl Db {
         }
     }
 
+    /// §3.2: server-side verification said `paid` but the exactly-once grant
+    /// claim produced no subscription/product grant. CAS from any non-terminal
+    /// state into `paid_ungranted`, stamping the recovery clock ONCE (the 24h
+    /// and 72h timers are measured from this value, never from a retry).
+    /// Returns false for a terminal `refunded`/`failed` row.
+    pub fn mark_invoice_paid_ungranted(&self, invoice_id: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE invoices SET status='paid_ungranted', \
+             paid_ungranted_at=COALESCE(paid_ungranted_at, ?2), updated_at=?2 \
+             WHERE invoice_id=?1 AND status NOT IN ('refunded','failed')",
+            params![invoice_id, now],
+        ) == Ok(1)
+    }
+
+    /// §3.3 success path: a later exactly-once claim succeeded, so the row
+    /// returns to `paid` and leaves the recovery queue. Clears the clock so a
+    /// subsequent ungranted event starts a fresh window.
+    pub fn finalize_invoice_grant_retry(&self, invoice_id: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE invoices SET status='paid', paid_ungranted_at=NULL, updated_at=?2 \
+             WHERE invoice_id=?1 AND status='paid_ungranted'",
+            params![invoice_id, now],
+        ) == Ok(1)
+    }
+
+    /// The recovery clock of one invoice, if it is (or was) ungranted.
+    pub fn invoice_paid_ungranted_at(&self, invoice_id: &str) -> Option<String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT paid_ungranted_at FROM invoices WHERE invoice_id=?1",
+            params![invoice_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// §3.3/§3.4 queue: every still-ungranted invoice whose clock is at or
+    /// before the injected cutoff. Returns
+    /// (invoice_id, seller_id, amount, asset, paid_ungranted_at) — all
+    /// seller-scoped and fully parameterized.
+    #[allow(clippy::type_complexity)]
+    pub fn paid_ungranted_before(
+        &self,
+        cutoff: &str,
+    ) -> Vec<(String, i64, String, String, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT invoice_id,seller_id,amount,asset,paid_ungranted_at FROM invoices \
+             WHERE status='paid_ungranted' AND paid_ungranted_at IS NOT NULL \
+               AND paid_ungranted_at <= ?1 ORDER BY paid_ungranted_at, invoice_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// §3.5 blocking-liability check: seller invoices still ungranted past
+    /// the escalation cutoff whose auto-refund (`idem_key` is the documented
+    /// `auto:ungranted:<invoice_id>`) has NOT reached a terminal executed
+    /// state. The server returns 409 `unresolved_ungranted_liability` for these.
+    pub fn unresolved_ungranted_invoices(
+        &self,
+        seller_id: i64,
+        escalation_cutoff: &str,
+    ) -> Vec<String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT i.invoice_id FROM invoices i \
+             WHERE i.seller_id=?1 AND i.status='paid_ungranted' \
+               AND i.paid_ungranted_at IS NOT NULL AND i.paid_ungranted_at <= ?2 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM refunds r \
+                 WHERE r.invoice_id=i.invoice_id \
+                   AND r.idem_key='auto:ungranted:' || i.invoice_id \
+                   AND r.status IN ('executed','processed') \
+               ) ORDER BY i.invoice_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![seller_id, escalation_cutoff], |r| {
+            r.get::<_, String>(0)
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     pub fn subscription_exists_for_invoice(&self, invoice_id: &str) -> bool {
         let conn = self
             .conn
@@ -1726,6 +2620,9 @@ impl Db {
     }
 
     // ---- Bots ----
+    /// Legacy constructor: creates a `shop_bot`, preserving the behavior of
+    /// every pre-multibot call site byte-for-byte. Typed callers should use
+    /// `create_bot_with_type`.
     pub fn create_bot(
         &self,
         key: &str,
@@ -1733,11 +2630,31 @@ impl Db {
         default_channel_id: Option<i64>,
         name: &str,
     ) -> i64 {
+        self.create_bot_with_type(
+            key,
+            owner_user_id,
+            default_channel_id,
+            name,
+            crate::config::DEFAULT_BOT_TYPE,
+        )
+    }
+
+    /// Create a bot with an explicit product/capability type. All values are
+    /// bound parameters; the default type keeps legacy callers on `shop_bot`.
+    pub fn create_bot_with_type(
+        &self,
+        key: &str,
+        owner_user_id: i64,
+        default_channel_id: Option<i64>,
+        name: &str,
+        bot_type: &str,
+    ) -> i64 {
+        let bot_type = crate::config::normalize_bot_type(bot_type);
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         let res = conn.execute(
-            "INSERT INTO bots(key, name, owner_user_id, default_channel_id, enabled, created_at) VALUES(?1,?2,?3,?4,1,?5)",
-            rusqlite::params![key, name, owner_user_id, default_channel_id, now],
+            "INSERT INTO bots(key, name, owner_user_id, default_channel_id, enabled, created_at, bot_type) VALUES(?1,?2,?3,?4,1,?5,?6)",
+            rusqlite::params![key, name, owner_user_id, default_channel_id, now, bot_type],
         );
         if res.is_ok() {
             return conn.last_insert_rowid();
@@ -1753,20 +2670,9 @@ impl Db {
     pub fn get_bot(&self, id: i64) -> Option<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE id = ?1",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE id = ?1",
             rusqlite::params![id],
-            |r| {
-                Ok(BotRecord {
-                    id: r.get(0)?,
-                    key: r.get(1)?,
-                    username: r.get(2)?,
-                    owner_user_id: r.get(3)?,
-                    default_channel_id: r.get(4)?,
-                    enabled: r.get::<_, i64>(5)? != 0,
-                    created_at: r.get(6)?,
-                    name: r.get(7)?,
-                })
-            },
+            bot_from_row,
         )
         .optional()
         .ok()
@@ -1776,20 +2682,9 @@ impl Db {
     pub fn get_bot_by_key(&self, key: &str) -> Option<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots WHERE key = ?1",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE key = ?1",
             rusqlite::params![key],
-            |r| {
-                Ok(BotRecord {
-                    id: r.get(0)?,
-                    key: r.get(1)?,
-                    username: r.get(2)?,
-                    owner_user_id: r.get(3)?,
-                    default_channel_id: r.get(4)?,
-                    enabled: r.get::<_, i64>(5)? != 0,
-                    created_at: r.get(6)?,
-                    name: r.get(7)?,
-                })
-            },
+            bot_from_row,
         )
         .optional()
         .ok()
@@ -1799,30 +2694,63 @@ impl Db {
     pub fn list_bots(&self) -> Vec<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match conn.prepare(
-            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name FROM bots ORDER BY id",
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots ORDER BY id",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
-        stmt.query_map([], |r| {
-            Ok(BotRecord {
-                id: r.get(0)?,
-                key: r.get(1)?,
-                username: r.get(2)?,
-                owner_user_id: r.get(3)?,
-                default_channel_id: r.get(4)?,
-                enabled: r.get::<_, i64>(5)? != 0,
-                created_at: r.get(6)?,
-                name: r.get(7)?,
-            })
-        })
-        .ok()
-        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        stmt.query_map([], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     pub fn list_bots_enabled(&self) -> Vec<BotRecord> {
         self.list_bots().into_iter().filter(|b| b.enabled).collect()
+    }
+
+    /// List every bot of one product/capability type. The type is a bound
+    /// parameter; an unknown type yields an empty vec — never a silent
+    /// fallback to all bots (the dispatcher refuses disabled types).
+    pub fn list_bots_of_type(&self, bot_type: &str) -> Vec<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id, key, username, owner_user_id, default_channel_id, enabled, created_at, name, bot_type FROM bots WHERE bot_type = ?1 ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![bot_type], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Enabled-only variant of `list_bots_of_type`, mirroring
+    /// `list_bots_enabled` for callers that dispatch inbound updates.
+    pub fn list_bots_of_type_enabled(&self, bot_type: &str) -> Vec<BotRecord> {
+        self.list_bots_of_type(bot_type)
+            .into_iter()
+            .filter(|b| b.enabled)
+            .collect()
+    }
+
+    /// Seller-scoped typed listing. A seller with a NULL `bot_id` is
+    /// attributed to the primary bot (lowest id), matching `sellers_for_bot`.
+    /// Both `seller_id` and `bot_type` are bound parameters: scoping narrows
+    /// reads only and never widens permission.
+    pub fn list_bots_of_type_for_seller(&self, seller_id: i64, bot_type: &str) -> Vec<BotRecord> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT b.id, b.key, b.username, b.owner_user_id, b.default_channel_id, b.enabled, b.created_at, b.name, b.bot_type FROM bots b JOIN sellers s ON COALESCE(s.bot_id, (SELECT MIN(id) FROM bots)) = b.id WHERE s.user_id = ?1 AND b.bot_type = ?2 ORDER BY b.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![seller_id, bot_type], bot_from_row)
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     /// Seller user_ids whose bot_id == bot_id (or primary bot if their bot_id
@@ -1899,6 +2827,22 @@ impl Db {
             Ok(0) => Err(format!("bot {bot_id} not found")),
             Ok(_) => Ok(()),
             Err(e) => Err(format!("failed to set name for bot {bot_id}: {e}")),
+        }
+    }
+
+    /// Set a bot's product/capability type. Empty/whitespace input falls
+    /// back to `shop_bot` (fail-safe), unknown bot ids are refused, and
+    /// failures are reported honestly. Parameterized SQL only.
+    pub fn set_bot_type(&self, bot_id: i64, bot_type: &str) -> Result<(), String> {
+        let bot_type = crate::config::normalize_bot_type(bot_type);
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        match conn.execute(
+            "UPDATE bots SET bot_type = ?1 WHERE id = ?2",
+            rusqlite::params![bot_type, bot_id],
+        ) {
+            Ok(0) => Err(format!("bot {bot_id} not found")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("failed to set type for bot {bot_id}: {e}")),
         }
     }
 
@@ -2084,7 +3028,7 @@ impl Db {
                 let _ = self.add_channel(ch, 0);
                 self.get_channel_id(ch)
             });
-            self.create_bot(&b.key, b.owner_id, channel_id, b.name.trim());
+            self.create_bot_with_type(&b.key, b.owner_id, channel_id, b.name.trim(), &b.bot_type);
         }
         if let Some(primary) = self.list_bots().first() {
             let pid = primary.id;
@@ -4451,6 +5395,59 @@ impl Db {
     }
 
     // ---- Refunds ----
+
+    /// Build a fail-closed rusqlite error carrying an operator-readable reason.
+    /// rusqlite 0.41 removed `Error::Msg`, so use a SQLite constraint failure
+    /// with a message; `Db::new` propagates it verbatim to the operator.
+    fn sqlite_fail(msg: impl Into<String>) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(msg.into()),
+        )
+    }
+
+    /// Parse a stored amount as base-10 decimal integer minor units at
+    /// scale 8 (spec §1.2). No `f64`, no `CAST(... AS REAL)`. Negative,
+    /// non-finite, over-precise or overflowing values are unquantizable and
+    /// must fail closed until an owner resolves them.
+    fn minor_units(value: &str) -> Option<i128> {
+        let text = value.trim();
+        if text.is_empty() || text.starts_with('-') || text.starts_with('+') {
+            return None;
+        }
+        let mut pieces = text.split('.');
+        let whole = pieces.next()?;
+        let frac = pieces.next().unwrap_or("");
+        if pieces.next().is_some()
+            || whole.is_empty()
+            || !whole.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+            || frac.len() > MONEY_MINOR_SCALE as usize
+        {
+            return None;
+        }
+        let whole_units: i128 = whole.parse().ok()?;
+        // `"".parse::<i128>()` fails; an empty fractional part is zero.
+        let mut frac_units: i128 = if frac.is_empty() {
+            0
+        } else {
+            frac.parse().ok()?
+        };
+        for _ in frac.len()..MONEY_MINOR_SCALE as usize {
+            frac_units = frac_units.checked_mul(10)?;
+        }
+        whole_units
+            .checked_mul(10_i128.pow(MONEY_MINOR_SCALE))?
+            .checked_add(frac_units)
+    }
+
+    /// Legacy-compatible wrapper (api.rs / web finance still call this with
+    /// the original six arguments). It now runs the full §1.2 safety block,
+    /// synthesizing a unique sentinel idem key and the documented
+    /// `created_by = -1` / `created_role = 'unknown'` actor. The server switches
+    /// those call sites to `create_refund_guarded` so the real actor is
+    /// recorded. Returns 0 on any refusal, matching the old "insert failed"
+    /// shape; never returns an id for a refund that was not created.
     pub fn create_refund(
         &self,
         seller_id: i64,
@@ -4460,30 +5457,188 @@ impl Db {
         asset: &str,
         reason: Option<&str>,
     ) -> i64 {
-        let conn = self
+        let seq = REFUND_IDEM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let idem_key = format!(
+            "auto:{}:{}:{}",
+            Utc::now().timestamp_micros(),
+            std::process::id(),
+            seq
+        );
+        match self.create_refund_guarded(RefundInput {
+            seller_id,
+            invoice_id,
+            user_id,
+            amount,
+            asset,
+            reason,
+            idem_key: &idem_key,
+            created_by: -1,
+            created_role: "unknown",
+        }) {
+            Ok(created) => created.id,
+            Err(_) => 0,
+        }
+    }
+
+    /// §1.2 creation algorithm in ONE `BEGIN IMMEDIATE`: WAL + busy_timeout
+    /// (`Db::new`) makes the immediate transaction the serialization point,
+    /// so two concurrent creators cannot both pass the cumulative cap.
+    /// An idem-key replay returns the existing row (no second money event);
+    /// a distinct key while another refund is in flight is refused.
+    pub fn create_refund_guarded(
+        &self,
+        input: RefundInput<'_>,
+    ) -> Result<RefundCreation, RefundCreateError> {
+        use RefundCreateError::*;
+        let mut conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| Database(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
-        // best-effort: fall back to the invoice's buyer when user_id unknown
-        let user_id = match user_id {
-            Some(u) => Some(u),
-            None => invoice_id.and_then(|inv| {
-                conn.query_row(
-                    "SELECT user_id FROM invoices WHERE invoice_id=?1",
+
+        // Idempotent replay first: same key for the same invoice is the SAME
+        // money movement, whatever state that row has reached.
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT id FROM refunds WHERE invoice_id IS ?1 AND idem_key=?2 ORDER BY id LIMIT 1",
+                params![input.invoice_id, input.idem_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Database(e.to_string()))?
+        {
+            tx.commit().map_err(|e| Database(e.to_string()))?;
+            return Ok(RefundCreation {
+                id: existing,
+                created_new: false,
+            });
+        }
+
+        // Fall back to the invoice's buyer when none was supplied, and load
+        // the fields needed for the cap / asset lock in the same snapshot.
+        let mut user_id = input.user_id;
+        if let Some(inv) = input.invoice_id {
+            let (inv_user, inv_amount, inv_asset, inv_status): (
+                Option<i64>,
+                String,
+                String,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT user_id,amount,asset,status FROM invoices WHERE invoice_id=?1",
+                    params![inv],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(|e| Database(e.to_string()))?
+                .ok_or(InvoiceNotFound)?;
+            if user_id.is_none() {
+                user_id = inv_user;
+            }
+            // Decision 3 keeps paid_ungranted non-terminal and its auto-refund
+            // must be creatable while the invoice is still in that state.
+            if inv_status != "paid" && inv_status != "paid_ungranted" {
+                return Err(InvoiceNotPaid);
+            }
+            if input.asset.trim() != inv_asset.trim() {
+                return Err(AssetMismatch);
+            }
+
+            let invoice_minor = Self::minor_units(&inv_amount).ok_or(UnquantizableLegacy)?;
+            let requested = if input.amount.trim().is_empty() {
+                invoice_minor
+            } else {
+                Self::minor_units(input.amount).ok_or(UnquantizableLegacy)?
+            };
+            // Counted states: every row except 'void' — including terminal
+            // executed/processed (a reverted attempt is still spent once).
+            let mut counted: Vec<String> = tx
+                .prepare("SELECT amount FROM refunds WHERE invoice_id=?1 AND status <> 'void'")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![inv], |r| r.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|e| Database(e.to_string()))?;
+            let mut cumulative: i128 = 0;
+            for row in counted.drain(..) {
+                let units = Self::minor_units(&row).ok_or(UnquantizableLegacy)?;
+                cumulative = cumulative.checked_add(units).ok_or(UnquantizableLegacy)?;
+            }
+            let total = cumulative
+                .checked_add(requested)
+                .ok_or(UnquantizableLegacy)?;
+            if total > invoice_minor {
+                return Err(CapExceeded);
+            }
+
+            let in_flight: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM refunds WHERE invoice_id=?1 \
+                     AND status IN ('pending','approved','executing','needs_reconciliation') LIMIT 1",
                     params![inv],
                     |r| r.get(0),
                 )
                 .optional()
-                .ok()
-                .flatten()
-            }),
-        };
-        let _ = conn.execute(
-            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,reason,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?7)",
-            params![seller_id, invoice_id, user_id, amount, asset, reason, now],
+                .map_err(|e| Database(e.to_string()))?;
+            if in_flight.is_some() {
+                return Err(InFlight);
+            }
+        }
+
+        let insert = tx.execute(
+            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,reason,status,idem_key,created_by,created_role,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?10)",
+            params![
+                input.seller_id,
+                input.invoice_id,
+                user_id,
+                input.amount,
+                input.asset,
+                input.reason,
+                input.idem_key,
+                input.created_by,
+                input.created_role,
+                now
+            ],
         );
-        conn.last_insert_rowid()
+        let id = match insert {
+            Ok(_) => tx.last_insert_rowid(),
+            Err(e) => {
+                // A concurrent creator can win either unique index between
+                // our read and our write; translate that race to the same
+                // stable outcome instead of leaking a rusqlite error.
+                let msg = e.to_string();
+                if msg.contains("uq_refunds_invoice_idem") {
+                    let existing = tx
+                        .query_row(
+                            "SELECT id FROM refunds WHERE invoice_id IS ?1 AND idem_key=?2 ORDER BY id LIMIT 1",
+                            params![input.invoice_id, input.idem_key],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|inner| Database(inner.to_string()))?;
+                    if let Some(id) = existing {
+                        tx.commit().map_err(|inner| Database(inner.to_string()))?;
+                        return Ok(RefundCreation {
+                            id,
+                            created_new: false,
+                        });
+                    }
+                }
+                if msg.contains("uq_refunds_invoice_inflight") {
+                    return Err(InFlight);
+                }
+                return Err(Database(msg));
+            }
+        };
+        tx.commit().map_err(|e| Database(e.to_string()))?;
+        Ok(RefundCreation {
+            id,
+            created_new: true,
+        })
     }
 
     /// (id, seller_id, invoice_id, user_id, amount, asset, reason, status)
@@ -4556,6 +5711,25 @@ impl Db {
         ).optional().ok().flatten()
     }
 
+    /// Persisted creator actor for a refund: (created_by, created_role).
+    /// Reads the authoritative columns written by `create_refund_guarded`,
+    /// which — unlike the `refund_create` audit event — never age out of the
+    /// audit window on a mature DB (§2 separation of duties).
+    pub fn refund_creator(&self, id: i64) -> Option<(i64, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT created_by, created_role FROM refunds WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn update_refund_status(&self, id: impl ToString, status: impl AsRef<str>) {
         self.update_refund_status_by(id, status, None);
     }
@@ -4612,7 +5786,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE refunds SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            "UPDATE refunds SET status='executing', updated_at=?2, executing_since=?2 \
+             WHERE id=?1 AND status='approved'",
             params![id, now],
         ) == Ok(1)
     }
@@ -4777,7 +5952,8 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE payouts SET status='executing', updated_at=?2 WHERE id=?1 AND status='approved'",
+            "UPDATE payouts SET status='executing', updated_at=?2, executing_since=?2 \
+             WHERE id=?1 AND status='approved'",
             params![id, now],
         ) == Ok(1)
     }
@@ -4821,6 +5997,325 @@ impl Db {
         conn.query_row("SELECT status FROM payouts WHERE id=?1", params![id], |r| {
             r.get(0)
         })
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    // ---- Money safety: spend-id ledger + reconciliation (§4 / §5) ----
+
+    /// §4.1: persist a FRESH spend_id in a committed transaction BEFORE any
+    /// transfer call. `attempt_no` increments monotonically per
+    /// (row_type, row_id) inside the same immediate transaction so two
+    /// concurrent attempts cannot claim the same number. A duplicate
+    /// spend_id is a hard error — never an overwrite. Returns the new row id.
+    pub fn record_transfer_attempt(
+        &self,
+        row_type: &str,
+        row_id: i64,
+        seller_id: i64,
+        spend_id: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        if !matches!(row_type, "refund" | "payout") || spend_id.trim().is_empty() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(attempt_no),0) FROM transfer_attempts \
+                 WHERE row_type=?1 AND row_id=?2",
+                params![row_type, row_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let now = Utc::now().to_rfc3339();
+        let attempt_no = last
+            .checked_add(1)
+            .ok_or_else(|| Self::sqlite_fail("transfer attempt number overflow"))?;
+        tx.execute(
+            "INSERT INTO transfer_attempts(row_type,row_id,attempt_no,spend_id,created_at,seller_id) \
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![row_type, row_id, attempt_no, spend_id, now, seller_id],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Look up an attempt by its globally unique spend_id — used by the
+    /// ambiguous-retry path (§4.1) to reuse the SAME key.
+    pub fn get_transfer_attempt(&self, spend_id: &str) -> Option<TransferAttemptRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,row_type,row_id,attempt_no,spend_id,created_at,outcome,resolved_at,seller_id \
+             FROM transfer_attempts WHERE spend_id=?1",
+            params![spend_id],
+            |r| {
+                Ok(TransferAttemptRow {
+                    id: r.get(0)?,
+                    row_type: r.get(1)?,
+                    row_id: r.get(2)?,
+                    attempt_no: r.get(3)?,
+                    spend_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    outcome: r.get(6)?,
+                    resolved_at: r.get(7)?,
+                    seller_id: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// The most recent attempt for a money row (highest attempt_no). The
+    /// digest (§5.4) attaches this spend_id to executing/reconciling rows.
+    pub fn latest_transfer_attempt(
+        &self,
+        row_type: &str,
+        row_id: i64,
+    ) -> Option<TransferAttemptRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,row_type,row_id,attempt_no,spend_id,created_at,outcome,resolved_at,seller_id \
+             FROM transfer_attempts WHERE row_type=?1 AND row_id=?2 \
+             ORDER BY attempt_no DESC, id DESC LIMIT 1",
+            params![row_type, row_id],
+            |r| {
+                Ok(TransferAttemptRow {
+                    id: r.get(0)?,
+                    row_type: r.get(1)?,
+                    row_id: r.get(2)?,
+                    attempt_no: r.get(3)?,
+                    spend_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    outcome: r.get(6)?,
+                    resolved_at: r.get(7)?,
+                    seller_id: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// §4.2 outcome persistence. Callers branch on the shared classifier
+    /// enum (server); the data layer only stores the token and stamps the
+    /// resolution clock. A missing spend_id is a no-op (never an overwrite).
+    pub fn set_transfer_attempt_outcome(&self, spend_id: &str, outcome: &str) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE transfer_attempts SET outcome=?2, resolved_at=?3 WHERE spend_id=?1",
+            params![spend_id, outcome, now],
+        ) == Ok(1)
+    }
+
+    /// §5.1: `executing` older than the injected cutoff -> `needs_reconciliation`.
+    /// No transfer is attempted and no state is guessed. The spend-id rows and
+    /// `executing_since` stay attached; `reconciliation_since` starts the 24h
+    /// owner-decision clock. CAS on the exact status, so a concurrent finish
+    /// can never be overwritten by the sweeper.
+    pub fn mark_needs_reconciliation(
+        &self,
+        row_type: &str,
+        id: i64,
+        executing_before: &str,
+    ) -> bool {
+        if !matches!(row_type, "refund" | "payout") {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let table = if row_type == "refund" {
+            "refunds"
+        } else {
+            "payouts"
+        };
+        // `table` is chosen from a fixed two-value match above, never input.
+        let sql = format!(
+            "UPDATE {table} SET status='needs_reconciliation', \
+             updated_at=?3, reconciliation_since=?3 \
+             WHERE id=?1 AND status='executing' \
+               AND executing_since IS NOT NULL AND executing_since <= ?2"
+        );
+        conn.execute(&sql, params![id, executing_before, now]) == Ok(1)
+    }
+
+    /// §5.4 digest input: every `executing` row past the due cutoff and every
+    /// `needs_reconciliation` row (with its overdue flag past the decision
+    /// cutoff), both money types, with the latest persisted spend_id. All
+    /// timestamps are injected so verification can test 30min/24h boundaries.
+    #[allow(clippy::type_complexity)]
+    pub fn reconciliation_rows(
+        &self,
+        executing_cutoff: &str,
+        overdue_cutoff: &str,
+    ) -> Vec<ReconciliationRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out = Vec::new();
+        for row_type in ["refund", "payout"] {
+            let table = if row_type == "refund" {
+                "refunds"
+            } else {
+                "payouts"
+            };
+            // `table`/`row_type` are fixed literals from the loop above.
+            let sql = format!(
+                "SELECT m.id,m.seller_id,m.amount,m.asset,m.status, \
+                 COALESCE(m.reconciliation_since,m.executing_since,'') AS since, \
+                 (SELECT t.spend_id FROM transfer_attempts t \
+                   WHERE t.row_type=?1 AND t.row_id=m.id \
+                   ORDER BY t.attempt_no DESC, t.id DESC LIMIT 1) AS spend_id \
+                 FROM {table} m \
+                 WHERE (m.status='executing' AND m.executing_since IS NOT NULL \
+                          AND m.executing_since <= ?2) \
+                    OR (m.status='needs_reconciliation' \
+                          AND COALESCE(m.reconciliation_since,m.executing_since,'') <= ?3) \
+                 ORDER BY m.id"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt.query_map(params![row_type, executing_cutoff, overdue_cutoff], |r| {
+                let since: String = r.get(5)?;
+                Ok(ReconciliationRow {
+                    row_type: row_type.to_string(),
+                    id: r.get(0)?,
+                    seller_id: r.get(1)?,
+                    amount: r.get(2)?,
+                    asset: r.get(3)?,
+                    status: r.get(4)?,
+                    overdue: since.as_str() <= overdue_cutoff,
+                    since,
+                    spend_id: r.get(6)?,
+                })
+            });
+            if let Ok(iter) = rows {
+                out.extend(iter.filter_map(|r| r.ok()));
+            }
+        }
+        out
+    }
+
+    /// §5.3 owner resolution. Exactly three outcomes; append-only (a second
+    /// resolution is rejected by the `resolution IS NULL` CAS and the
+    /// append-only trigger). `resolution` stores the human reason; the
+    /// resulting status stores the outcome token; `resolved_by`/`resolved_at`
+    /// record the auditor. The caller (server) writes the audit row with
+    /// spend_id + actor + reason.
+    pub fn resolve_reconciliation(
+        &self,
+        row_type: &str,
+        id: i64,
+        outcome: ReconciliationOutcome,
+        resolved_by: i64,
+        reason: &str,
+    ) -> Result<(), ReconcileError> {
+        use ReconcileError::*;
+        if !matches!(row_type, "refund" | "payout") {
+            return Err(NotFound);
+        }
+        if reason.trim().is_empty() {
+            return Err(ReasonRequired);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let existing: (String, Option<String>) = conn
+            .query_row(
+                &format!(
+                    "SELECT status,resolution FROM {} WHERE id=?1",
+                    if row_type == "refund" {
+                        "refunds"
+                    } else {
+                        "payouts"
+                    }
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Database(e.to_string()))?
+            .ok_or(NotFound)?;
+        if existing.1.is_some() {
+            return Err(AlreadyResolved);
+        }
+        if existing.0 != "needs_reconciliation" {
+            return Err(NotDue);
+        }
+        let status = outcome.status_for(row_type);
+        let now = Utc::now().to_rfc3339();
+        let table = if row_type == "refund" {
+            "refunds"
+        } else {
+            "payouts"
+        };
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE {table} SET status=?2, resolution=?3, resolved_by=?4, \
+                     resolved_at=?5, updated_at=?5 \
+                     WHERE id=?1 AND status='needs_reconciliation' AND resolution IS NULL"
+                ),
+                params![id, status, reason.trim(), resolved_by, now],
+            )
+            .map_err(|e| Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(AlreadyResolved);
+        }
+        Ok(())
+    }
+
+    /// Persisted resolution of a money row, if any:
+    /// (outcome-status, reason, resolved_by, resolved_at).
+    pub fn money_resolution(
+        &self,
+        row_type: &str,
+        id: i64,
+    ) -> Option<(String, String, i64, String)> {
+        let table = if row_type == "refund" {
+            "refunds"
+        } else if row_type == "payout" {
+            "payouts"
+        } else {
+            return None;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            &format!(
+                "SELECT status,resolution,resolved_by,resolved_at FROM {table} \
+                 WHERE id=?1 AND resolution IS NOT NULL"
+            ),
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()
         .ok()
         .flatten()
@@ -5313,7 +6808,7 @@ impl Db {
         out
     }
 
-    /// Per-asset paid revenue — the L5 ruling (CRYPTO_PAY.md, ruling 5):
+    /// Per-asset paid revenue — the finance ruling (CRYPTO_PAY.md, ruling 5):
     /// summing CAST(amount AS REAL) across assets (0.5 BTC + 50 USDT) is a
     /// meaningless number and a display defect, so revenue is reported per
     /// asset and must never be totalled cross-asset downstream. Same
@@ -5522,7 +7017,7 @@ impl Db {
         }
     }
 
-    // ---- Append-only additions for the L8 API/observability task
+    // ---- Append-only additions for the server API/observability task
     // (2026-10-25). Kept as a clearly-marked block at the end of the impl so
     // parallel edits elsewhere in db.rs cannot collide; no existing lines
     // were modified. Lock handling follows the poisoned-mutex recovery
@@ -5530,7 +7025,7 @@ impl Db {
 
     /// Cheap liveness probe for `/health`: `SELECT 1`. Returns false on any
     /// error so the health endpoint can report `db: "error"` honestly
-    /// instead of panicking. (L8 addition)
+    /// instead of panicking. (server addition)
     pub fn ping(&self) -> bool {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
@@ -5542,7 +7037,7 @@ impl Db {
     /// `keep_token` (hashed here, matching `create_web_session`/
     /// `get_web_session`). Used by the API password change so a password
     /// rotation evicts stolen sessions but keeps the caller logged in.
-    /// (L8 addition)
+    /// (server addition)
     pub fn delete_other_web_sessions(&self, account_id: i64, keep_token: &str) {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -5563,7 +7058,7 @@ impl Db {
     /// codes owned by that seller, `None` (admin/owner) deletes any. Returns
     /// true when a row was deleted. Redemption rows for the deleted code are
     /// removed too — and only after the scope predicate matched, so a
-    /// cross-seller attempt deletes nothing at all. (L8 addition)
+    /// cross-seller attempt deletes nothing at all. (server addition)
     pub fn delete_code_seller_scoped(&self, code: &str, seller_id: Option<i64>) -> bool {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         // Match first (with the scope predicate), then delete the row and its
@@ -6563,7 +8058,7 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: promo codes + shopping cart (L9)
+// Phase 1: promo codes + shopping cart (core)
 // ---------------------------------------------------------------------------
 
 pub type PromoCodeRow = (
@@ -7513,6 +9008,789 @@ impl Db {
     }
 }
 // end phase6 (placeholder marker)
+
+/// Cross-cutting moderation storage. Seller-scoped methods take `seller_id`
+/// in their WHERE clause (or INSERT values): a seller can never read, change
+/// or remove another seller's rows. Per-bot overrides additionally require
+/// `bot_id`, so the same bot id under a different seller is a different
+/// namespace. The `moderation_global_floor_*` methods are the exception: the
+/// floor is global (no seller_id) and owner-only at the web layer — storage
+/// just exposes explicit methods that any seller-scoped caller cannot reach
+/// implicitly. All SQL is parameterized and lives only in this layer.
+impl Db {
+    fn global_floor_term_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ModerationGlobalFloorTerm> {
+        Ok(ModerationGlobalFloorTerm {
+            id: r.get(0)?,
+            term: r.get(1)?,
+            mode: r.get(2)?,
+            created_at: r.get(3)?,
+            updated_at: r.get(4)?,
+        })
+    }
+
+    /// Query the persistent global floor. `Err` here means the table is
+    /// unavailable/unreadable — callers fall back to the compile-time defaults
+    /// and mark the resolved policy as degraded.
+    fn query_global_floor(&self) -> Result<Vec<ModerationGlobalFloorTerm>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id,term,mode,created_at,updated_at FROM moderation_global_floor ORDER BY term",
+        )?;
+        let rows = stmt.query_map([], Self::global_floor_term_from_row)?;
+        rows.collect()
+    }
+
+    /// List the owner-enforced global floor terms, sorted by term. The table
+    /// is seeded empty, so a fresh/legacy install returns an empty vector.
+    pub fn list_moderation_global_floor(&self) -> Vec<ModerationGlobalFloorTerm> {
+        self.query_global_floor().unwrap_or_default()
+    }
+
+    /// Add (or re-mode) one owner-enforced global floor term. The (term) UNIQUE
+    /// key makes this idempotent; calling with a stricter/looser mode updates
+    /// it in place. Invalid terms/modes are refused (fail closed). The web
+    /// layer MUST gate this to the owner — storage has no implicit auth.
+    pub fn add_moderation_global_floor_term(&self, term: &str, mode: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_global_floor(term,mode,created_at,updated_at) VALUES(?1,?2,?3,?3)
+             ON CONFLICT(term) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at",
+            params![term, mode, now],
+        )
+        .is_ok()
+    }
+
+    /// Remove one owner-enforced global floor term. Seller/allow-list callers
+    /// never reach this method; once removed, the term is no longer protected
+    /// and normal seller precedence applies.
+    pub fn remove_moderation_global_floor_term(&self, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_global_floor WHERE term=?1",
+            params![term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Floor terms in resolver input form. Returns `None` when the table is
+    /// unreadable so `resolve_effective_policy` can use the fallback default.
+    fn load_global_floor_terms(&self) -> Option<Vec<ModerationTermInput>> {
+        self.query_global_floor().ok().map(|rows| {
+            rows.into_iter()
+                .map(|r| ModerationTermInput {
+                    term: r.term,
+                    mode: r.mode,
+                })
+                .collect()
+        })
+    }
+
+    fn blocked_word_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationBlockedWord> {
+        Ok(ModerationBlockedWord {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            term: r.get(2)?,
+            mode: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    fn allow_word_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationAllowWord> {
+        Ok(ModerationAllowWord {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            term: r.get(2)?,
+            created_at: r.get(3)?,
+        })
+    }
+
+    fn bot_override_term_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ModerationBotOverrideTerm> {
+        Ok(ModerationBotOverrideTerm {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            term: r.get(3)?,
+            mode: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    fn appeal_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationAppeal> {
+        Ok(ModerationAppeal {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            decision_id: r.get(3)?,
+            message_ref: r.get(4)?,
+            reason: r.get(5)?,
+            status: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+        })
+    }
+
+    fn decision_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModerationDecision> {
+        Ok(ModerationDecision {
+            id: r.get(0)?,
+            seller_id: r.get(1)?,
+            bot_id: r.get(2)?,
+            term: r.get(3)?,
+            action: r.get(4)?,
+            reason: r.get(5)?,
+            message_ref: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    }
+
+    /// Upsert the single inheritance-sentinel row (term='', mode=NULL) for a
+    /// (seller, bot) scope. It is the source of truth for "Using your shop's
+    /// rules" (true) vs "Custom rules for this bot" (false).
+    fn upsert_bot_override_sentinel(
+        conn: &Connection,
+        seller_id: i64,
+        bot_id: i64,
+        inherits: bool,
+    ) -> bool {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_bot_overrides(seller_id,bot_id,term,mode,inherits,created_at,updated_at)
+             VALUES(?1,?2,'',NULL,?3,?4,?4)
+             ON CONFLICT(seller_id,bot_id,term) DO UPDATE SET inherits=excluded.inherits, updated_at=excluded.updated_at",
+            params![seller_id, bot_id, inherits as i64, now],
+        )
+        .is_ok()
+    }
+
+    // ---- (b) Seller-wide blocked words ----
+
+    /// Add or update one seller-scoped blocked word. Invalid terms/modes are
+    /// refused (fail closed); the (seller_id, term) UNIQUE key makes this
+    /// idempotent so the console's "Add a word" can be retried safely.
+    pub fn add_blocked_word(&self, seller_id: i64, term: &str, mode: &str, enabled: bool) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_blocked_words(seller_id,term,mode,enabled,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(seller_id,term) DO UPDATE SET mode=excluded.mode, enabled=excluded.enabled, updated_at=excluded.updated_at",
+            params![seller_id, term, mode, enabled as i64, now],
+        )
+        .is_ok()
+    }
+
+    pub fn set_blocked_word_mode(&self, seller_id: i64, term: &str, mode: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_blocked_words SET mode=?3, updated_at=?4 WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term, mode, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn set_blocked_word_enabled(&self, seller_id: i64, term: &str, enabled: bool) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_blocked_words SET enabled=?3, updated_at=?4 WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term, enabled as i64, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn remove_blocked_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_blocked_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_blocked_word(&self, seller_id: i64, term: &str) -> Option<ModerationBlockedWord> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,term,mode,enabled,created_at,updated_at
+             FROM moderation_blocked_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+            Self::blocked_word_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_blocked_words(&self, seller_id: i64) -> Vec<ModerationBlockedWord> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,term,mode,enabled,created_at,updated_at
+             FROM moderation_blocked_words WHERE seller_id=?1 ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id], Self::blocked_word_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- (b) "Always allow" list ----
+
+    pub fn add_allow_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_allow_words(seller_id,term,created_at) VALUES(?1,?2,?3)
+             ON CONFLICT(seller_id,term) DO NOTHING",
+            params![seller_id, term, now],
+        )
+        .is_ok()
+    }
+
+    pub fn remove_allow_word(&self, seller_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_allow_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_allow_word(&self, seller_id: i64, term: &str) -> Option<ModerationAllowWord> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,term,created_at FROM moderation_allow_words WHERE seller_id=?1 AND term=?2",
+            params![seller_id, term],
+            Self::allow_word_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_allow_words(&self, seller_id: i64) -> Vec<ModerationAllowWord> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,term,created_at FROM moderation_allow_words WHERE seller_id=?1 ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id], Self::allow_word_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- (c) Per-bot override (scoped by BOTH seller_id and bot_id) ----
+
+    /// Set "Using your shop's rules" (true) / "Custom rules for this bot"
+    /// (false). Custom terms are preserved through the toggle so returning
+    /// to inheritance is non-destructive.
+    pub fn set_bot_override_inherits(&self, seller_id: i64, bot_id: i64, inherits: bool) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::upsert_bot_override_sentinel(&conn, seller_id, bot_id, inherits)
+    }
+
+    /// Whether a bot inherits its seller's rules. Defaults to true when no
+    /// sentinel row exists — "inherits by default" per the spec.
+    pub fn bot_override_inherits(&self, seller_id: i64, bot_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT inherits FROM moderation_bot_overrides WHERE seller_id=?1 AND bot_id=?2 AND term=''",
+            params![seller_id, bot_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v != 0)
+        .unwrap_or(true)
+    }
+
+    /// Add/update a custom term for one bot. Adding the first custom term
+    /// activates "Custom rules for this bot" (inherits=false) so the console
+    /// need not issue a second call; the sentinel is written first so a
+    /// failed term insert can never leave an ignored term behind.
+    pub fn add_bot_override_term(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        term: &str,
+        mode: &str,
+    ) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        if !is_moderation_mode(mode) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !Self::upsert_bot_override_sentinel(&conn, seller_id, bot_id, false) {
+            return false;
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_bot_overrides(seller_id,bot_id,term,mode,inherits,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,0,?5,?5)
+             ON CONFLICT(seller_id,bot_id,term) DO UPDATE SET mode=excluded.mode, inherits=0, updated_at=excluded.updated_at",
+            params![seller_id, bot_id, term, mode, now],
+        )
+        .is_ok()
+    }
+
+    pub fn remove_bot_override_term(&self, seller_id: i64, bot_id: i64, term: &str) -> bool {
+        let Some(term) = normalize_moderation_term(term) else {
+            return false;
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM moderation_bot_overrides WHERE seller_id=?1 AND bot_id=?2 AND term=?3 AND term<>''",
+            params![seller_id, bot_id, term],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn get_bot_override_term(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        term: &str,
+    ) -> Option<ModerationBotOverrideTerm> {
+        let term = normalize_moderation_term(term)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,bot_id,term,mode,created_at,updated_at
+             FROM moderation_bot_overrides
+             WHERE seller_id=?1 AND bot_id=?2 AND term=?3 AND term<>''",
+            params![seller_id, bot_id, term],
+            Self::bot_override_term_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn list_bot_override_terms(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+    ) -> Vec<ModerationBotOverrideTerm> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,mode,created_at,updated_at
+             FROM moderation_bot_overrides
+             WHERE seller_id=?1 AND bot_id=?2 AND term<>'' ORDER BY term",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, bot_id], Self::bot_override_term_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ---- Appeals review queue (opaque refs only, never message content) ----
+
+    /// Create an appeal. `message_ref` must be an opaque token supplied by the
+    /// bot-side flow (server); `reason` is the short appeal justification, capped
+    /// by [`MODERATION_MAX_REASON_LEN`] — neither may carry the filtered body.
+    ///
+    /// Atomic dedup (security LOW): the unique index on
+    /// `(seller_id, COALESCE(bot_id, 0), message_ref)` makes concurrent
+    /// double-submissions a no-op instead of two rows. `None` is returned on
+    /// conflict — the existing `Option<i64>` signature already means "no row
+    /// created", so server/web call sites need no change (the handler's pre-check
+    /// still reports `AlreadyRequested` in the non-racy case).
+    pub fn create_moderation_appeal(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+        decision_id: Option<i64>,
+        message_ref: &str,
+        reason: Option<&str>,
+    ) -> Option<i64> {
+        let message_ref = normalize_moderation_ref(message_ref)?;
+        let reason = trim_moderation_reason(reason);
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let inserted = conn
+            .execute(
+                "INSERT INTO moderation_appeals(seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,'pending',?6,?6)
+                 ON CONFLICT(seller_id, COALESCE(bot_id, 0), message_ref) DO NOTHING",
+                params![seller_id, bot_id, decision_id, message_ref, reason, now],
+            )
+            .ok()?;
+        // `last_insert_rowid()` is per-connection and is NOT advanced by a
+        // DO NOTHING conflict; only report an id when a row was really added.
+        if inserted == 0 {
+            return None;
+        }
+        Some(conn.last_insert_rowid())
+    }
+
+    pub fn get_moderation_appeal(
+        &self,
+        seller_id: i64,
+        appeal_id: i64,
+    ) -> Option<ModerationAppeal> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals WHERE seller_id=?1 AND id=?2",
+            params![seller_id, appeal_id],
+            Self::appeal_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// `status` is an optional filter ('pending'|'approved'|'upheld'); an
+    /// invalid filter yields no rows instead of a raw SQL fragment.
+    pub fn list_moderation_appeals(
+        &self,
+        seller_id: i64,
+        status: Option<&str>,
+    ) -> Vec<ModerationAppeal> {
+        let status = match status {
+            None => None,
+            Some(s) if is_moderation_appeal_status(s) => Some(s.to_owned()),
+            Some(_) => return Vec::new(),
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals
+             WHERE seller_id=?1 AND (?2 IS NULL OR status=?2) ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, status], Self::appeal_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Bot-narrowed variant: both seller_id and bot_id are bound, so the same
+    /// bot id under another seller is a disjoint queue.
+    pub fn list_moderation_appeals_for_bot(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        status: Option<&str>,
+    ) -> Vec<ModerationAppeal> {
+        let status = match status {
+            None => None,
+            Some(s) if is_moderation_appeal_status(s) => Some(s.to_owned()),
+            Some(_) => return Vec::new(),
+        };
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at
+             FROM moderation_appeals
+             WHERE seller_id=?1 AND bot_id=?2 AND (?3 IS NULL OR status=?3) ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, bot_id, status], Self::appeal_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn set_moderation_appeal_status(
+        &self,
+        seller_id: i64,
+        appeal_id: i64,
+        status: &str,
+    ) -> bool {
+        if !is_moderation_appeal_status(status) {
+            return false;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE moderation_appeals SET status=?3, updated_at=?4 WHERE seller_id=?1 AND id=?2",
+            params![seller_id, appeal_id, status, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    // ---- Append-only decision audit ----
+
+    /// Record one moderation decision. There is intentionally NO message-text
+    /// parameter: `term` is the matched policy term and `message_ref` is an
+    /// opaque caller token. `reason` is a short code/justification, capped.
+    pub fn log_moderation_decision(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+        term: Option<&str>,
+        action: &str,
+        reason: Option<&str>,
+        message_ref: Option<&str>,
+    ) -> Option<i64> {
+        let term = term.and_then(normalize_moderation_term);
+        let action = normalize_moderation_ref(action)?;
+        let reason = trim_moderation_reason(reason);
+        let message_ref = message_ref.and_then(normalize_moderation_ref);
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO moderation_decisions(seller_id,bot_id,term,action,reason,message_ref,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![seller_id, bot_id, term, action, reason, message_ref, now],
+        )
+        .ok()?;
+        Some(conn.last_insert_rowid())
+    }
+
+    pub fn list_moderation_decisions(&self, seller_id: i64, limit: i64) -> Vec<ModerationDecision> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,action,reason,message_ref,created_at
+             FROM moderation_decisions WHERE seller_id=?1 ORDER BY id DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![seller_id, limit.max(0)], Self::decision_from_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn list_moderation_decisions_for_bot(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        limit: i64,
+    ) -> Vec<ModerationDecision> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,bot_id,term,action,reason,message_ref,created_at
+             FROM moderation_decisions WHERE seller_id=?1 AND bot_id=?2 ORDER BY id DESC LIMIT ?3",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(
+            params![seller_id, bot_id, limit.max(0)],
+            Self::decision_from_row,
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    // ---- Resolution ----
+
+    /// Resolve the effective policy for one (seller, optional bot) scope.
+    /// Reads the persistent owner floor, then applies seller rules, per-bot
+    /// custom rules (only when the override is active), and the seller
+    /// allow-list — see [`apply_moderation_precedence`] for the exact ladder.
+    /// If moderation storage is not ready or the floor cannot be read, the
+    /// compile-time defaults are used and `enforcement_degraded` is set so
+    /// callers fail closed instead of trusting a partial policy.
+    pub fn resolve_effective_policy(
+        &self,
+        seller_id: i64,
+        bot_id: Option<i64>,
+    ) -> EffectiveModerationPolicy {
+        let seller_terms: Vec<ModerationTermInput> = self
+            .list_blocked_words(seller_id)
+            .into_iter()
+            .filter(|w| w.enabled)
+            .map(|w| ModerationTermInput {
+                term: w.term,
+                mode: w.mode,
+            })
+            .collect();
+        let allow_terms: Vec<String> = self
+            .list_allow_words(seller_id)
+            .into_iter()
+            .map(|w| w.term)
+            .collect();
+
+        let mut bot_override_active = false;
+        let mut bot_terms: Vec<ModerationTermInput> = Vec::new();
+        if let Some(bot_id) = bot_id {
+            bot_override_active = !self.bot_override_inherits(seller_id, bot_id);
+            if bot_override_active {
+                bot_terms = self
+                    .list_bot_override_terms(seller_id, bot_id)
+                    .into_iter()
+                    .map(|w| ModerationTermInput {
+                        term: w.term,
+                        mode: w.mode,
+                    })
+                    .collect();
+            }
+        }
+
+        // Persistent floor is the shipped source of truth. Fall back to the
+        // compile-time defaults only when the table is unavailable/unreadable.
+        let storage_ready = self.moderation_storage_ready.load(Ordering::Relaxed);
+        let (floor_terms, floor_read_failed) = match self.load_global_floor_terms() {
+            Some(terms) => (terms, false),
+            None => (
+                MODERATION_FLOOR_TERMS
+                    .iter()
+                    .map(|t| ModerationTermInput {
+                        term: (*t).to_owned(),
+                        mode: MODERATION_FLOOR_MODE.to_owned(),
+                    })
+                    .collect(),
+                true,
+            ),
+        };
+        let terms = apply_moderation_precedence(
+            MODERATION_FLOOR_MODE,
+            &floor_terms,
+            &seller_terms,
+            &bot_terms,
+            &allow_terms,
+        );
+        EffectiveModerationPolicy {
+            seller_id,
+            bot_id,
+            floor_mode: MODERATION_FLOOR_MODE.to_owned(),
+            terms,
+            bot_override_active,
+            enforcement_degraded: !storage_ready || floor_read_failed,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

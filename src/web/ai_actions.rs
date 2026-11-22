@@ -105,7 +105,7 @@ pub(super) async fn ai_save(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "AI", "AI");
     }
 
@@ -273,7 +273,7 @@ pub(super) async fn ai_test(
                 .into_response();
         }
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"ok": false, "latency_ms": 0, "error": "Forbidden"})),

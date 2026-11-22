@@ -1,10 +1,10 @@
 # MANAGEMENT_DISCLOSURE_SPEC — progressive disclosure for the management surfaces
 
-Status: **READY FOR L7** · Owner-mandated redesign (demonstrated 2026-10-31: form
+Status: **READY FOR WEB** · Owner-mandated redesign (demonstrated 2026-10-31: form
 walls, meaningless `#id` titles, empty states that lie).
 Sources of truth: `DESIGN.md` + `assets/app.css`. Master: this file.
 **Zero token changes** — every color/spacing value below reuses existing tokens
-(`--line`, `--ink-3`, `--surface`…) → **nothing needs L6-C**.
+(`--line`, `--ink-3`, `--surface`…) → **nothing needs design**.
 
 Supersedes, for this wave only: `VISUAL_POLISH_SPEC.md` §B16 ("report-only")
 and its F-3 budget flag — the owner explicitly ordered the `bots_admin.rs`
@@ -155,7 +155,7 @@ route renames, no `bots_config.rs` edits.
 File: `src/web/bots_admin.rs` — `bot_card_html` (:237-322 pre-split) and
 `bots_page_html` (:188-233 pre-split). One `<details>` per bot, **collapsed by
 default**, mirroring the Settings accordion (`settings.rs:260`) but with the
-card itself as the surface — hence `panel`, not the coordinator shorthand
+card itself as the surface — hence `panel`, not the shorthand
 `card` (`.card` has no surface rules, `assets/app.css:226-235`).
 
 ### 2a. Markup (exact replacement for the `format!` in `bot_card_html`)
@@ -435,7 +435,7 @@ also call the helper — optional, same bytes.)
 
 ---
 
-## §6 Constraints & gates for L7
+## §6 Constraints & gates for web
 
 1. **Order**: §1 move-only → `wc -l` proof (both files ≤ 800) + `cargo build &&
    cargo test -q && cargo clippy -- -D warnings && cargo fmt --check` green →

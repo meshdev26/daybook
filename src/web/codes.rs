@@ -29,7 +29,7 @@ pub(super) async fn codes_page(
 /// handler can render its one-time replacement code in place (EDIT_FLOW_SPEC
 /// E4 — no PRG: the code must not ride a URL).
 fn codes_body(state: &WebState, session: &Session, banner: &str) -> String {
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -88,7 +88,7 @@ fn codes_rows_html(state: &WebState, session: &Session, codes: &[CodeRow]) -> St
             } else {
                 ""
             };
-            let actions = if session.role == "owner" {
+            let actions = if Role::from_role_str(&session.role).has_level(Role::Owner) {
                 format!(
                     r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Delete code {}" onclick="return confirm('Delete code {}?')">Delete</button></form>"#,
                     state.url("/codes/delete"),
@@ -104,14 +104,14 @@ fn codes_rows_html(state: &WebState, session: &Session, codes: &[CodeRow]) -> St
             // confirm naming the code and the consequence. The per-row
             // "New length" field is gone (the 12 default stays server-side).
             let reclaim = format!(
-                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Reclaim code {}" onclick="return confirm('Reclaim code {}? The old code stops working and a new one is issued.')">Reclaim</button></form>"#,
+                r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="code" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Reclaim code {}" onclick="return confirm('Reclaim code {}? The old code stops working and a new one is issued.')">Reclaim</button></form>"#,
                 state.url("/codes/reclaim"),
                 esc(&c.0),
                 esc(&c.0),
                 esc(&c.0)
             );
             format!(
-                r#"<tr><td class="mono">{}{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td><td>{}{}</td></tr>"#,
+                r#"<tr><td class="mono">{}{}</td><td>{}</td><td class="num">{}</td><td class="num">{}</td><td class="num">{}</td><td class="actions">{}{}</td></tr>"#,
                 esc(&c.0),
                 revoked_badge,
                 c.1.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string()),
@@ -158,7 +158,7 @@ pub(super) async fn codes_generate(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -166,7 +166,7 @@ pub(super) async fn codes_generate(
             None => return Redirect::to(&state.url("/codes")).into_response(),
         }
     };
-    let _scope = if session.role == "seller" {
+    let _scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -216,7 +216,7 @@ pub(super) async fn codes_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -241,7 +241,7 @@ pub(super) async fn codes_reclaim(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

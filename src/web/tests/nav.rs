@@ -131,6 +131,8 @@ async fn nav_role_visibility_owner() {
     // owner sees all incl. Settings in utilities
     for p in [
         "/bots",
+        "/blocked-words",
+        "/content-policy",
         "/identity",
         "/ai",
         "/crypto",
@@ -168,8 +170,9 @@ async fn nav_role_visibility_seller() {
         selected_bot_id: None,
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
-    // seller sees finance, api keys, abandoned carts
-    for p in ["finance", "keys", "carts"] {
+    // seller sees finance, api keys, abandoned carts and the Blocked words
+    // capability page, but never the owner-only global policy.
+    for p in ["finance", "keys", "carts", "blocked-words"] {
         assert!(
             body.contains(&format!(r#"href="/{}""#, p)),
             "seller missing {} in:\n{}",
@@ -179,7 +182,15 @@ async fn nav_role_visibility_seller() {
     }
     // seller does not see owner-only
     for p in [
-        "bots", "identity", "ai", "crypto", "admins", "sellers", "webusers", "settings",
+        "bots",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "admins",
+        "sellers",
+        "webusers",
+        "settings",
     ] {
         assert!(
             !body.contains(&format!(r#"href="/{}""#, p)),
@@ -188,6 +199,70 @@ async fn nav_role_visibility_seller() {
             body
         );
     }
+}
+
+/// Admin sits above Seller in the ordered Role ladder: it keeps the
+/// seller-tier rows (including the Blocked words capability row) but still
+/// never sees owner-only rows. The check is by level, not by role string.
+#[tokio::test]
+async fn nav_role_visibility_admin() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .create_web_account("admin", "secret", "admin", None)
+        .await
+        .unwrap();
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("admin").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "admin".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = rail_nav(&state, "Dashboard", Some(&sess));
+    // Admin outranks Seller: same non-owner tier, including Blocked words.
+    for p in ["finance", "keys", "carts", "blocked-words"] {
+        assert!(
+            body.contains(&format!(r#"href="/{}""#, p)),
+            "admin missing {} in:\n{}",
+            p,
+            body
+        );
+    }
+    // Owner-only rows stay hidden from admin.
+    for p in [
+        "bots",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "admins",
+        "sellers",
+        "webusers",
+        "settings",
+    ] {
+        assert!(
+            !body.contains(&format!(r#"href="/{}""#, p)),
+            "admin should not see {} in:\n{}",
+            p,
+            body
+        );
+    }
+}
+
+/// The nav visibility predicate consumes Role levels directly, so unknown
+/// session strings degrade to User (least privilege) and cannot unlock rows.
+#[test]
+fn nav_visibility_uses_ordered_role_levels() {
+    assert!(NavRole::Owner.visible(Role::Owner));
+    assert!(!NavRole::Owner.visible(Role::Admin));
+    assert!(!NavRole::Owner.visible(Role::Seller));
+    assert!(!NavRole::Owner.visible(Role::User));
+    for role in [Role::Seller, Role::Admin, Role::Owner] {
+        assert!(NavRole::SellerAdminOwner.visible(role));
+    }
+    assert!(!NavRole::SellerAdminOwner.visible(Role::User));
+    assert!(NavRole::All.visible(Role::User));
 }
 
 #[tokio::test]
@@ -233,8 +308,20 @@ async fn nav_role_visibility_buyer() {
         );
     }
     let forbidden = [
-        "monitor", "bots", "identity", "ai", "crypto", "finance", "admins", "sellers", "webusers",
-        "keys", "carts", "settings",
+        "monitor",
+        "bots",
+        "blocked-words",
+        "content-policy",
+        "identity",
+        "ai",
+        "crypto",
+        "finance",
+        "admins",
+        "sellers",
+        "webusers",
+        "keys",
+        "carts",
+        "settings",
     ];
     for p in forbidden {
         assert!(
@@ -281,4 +368,461 @@ async fn nav_page_smoke() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("skip-link"), "{body}");
+}
+
+// ---- multibot foundation: product scope + gated nav (Step 3) ------------
+
+/// The default build keeps the shipped 27 rows and every path byte-identical:
+/// no existing item is tagged with a capability or a product type, so both
+/// new filters are no-ops here. A capability/page may only be hidden when a
+/// builder opts out of that feature or selects a narrower product type.
+#[test]
+fn default_build_nav_rows_are_untagged_and_paths_unchanged() {
+    assert_eq!(NAV_ITEMS.len(), 27);
+    for item in NAV_ITEMS {
+        assert_eq!(
+            item.feature, None,
+            "{} must stay in the default build",
+            item.id
+        );
+        assert_eq!(
+            item.product_types, None,
+            "{} must not be type-filtered",
+            item.id
+        );
+    }
+    // Capability flags resolve from Cargo features; unknown never enables.
+    assert!(capability_enabled("shop_bot")); // default feature
+    assert!(!capability_enabled("movie_bot")); // not compiled by default
+    assert!(!capability_enabled("not_a_capability"));
+    assert_eq!(product_type_label("movie_bot"), "Movie bots");
+    assert_eq!(product_type_label("raw_slug"), "Other products");
+}
+
+/// A nav item whose capability was not compiled is absent. This exercises
+/// the exact filter `rail_nav` applies; a `--no-default-features --features
+/// movie_bot` build makes the mirror case (a shop-gated item absent) true.
+#[test]
+fn feature_gated_item_absent_when_not_compiled() {
+    let movie_only = NavItem {
+        id: "movie-catalog",
+        label: "Movie catalog",
+        path: "movie-catalog",
+        group: "Offerings",
+        roles: NavRole::Owner,
+        titles: &["Movie catalog"],
+        pref: None,
+        feature: Some("movie_bot"),
+        product_types: Some(&["movie_bot"]),
+    };
+    // Default build: movie_bot is not compiled -> the item is filtered out.
+    assert!(!movie_only.feature.is_none_or(capability_enabled));
+    // Runtime type filter is a view filter only: the selected movie product
+    // keeps the item; an unscoped owner ("All products") also keeps it.
+    assert!(nav_item_type_ok(&movie_only, Some("movie_bot")));
+    assert!(nav_item_type_ok(&movie_only, None));
+    assert!(!nav_item_type_ok(&movie_only, Some("shop_bot")));
+    // An untagged item is never removed by either filter.
+    let core = &NAV_ITEMS[0];
+    assert!(core.feature.is_none_or(capability_enabled));
+    assert!(nav_item_type_ok(core, Some("shop_bot")));
+}
+
+#[tokio::test]
+async fn product_scope_owner_has_type_facet_and_optgroups() {
+    let (state, _dir) = make_state().await;
+    state.db.create_bot("cinema", 1, None, "");
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
+    assert!(
+        body.contains(r#"class="bot-scope product-scope""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<label for="scope-type">Product type</label>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<label for="scope-product">Product</label>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<select id="scope-type""#), "{body}");
+    assert!(
+        body.contains(r#"<option value="">All types</option>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="">All products</option>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="shop_bot">Shop bots</option>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<optgroup label="Shop bots">"#), "{body}");
+    assert!(body.contains(r#"data-type="shop_bot""#), "{body}");
+    assert!(body.contains(">Switch</button>"), "{body}");
+    // The old label/facet must be gone, and the facet is client-side only:
+    // no `name` on the type select and no forged seller field in the form.
+    assert!(!body.contains("All bots (primary)"), "{body}");
+    assert!(!body.contains(r#"name="seller_id""#), "{body}");
+    assert!(!body.contains(r#"name="product_type""#), "{body}");
+    let type_tag = body
+        .split(r#"<select id="scope-type">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</select>").next())
+        .unwrap_or("");
+    assert!(!type_tag.contains("name="), "{type_tag}");
+}
+
+#[tokio::test]
+async fn product_scope_seller_pinned_buyer_absent() {
+    let (state, _dir) = make_state().await;
+    state
+        .db
+        .create_web_account("seller", "secret", "seller", Some(42))
+        .await
+        .unwrap();
+    state
+        .db
+        .create_web_account("buyer", "secret", "user", None)
+        .await
+        .unwrap();
+    let (sacc, _u, _h, _r, _s) = state.db.get_web_account_by_username("seller").unwrap();
+    let seller = Session {
+        account_id: sacc,
+        role: "seller".to_string(),
+        seller_id: Some(42),
+        selected_bot_id: None,
+    };
+    let seller_body = html_page(&state, Some(&seller), "Dashboard", "<p>x</p>");
+    assert!(
+        seller_body.contains(r#"aria-label="Active product""#),
+        "{seller_body}"
+    );
+    assert!(
+        seller_body.contains(r#"<span class="help">Product</span>"#),
+        "{seller_body}"
+    );
+    assert!(
+        !seller_body.contains(r#"<select id="scope-product""#),
+        "{seller_body}"
+    );
+    assert!(
+        !seller_body.contains(r#"aria-label="Active bot""#),
+        "{seller_body}"
+    );
+
+    let (bacc, _u, _h, _r, _s) = state.db.get_web_account_by_username("buyer").unwrap();
+    let buyer = Session {
+        account_id: bacc,
+        role: "user".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let buyer_body = html_page(&state, Some(&buyer), "Dashboard", "<p>x</p>");
+    assert!(!buyer_body.contains("bot-scope"), "{buyer_body}");
+    assert!(!buyer_body.contains("scope-type"), "{buyer_body}");
+}
+
+#[tokio::test]
+async fn scope_control_375px_stacked_markup_and_css() {
+    let (state, _dir) = make_state().await;
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
+    // Two labeled selects + a full-width Switch: the markup a 375px stack
+    // binds to. Ordering is Type label -> type select -> Product label ->
+    // product select -> Switch, so no side-by-side controls can form.
+    let type_label = body
+        .find(r#"<label for="scope-type">Product type</label>"#)
+        .unwrap();
+    let type_sel = body.find(r#"<select id="scope-type""#).unwrap();
+    let product_label = body
+        .find(r#"<label for="scope-product">Product</label>"#)
+        .unwrap();
+    let product_sel = body.find(r#"<select id="scope-product""#).unwrap();
+    let switch = body.find(">Switch</button>").unwrap();
+    assert!(type_label < type_sel && type_sel < product_label);
+    assert!(product_label < product_sel && product_sel < switch);
+
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    assert!(css.contains(".rail .product-scope"), "{css}");
+    assert!(css.contains("flex-direction: column"), "{css}");
+    assert!(css.contains("min-height: 44px"), "{css}");
+}
+
+// ---- Step 4.3: feature-gated moderation nav items -------------------------
+
+/// The 27 shipped group rows are untouched; capability rows live in their own
+/// table and are all tagged with `moderation` so they disappear in a build
+/// that opts out of the capability. Buyers never see either one.
+#[test]
+fn moderation_nav_rows_are_gated_and_separate_from_core_table() {
+    assert_eq!(NAV_ITEMS.len(), 27);
+    assert!(NAV_ITEMS.iter().all(|item| item.feature.is_none()));
+    assert_eq!(FEATURE_NAV_ITEMS.len(), 2);
+    for item in FEATURE_NAV_ITEMS {
+        assert_eq!(item.feature, Some("moderation"), "{}", item.id);
+        assert!(!item.roles.visible(Role::User), "{}", item.id);
+        // Compiled-in by default; a movie-only build filters it out.
+        assert!(item.feature.is_none_or(capability_enabled));
+        assert!(!item.feature.is_none_or(|f| f == "movie_bot"));
+    }
+    let ids: Vec<&str> = FEATURE_NAV_ITEMS.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec!["blocked-words", "content-policy"]);
+    let anchors: Vec<(&str, &str)> = FEATURE_NAV_AFTER
+        .iter()
+        .map(|(id, anchor)| (*id, *anchor))
+        .collect();
+    assert_eq!(
+        anchors,
+        vec![("blocked-words", "bots"), ("content-policy", "ai")]
+    );
+    assert_eq!(active_nav_id("Blocked words"), Some("blocked-words"));
+    assert_eq!(active_nav_id("Content policy"), Some("content-policy"));
+}
+
+/// A capability row is injected after its anchor (Content policy beside AI),
+/// and the active state is id-keyed with `aria-current="page"`.
+#[tokio::test]
+async fn moderation_nav_placement_and_active_state() {
+    let (state, _dir) = make_state().await;
+    state.db.set_config(
+        "sidebar_items",
+        r#"{"ai":true,"crypto":true,"admins":true,"sellers":true,"webusers":true}"#,
+    );
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    let sess = Session {
+        account_id: acc,
+        role: "owner".to_string(),
+        seller_id: None,
+        selected_bot_id: None,
+    };
+    let body = rail_nav(&state, "Content policy", Some(&sess));
+    let bots = body.find(">Bots</a>").unwrap();
+    let blocked = body.find(">Blocked words</a>").unwrap();
+    let products = body.find(">Products</a>").unwrap();
+    assert!(products < bots && bots < blocked, "{body}");
+    let ai = body.find(">AI</a>").unwrap();
+    let policy = body.find(">Content policy</a>").unwrap();
+    let crypto = body.find(">Crypto</a>").unwrap();
+    assert!(ai < policy && policy < crypto, "{body}");
+    assert!(body.contains(r#"href="/blocked-words""#), "{body}");
+    let active = body
+        .split(r#"href="/content-policy""#)
+        .nth(1)
+        .unwrap_or("")
+        .split('>')
+        .next()
+        .unwrap_or("");
+    assert!(active.contains("aria-current=\"page\""), "{active}");
+    // No seventh group was introduced.
+    assert_eq!(body.matches("data-nav-group=\"").count(), 6);
+}
+
+/// The 375px rules for moderation forms reuse the shipped token contract and
+/// enforce ≥44px targets with a stacked layout at the drawer breakpoint.
+#[tokio::test]
+async fn moderation_forms_have_375px_targets_and_stacked_rules() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.css")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+    assert!(css.contains(".mod-form"), "{css}");
+    assert!(css.contains(".moderation-override"), "{css}");
+    assert!(css.contains("min-height: 44px"), "{css}");
+    assert!(css.contains(".mod-row-form"), "{css}");
+}
+
+/// B1 (WCAG 2.2 AA 2.1.1 / 2.4.3 / 4.1.2 / 1.3.1): at 375px the rail is
+/// flattened and the group toggles are hidden. A non-current group must stay
+/// navigable — APP_JS forces every panel open on mobile, so no visible link is
+/// `inert` or `aria-hidden` and every `<a href>` stays keyboard-focusable.
+#[tokio::test]
+async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
+    let (state, _dir) = make_state().await;
+    let (acc, _u, _h, _r, _s) = state.db.get_web_account_by_username("owner").unwrap();
+    // A seller at the drawer breakpoint: the B1 report's exact scenario.
+    let sess = Session {
+        account_id: acc,
+        role: "seller".to_string(),
+        seller_id: Some(41),
+        selected_bot_id: None,
+    };
+    let nav = rail_nav(&state, "Dashboard", Some(&sess));
+
+    // The CSS that flattens every group at 375px must still ship, including a
+    // stale-class fallback for the no-JS / pre-JS paint.
+    let app = router(state.clone());
+    let css = body_string(
+        app.clone()
+            .oneshot(get_req("/assets/app.css"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        css.contains(".nav-group-toggle { display: none; }"),
+        "{css}"
+    );
+    assert!(
+        css.contains(".nav-group, .nav-group-panel { display: contents; }"),
+        "{css}"
+    );
+    assert!(
+        css.contains(
+            ".nav-group.is-collapsed .nav-group-panel { max-height: none; overflow: visible; }"
+        ),
+        "{css}"
+    );
+
+    // DOM-equivalent assertion on the markup the mobile JS enhances: no panel
+    // or link carries inert / aria-hidden="true", and every panel link is a
+    // native, focusable <a href> (no tabindex="-1").
+    assert!(!nav.contains("inert"), "{nav}");
+    let panels: Vec<&str> = nav
+        .split("<div class=\"nav-group-panel\"")
+        .skip(1)
+        .map(|chunk| chunk.split("</div>").next().unwrap_or(""))
+        .collect();
+    assert!(panels.len() >= 2, "expected several nav groups: {nav}");
+    let mut links = 0usize;
+    for panel in panels {
+        assert!(!panel.contains("inert"), "{panel}");
+        assert!(!panel.contains("aria-hidden=\"true\""), "{panel}");
+        for anchor in panel.split("<a ").skip(1) {
+            let tag = anchor.split('>').next().unwrap_or("");
+            assert!(tag.contains("href="), "nav link without href: {tag}");
+            assert!(
+                !tag.contains("tabindex=\"-1\""),
+                "unfocusable nav link: {tag}"
+            );
+            links += 1;
+        }
+    }
+    assert!(links >= 5, "expected seller nav links, got {links}: {nav}");
+}
+
+/// Scroll memory is covered by the checked `assets/app.js` and its jsdom
+/// harness. This test pins only the shell markup that enhancement relies on:
+/// the skip link, the main landmark, and no extra tabindex on either.
+#[tokio::test]
+async fn nav_shell_markup_unchanged() {
+    let (state, _dir) = make_state().await;
+    let body = html_page(&state, None, "Dashboard", "<p>x</p>");
+    assert!(
+        body.contains(r#"<a class="skip-link" href='#main'>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<main class="main" id="main">"#), "{body}");
+    // No tabindex was added to the skip link or the main landmark.
+    assert!(
+        !body.contains(r#"class="skip-link" href='#main' tabindex"#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<main class="main" id="main" tabindex"#),
+        "{body}"
+    );
+}
+
+/// Rail-scroll CSS contract (screenshot fix): on desktop the rail is its own
+/// scroll container — never the page — and it carries a stable scrollbar
+/// gutter so the nav does not jump horizontally when it starts to overflow.
+/// At the drawer breakpoint the same rail must hand scrolling back to the
+/// document (`overflow-y: visible`), or a wrapping header becomes a second,
+/// unreachable scroll area.
+#[tokio::test]
+async fn rail_is_a_scoped_desktop_scroll_container() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(get_req("/assets/app.css"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let css = body_string(resp).await;
+
+    let start = css.find(".rail {").expect("the base .rail rule is served");
+    let end = css[start..]
+        .find('}')
+        .map(|i| start + i)
+        .unwrap_or(css.len());
+    let base = &css[start..end];
+    for needle in [
+        "overflow-y: auto",
+        "overscroll-behavior-y: contain",
+        "scrollbar-gutter: stable",
+    ] {
+        assert!(base.contains(needle), "missing `{needle}` in .rail: {base}");
+    }
+
+    // Whitespace-tolerant media-query assertions: the contract is the
+    // desktop-only `flex-shrink:0` pin and the mobile `overflow-y:visible`
+    // override inside a `@media (max-width: 900px)` block.
+    let compact: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("@media(min-width:901px){.rail>*{flex-shrink:0;}}"),
+        "desktop-only rail child pin missing: {css}"
+    );
+    let mobile_override = css
+        .match_indices("@media (max-width: 900px) {")
+        .any(|(i, _)| {
+            let mq = &css[i..];
+            let end = mq.find("\n}").unwrap_or(mq.len());
+            let mq = &mq[..end];
+            mq.split(".rail {").skip(1).any(|chunk| {
+                chunk
+                    .split('}')
+                    .next()
+                    .unwrap_or("")
+                    .contains("overflow-y: visible")
+            })
+        });
+    assert!(
+        mobile_override,
+        "mobile .rail must restore document scrolling: {css}"
+    );
+}
+
+/// The checked client asset is served from the same source TypeScript and
+/// jsdom validate: `include_str!` supplies APP_JS and the route must return
+/// those exact bytes with a JavaScript content type.
+#[tokio::test]
+async fn app_js_asset_route_serves_checked_source() {
+    let (state, _dir) = make_state().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/assets/app.js")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("application/javascript"),
+        "unexpected content-type: {content_type}"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), super::super::html::APP_JS.as_bytes());
 }

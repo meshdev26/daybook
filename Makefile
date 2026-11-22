@@ -1,5 +1,5 @@
 # Telegram Agent — one entry point for everything.
-# Each target maps to the role level that owns it (see AUTO_ROUTE.md).
+# Targets are grouped by purpose below.
 
 SHELL := /usr/bin/env bash
 VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -11,7 +11,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-## --- run & configure (L8) -------------------------------------------------
+## --- run & configure ------------------------------------------------------
 .PHONY: setup
 setup: ## Interactive first-run configuration (writes .env, 0600)
 	./setup.sh
@@ -20,23 +20,30 @@ setup: ## Interactive first-run configuration (writes .env, 0600)
 run: ## Build (debug) and run locally
 	cargo run
 
+.PHONY: tg
+tg: ## Short alias: build and run Daybook locally
+	@$(MAKE) run
+
 .PHONY: run-release
 run-release: ## Build (release) and run locally
 	cargo build --release && ./target/release/telegram-agent
 
-## --- quality gates (L3) ----------------------------------------------------
+## --- quality gates --------------------------------------------------------
 .PHONY: build
 build: ## cargo build
 	cargo build
 
 .PHONY: test
-test: ## Full gate suite: fmt, clippy, test, audit, deny, routing contract
+test: ## Full gate suite: fmt, clippy, test, audit, deny
 	cargo fmt --check
 	cargo clippy -- -D warnings
 	cargo test
 	cargo audit
 	cargo deny check
-	python3 scripts/verify-agent-tiers.py
+
+.PHONY: js-check
+js-check: ## Dev-only: type-check + test dashboard client JS (Node required)
+	npm ci --prefix assets && npm run --prefix assets check && npm test --prefix assets
 
 .PHONY: fmt
 fmt: ## Format all Rust code
@@ -46,11 +53,7 @@ fmt: ## Format all Rust code
 doctor: ## Environment diagnostics (read-only)
 	bash scripts/doctor.sh --fix-hints
 
-.PHONY: verify-agents
-verify-agents: ## Check the role-level routing contract
-	python3 scripts/verify-agent-tiers.py
-
-## --- fuzzing (L3) -----------------------------------------------------------
+## --- fuzzing ----------------------------------------------------------------
 ## Requires: rustup nightly + `cargo install cargo-fuzz`. Property tests run
 ## as part of `make test`; this runs a bounded libFuzzer campaign over the
 ## security-critical pure functions (esc, hmac+ct_eq, invoice parsing,
@@ -59,7 +62,7 @@ verify-agents: ## Check the role-level routing contract
 fuzz: ## Bounded fuzz campaign (FUZZ_SECS=45, sanitizer-free)
 	cargo +nightly fuzz run -s none fuzz_core -- -max_total_time=$(FUZZ_SECS) -rss_limit_mb=4096
 
-## --- distribution (L9) -----------------------------------------------------
+## --- distribution -----------------------------------------------------------
 .PHONY: icons
 icons: ## Regenerate app icons from DESIGN.md tokens
 	python3 scripts/gen_icons.py

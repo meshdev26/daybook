@@ -28,7 +28,7 @@ and the setup & management UX polish
 - One-time setup links: `/setup/claim` (15-minute, single-use, auto-login)
   replaces DM'd plaintext passwords for `/becomeseller` and `/dashboard`.
 - Revenue-by-asset analytics on the console Analytics page — per-asset rows
-  per the L5 ruling (cross-asset sum display removed).
+  per the finance ruling (cross-asset sum display removed).
 - Trust pack: `CHANGELOG.md` (Keep a Changelog) and `docs/RELEASING.md`
   release runbook; Cargo tracks milestones (`0.N.0` for milestone vN).
 - Owner money approvals in Telegram: `/refundapprove` and `/payoutapprove`
@@ -59,6 +59,9 @@ and the setup & management UX polish
 - MCP `publish_post`/`edit_post` accept an optional `parse_mode` (`"html"` 
   only): the send carries Telegram HTML entities; absent keeps the
   historical plain-text path with zero drift for scripted callers.
+
+### Removed
+- Removed the separate AI-agent workflow layer; AGENT.md is now the only agent instruction file.
 
 ### Changed
 - Setup and management UX polish (per
@@ -146,7 +149,7 @@ and the setup & management UX polish
   posting commands resolve to the seller's own channel only.
 - Security-headers middleware on every response (CSP, `nosniff`,
   frame-ancestors DENY, no-referrer, Permissions-Policy).
-- WCAG 2.1 AA floor in the console (release floor per `AUTO_ROUTE.md` §5):
+- WCAG 2.1 AA floor in the console (release floor):
   contrast tokens, skip link, labelled controls, visible focus, alert roles.
 - Output escaping applied across all new console surfaces (settings values, AI
   settings, dynamic rows) and client-side rendering in `assets/app.js`.
@@ -195,8 +198,7 @@ Untagged milestone wave (v1.3 / v1.3.x per `PLAN.md`); spans
 
 ### Fixed
 - CI runs the project gate (`make test`) on every push and pull request.
-- The agent charters the routing contract verifies are published, so the gate
-  passes on a clean checkout; clippy and rustfmt ship in the toolchain pin.
+- The checks pass on a clean checkout; clippy and rustfmt ship in the toolchain pin.
 - The patched teloxide fork is shipped in-tree, so the repo builds on any
   machine while keeping the RUSTSEC-2026-0173 subtree out of the lock.
 - Documented that a real environment variable wins over `.env` (systemd and
@@ -222,9 +224,8 @@ Initial public release (tag `v1.2.1`).
   installer with hardened systemd unit, Docker, subpath mounting
   (`WEB_BASE_PATH`), embeddable dashboard (`embed::AgentAppBuilder`),
   compile-time command registry for extensions.
-- Role-level architecture (L3–L11) machine-checked by
-  `scripts/verify-agent-tiers.py`; 94 tests including property invariants and
-  libFuzzer targets; WAL-safe `make backup`; `make doctor` diagnostics.
+- 94 tests including property invariants and libFuzzer targets; WAL-safe
+  `make backup`; `make doctor` diagnostics.
 
 ### Security
 - Same-day security floor (2026-10-25 review remediation): CSPRNG tokens with

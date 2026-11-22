@@ -39,6 +39,31 @@ const POST_ATTEMPT_CAP: i64 = 10;
 fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
     let attempts = db.bump_invoice_attempts(inv_id);
     if attempts >= VERIFY_ATTEMPT_CAP {
+        // §3.1: once the provider has verified `paid` the money is settled —
+        // terminal `failed` is illegal (it would strand a paid buyer and hide
+        // the liability). Refuse the transition and raise an audited alarm.
+        let status = db.get_invoice(inv_id).map(|i| i.2).unwrap_or_default();
+        if status == "paid" || status == "paid_ungranted" {
+            db.log_action(
+                0,
+                "system",
+                "invoice_failed_after_paid_blocked",
+                "invoice",
+                inv_id,
+                Some(&format!(
+                    "attempts={} reason={} status={}",
+                    attempts, reason, status
+                )),
+            );
+            tracing::error!(
+                "blocked terminal-failed transition on paid invoice {} (status {}, {} attempts, reason: {})",
+                inv_id,
+                status,
+                attempts,
+                reason
+            );
+            return attempts;
+        }
         db.update_invoice_status(inv_id, "failed");
         tracing::error!(
             "invoice {} failed terminally after {} verification attempts ({}); restore manually via the admin invoice-status API if needed",
@@ -58,7 +83,118 @@ fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
     attempts
 }
 
-/// Security headers on every response of the merged router (L10). All values
+/// §3.2: verification said `paid` but the exactly-once grant claim produced
+/// no subscription/product grant. Move the row to the non-terminal recovery
+/// state, stamp the clock once, and audit. Never call `finalize_invoice_paid`
+/// on this path — that would hide the ungranted liability.
+fn mark_paid_ungranted(db: &Db, inv_id: &str, seller_id: i64, reason: &str) {
+    if !db.mark_invoice_paid_ungranted(inv_id) {
+        return;
+    }
+    let inv = db.get_invoice(inv_id);
+    let meta = serde_json::json!({
+        "seller_id": seller_id,
+        "amount": inv.as_ref().map(|i| i.0.as_str()).unwrap_or("-"),
+        "asset": inv.as_ref().map(|i| i.1.as_str()).unwrap_or("-"),
+        "reason": reason,
+    })
+    .to_string();
+    db.log_action(
+        0,
+        "system",
+        "invoice_paid_ungranted",
+        "invoice",
+        inv_id,
+        Some(&meta),
+    );
+    tracing::warn!(
+        "invoice {} verified paid but not granted ({}); queued for 30s recovery",
+        inv_id,
+        reason
+    );
+}
+
+/// Best-effort owner DM from the primary bot. Send failures are logged (error
+/// text only — never message content or secrets) and never propagate into a
+/// money state transition.
+async fn dm_owner(bm: &bots::BotManager, owner_id: i64, text: String) {
+    if owner_id == 0 {
+        return;
+    }
+    let bot = bm.for_seller(0).bot.clone();
+    if let Err(e) = bot
+        .send_message(teloxide::types::ChatId(owner_id), text)
+        .await
+    {
+        tracing::warn!("money alert: failed to DM owner: {}", e);
+    }
+}
+
+/// Emit an audited BLOCKING owner alert at most once per money row. The audit
+/// is the durable "already alerted" marker, so a restart cannot re-spam.
+async fn alert_once(
+    db: &Db,
+    bm: &bots::BotManager,
+    owner_id: i64,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    text: String,
+) {
+    if crate::handlers::money::has_audit_action(db, action, target_type, target_id) {
+        return;
+    }
+    db.log_action(0, "system", action, target_type, target_id, None);
+    dm_owner(bm, owner_id, text).await;
+}
+
+/// §3.3 exactly-once grant claim replay for a `paid_ungranted` invoice.
+/// Returns true only when the durable grant (product_grant or subscription)
+/// exists for the invoice. No invite-link or DM side effects here — the
+/// claim row is the source of truth; the 24h/72h timers keep running from
+/// `paid_ungranted_at` regardless of retries.
+async fn retry_ungranted_grant(
+    db: &Db,
+    inv_id: &str,
+    seller_id: i64,
+    user_id: Option<i64>,
+) -> bool {
+    if let Some(pid) = db.invoice_product(inv_id) {
+        if db.product_grant_exists(inv_id) {
+            return true;
+        }
+        let Some(uid) = user_id.filter(|u| *u != 0) else {
+            return false;
+        };
+        return db.grant_product(seller_id, uid, pid, inv_id).is_ok();
+    }
+    if db.subscription_exists_for_invoice(inv_id) {
+        return true;
+    }
+    let Some(uid) = user_id.filter(|u| *u != 0) else {
+        return false;
+    };
+    let plan_name = db.get_invoice(inv_id).and_then(|i| i.4);
+    let plan_info = plan_name.as_ref().and_then(|pn| db.get_plan(seller_id, pn));
+    let days = plan_info
+        .as_ref()
+        .map(|p| p.4)
+        .unwrap_or(30)
+        .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+    let ch = plan_info
+        .as_ref()
+        .and_then(|p| p.5.clone())
+        .or_else(|| db.seller_channel(seller_id))
+        .or_else(|| db.get_config("channel"))
+        .unwrap_or_default();
+    if ch.is_empty() {
+        return false;
+    }
+    db.create_subscription(seller_id, uid, None, &ch, days, Some(inv_id), None);
+    db.subscription_exists_for_invoice(inv_id)
+}
+
+/// Security headers on every response of the merged router (security). All values
 /// are static, so `HeaderValue::from_static` is valid for each. Applied
 /// outside the request-timeout layer so aborted requests still carry them;
 /// the metrics layer stays outermost so those responses are still counted.
@@ -121,7 +257,7 @@ async fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    // Pin the metrics uptime gauge to process start (L8 observability).
+    // Pin the metrics uptime gauge to process start (server observability).
     metrics::note_process_start();
 
     let app_cfg = AppConfig::from_env();
@@ -252,8 +388,10 @@ async fn run() {
     let db = match Db::new(&cfg.db_path) {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            eprintln!("DB error: {}", e);
-            return;
+            tracing::error!("DB error: {e}; exiting so systemd can restart");
+            // Must be non-zero: a silent `return` left systemd's
+            // Restart=on-failure blind to a dead-on-arrival process.
+            std::process::exit(1);
         }
     };
 
@@ -524,12 +662,14 @@ async fn run() {
                             let target_user = uid.unwrap_or(0);
                             if target_user == 0 {
                                 // Verified paid but nobody bound to deliver to:
-                                // finalize so it stops re-queueing.
-                                tracing::info!(
-                                    "invoice {} paid but has no bound user; finalizing without product grant",
-                                    inv_id
+                                // this is exactly the §3.2 paid-but-ungranted
+                                // case; keep it recoverable, never finalize.
+                                mark_paid_ungranted(
+                                    &db_bg,
+                                    &inv_id,
+                                    inv_seller,
+                                    "paid product invoice has no bound user",
                                 );
-                                db_bg.finalize_invoice_paid(&inv_id);
                                 continue;
                             }
                             if !db_bg.product_grant_exists(&inv_id) {
@@ -541,6 +681,9 @@ async fn run() {
                                             &kind,
                                             &pname,
                                             delivery.as_deref(),
+                                            &db_bg,
+                                            inv_seller,
+                                            Some(this_id),
                                         )
                                         .await
                                         {
@@ -556,18 +699,25 @@ async fn run() {
                                     // the UNIQUE(invoice_id) race; nothing to do.
                                     Ok(false) => {}
                                     // e.g. out of stock: money settled, grant not —
-                                    // surface loudly and finalize so the invoice
-                                    // stops re-queueing (manual fulfillment).
+                                    // §3.2 paid-but-ungranted, kept recoverable.
                                     Err(e) => {
                                         tracing::warn!(
-                                            "invoice {}: product grant failed ({}); finalizing without delivery",
+                                            "invoice {}: product grant failed ({}); queuing for recovery",
                                             inv_id,
                                             e
                                         );
+                                        mark_paid_ungranted(
+                                            &db_bg,
+                                            &inv_id,
+                                            inv_seller,
+                                            "product grant failed",
+                                        );
+                                        continue;
                                     }
                                 }
                             }
-                            // Terminal: verified paid + grant attempted.
+                            // Terminal: verified paid + grant succeeded (or a
+                            // concurrent granter won the idempotency race).
                             db_bg.finalize_invoice_paid(&inv_id);
                             continue;
                         }
@@ -580,13 +730,14 @@ async fn run() {
                         // (e) Grant: subscription + single-use invite link + notice.
                         let target_user = uid.unwrap_or(0);
                         if target_user == 0 {
-                            // Verified paid but nobody is bound to grant to: finalize
-                            // so it stops re-queueing instead of spinning forever.
-                            tracing::info!(
-                                "invoice {} paid but has no bound user; finalizing without grant",
-                                inv_id
+                            // Verified paid but nobody bound to grant to:
+                            // §3.2 paid-but-ungranted, never terminal 'paid'.
+                            mark_paid_ungranted(
+                                &db_bg,
+                                &inv_id,
+                                inv_seller,
+                                "paid plan invoice has no bound user",
                             );
-                            db_bg.finalize_invoice_paid(&inv_id);
                             continue;
                         }
                         // Seller-scoped plan lookup: the invoice's plan is
@@ -609,24 +760,17 @@ async fn run() {
                             .or_else(|| db_bg.get_config("channel"))
                             .unwrap_or_default();
                         if ch.is_empty() {
-                            // Paid but not grantable yet: leave the claim so the
-                            // next cycle retries once a channel is configured.
-                            // Bounded retry: an unresolvable channel is a
-                            // misconfiguration, not a buyer-side condition.
-                            let attempts = bump_invoice_failure(
+                            // Verified paid but no channel to grant into: §3.2
+                            // paid-but-ungranted with a recoverable clock. Do
+                            // NOT age this to terminal 'failed' — the money
+                            // is settled; the recovery sweeper retries the
+                            // exactly-once grant once a channel exists.
+                            mark_paid_ungranted(
                                 &db_bg,
                                 &inv_id,
-                                &format!("no channel resolvable for seller {}", seller_id),
+                                seller_id,
+                                "no channel resolvable",
                             );
-                            if attempts < VERIFY_ATTEMPT_CAP {
-                                tracing::warn!(
-                                    "invoice {} paid but no channel resolvable for seller {}; leaving for retry (attempt {}/{})",
-                                    inv_id,
-                                    seller_id,
-                                    attempts,
-                                    VERIFY_ATTEMPT_CAP
-                                );
-                            }
                             continue;
                         }
                         let sub_id = db_bg.create_subscription(
@@ -651,45 +795,68 @@ async fn run() {
                             .ok()
                             .map(|l| l.invite_link);
                         match link {
-                        Some(l) => {
-                            match bot_bg
-                                .send_message(
-                                    teloxide::types::ChatId(target_user),
-                                    format!(
-                                        "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
-                                        l, sub_id
-                                    ),
+                            Some(l) => {
+                                let grant_text = format!(
+                                    "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
+                                    l, sub_id
+                                );
+                                // security outbound gate before this raw-Bot DM (the
+                                // grant itself is already durable and finalizes
+                                // below; only the notice is skipped while held).
+                                if crate::handlers::moderation::gate_outbound(
+                                    &db_bg,
+                                    seller_id,
+                                    Some(this_id),
+                                    &grant_text,
                                 )
-                                .await
-                            {
-                                Err(e) => tracing::warn!("failed to send grant message: {}", e),
-                                Ok(_) => metrics::bot_sent(),
+                                .is_ok()
+                                {
+                                    match bot_bg
+                                        .send_message(
+                                            teloxide::types::ChatId(target_user),
+                                            grant_text,
+                                        )
+                                        .await
+                                    {
+                                        Err(e) => {
+                                            tracing::warn!("failed to send grant message: {}", e)
+                                        }
+                                        Ok(_) => metrics::bot_sent(),
+                                    }
+                                }
+                            }
+                            None => {
+                                // Money settled and the subscription row exists,
+                                // but no invite link could be created: still
+                                // finalize (the grant is durable), then tell the
+                                // buyer honestly — never leave them waiting on a
+                                // link that will not come. DM failures are logged,
+                                // never propagated: the sweeper/granter must not
+                                // die on a send error.
+                                let notice = "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.";
+                                // security outbound gate before this raw-Bot DM.
+                                if crate::handlers::moderation::gate_outbound(
+                                    &db_bg,
+                                    seller_id,
+                                    Some(this_id),
+                                    notice,
+                                )
+                                .is_ok()
+                                {
+                                    match bot_bg
+                                        .send_message(teloxide::types::ChatId(target_user), notice)
+                                        .await
+                                    {
+                                        Err(e) => tracing::warn!(
+                                            "invoice {}: granted without invite link and buyer notice failed: {}",
+                                            inv_id,
+                                            e
+                                        ),
+                                        Ok(_) => metrics::bot_sent(),
+                                    }
+                                }
                             }
                         }
-                        None => {
-                            // Money settled and the subscription row exists,
-                            // but no invite link could be created: still
-                            // finalize (the grant is durable), then tell the
-                            // buyer honestly — never leave them waiting on a
-                            // link that will not come. DM failures are logged,
-                            // never propagated: the sweeper/granter must not
-                            // die on a send error.
-                            match bot_bg
-                                .send_message(
-                                    teloxide::types::ChatId(target_user),
-                                    "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.",
-                                )
-                                .await
-                            {
-                                Err(e) => tracing::warn!(
-                                    "invoice {}: granted without invite link and buyer notice failed: {}",
-                                    inv_id,
-                                    e
-                                ),
-                                Ok(_) => metrics::bot_sent(),
-                            }
-                        }
-                    }
                         // (f) Terminal: verified paid + granted.
                         db_bg.finalize_invoice_paid(&inv_id);
                     }
@@ -726,6 +893,21 @@ async fn run() {
                     // a channel owned by another bot.
                     let bot_ctx = bm_bg.for_channel(&chat_id);
                     let bot = bot_ctx.bot.clone();
+                    // security outbound gate before this raw-Bot scheduled send.
+                    // Seller scope is the row's own seller (owner-scheduled
+                    // posts carry 0 → global floor). A held post stays due so
+                    // a later policy change can release it; the gate already
+                    // wrote an opaque audit row and a scoped warn log.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        seller_id,
+                        Some(bot_ctx.id),
+                        &text,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
                     match bot
                         .send_message(util::to_chat_id(&chat_id), text.clone())
                         .await
@@ -741,7 +923,7 @@ async fn run() {
                                 "bot",
                             );
                             tracing::info!("scheduled post {} posted", id);
-                            // Metrics hook only (L8): bot_messages_sent_total.
+                            // Metrics hook only (server): bot_messages_sent_total.
                             metrics::bot_sent();
                         }
                         Err(e) => {
@@ -789,23 +971,34 @@ async fn run() {
                 tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
                 let expired = expire_subscriptions(&bm_bg, &db_bg).await;
                 for (_sub_id, seller_id, uid, channel) in &expired {
-                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
-                    match bot
-                        .send_message(
-                            teloxide::types::ChatId(*uid),
-                            format!(
-                                "Your access to {channel} has expired. To renew, use /plans or contact the seller."
-                            ),
-                        )
-                        .await
+                    let bot_ctx = bm_bg.for_seller(*seller_id);
+                    let bot = bot_ctx.bot.clone();
+                    let notice = format!(
+                        "Your access to {channel} has expired. To renew, use /plans or contact the seller."
+                    );
+                    // security outbound gate before this raw-Bot DM. The expiry
+                    // transition is already durable; only the notice is
+                    // skipped while held.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        *seller_id,
+                        Some(bot_ctx.id),
+                        &notice,
+                    )
+                    .is_ok()
                     {
-                        Ok(_) => metrics::bot_sent(),
-                        Err(e) => tracing::warn!(
-                            "expiry sweeper: failed to DM user {} about expired access to {}: {}",
-                            uid,
-                            channel,
-                            e
-                        ),
+                        match bot
+                            .send_message(teloxide::types::ChatId(*uid), notice)
+                            .await
+                        {
+                            Ok(_) => metrics::bot_sent(),
+                            Err(e) => tracing::warn!(
+                                "expiry sweeper: failed to DM user {} about expired access to {}: {}",
+                                uid,
+                                channel,
+                                e
+                            ),
+                        }
                     }
                 }
                 if !expired.is_empty() {
@@ -830,27 +1023,261 @@ async fn run() {
                 tokio::time::sleep(Duration::from_secs(5 * 60)).await;
                 let expired = db_bg.expire_held_bookings();
                 for (booking_id, buyer, service, seller_id) in &expired {
-                    let bot = bm_bg.for_seller(*seller_id).bot.clone();
-                    match bot
-                        .send_message(
-                            teloxide::types::ChatId(*buyer),
-                            format!(
-                                "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
-                            ),
-                        )
-                        .await
+                    let bot_ctx = bm_bg.for_seller(*seller_id);
+                    let bot = bot_ctx.bot.clone();
+                    let notice = format!(
+                        "Booking #{booking_id} ({service}) expired — the seller didn't respond in time, so the slot was released.\nYou can book again: /book {service}"
+                    );
+                    // security outbound gate before this raw-Bot DM. The hold
+                    // release is already durable; only the notice is skipped
+                    // while held.
+                    if crate::handlers::moderation::gate_outbound(
+                        &db_bg,
+                        *seller_id,
+                        Some(bot_ctx.id),
+                        &notice,
+                    )
+                    .is_ok()
                     {
-                        Ok(_) => metrics::bot_sent(),
-                        Err(e) => tracing::warn!(
-                            "held-slot sweeper: failed to DM buyer {} about expired booking #{}: {}",
-                            buyer,
-                            booking_id,
-                            e
-                        ),
+                        match bot
+                            .send_message(teloxide::types::ChatId(*buyer), notice)
+                            .await
+                        {
+                            Ok(_) => metrics::bot_sent(),
+                            Err(e) => tracing::warn!(
+                                "held-slot sweeper: failed to DM buyer {} about expired booking #{}: {}",
+                                buyer,
+                                booking_id,
+                                e
+                            ),
+                        }
                     }
                 }
                 if !expired.is_empty() {
                     tracing::info!("held-slot sweeper expired {} bookings", expired.len());
+                }
+            }
+        });
+    }
+    // §3 paid-but-ungranted recovery. One 30s loop drives the injected-clock
+    // timeline: 30s exactly-once grant retry, 24h system auto-refund + owner
+    // and buyer alerts, 72h BLOCKING owner escalation / payout hold. A paid
+    // invoice is NEVER moved to terminal 'failed' here. All timers are
+    // internal operational targets, not customer SLAs (G7).
+    {
+        let bm_bg = bot_manager.clone();
+        let db_bg = db.clone();
+        let owner_id = cfg.owner_id;
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                tokio::time::sleep(Duration::from_secs(
+                    telegram_agent::db::PAID_UNGRANTED_RETRY_SECONDS as u64,
+                ))
+                .await;
+                let now = chrono::Utc::now();
+                let retry_cutoff = handlers::money::paid_ungranted_retry_cutoff(now);
+                let auto_cutoff = handlers::money::paid_ungranted_auto_refund_cutoff(now);
+                let escalation_cutoff = handlers::money::paid_ungranted_escalation_cutoff(now);
+                let due = db_bg.paid_ungranted_before(&retry_cutoff);
+                for (inv_id, seller_id, amount, asset, since) in due {
+                    // 72h: blocking escalation, emitted once per invoice.
+                    if since <= escalation_cutoff
+                        && db_bg
+                            .unresolved_ungranted_invoices(seller_id, &escalation_cutoff)
+                            .iter()
+                            .any(|id| id == &inv_id)
+                    {
+                        alert_once(
+                            &db_bg,
+                            &bm_bg,
+                            owner_id,
+                            "invoice_ungranted_escalation",
+                            "invoice",
+                            &inv_id,
+                            format!(
+                                "BLOCKING: invoice {inv_id} (seller {seller_id}, {amount} {asset}) is still ungranted past 72h with no executed refund. New payouts for this seller are held."
+                            ),
+                        )
+                        .await;
+                    }
+                    // 24h: a system refund suppresses any further grant retry
+                    // and stays subject to the owner-only approval flow.
+                    if since <= auto_cutoff {
+                        let idem = format!("auto:ungranted:{inv_id}");
+                        let created =
+                            db_bg.create_refund_guarded(telegram_agent::db::RefundInput {
+                                seller_id,
+                                invoice_id: Some(&inv_id),
+                                user_id: None,
+                                amount: &amount,
+                                asset: &asset,
+                                reason: Some(
+                                    "automatic refund: invoice paid but ungranted for 24h",
+                                ),
+                                idem_key: &idem,
+                                created_by: -1,
+                                created_role: "system",
+                            });
+                        match created {
+                            Ok(c) if c.created_new => {
+                                let meta = serde_json::json!({
+                                    "seller_id": seller_id, "amount": amount,
+                                    "asset": asset, "idem_key": idem,
+                                })
+                                .to_string();
+                                db_bg.log_action(
+                                    -1,
+                                    "system",
+                                    "invoice_ungranted_refund_queued",
+                                    "invoice",
+                                    &inv_id,
+                                    Some(&meta),
+                                );
+                                tracing::warn!(
+                                    "invoice {} ungranted past 24h: auto-refund #{} queued",
+                                    inv_id,
+                                    c.id
+                                );
+                                alert_once(
+                                    &db_bg,
+                                    &bm_bg,
+                                    owner_id,
+                                    "invoice_ungranted_refund_owner_notice",
+                                    "invoice",
+                                    &inv_id,
+                                    format!(
+                                        "Invoice {inv_id} ({amount} {asset}) paid but ungranted for 24h: refund #{} queued — approve in Finance.",
+                                        c.id
+                                    ),
+                                )
+                                .await;
+                                // Buyer gets a "queued" notice only; "sent"
+                                // comes after the owner executes the refund.
+                                if let Some(uid) = db_bg.get_invoice(&inv_id).and_then(|i| i.5) {
+                                    let bot_ctx = bm_bg.for_seller(seller_id);
+                                    let notice = format!(
+                                        "Your payment for invoice {inv_id} is being refunded ({amount} {asset})."
+                                    );
+                                    if handlers::moderation::gate_outbound(
+                                        &db_bg,
+                                        seller_id,
+                                        Some(bot_ctx.id),
+                                        &notice,
+                                    )
+                                    .is_ok()
+                                    {
+                                        let _ = bot_ctx
+                                            .bot
+                                            .send_message(teloxide::types::ChatId(uid), notice)
+                                            .await;
+                                    }
+                                }
+                            }
+                            // Replayed key or a manual refund already in
+                            // flight: suppressed, no second money event.
+                            Ok(_) | Err(telegram_agent::db::RefundCreateError::InFlight) => {}
+                            Err(e) => tracing::warn!(
+                                "invoice {}: auto-refund could not be queued: {:?}",
+                                inv_id,
+                                e
+                            ),
+                        }
+                        continue;
+                    }
+                    // 30s: replay the exactly-once grant claim. Each attempt is
+                    // audited; success returns the row to 'paid' and stops the
+                    // job for that invoice. The 24h clock is never reset.
+                    let user_id = db_bg.get_invoice(&inv_id).and_then(|i| i.5);
+                    let granted = retry_ungranted_grant(&db_bg, &inv_id, seller_id, user_id).await;
+                    if granted && db_bg.finalize_invoice_grant_retry(&inv_id) {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "invoice_grant_retry",
+                            "invoice",
+                            &inv_id,
+                            Some("outcome=granted"),
+                        );
+                        tracing::info!("invoice {} grant retry succeeded", inv_id);
+                    } else {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "invoice_grant_retry",
+                            "invoice",
+                            &inv_id,
+                            Some("outcome=no_grant"),
+                        );
+                    }
+                }
+            }
+        });
+    }
+    // §5 executing-row state machine + 09:00 UTC owner digest. The same
+    // injectable-clock cutoffs drive the 30min transition and the 24h overdue
+    // alert; no transfer is attempted and no state is guessed by this job.
+    {
+        let db_bg = db.clone();
+        let bm_bg = bot_manager.clone();
+        let owner_id = cfg.owner_id;
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let now = chrono::Utc::now();
+                let (due, overdue) = handlers::money::reconciliation_cutoffs(now);
+                let rows = db_bg.reconciliation_rows(&due, &overdue);
+                for r in &rows {
+                    if r.status == "executing"
+                        && db_bg.mark_needs_reconciliation(&r.row_type, r.id, &due)
+                    {
+                        db_bg.log_action(
+                            0,
+                            "system",
+                            "transfer_reconciliation_due",
+                            &r.row_type,
+                            r.id,
+                            Some(&format!(
+                                "spend_id={}",
+                                r.spend_id.as_deref().unwrap_or("-")
+                            )),
+                        );
+                    }
+                    if r.overdue {
+                        alert_once(
+                            &db_bg,
+                            &bm_bg,
+                            owner_id,
+                            "transfer_reconciliation_overdue",
+                            &r.row_type,
+                            &r.id.to_string(),
+                            format!(
+                                "BLOCKING: {} #{} ({} {}) is past the 24h owner-decision deadline. Resolve it in Finance.",
+                                r.row_type, r.id, r.amount, r.asset
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                if handlers::money::should_run_digest(now) {
+                    let rows = handlers::money::all_reconciliation_rows(&db_bg, &due, &overdue);
+                    let hash = handlers::money::digest_row_ids_hash(&rows);
+                    let text = handlers::money::format_digest(&rows, now);
+                    let meta = serde_json::json!({
+                        "row_count": rows.len(), "hash": hash,
+                        "overdue": rows.iter().filter(|r| r.overdue).count(),
+                    })
+                    .to_string();
+                    db_bg.log_action(
+                        0,
+                        "system",
+                        "transfer_reconciliation_digest",
+                        "reconciliation",
+                        "digest",
+                        Some(&meta),
+                    );
+                    dm_owner(&bm_bg, owner_id, text).await;
                 }
             }
         });
@@ -898,6 +1325,119 @@ async fn run() {
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
+                // Multibot capability gate (server). The receiving bot's `bot_type`
+                // selects its command set / inbound handler. Only `shop_bot`
+                // (the default) falls through to the unchanged built-in tree
+                // below, so the default build's paths stay byte-identical.
+                // Every other type is intercepted here: an uncompiled or
+                // unknown type gets an explicit, logged refusal; a compiled
+                // vertical stub gets an explicit notice. Never a silent drop.
+                .branch(
+                    dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
+                        !cap.is_legacy_shop()
+                    })
+                    .endpoint(
+                        |bot: Bot,
+                         msg: Message,
+                         cap: Arc<handlers::capabilities::BotCapability>| {
+                            async move {
+                                handlers::capabilities::refuse_message(
+                                    &bot,
+                                    msg.chat.id,
+                                    &cap,
+                                    "message",
+                                )
+                                .await
+                            }
+                        },
+                    ),
+                )
+                // End-user appeal reason collection (multibot foundation
+                // Step 4.4, server). This branch runs BEFORE the inbound
+                // moderation gate so the buyer's short reason is not itself
+                // held by a blocked term. Reachable only from the single
+                // "Request review" callback, which stores the decision's
+                // ORIGINAL opaque reference in the dialogue — never the held
+                // text. No state fields are bound with dptree::case! (see
+                // AGENT.md startup-panic decision log).
+                .branch(
+                    dptree::entry()
+                        .enter_dialogue::<Message, ErasedStorage<State>, State>()
+                        .filter(|state: State| {
+                            matches!(state, State::AwaitingAppealReason { .. })
+                        })
+                        .endpoint(
+                            move |bot: Bot,
+                                  msg: Message,
+                                  dialogue: Dialogue<State, ErasedStorage<State>>,
+                                  bot_ctx: Arc<bots::BotContext>| async move {
+                                handlers::messages::awaiting_appeal_reason_handler(
+                                    bot, msg, dialogue, bot_ctx,
+                                )
+                                .await
+                            },
+                        ),
+                )
+                // Cross-cutting inbound moderation gate (multibot foundation
+                // Step 4.2). Runs for every message BEFORE dialogue entry or
+                // command/text routing, so a hidden/review/degraded message
+                // never reaches a handler. `evaluate_inbound_detailed` reads
+                // only the effective policy, appends one opaque audit row,
+                // and fails closed to a hold when enforcement is degraded.
+                // Pass/warn fall through unchanged (warn is recorded, not
+                // surfaced here — the warning UX stays deferred). For a
+                // blocking verdict the buyer gets ONE content-free notice with
+                // a "Request review" button carrying the SAME opaque reference
+                // from the audit row.
+                .branch(
+                    dptree::filter_map(
+                        |msg: Message, bot_ctx: Arc<bots::BotContext>| {
+                            let text = msg
+                                .text()
+                                .or_else(|| msg.caption())
+                                .unwrap_or_default()
+                                .to_string();
+                            let sender = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+                            let seller_id = handlers::moderation::inbound_seller_scope(
+                                &bot_ctx.db,
+                                bot_ctx.id,
+                                sender,
+                            );
+                            let evaluation = handlers::moderation::evaluate_inbound_detailed(
+                                &bot_ctx.db,
+                                seller_id,
+                                Some(bot_ctx.id),
+                                &text,
+                            );
+                            evaluation
+                                .mode
+                                .blocks_inbound_routing()
+                                .then_some((seller_id, evaluation))
+                        },
+                    )
+                    .endpoint(
+                        move |bot: Bot,
+                              msg: Message,
+                              bot_ctx: Arc<bots::BotContext>,
+                              gated: (i64, handlers::moderation::ModerationEvaluation)| async move {
+                            let (seller_id, evaluation) = gated;
+                            let offer = handlers::moderation::AppealOffer {
+                                seller_id,
+                                bot_id: bot_ctx.id,
+                                message_ref: evaluation.message_ref,
+                                decision_id: evaluation.decision_id,
+                            };
+                            let _ = handlers::moderation::send_appeal_offer(
+                                &bot,
+                                &bot_ctx.db,
+                                msg.chat.id,
+                                &offer,
+                            )
+                            .await;
+                            Ok(()) as HandlerResult
+                        },
+                    ),
+                )
                 .enter_dialogue::<Message, ErasedStorage<State>, State>()
                 .branch(
                     dptree::case![State::Idle]
@@ -1036,6 +1576,23 @@ async fn run() {
         )
         .branch(
             Update::filter_callback_query()
+                // Same gate as the message path: answer the callback with an
+                // explicit notice so no inline press is silently dropped.
+                .branch(
+                    dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
+                        !cap.is_legacy_shop()
+                    })
+                    .endpoint(
+                        |bot: Bot,
+                         q: CallbackQuery,
+                         cap: Arc<handlers::capabilities::BotCapability>| {
+                            async move {
+                                handlers::capabilities::refuse_callback(&bot, &q, &cap, "callback")
+                                    .await
+                            }
+                        },
+                    ),
+                )
                 .enter_dialogue::<CallbackQuery, ErasedStorage<State>, State>()
                 .branch(dptree::endpoint(
                     move |bot: Bot,
@@ -1066,12 +1623,12 @@ async fn run() {
         web_router
             .merge(api_router)
             .merge(mcp::router(web_state))
-            // 30s request ceiling for the whole control plane (L8). The bot
+            // 30s request ceiling for the whole control plane (server). The bot
             // long-poll never passes through axum and the cryptopay webhook
             // is two DB writes, so nothing legitimate needs longer (see
             // web::REQUEST_TIMEOUT).
             .layer(axum::middleware::from_fn(web::request_timeout))
-            // Security headers on every response (L10): outside the timeout
+            // Security headers on every response (security): outside the timeout
             // layer so aborted requests still carry them; metrics below stays
             // outermost so those responses are still counted.
             .layer(axum::middleware::from_fn(security_headers))
@@ -1085,8 +1642,12 @@ async fn run() {
     let listener = match tokio::net::TcpListener::bind(format!("{web_bind}:{web_port}")).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("failed to bind {web_bind}:{web_port}: {e}");
-            return;
+            tracing::error!(
+                "failed to bind {web_bind}:{web_port}: {e}; exiting so systemd can restart"
+            );
+            // Non-zero: a bind failure must trigger Restart=on-failure, not
+            // leave a half-dead process that answers no requests.
+            std::process::exit(1);
         }
     };
     tracing::info!(
@@ -1106,6 +1667,9 @@ async fn run() {
         let mut tasks = Vec::new();
         let mut first = true;
         for ctx in bot_contexts.clone() {
+            // One capability selection per dispatcher: this dispatcher only
+            // ever serves `ctx`, so the gate sees the receiving bot's type.
+            let capability = Arc::new(bot_manager.capability_for_bot(ctx.id));
             let mut builder = Dispatcher::builder(ctx.bot.clone(), handler.clone()).dependencies(
                 // `bot_manager` is injected (not captured per
                 // endpoint) so per-seller moderation such as
@@ -1116,7 +1680,8 @@ async fn run() {
                     ctx.clone(),
                     ctx.owner_id,
                     registry.clone(),
-                    bot_manager.clone()
+                    bot_manager.clone(),
+                    capability
                 ],
             );
             if first {
@@ -1170,16 +1735,53 @@ async fn run() {
     // ConnectInfo<SocketAddr> so codeless claiming works only from loopback —
     // without the make-service wrapper axum cannot see peer addresses.
     let web_task = tokio::spawn(async move {
-        axum::serve(
+        match axum::serve(
             listener,
             web_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
-        .unwrap()
+        {
+            Ok(()) => tracing::info!("web server stopped"),
+            Err(e) => {
+                // Previously `.unwrap()` aborted the task with a panic that
+                // nothing surfaced as a failed process. Fail loudly instead.
+                tracing::error!("web server failed: {e}; exiting non-zero");
+                std::process::exit(1);
+            }
+        }
     });
 
+    // Shutdown must be reachable from `systemctl stop`, not just an interactive
+    // Ctrl-C. SIGTERM takes the SAME graceful path below (WAL checkpoint +
+    // teardown); without this arm systemd waits for its kill timeout and
+    // SIGKILLs the process, leaving an uncheckpointed database.
+    #[cfg(unix)]
+    let shutdown = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { tracing::info!("shutdown signal received"); }
+            _ = async {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        sigterm.recv().await;
+                        tracing::info!("SIGTERM received");
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to install SIGTERM handler: {e}");
+                        // Never let a missing handler turn into a busy loop.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {}
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+    };
+
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => { tracing::info!("shutdown signal received"); }
+        _ = shutdown => {}
         _ = async {
             match bot_task {
                 Some(t) => { let _ = t.await; }

@@ -14,6 +14,7 @@ use teloxide::{Bot, prelude::*};
 use tower_http::services::ServeDir;
 
 use crate::identity::{IdentityError, IdentityState, IdentityStatus, NormalizedMessage};
+use crate::roles::Role;
 use crate::{config::Config, db::Db, util::ct_eq};
 
 // Re-export auth helpers moved to `crate::auth` so existing
@@ -46,6 +47,8 @@ mod html;
 mod identity;
 mod keys_setup;
 mod mfa_users;
+#[cfg(feature = "moderation")]
+mod moderation;
 mod monitor;
 mod promos;
 mod referrals;
@@ -93,6 +96,8 @@ use html::*;
 use identity::*;
 use keys_setup::*;
 use mfa_users::*;
+#[cfg(feature = "moderation")]
+use moderation::*;
 use monitor::*;
 use promos::*;
 use referrals::*;
@@ -211,6 +216,10 @@ pub fn router(state: WebState) -> Router {
     let r = routes_admin(r);
     let r = routes_mfa_posts(r);
     let r = routes_identity_bots(r);
+    // Moderation capability pages register only when compiled in. No existing
+    // route is renamed or moved; the default build keeps every prior path.
+    #[cfg(feature = "moderation")]
+    let r = routes_moderation(r);
     let r = r
         .nest_service("/static", ServeDir::new("static"))
         .fallback(not_found);
@@ -329,6 +338,10 @@ fn routes_finance(r: Router<WebState>) -> Router<WebState> {
         .route("/finance/refund/create", post(finance_refund_create))
         .route("/finance/refund/approve", post(finance_refund_approve))
         .route("/finance/refund/execute", post(finance_refund_execute))
+        .route(
+            "/finance/reconciliation/resolve",
+            post(finance_reconciliation_resolve),
+        )
         .route("/broadcast", get(broadcast_page))
         .route("/broadcast/send", post(broadcast_send))
         .route("/crypto", get(crypto_page))
@@ -403,6 +416,33 @@ fn routes_identity_bots(r: Router<WebState>) -> Router<WebState> {
         .route("/bots/{id}/delete", post(bots_delete))
 }
 
+/// Moderation capability routes (IA amendment §4/§5). Registered only when
+/// the `moderation` feature is compiled in; all writes go through `Db`
+/// methods that bind `seller_id` (and `bot_id` for per-bot overrides).
+#[cfg(feature = "moderation")]
+fn routes_moderation(r: Router<WebState>) -> Router<WebState> {
+    r.route("/content-policy", get(content_policy_page))
+        .route("/content-policy/add", post(content_policy_add))
+        .route("/content-policy/remove", post(content_policy_remove))
+        .route("/blocked-words", get(blocked_words_page))
+        .route("/blocked-words/add", post(blocked_words_add))
+        .route("/blocked-words/mode", post(blocked_words_set_mode))
+        .route("/blocked-words/remove", post(blocked_words_remove))
+        .route("/blocked-words/allow", post(blocked_words_allow))
+        .route(
+            "/blocked-words/allow/remove",
+            post(blocked_words_allow_remove),
+        )
+        .route(
+            "/blocked-words/appeal/status",
+            post(blocked_words_appeal_status),
+        )
+        .route("/bots/{id}/moderation/inherit", post(bot_override_inherit))
+        .route("/bots/{id}/moderation/add", post(bot_override_add))
+        .route("/bots/{id}/moderation/mode", post(bot_override_set_mode))
+        .route("/bots/{id}/moderation/remove", post(bot_override_remove))
+}
+
 /// Mount `router` under a base path. An empty base returns the router
 /// unchanged — `Router::nest("")` panics, so the guard is load-bearing.
 /// `base + "/"` (trailing slash) is redirected to `base`: axum's nest maps
@@ -418,7 +458,7 @@ pub fn mount(base: &str, router: Router) -> Router {
         .route(&trailing, get(move || async move { Redirect::to(&target) }))
 }
 
-// ---- Request timeout (control-plane hardening, L8; zero new deps) ----
+// ---- Request timeout (control-plane hardening, server; zero new deps) ----
 
 /// Production ceiling for any request on the merged router. Generous by
 /// design: dashboard/API/MCP handlers do SQLite writes and awaited Telegram
@@ -462,13 +502,13 @@ const SECRET_TOGGLE: &str = r#"<button type="button" class="secret-toggle" aria-
 
 /// Resolve the effective bot context for a web session.
 pub fn effective_bot(state: &WebState, session: &Session) -> Arc<crate::bots::BotContext> {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             return state.bots.for_seller(sid);
         }
         return state.bots.primary.clone();
     }
-    if session.role == "admin" {
+    if Role::from_role_str(&session.role) == Role::Admin {
         if let Some(bid) = state.db.get_admin_bot_id(session.account_id)
             && let Some(ctx) = state.bots.get(bid)
         {
@@ -490,7 +530,7 @@ pub fn effective_bot(state: &WebState, session: &Session) -> Arc<crate::bots::Bo
 /// selected bot and only rows owned by those sellers are in scope. Sellers
 /// and admins never reach this — their queries are already seller-scoped.
 fn bot_scope_sellers(state: &WebState, session: &Session) -> Option<Vec<i64>> {
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return None;
     }
     session
@@ -511,77 +551,205 @@ fn bot_display_name(b: &crate::db::BotRecord) -> &str {
     if b.name.is_empty() { &b.key } else { &b.name }
 }
 
-/// Bot scope control for the console shell: a real form (select + submit)
-/// for the global owner — `onchange` submit is progressive enhancement and
-/// the button keeps it working without JS — and a pinned, plain-text label
-/// for roles that cannot switch (their bot is resolved server-side).
-fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
-    let Some(s) = session else {
-        return String::new();
-    };
-    if s.role == "seller" || s.role == "admin" {
-        let ctx = effective_bot(state, s);
-        return format!(
-            r#"<div class="bot-scope bot-scope-pinned" aria-label="Active bot"><span class="help">Bot</span><span class="mono">{}</span></div>"#,
-            esc(&ctx.key)
-        );
+/// The product-type metadata values the IA amendment knows about, paired
+/// with their plain-language `<optgroup>` / facet labels. The **compiled-in**
+/// subset is derived from Cargo features; every enabled product still renders
+/// in the Product select grouped by its stored type even when that type's
+/// capability was not compiled in (the picker never hides a real product).
+const ALL_PRODUCT_TYPES: &[(&str, &str)] = &[
+    ("shop_bot", "Shop bots"),
+    ("movie_bot", "Movie bots"),
+    ("reply_bot", "Reply bots"),
+    ("web_app", "Web apps"),
+    ("service", "Services"),
+    ("file_share", "File sharing"),
+    ("automation", "Automation"),
+];
+
+/// Compile-time capability check shared by the nav projection and the type
+/// facet. An unknown name is never enabled (fail closed), so a typo in a nav
+/// row can never surface a capability that was not compiled in.
+fn capability_enabled(feature: &str) -> bool {
+    match feature {
+        "shop_bot" => cfg!(feature = "shop_bot"),
+        "moderation" => cfg!(feature = "moderation"),
+        "movie_bot" => cfg!(feature = "movie_bot"),
+        "reply_bot" => cfg!(feature = "reply_bot"),
+        "web_app" => cfg!(feature = "web_app"),
+        "service" => cfg!(feature = "service"),
+        "file_share" => cfg!(feature = "file_share"),
+        "automation" => cfg!(feature = "automation"),
+        _ => false,
     }
-    if s.role != "owner" {
-        return String::new();
-    }
-    let bots = state.db.list_bots_enabled();
-    let mut options = r#"<option value=""{sel0}>All bots (primary)</option>"#.to_string();
-    if s.selected_bot_id.is_none() {
-        options = options.replace("{sel0}", " selected");
-    } else {
-        options = options.replace("{sel0}", "");
-    }
-    for b in &bots {
-        options.push_str(&format!(
-            r#"<option value="{}"{}>{}{}</option>"#,
-            b.id,
-            if s.selected_bot_id == Some(b.id) {
+}
+
+/// Product types available to the type facet / config dropdowns in this
+/// build. A movie-only install lists only movie bots; the default build
+/// lists the shop bot it compiles. Data-layer values outside this list are
+/// still rendered (see `product_type_label`) so existing config is editable.
+fn compiled_product_types() -> Vec<&'static (&'static str, &'static str)> {
+    ALL_PRODUCT_TYPES
+        .iter()
+        .filter(|(value, _)| capability_enabled(value))
+        .collect()
+}
+
+/// Plain-language group label for a stored product type. Unknown values get
+/// a neutral bucket rather than leaking a raw metadata slug into the UI.
+fn product_type_label(value: &str) -> &'static str {
+    ALL_PRODUCT_TYPES
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, label)| *label)
+        .unwrap_or("Other products")
+}
+
+/// `<option>` list for a product-type `<select>`, offering the compiled-in
+/// types plus the row's current value so a stored type from a config file is
+/// never silently rewritten on save.
+fn product_type_options(current: Option<&str>) -> String {
+    let mut out = String::new();
+    for (value, label) in compiled_product_types() {
+        out.push_str(&format!(
+            r#"<option value="{}"{}>{}</option>"#,
+            esc(value),
+            if current == Some(*value) {
                 " selected"
             } else {
                 ""
             },
-            esc(bot_display_name(b)),
-            b.username
-                .as_deref()
-                .map(|u| format!(" · {}", esc(u)))
-                .unwrap_or_default()
+            esc(label)
         ));
     }
+    if let Some(cur) = current
+        && !cur.is_empty()
+        && !compiled_product_types().iter().any(|(v, _)| *v == cur)
+    {
+        out.push_str(&format!(
+            r#"<option value="{}" selected>{}</option>"#,
+            esc(cur),
+            esc(product_type_label(cur))
+        ));
+    }
+    out
+}
+
+/// Product scope control for the console shell (IA amendment §3.4).
+///
+/// - Owner: a Product `<select>` with `<optgroup>` grouping by type, a
+///   client-side Type facet, and a visible Switch button. `onchange` submit
+///   is progressive enhancement; the button keeps keyboard/no-JS working.
+/// - Seller/admin: a pinned plain-text label (`aria-label="Active product"`).
+/// - Buyer/pre-auth: absent.
+///
+/// "All products" (`value=""`) keeps the byte-identical widening semantics
+/// of "All bots (primary)" — no selection means the unscoped global view.
+fn bot_scope_control(state: &WebState, session: Option<&Session>) -> String {
+    let Some(s) = session else {
+        return String::new();
+    };
+    let s_role = Role::from_role_str(&s.role);
+    if s_role == Role::Seller || s_role == Role::Admin {
+        let ctx = effective_bot(state, s);
+        return format!(
+            r#"<div class="bot-scope bot-scope-pinned" aria-label="Active product"><span class="help">Product</span><span class="mono">{}</span></div>"#,
+            esc(&ctx.key)
+        );
+    }
+    if !Role::from_role_str(&s.role).has_level(Role::Owner) {
+        return String::new();
+    }
+    let bots = state.db.list_bots_enabled();
+    // Group options by their stored type label. Iteration stays in bot id
+    // order within each group; the group order follows ALL_PRODUCT_TYPES so
+    // the facet and the optgroups read in the same sequence.
+    let mut product_options = String::from(r#"<option value="">All products</option>"#);
+    for (value, label) in ALL_PRODUCT_TYPES {
+        let group: Vec<&crate::db::BotRecord> =
+            bots.iter().filter(|b| b.bot_type == *value).collect();
+        if group.is_empty() {
+            continue;
+        }
+        product_options.push_str(&format!(r#"<optgroup label="{}">"#, esc(label)));
+        for b in group {
+            product_options.push_str(&format!(
+                r#"<option value="{}" data-type="{}"{}>{}{}</option>"#,
+                b.id,
+                esc(&b.bot_type),
+                if s.selected_bot_id == Some(b.id) {
+                    " selected"
+                } else {
+                    ""
+                },
+                esc(bot_display_name(b)),
+                b.username
+                    .as_deref()
+                    .map(|u| format!(" · {}", esc(u)))
+                    .unwrap_or_default()
+            ));
+        }
+        product_options.push_str("</optgroup>");
+    }
+    // A stored type outside ALL_PRODUCT_TYPES still gets a group so no
+    // enabled product disappears from the picker.
+    let mut leftover: Vec<&crate::db::BotRecord> = bots
+        .iter()
+        .filter(|b| !ALL_PRODUCT_TYPES.iter().any(|(v, _)| *v == b.bot_type))
+        .collect();
+    if !leftover.is_empty() {
+        leftover.sort_by_key(|b| b.id);
+        product_options.push_str(r#"<optgroup label="Other products">"#);
+        for b in leftover {
+            product_options.push_str(&format!(
+                r#"<option value="{}" data-type="{}"{}>{}{}</option>"#,
+                b.id,
+                esc(&b.bot_type),
+                if s.selected_bot_id == Some(b.id) {
+                    " selected"
+                } else {
+                    ""
+                },
+                esc(bot_display_name(b)),
+                b.username
+                    .as_deref()
+                    .map(|u| format!(" · {}", esc(u)))
+                    .unwrap_or_default()
+            ));
+        }
+        product_options.push_str("</optgroup>");
+    }
+
+    // The Type facet is a client-side aid: no `name`, so it never submits and
+    // never persists. Without JS every product remains present and grouped.
+    let mut type_options = String::from(r#"<option value="">All types</option>"#);
+    for (value, label) in compiled_product_types() {
+        type_options.push_str(&format!(
+            r#"<option value="{}">{}</option>"#,
+            esc(value),
+            esc(label)
+        ));
+    }
+    // A11y polish (design D1/D2): the Type facet has ONE accessible name — its
+    // visible label "Product type" — so no competing aria-label. A visually
+    // hidden role="status" region announces the resolved product at the moment
+    // a scope change is applied, on both the select's `onchange` path and the
+    // Switch button's native submit path. The PRG redirect then refreshes the
+    // rail with the new selection. No query flag, auth, or server storage.
+    let scope_status = r#"<div id="bot-scope-status" class="sr-only" role="status" aria-live="polite"></div>
+<script>function announceBotScope(){var s=document.getElementById('scope-product'),o=s&&s.options[s.selectedIndex],n=o?o.text:'',el=document.getElementById('bot-scope-status');if(el)el.textContent='Active product: '+(o&&!o.value?'All products':n);}</script>"#;
     format!(
-        r#"<form method="post" action="{action}" class="bot-scope"><label for="bot-scope-select">Bot</label><select id="bot-scope-select" name="bot_id" onchange="this.form.submit()">{options}</select><button type="submit" class="btn btn-ghost btn-sm">Switch</button></form>"#,
+        r#"<form method="post" action="{action}" class="bot-scope product-scope" onsubmit="announceBotScope()">
+  <label for="scope-type">Product type</label>
+  <select id="scope-type">{type_options}</select>
+  <label for="scope-product">Product</label>
+  <select id="scope-product" name="bot_id" onchange="announceBotScope();this.form.submit()">{product_options}</select>
+  <button type="submit" class="btn btn-ghost btn-sm">Switch</button>
+</form>{scope_status}"#,
         action = state.url("/bot/select"),
-        options = options
+        type_options = type_options,
+        product_options = product_options,
+        scope_status = scope_status
     )
-}
-
-/// Mirrors `api.rs`'s `is_admin_role`: admins and owners share the
-/// privileged tier, sellers are scoped to their own rows. One definition of
-/// the tier so console pages and REST endpoints can never drift apart.
-fn is_admin_role(role: &str) -> bool {
-    role == "admin" || role == "owner"
-}
-
-/// Normalizes a console channel target for owner comparison: trimmed, no
-/// leading `@`, ASCII-lowercased. Stored channel names may be `@handles` or
-/// numeric chat ids, so the comparison tolerates both forms — the value that
-/// is actually sent to Telegram is never rewritten.
-fn channel_key(channel: &str) -> String {
-    channel.trim().trim_start_matches('@').to_ascii_lowercase()
-}
-
-/// Whether the `channels` row for this target belongs to `seller_id`, keyed
-/// exactly as stored first and then in normalized form.
-fn owns_channel_row(state: &WebState, seller_id: i64, chat_id: &str) -> bool {
-    state
-        .db
-        .get_channel_seller_id(chat_id.trim())
-        .or_else(|| state.db.get_channel_seller_id(&channel_key(chat_id)))
-        == Some(seller_id)
 }
 
 /// Tenant gate for every channel-addressed console mutation (post edits,
@@ -598,31 +766,21 @@ fn owns_channel_row(state: &WebState, seller_id: i64, chat_id: &str) -> bool {
 /// bound to the target channel is what performs the mutation, so this check is
 /// what stops tenant A's session from driving tenant B's bot (review H1).
 fn may_mutate_channel(state: &WebState, session: &Session, chat_id: &str) -> bool {
-    if session.role == "owner" || is_admin_role(&session.role) {
-        return true;
-    }
-    let key = channel_key(chat_id);
-    if key.is_empty() {
-        return false;
-    }
-    let Some(sid) = session.seller_id else {
-        return false;
-    };
-    if owns_channel_row(state, sid, chat_id) {
-        return true;
-    }
-    state
-        .db
-        .seller_channel(sid)
-        .map(|own| channel_key(&own))
-        .is_some_and(|own| !own.is_empty() && own == key)
+    crate::handlers::channel_access::may_mutate_channel(
+        state.db.as_ref(),
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }
 
 /// Post-row ownership for the unscoped `update_post_content` / `delete_post`
 /// mutations: owner/admin pass, a seller must own the row, and a `post_id`
 /// that does not exist is a denial for a seller (fail closed).
 fn may_mutate_post(state: &WebState, session: &Session, post_id: Option<i64>) -> bool {
-    if session.role == "owner" || is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
         return true;
     }
     let Some(pid) = post_id else {
@@ -640,12 +798,12 @@ fn may_mutate_post(state: &WebState, session: &Session, post_id: Option<i64>) ->
 /// address a global row or a channel they own — never another seller's
 /// channel (review H1: that send is executed by the victim channel's bot).
 fn may_post_to_channel(state: &WebState, session: &Session, chat_id: &str) -> bool {
-    if may_mutate_channel(state, session, chat_id) {
-        return true;
-    }
-    let key = channel_key(chat_id);
-    if key.is_empty() {
-        return false;
-    }
-    owns_channel_row(state, 0, chat_id)
+    crate::handlers::channel_access::may_post_to_channel(
+        state.db.as_ref(),
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }

@@ -19,7 +19,7 @@ pub(super) struct BotAddForm {
     pub(super) token_env: String,
 }
 
-// ---------- Bot config wizard (L11) ----------
+// ---------- Bot config wizard (architecture) ----------
 
 static LAST_BOT_SNIPPET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -374,7 +374,7 @@ pub(super) async fn bots_add_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Add bot").into_response();
     }
     let mut banner = String::new();
@@ -408,7 +408,7 @@ pub(super) async fn bots_add_validate(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Add bot").into_response();
     }
     let token = f.token.trim().to_string();
@@ -469,7 +469,7 @@ pub(super) async fn bots_add_submit(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Add bot").into_response();
     }
     let v = match validate_bot_add(&f) {
@@ -596,7 +596,7 @@ pub(super) async fn bots_add_snippet(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Add bot").into_response();
     }
     // Lock failure degrades to the empty placeholder — never a panic (P2-1).

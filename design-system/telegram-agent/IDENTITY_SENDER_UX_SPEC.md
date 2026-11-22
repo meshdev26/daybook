@@ -1,8 +1,8 @@
 # Identity Sender — Channel Binding & Attribution — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec, from the ratified identity decision record (2026-10-27). WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 **Related:** `IDENTITY_UX_SPEC.md` (Enable-posting gate, unlock banner, wizard), `assets/app.css`, `src/web.rs` (`channels_body` row idiom, `posts_page`, dashboard composer, `keys_body` confirm idiom), `docs/BOOKINGS_UX_SPEC.md` (flash + `confirm()` vocabulary).
 
 ---
@@ -71,7 +71,7 @@ Bind {channel} to your personal account? Posts to this channel will be sent as y
 Rules:
 
 - The badge and buttons are affordances; the gate and the lock are enforced in the handler, never inferred from the UI.
-- **Honesty while locked, on every path:** a user-bound send that fails because the identity is locked (scheduled post firing, immediate send) must surface as an explicit failure on its own surface — never silence, never a bot-post fallback. If the lock lands mid-schedule, the post fails loudly with "identity locked" as the reason. **L8 contract; L3 verifies no silent-drop path.**
+- **Honesty while locked, on every path:** a user-bound send that fails because the identity is locked (scheduled post firing, immediate send) must surface as an explicit failure on its own surface — never silence, never a bot-post fallback. If the lock lands mid-schedule, the post fails loudly with "identity locked" as the reason. **Server contract; verification confirms no silent-drop path.**
 - A channel deleted or removed while user-bound simply loses its row; no orphan cleanup surface in v1.
 
 ---
@@ -131,22 +131,22 @@ Rules:
 
 ---
 
-## 8. Backend contracts L7/L8 must satisfy (flags, not fixes)
+## 8. Backend contracts web/server must satisfy (flags, not fixes)
 
-1. **Binding state per channel** — one stored fact (bot | user) the console reads; default `bot` for every existing channel so nothing changes behavior on deploy. **Owner: L9 (storage), L8 (enforcement).**
-2. **Send path honors the binding** — the user-bound send goes through the identity client; while locked it fails loudly (§3). **Owner: L8.**
-3. **Dashboard target resolution** — the composer's target channel id must resolve to its binding server-side each render. **Owner: L7/L8.**
-4. **Flash keys** — `bound-user`, `bound-bot`, `error=posting`, `error=locked` on `/channels`. **Owner: L7.**
+1. **Binding state per channel** — one stored fact (bot | user) the console reads; default `bot` for every existing channel so nothing changes behavior on deploy. **Owner: core (storage), server (enforcement).**
+2. **Send path honors the binding** — the user-bound send goes through the identity client; while locked it fails loudly (§3). **Owner: server.**
+3. **Dashboard target resolution** — the composer's target channel id must resolve to its binding server-side each render. **Owner: web/server.**
+4. **Flash keys** — `bound-user`, `bound-bot`, `error=posting`, `error=locked` on `/channels`. **Owner: web.**
 
 ---
 
-## 9. Token-contract flags (L6-C)
+## 9. Token-contract flags (design)
 
 **None.** No new CSS, no new classes, no inline styles, no new color values. Everything reuses: `badge badge-warning`, `btn`/`btn-secondary`/`btn-ghost`/`btn-sm`, `inline-form`, `alert`/`alert-success`/`alert-error`, `help`, `mono`, and the native `confirm()` idiom from `keys_body`. The ellipsis in "Post as user…" is text, not a new component.
 
 ---
 
-## 10. Acceptance checklist (for L7 / L3 verification)
+## 10. Acceptance checklist (for web / verification)
 
 - [ ] Bot-bound rows (owner): "Post as user…" ghost button + confirm naming the channel and the risk; user-bound rows: "as user" badge + "Post as bot" with no confirm.
 - [ ] Bot-bound rows carry no marker anywhere (channels, posts, dashboard).
@@ -164,7 +164,7 @@ Rules:
 
 1. **Broadcast page inherits the same pre-send help** when it grows per-channel targeting — same badge, same one-line disclosure, same exception-only rule. Not in v1 because Broadcast has no channel picker today.
 2. **Bulk binding** (bind several channels at once) — deferred; the one-row confirm copy does not generalize to N channels, and a bulk-risk sentence should be written deliberately, not squeezed into this one.
-3. **Binding history in the post row** — whether a *sent* post should record which sender it used (fact at send time) rather than deriving from the current binding; matters only once channels can be re-bound often. L8/L9 to size.
+3. **Binding history in the post row** — whether a *sent* post should record which sender it used (fact at send time) rather than deriving from the current binding; matters only once channels can be re-bound often. server/core to size.
 
 ---
 

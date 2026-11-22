@@ -1,4 +1,5 @@
-use super::{Session, WebState};
+use super::{Session, WebState, capability_enabled, effective_bot};
+use crate::roles::Role;
 use axum::{
     http::header,
     response::{IntoResponse, Response},
@@ -9,115 +10,7 @@ const FONT_SANS: &[u8] = include_bytes!("../../assets/fonts/IBMPlexSans-var.woff
 const FONT_MONO_400: &[u8] = include_bytes!("../../assets/fonts/IBMPlexMono-400.woff2");
 const FONT_MONO_500: &[u8] = include_bytes!("../../assets/fonts/IBMPlexMono-500.woff2");
 
-const APP_JS: &str = r#"(function () {
-  'use strict';
-  function init() {
-    var toggles = document.querySelectorAll('.secret-toggle');
-    for (var i = 0; i < toggles.length; i++) {
-      var btn = toggles[i];
-      if (btn.dataset.secretBound) continue;
-      btn.dataset.secretBound = '1';
-      btn.addEventListener('click', function () {
-        var field = this.closest('.secret-field');
-        var input = field ? field.querySelector('input') : null;
-        if (!input) return;
-        var show = input.type === 'password';
-        // Type swap keeps the typed value; only the rendering changes.
-        input.type = show ? 'text' : 'password';
-        this.setAttribute('aria-pressed', show ? 'true' : 'false');
-        this.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
-      });
-    }
-    // Visibility-aware add form (CHANNEL_ADD_REDESIGN_SPEC §3.3): the radio
-    // swaps the identifier placeholder, the visible help line, and the
-    // aria-describedby target. Enhancement only — without JS the public help
-    // shows by default and the omnibus details still carries both rules.
-    var vform = document.querySelector('[data-visibility-form]');
-    if (vform && !vform.dataset.visBound) {
-      vform.dataset.visBound = '1';
-      var id = vform.querySelector('input[name="channel"]');
-      var vpub = vform.querySelector('#ch-id-help-public');
-      var vpriv = vform.querySelector('#ch-id-help-private');
-      vform.querySelectorAll('input[name="visibility"]').forEach(function (r) {
-        r.addEventListener('change', function () {
-          var priv = this.value === 'private';
-          id.placeholder = priv ? id.dataset.phPrivate : id.dataset.phPublic;
-          vpriv.hidden = !priv;
-          vpub.hidden = priv;
-          id.setAttribute('aria-describedby', priv ? 'ch-id-help-private' : 'ch-id-help-public');
-        });
-      });
-    }
-    // Focus-on-render for the standing unlock banner and for error alerts
-    // that re-render after a failed POST (IDENTITY_UX_SPEC §3.8/§4.2). The
-    // containers carry tabindex="-1"; without JS the page still works.
-    var banner = document.querySelector('.unlock-banner');
-    if (banner && typeof banner.focus === 'function') { banner.focus(); return; }
-    var alertEl = document.querySelector('[data-focus-on-load]');
-    if (alertEl && typeof alertEl.focus === 'function') { alertEl.focus(); }
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
-})();
-(function () {
-  'use strict';
-  var KEY = 'tg.sidebar.groups.v1';
-  function readState() {
-    try { var r = localStorage.getItem(KEY); return r ? (JSON.parse(r) || {}) : {}; }
-    catch (e) { return {}; }
-  }
-  function writeState(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {} }
-  var state = readState();
-  var hasStored = Object.keys(state).length > 0;
-  function isMobile() { return window.matchMedia('(max-width: 900px)').matches; }
-  function groupKey(el) {
-    if (!el) return null;
-    var v = el.getAttribute('data-nav-group');
-    if (v !== null) return v;
-    return el.getAttribute('data-group');
-  }
-  function setGroup(group, open) {
-    var el = document.querySelector('.nav-group[data-nav-group="' + group + '"]') || document.querySelector('.nav-group[data-group="' + group + '"]');
-    if (!el) return;
-    el.classList.toggle('is-collapsed', !open);
-    var btn = el.querySelector('.nav-group-toggle');
-    if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    var panel = el.querySelector('.nav-group-panel');
-    if (panel) {
-      if (open) panel.removeAttribute('inert'); else panel.setAttribute('inert', '');
-      panel.setAttribute('aria-hidden', open ? 'false' : 'true');
-    }
-  }
-  function init() {
-    document.querySelectorAll('.nav-group').forEach(function (el) {
-      var g = groupKey(el);
-      var stored = Object.prototype.hasOwnProperty.call(state, g) ? state[g] : null;
-      var open;
-      if (stored !== null) open = !!stored;
-      else if (isMobile()) open = el.getAttribute('data-current') === 'true';
-      else open = true;
-      setGroup(g, open);
-    });
-    document.querySelectorAll('.nav-group-toggle').forEach(function (btn) {
-      if (btn.dataset.sidebarBound) return;
-      btn.dataset.sidebarBound = '1';
-      btn.addEventListener('click', function () {
-        var el = this.closest('.nav-group');
-        var g = groupKey(el);
-        var nowOpen = el.classList.contains('is-collapsed');
-        setGroup(g, nowOpen);
-        state[g] = nowOpen;
-        writeState(state);
-      });
-    });
-  }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
-})();
-"#;
+pub(super) const APP_JS: &str = include_str!("../../assets/app.js");
 
 const PLANE_SVG: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 3.5 3.8 10.2c-.8.3-.8 1.4 0 1.7l4.9 1.8 1.8 4.9c.3.8 1.4.8 1.7 0L19 5.5"/><path d="M10.5 13.7 21 3.5"/></svg>"#;
 
@@ -193,11 +86,12 @@ pub(super) fn html_page(
 ) -> String {
     let base = &state.base_path;
     let snap = super::identity_snapshot();
-    let unlock_banner = if session.is_some_and(|s| s.role == "owner") {
-        super::identity_unlock_banner(base, &snap).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let unlock_banner =
+        if session.is_some_and(|s| Role::from_role_str(&s.role).has_level(Role::Owner)) {
+            super::identity_unlock_banner(base, &snap).unwrap_or_default()
+        } else {
+            String::new()
+        };
     let identity_flash = if snap.unlocked {
         r#"<div class="alert alert-success" role="status" aria-live="polite">Identity unlocked.</div>"#
     } else {
@@ -210,7 +104,7 @@ pub(super) fn html_page(
         identity_line
     );
     format!(
-        r##"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
+        r##"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <link rel="preload" href="{base}/assets/fonts/IBMPlexSans-var.woff2" as="font" type="font/woff2" crossorigin>
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
@@ -219,7 +113,7 @@ pub(super) fn html_page(
 <a class="skip-link" href='#main'>Skip to content</a>
 <div class="shell">
 <aside class="rail">
-  <div class="brand">{plane}<b>Telegram Business<small>operator console</small></b></div>
+  <div class="brand">{plane}<b>Daybook<small>operator console</small></b></div>
   {bot_scope}
   <nav>{nav}</nav>
 </aside>
@@ -227,7 +121,6 @@ pub(super) fn html_page(
 {b}
 </div></main>
 </div>
-<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}}</script>
 </body></html>"##,
         base = base,
         t = title,
@@ -251,18 +144,17 @@ pub(super) fn html_page_bare_panel(
     panel_class: &str,
 ) -> String {
     format!(
-        r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Telegram Business</title>
+        r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
 <script src="{base}/assets/app.js" defer></script>
 </head><body>
 <a class="skip-link" href='#main'>Skip to content</a>
 <main class="door" id="main">
-  <div class="brand">{plane}<b>Telegram Business</b></div>
-  <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button>
+  <div class="brand">{plane}<b>Daybook</b></div>
+  <button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()" aria-pressed="false" aria-label="Switch to dark theme">Theme</button>
   <div class="{panel_class}">{b}</div>
 </main>
-<script>function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme');var n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}}</script>
 </body></html>"#,
         base = base,
         t = title,
@@ -280,13 +172,14 @@ pub(super) enum NavRole {
 }
 
 impl NavRole {
-    pub(super) fn visible(self, role: &str) -> bool {
+    pub(super) fn visible(self, role: Role) -> bool {
         match self {
             NavRole::All => true,
-            NavRole::Owner => role == "owner",
-            NavRole::SellerAdminOwner => {
-                role == "seller" || role == "admin" || role == "owner" || super::is_admin_role(role)
-            }
+            NavRole::Owner => role.has_level(Role::Owner),
+            // Seller/Admin/Owner share the non-buyer tier. Ordered level
+            // check: a role that outranks Seller is included without naming
+            // each role string.
+            NavRole::SellerAdminOwner => role.has_level(Role::Seller),
         }
     }
 }
@@ -300,6 +193,14 @@ pub(super) struct NavItem {
     pub(super) roles: NavRole,
     pub(super) titles: &'static [&'static str],
     pub(super) pref: Option<&'static str>,
+    /// Compile-time capability this item belongs to. `None` = always
+    /// compiled (the shipped default build); `rail_nav` drops items whose
+    /// feature was not compiled in. View filter only — never a page gate.
+    pub(super) feature: Option<&'static str>,
+    /// Product-type metadata values this item applies to. `None` = all
+    /// types. A selected product narrows the view; "All products" (no
+    /// selection) never narrows it.
+    pub(super) product_types: Option<&'static [&'static str]>,
 }
 
 pub(super) const NAV_ITEMS: &[NavItem] = &[
@@ -312,6 +213,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Dashboard"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "analytics",
@@ -321,6 +224,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Analytics"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "monitor",
@@ -330,6 +235,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Monitor"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Offerings
     NavItem {
@@ -340,6 +247,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Products"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "plans",
@@ -349,6 +258,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Plans"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "channels",
@@ -358,6 +269,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Channels"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "bots",
@@ -367,6 +280,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Bots", "Add bot"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Sales
     NavItem {
@@ -377,6 +292,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Orders"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "customers",
@@ -386,6 +303,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Customers"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "codes",
@@ -395,6 +314,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Codes"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "promos",
@@ -404,6 +325,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Promos"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "referrals",
@@ -413,6 +336,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Referrals", "Reviews"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "cart",
@@ -422,6 +347,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Cart"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "carts",
@@ -431,6 +358,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["Carts"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Fulfill
     NavItem {
@@ -441,6 +370,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Subscriptions"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "bookings",
@@ -450,6 +381,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Bookings"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "tickets",
@@ -459,6 +392,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Tickets"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Communicate
     NavItem {
@@ -469,6 +404,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Posts"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "broadcast",
@@ -478,6 +415,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::All,
         titles: &["Broadcast"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     // Workspace
     NavItem {
@@ -488,6 +427,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Identity"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "ai",
@@ -497,6 +438,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["AI"],
         pref: Some("ai"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "crypto",
@@ -506,6 +449,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Crypto"],
         pref: Some("crypto"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "finance",
@@ -515,6 +460,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["Finance"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "admins",
@@ -524,6 +471,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Admins"],
         pref: Some("admins"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "sellers",
@@ -533,6 +482,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Sellers"],
         pref: Some("sellers"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "webusers",
@@ -542,6 +493,8 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::Owner,
         titles: &["Web users"],
         pref: Some("webusers"),
+        feature: None,
+        product_types: None,
     },
     NavItem {
         id: "apikeys",
@@ -551,8 +504,42 @@ pub(super) const NAV_ITEMS: &[NavItem] = &[
         roles: NavRole::SellerAdminOwner,
         titles: &["API keys"],
         pref: None,
+        feature: None,
+        product_types: None,
     },
 ];
+
+/// Capability items are injected into `rail_nav` after their anchor row only
+/// when the capability is compiled in; page handlers carry their own gate.
+pub(super) const FEATURE_NAV_ITEMS: &[NavItem] = &[
+    NavItem {
+        id: "blocked-words",
+        label: "Blocked words",
+        path: "blocked-words",
+        group: "Offerings",
+        roles: NavRole::SellerAdminOwner,
+        titles: &["Blocked words"],
+        pref: None,
+        feature: Some("moderation"),
+        product_types: None,
+    },
+    NavItem {
+        id: "content-policy",
+        label: "Content policy",
+        path: "content-policy",
+        group: "Workspace",
+        roles: NavRole::Owner,
+        titles: &["Content policy"],
+        pref: None,
+        feature: Some("moderation"),
+        product_types: None,
+    },
+];
+
+/// Stable insertion anchors for the capability rows: "Blocked words" follows
+/// Bots in Offerings, "Content policy" sits beside AI in Workspace.
+pub(super) const FEATURE_NAV_AFTER: &[(&str, &str)] =
+    &[("blocked-words", "bots"), ("content-policy", "ai")];
 
 pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
     // Settings is owner-only and lives in Utilities (outside NAV_ITEMS), but
@@ -563,18 +550,56 @@ pub(super) fn active_nav_id(title: &str) -> Option<&'static str> {
     }
     NAV_ITEMS
         .iter()
+        .chain(FEATURE_NAV_ITEMS.iter())
         .find(|item| item.titles.contains(&title))
         .map(|item| item.id)
 }
 
+/// The product type metadata of the session's resolved scope, or `None` for
+/// the unscoped "All products" view. Sellers/admins are pinned to their bot;
+/// an owner with no selection is unscoped and therefore never type-narrowed.
+/// This is view metadata only — it changes no page gate or write permission.
+fn selected_product_type(state: &WebState, session: Option<&Session>) -> Option<String> {
+    let s = session?;
+    let role = Role::from_role_str(&s.role);
+    // Exact-level branches: the original gave owners their explicit
+    // selection, sellers/admins their pinned bot, and buyers nothing. An
+    // ordered `has_level(Seller)` here would wrongly catch the owner branch,
+    // so each branch keeps its exact level.
+    let bot_id = if role == Role::Owner {
+        s.selected_bot_id
+    } else if role == Role::Seller || role == Role::Admin {
+        Some(effective_bot(state, s).id)
+    } else {
+        None
+    };
+    bot_id
+        .and_then(|id| state.db.get_bot(id))
+        .map(|b| b.bot_type)
+}
+
+/// Runtime type filter. `None` on either side admits the item: an unscoped
+/// owner sees every item, and an item not tied to a type is always eligible.
+pub(super) fn nav_item_type_ok(item: &NavItem, product_type: Option<&str>) -> bool {
+    match (item.product_types, product_type) {
+        (None, _) | (Some(_), None) => true,
+        (Some(types), Some(pt)) => types.contains(&pt),
+    }
+}
+
 pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>) -> String {
     let base = &state.base_path;
-    let role = session.map(|s| s.role.as_str()).unwrap_or("");
+    let role = session
+        .map(|s| Role::from_role_str(&s.role))
+        .unwrap_or(Role::User);
     let prefs = session
-        .filter(|s| s.role == "owner")
+        .filter(|s| Role::from_role_str(&s.role).has_level(Role::Owner))
         .map(|s| super::effective_sidebar_prefs(state, s));
 
     let active_id = active_nav_id(title);
+    // The capability set and product type are view filters only; neither
+    // touches a route or page gate.
+    let product_type = selected_product_type(state, session);
 
     // Group order per spec.
     let group_order = [
@@ -588,14 +613,12 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
 
     let mut out = String::new();
     for group in group_order {
-        // Collect visible items for this group.
-        let items: Vec<&NavItem> = NAV_ITEMS
-            .iter()
-            .filter(|item| item.group == group)
-            .filter(|item| item.roles.visible(role))
-            .filter(|item| {
-                if let Some(key) = item.pref {
-                    // sidebar pref gating for owner-managed items
+        // One shared visibility predicate for core and capability rows: role,
+        // sidebar pref, compile-time feature and runtime product type. Keeping
+        // it in one place means a capability row can never bypass a core gate.
+        let visible = |item: &NavItem| {
+            item.roles.visible(role)
+                && if let Some(key) = item.pref {
                     prefs
                         .map(|p| match key {
                             "ai" => p.ai,
@@ -609,8 +632,32 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
                 } else {
                     true
                 }
-            })
-            .collect();
+                && item.feature.is_none_or(capability_enabled)
+                && nav_item_type_ok(item, product_type.as_deref())
+        };
+        // Core rows render first, byte-identical to the shipped table. Each
+        // capability row is injected directly after its anchor so "beside AI"
+        // holds without touching the 27-row constant.
+        let mut items: Vec<&NavItem> = Vec::new();
+        for item in NAV_ITEMS.iter().filter(|item| item.group == group) {
+            if visible(item) {
+                items.push(item);
+            }
+            // Inject at the anchor's slot even when the anchor itself is
+            // pref-hidden, so "beside AI" survives sidebar customisation.
+            for extra in FEATURE_NAV_ITEMS
+                .iter()
+                .filter(|extra| extra.group == group)
+                .filter(|extra| {
+                    FEATURE_NAV_AFTER
+                        .iter()
+                        .any(|(id, anchor)| *id == extra.id && *anchor == item.id)
+                })
+                .filter(|extra| visible(extra))
+            {
+                items.push(extra);
+            }
+        }
         if items.is_empty() {
             continue;
         }
@@ -652,7 +699,7 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
 
     // Utilities strip
     out.push_str(r#"<div class="utilities">"#);
-    if session.is_some_and(|s| s.role == "owner") {
+    if session.is_some_and(|s| Role::from_role_str(&s.role).has_level(Role::Owner)) {
         let active_attr = if active_id == Some("settings") {
             " class=\"active\" aria-current=\"page\""
         } else {
@@ -665,7 +712,7 @@ pub(super) fn rail_nav(state: &WebState, title: &str, session: Option<&Session>)
         ));
     }
     if session.is_some() {
-        out.push_str(r#"<button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()">Theme</button>"#);
+        out.push_str(r#"<button type="button" class="btn btn-ghost btn-sm theme-toggle" onclick="toggleTheme()" aria-pressed="false" aria-label="Switch to dark theme">Theme</button>"#);
         out.push_str(&format!(
             r#"<a href="{base}/logout">Sign out</a>"#,
             base = base

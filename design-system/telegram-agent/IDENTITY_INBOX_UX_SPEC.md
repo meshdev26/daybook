@@ -1,8 +1,8 @@
 # Identity Inbox — Pairing, Allowlist & Replies — UX & Accessibility Spec
 
-**Owner:** L6 (Senior UX Designer) — spec only; L7 implements in `src/web.rs`.
+**Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec, from the ratified identity decision record (2026-10-27). WCAG 2.1 AA is a release floor and is non-waivable.
-**Audience:** L7 (implementation), L8 (handlers/data), L9 (data layer), L10 (security review), L6-C (token contract).
+**Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
 **Related:** `IDENTITY_UX_SPEC.md` (unlock banner, identity status line), `IDENTITY_MONITOR_UX_SPEC.md` (`.timeline` list idiom), `docs/SETUP_MCP_UX_SPEC.md` (shown-once secret idiom, TTL copy), `docs/BOOKINGS_UX_SPEC.md` (routes/flash/confirm vocabulary), `assets/app.css`.
 
 ---
@@ -137,12 +137,12 @@ When the buyer DMs the code to the personal account, the allowlist table gains a
 
 ---
 
-## 8. Security & privacy (L10 flags)
+## 8. Security & privacy (security flags)
 
-1. **The pairing code is a bearer secret, shown once.** 8 chars of `gen_token`, hashed at rest, TTL 15 minutes, single-use, single-active per owner; generation and consumption are audited. **Owner: L8/L9; L10 confirms the TTL + hash posture.**
-2. **Deny-by-default contact.** The Blocked panel's promise ("Nothing was sent to them") is an L3-testable invariant: no auto-ack, no auto-reply, no read receipt from any non-allowlisted contact path. **Owner: L8.**
+1. **The pairing code is a bearer secret, shown once.** 8 chars of `gen_token`, hashed at rest, TTL 15 minutes, single-use, single-active per owner; generation and consumption are audited. **Owner: server/core; security confirms the TTL + hash posture.**
+2. **Deny-by-default contact.** The Blocked panel's promise ("Nothing was sent to them") is a testable invariant: no auto-ack, no auto-reply, no read receipt from any non-allowlisted contact path. **Owner: server.**
 3. **Approve/Allow are the only doors to the composer.** `?t=` for a non-allowlisted contact renders the thread list with the `error=unknown` flash — never the thread, never an oracle about whether the id exists.
-4. **The 30/day cap is enforced server-side** on the identity client path; a forged or replayed composer POST cannot exceed it. **Owner: L8.**
+4. **The 30/day cap is enforced server-side** on the identity client path; a forged or replayed composer POST cannot exceed it. **Owner: server.**
 5. **Audit without content.** `log_action` rows carry ids and actions, never message text or pairing codes.
 6. **Escaping.** Snippets, names, codes via `esc()`; badge classes from the fixed allow-list.
 7. **CSRF** — existing SameSite=Strict posture; no new scheme.
@@ -150,17 +150,17 @@ When the buyer DMs the code to the personal account, the allowlist table gains a
 
 ---
 
-## 9. Token-contract flags (L6-C)
+## 9. Token-contract flags (design)
 
 **None.** No new CSS, no new classes, no inline styles, no new color values. Reuses: `table-wrap`, `badge`/`badge-warning`/`badge-success`, `btn`/`btn-ghost`/`btn-sm`, `inline-form`, `alert`/`-success`/`-error`, `code.copyable`, `empty`, `help`, `mono`, `sr-only`, and `.timeline` (already authorized in `IDENTITY_MONITOR_UX_SPEC.md` §3.2 — this spec adds nothing to it).
 
 ---
 
-## 10. Acceptance checklist (for L7 / L3 verification)
+## 10. Acceptance checklist (for web / verification)
 
 - [ ] `/inbox` (owner only) renders: thread list, Blocked panel (only when blocked contacts exist), thread view (only with `?t=`), pairing panel, allowlist — in that order.
 - [ ] Thread list columns From · Last message · Status; status is a badge word; From is the only link per row.
-- [ ] Blocked panel rows read "Not on the allowlist. Nothing was sent to them." verbatim, with Allow as the only action; no auto-reply exists on any blocked path (L3 invariant).
+- [ ] Blocked panel rows read "Not on the allowlist. Nothing was sent to them." verbatim, with Allow as the only action; no auto-reply exists on any blocked path (verification invariant).
 - [ ] No compose-first affordance exists anywhere in the console — grep for "New message" finds nothing.
 - [ ] Pairing: generate → 8-char code in `code.copyable`, shown once, TTL + single-active help lines; regenerate invalidates; a second render never shows the code.
 - [ ] Pending row: Approve (no confirm) / Deny (no confirm), both with contact-named `aria-labels`; both audited.
@@ -174,11 +174,11 @@ When the buyer DMs the code to the personal account, the allowlist table gains a
 
 ## 11. Follow-ups (non-blocking)
 
-1. **Pairing TTL + single-active — carried.** 15 minutes, one live code per owner, single-use, hashed at rest is this spec's assumption; L9 owns the storage constants and L10 the review. If the TTL moves, §5.1's help copy moves with it — the two must never drift.
+1. **Pairing TTL + single-active — carried.** 15 minutes, one live code per owner, single-use, hashed at rest is this spec's assumption; core owns the storage constants and security the review. If the TTL moves, §5.1's help copy moves with it — the two must never drift.
 2. **Thread pagination.** Threads beyond 100 messages have no older-page link in v1 (replies are short; the cap is generous). If real threads hit it, reuse the Monitor `?before=` idiom inside `?t=` rather than inventing a second pagination vocabulary.
 3. **Blocked-panel trim.** The 20-row cap with a footer count (§3) is a v1 guardrail; a proper "show more" needs its own focus management pass.
-4. **Unread emphasis.** Which threads have unseen messages is a product question (presence rules touch L10's "never reveal user presence" floor); deferred until that ruling exists.
-5. **Buyer-side pairing copy.** What the buyer is told when they DM the code (bot-side reply) belongs in the L8 bot-copy pass — this spec owns the console half only.
+4. **Unread emphasis.** Which threads have unseen messages is a product question (presence rules touch security's "never reveal user presence" floor); deferred until that ruling exists.
+5. **Buyer-side pairing copy.** What the buyer is told when they DM the code (bot-side reply) belongs in the server bot-copy pass — this spec owns the console half only.
 
 ---
 

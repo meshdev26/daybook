@@ -1,15 +1,6 @@
 /* Telegram Business — operator console design system.
- *
- * The materialized token contract DESIGN.md specifies: calm, confident,
- * helpful — never loud. One idea carries the identity: the operator's
- * ledger — a commerce back-office set like a well-kept financial book.
- * Borders lead, shadows whisper, figures sit in mono, status is a dot
- * before a word. No hover-lift theatre, no gradient washes.
- *
- * Served from the binary (include_str!) — no CDN, no build step.
- * WCAG 2.2 AA: every text pair below is >= 4.5:1 on its surface
- * (checked: ink/surface 12.9:1, ink-2/surface 5.6:1, brand-ink/brand 5.1:1,
- * on dark: ink/surface 11.2:1, ink-2/surface 6.1:1).
+ * Calm, confident, helpful: borders lead, shadows whisper, figures sit in
+ * mono, status is a dot before a word. Served from the binary, no CDN.
  */
 
 /* ---- fonts (bundled, latin subset; Plex Sans ships as a variable file) -- */
@@ -129,7 +120,11 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   top: 0;
   height: 100vh;
   padding: 20px 14px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
 }
+@media (min-width:901px){ .rail > * { flex-shrink:0; } }
 .rail .brand {
   display: flex;
   align-items: center;
@@ -179,6 +174,13 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .rail .bot-scope select { width: 100%; font-size: 13px; }
 .rail .bot-scope .btn { align-self: flex-start; }
 .rail .bot-scope-pinned span.mono { font-size: 13px; color: var(--ink); }
+/* Product scope + Type facet: native controls, no new tokens. */
+.rail .product-scope { align-items: stretch; }
+.rail .product-scope select { min-height: 44px; }
+.rail .product-scope .btn { align-self: stretch; min-height: 44px; }
+.rail .bot-scope-pinned span.mono { white-space: normal; overflow-wrap: anywhere; }
+details.advanced { margin: 8px 0; }
+details.advanced > summary { font-size: 12px; font-weight: 500; color: var(--ink-3); min-height: 44px; display: flex; align-items: center; }
 .rail nav a {
   display: flex;
   align-items: center;
@@ -283,6 +285,7 @@ code.copyable {
   margin: 4px 0 10px;
 }
 .qr svg { display: block; }
+.panel canvas { display: block; width: 100%; max-width: 640px; height: auto; margin: 8px 0 0; }
 
 /* ---- checkboxes ----------------------------------------------------------- */
 input[type="checkbox"] {
@@ -343,22 +346,37 @@ input:focus, select:focus, textarea:focus {
 }
 textarea { min-height: 96px; resize: vertical; }
 form button[type="submit"] { margin-top: 16px; }
+/* Horizontal forms share one baseline with their inputs; a submit wrapped in
+ * a div must not reclaim the stacked-form gap. */
+.inline-form button[type="submit"],
+.form-row button[type="submit"] { margin-top: 0; }
 .help { font-size: 12px; color: var(--ink-3); margin: 2px 0 0; }
 
-/* Collapsed long-form help (MANAGEMENT_DISCLOSURE_SPEC §4) */
+/* Collapsed long-form help */
 .help-more { margin: 2px 0 0; }
 .help-more summary { padding: 2px 0; font-size: 12px; font-weight: 500; color: var(--ink-3); }
 .help-more[open] summary { margin-bottom: 4px; }
-.form-row { display: grid; gap: 0 16px; grid-template-columns: 1fr 1fr; }
+/* Label-above-field rows align on their bottom edges; legacy two-column
+ * grids keep equal widths via flex:1. */
+.form-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.form-row > div { flex: 1 1 240px; min-width: 0; }
+.form-row > label { display: flex; flex-direction: column; gap: 6px; flex: 1 1 220px; min-width: 0; margin: 0; }
+.form-row > button[type="submit"] { margin-top: 0; }
+/* One control-height baseline for inline + stacked forms; :where() keeps it
+ * below the shipped 44px touch-target rules. */
+input:where(:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])),
+select,
+.form-row input:where(:not([type="checkbox"])),
+.form-row select { min-height: 40px; }
+.rail select { min-height: 0; } /* compact rail; .product-scope reasserts 44px */
+/* Filter form + status chips are one bar with a real gap between the two. */
+.filter-bar { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
 /* Compact numeric entry inside table rows and inline forms. */
 .input-num { width: 4.5em; min-width: 4.5em; margin-top: 0; }
 
 /* ---- secret fields: password/token inputs with a reveal toggle -------------
- * Wrapper follows the field's <label> as a sibling (the toggle button must
- * never nest inside a label) and is absolutely positioned over the input's
- * right edge, so nothing shifts when it appears and the input keeps its
- * full-width rhythm. Icons swap on the button's aria-pressed state;
- * behavior lives in /assets/app.js (one shared script, no inline handlers). */
+ * The toggle sits over the input's right edge and never nests inside its
+ * label; behavior lives in /assets/app.js. */
 .secret-field { position: relative; display: block; }
 .secret-field input { padding-right: 46px; } /* text never runs under the button */
 .secret-toggle {
@@ -369,7 +387,7 @@ form button[type="submit"] { margin-top: 16px; }
   width: 40px;
   padding: 0;
   background: transparent;
-  color: var(--ink-3);    /* >= 3:1 on both themes (WCAG 1.4.11 non-text) */
+  color: var(--ink-3);    /* meets non-text contrast on both themes */
   border: none;
   border-left: 1px solid var(--line);
   border-radius: 0 var(--radius-ctl) var(--radius-ctl) 0;
@@ -440,7 +458,27 @@ article ul li:last-child, .panel ul li:last-child, .rows li:last-child { border-
   padding: 4px 10px;
   font-size: 12.5px;
 }
+.rows li .row-action, .row-actions { flex: 0 0 auto; }
+@media (max-width: 900px){ .rows li .row-action, .row-actions { margin-left: 0; } }
 .mono { font-family: var(--font-data); font-size: 13px; }
+/* ---- one-time recovery codes: compact two-column chip grid ----------------
+ * The ledger row rule above (`.panel ul li`: flex, dividers, padding) would
+ * give every code its own full-width row on the bare enroll page. These rules
+ * come after it and carry equal-or-higher specificity to opt out of that
+ * rhythm; the chip surface itself reuses the shipped `code` token pairing. */
+.recovery-codes, .panel ul.recovery-codes {
+  list-style: none; padding: 0; margin: 0 0 14px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px; align-self: stretch; width: 100%;
+}
+ul.recovery-codes > li, .panel ul.recovery-codes > li {
+  display: block; padding: 0; border-bottom: 0; font-size: inherit; min-width: 0;
+}
+.recovery-codes code.copyable {
+  display: block; margin: 0; padding: 7px 10px;
+  font-size: 12.5px; text-align: center;
+  overflow-wrap: anywhere; word-break: break-all;
+}
 /* ---- metric card (.stat) -------------------------------------------------- */
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat-value {
@@ -528,6 +566,11 @@ td.actions { text-align: right; }
 .empty b { display: block; color: var(--ink); font-size: 14.5px; margin-bottom: 4px; }
 li.empty { text-align: left; padding: 14px 2px; }
 li.empty b { display: inline; margin-right: 8px; }
+/* Two-line empty states: headline, then detail on its own line with breathing
+ * room. li.empty is a flex row, so `display:block` alone does NOT wrap the
+ * detail onto a new line — flex-basis:100% forces the break at every viewport
+ * (desktop and 375px alike). */
+.empty .empty-detail { display: block; flex: 0 0 100%; width: 100%; margin-top: 4px; }
 
 /* ---- setup steps --------------------------------------------------------------------- */
 details { border: 1px solid var(--line); border-radius: var(--radius-ctl); background: var(--surface-2); }
@@ -566,11 +609,23 @@ details > article.panel {
   margin-bottom: 16px;
 }
 .grid-stats .panel { margin-bottom: 0; }
-.inline-form { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; vertical-align: middle; }
+/* Shared inline controls: INLINE-level so multiple forms (web-users Actions
+ * cell) and a trailing help span (channel Identity/Default) stay on one line.
+ * Block-level `flex` here stacked them vertically. One gap between fields, one
+ * gap between a caption and its input. .filter-bar / .mod-form are flex
+ * containers themselves (children blockified), so their spacing is unaffected;
+ * .alert-form reasserts its tighter 8px gap further down. */
+.inline-form { display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; vertical-align: middle; }
+.inline-form label { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 .inline-form input:not([type="hidden"]) { width: auto; min-width: 10rem; }
+.inline-form input:not([type="hidden"]),
+.inline-form select { margin-top: 0; margin-bottom: 0; }
+/* td.actions is text-align:right; explicit flex-end keeps action forms hugged
+ * right (subs extend/revoke, finance approve/execute, referrals approve). */
+td.actions .inline-form { justify-content: flex-end; }
 /* ---- bot cards (Bot management v2) ---------------------------------------- */
-/* Collapsed accordion cards (MANAGEMENT_DISCLOSURE_SPEC §2): the summary is
-   the card header; form + actions live in the expanded body. */
+/* Collapsed accordion cards: the summary is the header; the body holds the
+   form and actions. */
 details.bot-card { display: block; padding: 0; } /* .panel surface, padding moves to summary/body */
 details.bot-card > summary {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -611,7 +666,7 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 /* Skip link: off-canvas until keyboard-focused, then the first stop on every
- * console page (2.4.1 Bypass Blocks). Focus ring comes from :focus-visible. */
+ * console page. Focus ring comes from :focus-visible. */
 .skip-link { position: absolute; left: -9999px; }
 .skip-link:focus {
   left: 12px; top: 12px;
@@ -636,6 +691,7 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
     width: 100%; flex: none; height: auto; position: static;
     flex-direction: row; align-items: center; flex-wrap: wrap;
     gap: 4px; padding: 10px 14px;
+    overflow-y: visible; overscroll-behavior-y: auto; scrollbar-gutter: auto;
     border-right: none; border-bottom: 1px solid var(--line);
   }
   .rail .brand { border: none; padding: 0 10px 0 0; margin: 0; }
@@ -643,10 +699,15 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   .nav-group-toggle { display: none; }
   .nav-group, .nav-group-panel { display: contents; }
   .nav-group-panel { max-height: none; opacity: 1; overflow: visible; }
+  /* Defensive: a stale is-collapsed class (before APP_JS runs, or if JS is
+   * unavailable) must never hide links on mobile — the toggle is gone here. */
+  .nav-group.is-collapsed .nav-group-panel { max-height: none; overflow: visible; }
   .rail nav { display: flex; flex-wrap: wrap; gap: 2px; }
   .rail .foot { margin: 0 0 0 auto; padding: 0; border: none; }
   .main { padding: 20px 16px 48px; }
-  .form-row { grid-template-columns: 1fr; }
+  /* Shared rows stack full-width at the drawer breakpoint (375px included). */
+  .form-row { flex-direction: column; align-items: stretch; }
+  .form-row > label, .form-row > div { flex: 1 1 auto; width: 100%; }
   .rail .bot-scope {
     flex-direction: row; align-items: center;
     flex: 1 1 100%; gap: 8px;
@@ -654,6 +715,15 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   }
   .rail .bot-scope select { flex: 1 1 auto; width: auto; min-width: 8rem; }
   .rail .bot-scope .btn { align-self: center; }
+  /* Stack Type / Product selects and the Switch at 375px; no horizontal
+     scroll. */
+  .rail .product-scope {
+    flex-direction: column; align-items: stretch;
+    flex: 1 1 100%; gap: 6px; padding: 4px 0 10px;
+  }
+  .rail .product-scope select,
+  .rail .product-scope .btn { width: 100%; min-width: 0; min-height: 44px; }
+  .rail .product-scope optgroup { white-space: normal; }
 }
 @media (max-width: 900px) { .kv { grid-template-columns: 1fr; gap: 2px 0; } .kv dt { margin-top: 8px; } }
 @media (prefers-reduced-motion: reduce) {
@@ -661,17 +731,56 @@ details.bot-card > summary h3 { margin: 0; font-size: 14px; font-weight: 600; }
   html { scroll-behavior: auto; }
 }
 
-/* ---- Identity: unlock-banner inline form (IDENTITY_UX_SPEC §9) -----------
- * .alert is a flex row and the shipped `input { width: 100% }` breaks inside
- * it; this keeps the banner's field row inline (wrap allowed, input flexes,
- * 44px height). The only new CSS the Identity spec authorizes. */
+/* ---- Identity: unlock-banner inline form ---------------------------------
+ * Keep the banner's field row inline (wrap allowed, input flexes, 44px). */
 .alert-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; }
 .alert-form input { flex: 1 1 220px; width: auto; min-height: 44px; }
 
-/* ---- Identity Monitor: read-only timeline (IDENTITY_MONITOR_UX_SPEC §3.2) -
- * Global CSS resets ul but not ol; without this block the timeline renders
- * with browser-default numbering and no ledger dividers. */
+/* ---- Identity Monitor: read-only timeline --------------------------------
+ * Reset ol explicitly: the global ul reset does not reach it. */
 .timeline { margin: 4px 0 0; padding-left: 20px; }
 .timeline li { border-bottom: 1px solid var(--line); padding: 10px 0; }
 .timeline li:last-child { border-bottom: none; }
 .timeline .timeline, .timeline ol { margin-top: 6px; padding-left: 18px; }
+
+/* ---- Moderation configuration surfaces -----------------------------------
+ * Layout and touch targets only; all values come from the token contract. */
+.moderation-override { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.moderation-override h4 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 4px; }
+.moderation-state { text-align: left; padding: 10px 2px; }
+.mod-term { flex: 1 1 160px; overflow-wrap: anywhere; }
+.mod-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
+.mod-form .mod-field { flex: 1 1 220px; }
+.mod-form .mod-field select { flex: 1 1 180px; }
+.mod-row-form, .moderation-override .inline-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Shared word/appeal row: term | mode form | actions, with actions always in
+ * column 3 so they line up on two-cell rows too. */
+li.moderation-row, .rows li.moderation-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center; gap: 12px;
+}
+.moderation-row > .row-actions {
+  grid-column: 3; display: flex; gap: 8px; align-items: center;
+  justify-content: flex-end; margin-left: 0;
+}
+.moderation-row select { width: auto; min-width: 8rem; max-width: 100%; }
+/* ≥44px targets at every viewport, including mode selects and the single
+ * primary action on each moderation screen. */
+.mod-form input[type="text"], .mod-form select, .mod-form button,
+.mod-row select, .mod-row button, .moderation-override input[type="text"],
+.moderation-override select, .moderation-override button,
+.moderation-row select, .moderation-row button { min-height: 44px; }
+@media (max-width: 900px) {
+  .mod-form .mod-field, .mod-form select, .mod-form button { flex: 1 1 100%; width: 100%; }
+  .mod-row, .mod-row-form, .moderation-override .inline-form {
+    flex-direction: column; align-items: stretch; width: 100%;
+  }
+  .moderation-override .btn { width: 100%; }
+  /* Stack the row grid cleanly: no side-by-side select/actions, no overflow. */
+  li.moderation-row, .rows li.moderation-row {
+    grid-template-columns: 1fr; justify-items: stretch; gap: 8px;
+  }
+  .moderation-row > .row-actions { grid-column: auto; justify-content: flex-start; }
+  .moderation-row .inline-form { width: 100%; }
+  .moderation-row select { width: 100%; }
+}

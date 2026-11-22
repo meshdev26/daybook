@@ -1,4 +1,6 @@
-# Telegram Channel & Subscription Operator Agent (Rust)
+# Daybook — Telegram commerce back-office
+
+Daybook — the calm back-office ledger for your Telegram commerce.
 
 An **owner-only** Telegram bot that:
 - Posts and manages a target Telegram channel **only on your command**.
@@ -21,7 +23,7 @@ An **owner-only** Telegram bot that:
 - **Public (user side)**: any user can `/start`, browse `/plans` and `/shop`, `/buy`, `/paid`, `/redeem`, plus `/services` and `/book`.
 - **Admin (server side)**: sellers/admins manage their own channels, plans, codes, broadcasts.
 - `/broadcast <text>` sends a message to a seller's customers (admin: all users).
-- Owner/admin approve refunds and payouts from the bot: `/refundapprove <id>`, `/payoutapprove <id>` (approve only — transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation).
+- Refunds and payouts are **approve-only from the bot**: `/refundapprove <id>` and `/payoutapprove <id>` approve a pending request; the bot never moves money. Transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation.
 
 ### Channel management (multi-channel)
 - `/channels` — list known channels.
@@ -88,6 +90,30 @@ pages scoped to a single bot; sellers and admins see a pinned label instead
 
 Adding or retokenizing a bot needs a restart. Full guide:
 [docs/MULTI_BOT.md](docs/MULTI_BOT.md).
+
+### Product types & capability builds
+
+Bots carry a product type (`shop_bot` by default); the console Product / Type
+selector lets the owner pick a product while sellers and admins stay pinned.
+Capabilities are chosen at build time with Cargo features: `shop_bot`,
+`moderation` (both default), `movie_bot`, `reply_bot`, `file_share`, `web_app`,
+`service`, and `automation`. These features control which capabilities are
+registered and which bot types are accepted at runtime — a movie-only build
+registers only the movie capability and refuses other types. They do **not**
+omit dependencies or shrink the binary (all crates stay compiled); dropping
+unused dependencies is a deferred follow-up. A movie-only install
+builds with `cargo build --no-default-features --features movie_bot`; changing
+capabilities means rebuilding and redeploying.
+
+Only `shop_bot` has a live vertical — a real inbound command and dialogue tree.
+The other six types (`movie_bot`, `reply_bot`, `file_share`, `web_app`, `service`,
+`automation`) are build-time registration types only: inbound updates to a bot
+of one of these types return an explicit "not available" notice (`VerticalStub`)
+instead of running a product. They are not shipped products.
+
+Message moderation uses an owner floor, seller "Blocked words", and per-bot
+overrides — set at least one floor term before enabling it. Full guide:
+[docs/MULTIBOT_FOUNDATION.md](docs/MULTIBOT_FOUNDATION.md).
 
 ## Build & run
 ```bash
@@ -165,20 +191,21 @@ see [docs/DEPLOY_PROFILES.md](docs/DEPLOY_PROFILES.md).
 
 ## Documentation
 See `docs/` and root MD files:
+- `CONTRIBUTING.md` — contributor guide: setup, rules, and how to propose a change.
 - `PLAN.md` — product vision & roadmap.
 - `ARCHITECTURE.md` — system design.
-- `AGENT.md` — AI agent instructions.
 - `docs/COMMANDS.md` — command reference.
 - `docs/SETUP.md` — setup guide.
 - `docs/MULTI_BOT.md` — running several bot tokens in one instance.
+- `docs/MULTIBOT_FOUNDATION.md` — product types, capability builds, and moderation.
 - `docs/ARCHITECTURE.md` — code structure.
 - `docs/CRYPTO_PAY.md` — Crypto Pay integration.
 - `docs/SECURITY.md` — security model.
 - `docs/DEPLOYMENT.md` — deployment guide.
 - `docs/DEPLOY_PROFILES.md` — same app anywhere: desktop / new / existing server, Docker, ARM.
 - `docs/DESKTOP.md` — desktop app distribution (.exe / .app).
-- `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan (L11/L8/L10 dispatch).
-- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (T1, awaiting approval).
+- `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan.
+- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (awaiting approval).
 - `docs/COMMANDS.md` — full command reference.
 - `docs/SETUP.md` — step-by-step setup.
 - `docs/ARCHITECTURE.md` — code structure.

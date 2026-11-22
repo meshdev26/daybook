@@ -1,8 +1,8 @@
 # Architecture — v1.4 "Close the loop"
 
-Status: ratified plan (L11, 2026-10-27). Implementers: L9 → L8 → L6 → L7, gated
-by L3, floored by L10, docs by L4. Companion: [`ARCHITECTURE.md`](../ARCHITECTURE.md),
-[`AUTO_ROUTE.md`](../AUTO_ROUTE.md).
+Status: ratified plan (architecture, 2026-10-27). Implementers: core → server → design → web, gated
+by verification, floored by security; documentation tracked throughout. Companion:
+[`ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 v1.4 closes the last open business loop (bookings) and two auth-hygiene debts
 (per-seller MCP tokens, plaintext setup passwords). Every claim was verified
@@ -30,7 +30,7 @@ The supervisor's proposal is ratified with four adjustments forced by the code:
 | # | Decision | Rationale (one line) |
 |---|----------|----------------------|
 | D1 | **Appointment model**: 1 slot = 1 booking for v1.4; class capacity (N seats) deferred to v1.5 | The code already behaves as appointments (whole-slot hold, `db.rs:5071-5076`); class capacity needs atomic seat accounting with no demand signal yet |
-| D2 | **Money: free-confirmation-only in v1.4.** Priced bookings (Crypto Pay invoice per booking) deferred to v1.5, pending the L5 ruling (Q1) | Booking money semantics (pay-then-hold vs hold-then-pay, expiry-after-payment) are unresolved and would block the milestone on one decision; deferral costs nothing (`bookings.invoice_id` already exists, `schema.sql:397`) |
+| D2 | **Money: free-confirmation-only in v1.4.** Priced bookings (Crypto Pay invoice per booking) deferred to v1.5, pending the finance ruling (Q1) | Booking money semantics (pay-then-hold vs hold-then-pay, expiry-after-payment) are unresolved and would block the milestone on one decision; deferral costs nothing (`bookings.invoice_id` already exists, `schema.sql:397`) |
 | D3 | Hold = seller-response window: `expires_at = min(now + 60 min, slot start)`; `/bookingconfirm` may resurrect an expired hold if the slot is still free | One named constant, one rule; covers the late-responding seller without unbounded zombie holds |
 | D4 | Slot claim moves into `Db::create_booking` as one transaction; `create_slot` validates time and derives `ends_at` | Kills the handler-level TOCTOU (0.1) and makes slots sortable/renderable |
 | D5 | Held-slot sweeper (`main.rs:716-729`) DMs each buyer whose hold expired, mirroring the subscription sweeper (`main.rs:686-714`) | Closes the loop for the buyer; send failure logged, never propagated |
@@ -58,7 +58,7 @@ cancel/decline/expiry. Consequences:
 Class capacity (N seats, atomic `booked` counter, per-seat holds) is the
 explicit v1.5 candidate — **not** half-built here.
 
-### D2: the money story — two options, recommendation, and the L5 question
+### D2: the money story — two options, recommendation, and the finance question
 
 **Option A — priced bookings in v1.4.** `/book` creates a Crypto Pay invoice
 bound to the booking, reusing the poller's claim → verify → grant machinery
@@ -70,15 +70,15 @@ the same way, `pending_invoices()` (`db.rs:1381-1406`) would queue on it, and
 **Option B — free-confirmation-only in v1.4 (recommended).** `services.price`
 stays display-only; the buyer reserves time, settling with the seller directly
 (or out-of-band link). The invoice integration is specified at contract level
-(Option A) but implemented in v1.5 after the L5 ruling.
+(Option A) but implemented in v1.5 after the finance ruling.
 
 Why B: the poller's grant dispatch is guarded by subtle idempotency invariants
 (claim/`release_invoice_claim`/`finalize_invoice_paid`, `db.rs:1298-1345`);
-a third grant arm mid-milestone expands the L9/L8 blast radius, and the real
-blockers are money questions only L5 can answer (Q1). B forecloses nothing —
+a third grant arm mid-milestone expands the core/server impact, and the real
+blockers are money questions only finance can answer (Q1). B forecloses nothing —
 the state machine and `invoice_id` column carry forward unchanged.
 
-**Q1 for L5 (senior-finance — rules before the v1.5 spec):**
+**Q1 for finance (rules before the v1.5 spec):**
 1. A buyer pays for a booking that then expires unconfirmed or whose slot
    passes without seller confirmation — refund, credit, or rebook? (Decides
    hold-then-pay vs pay-then-hold for the v1.5 invoice.)
@@ -101,17 +101,17 @@ the state machine and `invoice_id` column carry forward unchanged.
 Terminal: `confirmed`, `cancelled`, `declined`; `expired` resurrectable (D3)
 only while the slot is `available`.
 
-### Module boundaries (AUTO_ROUTE.md §1)
+### Module boundaries
 
-| Artifact | File(s) | Rung |
+| Artifact | File(s) | Team |
 |----------|---------|------|
-| Slot/booking state machine, sweep query, `SlotRow` | `src/db.rs` | L9 |
-| `/book` `/slotadd` `/mybookings` `/cancelbooking` `/bookingconfirm` `/bookingdecline` + registry entries; sweeper DM loop (`src/main.rs`) | `src/handlers/commands.rs`, `src/handlers/registry.rs` | L8 |
-| `/bookings` page + booking POST routes | `src/web.rs` | L7 (spec: L6) |
+| Slot/booking state machine, sweep query, `SlotRow` | `src/db.rs` | core |
+| `/book` `/slotadd` `/mybookings` `/cancelbooking` `/bookingconfirm` `/bookingdecline` + registry entries; sweeper DM loop (`src/main.rs`) | `src/handlers/commands.rs`, `src/handlers/registry.rs` | server |
+| `/bookings` page + booking POST routes | `src/web.rs` | web (spec: design) |
 
 ### Interface contracts
 
-**Db methods (L9 owns; exact signatures):**
+**Db methods (exact signatures):**
 
 ```rust
 pub struct SlotRow { pub id: i64, pub starts_at: String,
@@ -160,7 +160,7 @@ pub fn expire_held_bookings(&self) -> Vec<(String, i64, i64, String)>
 // transition is the exactly-once guard for the DM (D5).
 ```
 
-**Bot commands (L8; register via `handlers::registry::CommandSpec`, `min_role`):**
+**Bot commands (register via `handlers::registry::CommandSpec`, `min_role`):**
 
 | Command | Tier | Args | Behavior |
 |---------|------|------|----------|
@@ -172,7 +172,7 @@ pub fn expire_held_bookings(&self) -> Vec<(String, i64, i64, String)>
 | `/bookingdecline` | **new, Seller** (Admin/Owner: any) | `<booking_id>` | `decline_booking`; DMs the buyer |
 | `/bookings` | Seller+ (unchanged) | — | Seller/admin view as today; buyers are pointed at `/mybookings` |
 
-**Console routes (L7; method + path + auth + role):**
+**Console routes (method + path + auth + role):**
 
 ```
 GET  /bookings            session   seller → scope = session.seller_id; admin/owner →
@@ -186,7 +186,7 @@ Page surfaces (D8): bookings table (buyer, service, slot time, status,
 expires, per-status action buttons) + read-only services panel (name, price,
 duration, active slot counts) pointing at `/serviceadd` `/slotadd`.
 POST-redirect-flash. WCAG AA floor applies (labels, focus, contrast, SR
-semantics — L6 specifies).
+semantics — design specifies).
 
 ### Data model deltas
 
@@ -209,7 +209,7 @@ v1.5 priced-bookings shape (Option A) would add one additive column —
 - **Multi-tenancy**: every read/write is scoped by `seller_scope` or `user_id`
   inside the `Db` method; handlers only choose the scope from the role.
 
-### Test strategy (L3 invariants)
+### Test strategy (verified invariants)
 
 1. **Atomic claim**: 8 `create_booking` calls on one slot — exactly 1 `Ok`,
    7 `Err`, slot ends `held`, one booking row.
@@ -252,13 +252,13 @@ handlers already scope every query by `principal.seller_id` (`tools.rs:43-58`,
 **Rate limit** (`principal_key`, `mcp/mod.rs:179-184`):
 `principal.seller_id.unwrap_or(principal.role as i64)` — one bucket per seller
 at the existing `RATE_RPM = 60` (`mcp/mod.rs:103`); the owner keeps the
-role-keyed bucket. L3 invariant: seller ids are real Telegram user ids, never
+role-keyed bucket. Verified invariant: seller ids are real Telegram user ids, never
 colliding with the small-integer role keys. **Audit**: `mcp_audit` gains
-`seller_id` (below) so "which token did what" is answerable — L10 will ask.
+`seller_id` (below) so "which token did what" is answerable — security will ask.
 
 ### Interface contracts
 
-**Db methods (L9):**
+**Db methods:**
 
 ```rust
 pub fn create_mcp_token(&self, seller_id: i64, name: Option<&str>,
@@ -278,10 +278,10 @@ pub fn mcp_audit(&self, tool: &str, role: &str, seller_id: Option<i64>,
                  ok: bool, detail: Option<&str>)
 // CHANGED signature (+ seller_id). All ~10 call sites in mcp/mod.rs
 // (320, 332, 355, 363, 439, 449, 463, 475, 500) pass principal.seller_id —
-// mechanical, L8 after L9 lands the column.
+// mechanical, server after core lands the column.
 ```
 
-**Bot command (L8, Seller+ self-service):**
+**Bot command (Seller+ self-service):**
 
 | Form | Behavior |
 |------|----------|
@@ -307,9 +307,9 @@ flow, no MCP tool for token lifecycle (bootstrap stays in the bot).
   transaction; the loser errors.
 - A seller token can never read another seller's data by passing explicit
   `seller_id` args: tools take the seller from the principal, not from args
-  (`tools.rs:453`, now load-bearing — L3 must test it).
+  (`tools.rs:453`, now load-bearing — must be tested).
 
-### Test strategy (L3 invariants)
+### Test strategy (verified invariants)
 
 1. Owner path byte-identical to today; disabled path identical for every input
    (403 before parse).
@@ -344,7 +344,7 @@ replaces both with single-use 15-minute hashed-token links (D7).
   neither expiry nor purpose, and `delete_pending_mfa` succeeds whether or
   not a row existed — hence the claim primitive below; GET validates, POST consumes.
 
-**Db methods (L9):**
+**Db methods:**
 
 ```rust
 pub fn consume_pending_token(&self, token_hash: &str) -> Option<(i64, String)>
@@ -357,7 +357,7 @@ pub async fn set_web_password_by_id(&self, account_id: i64, password: &str)
 // addressed by id — the token yields account_id, not a username.
 ```
 
-**Routes (L7; method + path + auth + role):**
+**Routes (method + path + auth + role):**
 
 ```
 GET  /setup/claim?token=…   public   validates hash + purpose + expiry (no consume); renders the password form
@@ -379,10 +379,10 @@ account (`seller_id` bound from `msg.from.id`); admin-minted links are a non-goa
 - Second `/dashboard` link: the PK is `token_hash`, so re-minting adds
   another live token, valid until use or TTL — acceptable (requester owns
   the chat).
-- The link DM never contains a password or any other secret (L10 review point);
+- The link DM never contains a password or any other secret (security review point);
   the claim POST shares the login throttle (token guessing is login-class).
 
-### Test strategy (L3 invariants)
+### Test strategy (verified invariants)
 
 1. Single-use: two POSTs with one token — first succeeds, second fails;
    `consume_pending_token` returns `Some` exactly once under concurrent callers.
@@ -390,7 +390,7 @@ account (`seller_id` bound from `msg.from.id`); admin-minted links are a non-goa
 3. Purpose separation: an MFA `verify` token does not work on `/setup/claim`
    and vice versa.
 4. No-password-in-DM: the `/becomeseller` and `/dashboard` replies contain no
-   credential material (L3 greps the message constructors).
+   credential material (tests grep the message constructors).
 5. The claimed session lands on `/dashboard` as the right account (binding kept).
 
 **Non-goals (Area C, v1.4):** admin-minted links; email delivery; link
@@ -398,53 +398,53 @@ revocation UI; migrating the MFA flow onto `consume_pending_token`.
 
 ## 5. Area D — Trust pack (process, kept short)
 
-- **`CHANGELOG.md`** — Keep a Changelog 1.1 format; L4 backfills 0.1.0 → v1.3
+- **`CHANGELOG.md`** — Keep a Changelog 1.1 format; docs backfills 0.1.0 → v1.3
   from AGENT.md §11's decision log, then appends per release.
-- **`docs/RELEASING.md`** — runbook: gates (AUTO_ROUTE §7) → version bump →
+- **`docs/RELEASING.md`** — runbook: gates → version bump →
   tag `v*` → release CI (`.github/workflows/release.yml`) → artifact smoke →
-  **human approval** (T2, AUTO_ROUTE §2) → publish + date the changelog.
+  **human approval** → publish + date the changelog.
 - **Version policy** — Cargo tracks the milestone: v1.4 ships as `0.4.0`
   (`Cargo.toml:3` is `0.1.0`; 0.x = pre-1.0, minors may break). `1.0.0`
-  requires: zero open P0/P1 data/money defects; L10 sign-off on
+  requires: zero open P0/P1 data/money defects; security sign-off on
   `docs/SECURITY.md`; one real seller in production for 30 days.
 
 ## 6. Dispatch plan
 
-Ordered; briefs liftable verbatim. L5 first, parallel with everything (its
-ruling shapes v1.5, not v1.4); L6 parallel with L8.
+Ordered; briefs liftable verbatim. Finance first, parallel with everything (its
+ruling shapes v1.5, not v1.4); design parallel with server.
 
-1. **L5 (senior-finance)** — "Rule on §2 Q1 (booking refund/credit semantics +
+1. **Finance** — "Rule on §2 Q1 (booking refund/credit semantics +
    price snapshot); v1.4 ships free-confirmation regardless."
-2. **L9 (staff-core-systems)** — "Land all Db contracts in §2/§3/§4 in
+2. **Core** — "Land all Db contracts in §2/§3/§4 in
    `src/db.rs` + the one `schema.sql` migrate (`mcp_audit.seller_id`): booking
    state machine with atomic slot claim, MCP token CRUD with 10-cap,
    `consume_pending_token`, `set_web_password_by_id`, `expire_held_bookings`
    row return. Unit tests per AGENT.md §6; no handler/web changes."
-3. **L8 (staff-server)** — "Wire bot surfaces per §2/§3/§4: /mybookings
+3. **Server** — "Wire bot surfaces per §2/§3/§4: /mybookings
    /cancelbooking /bookingconfirm /bookingdecline /mcptoken (registry specs),
    fix the /book 'confirmed' lie, delete the handler-side availability
    pre-check, replace DM'd passwords in /becomeseller //dashboard with link
    DMs, sweeper buyer DM, `authenticate()` seller wiring + `mcp_audit` call
    sites. No raw SQL; role checks before action."
-4. **L6 (senior-design-ux, parallel with L8)** — "UX spec for the /bookings
+4. **Design (parallel with server)** — "UX spec for the /bookings
    page (bookings table + confirm/decline/cancel + read-only services panel)
    and /setup/claim, design-system tokens, WCAG AA floor per element."
-5. **L7 (staff-client-platforms, after L6 + L9)** — "Implement §2/§4 console
+5. **Web (after design + core)** — "Implement §2/§4 console
    routes in `src/web.rs` exactly as contracted: /bookings + three booking
    POSTs (log_action audit), /setup/claim GET/POST under the shared login
    throttle, POST-redirect-flash, orders_page scoping."
-6. **L3 (associate-verification)** — "Run AUTO_ROUTE §7 gates and verify the
+6. **Verification** — "Run gates and verify the
    invariant lists in §2/§3/§4 (atomic claim, state-machine proptest,
    exactly-once expiry DM, two-seller tenancy, MCP 401 indistinguishability,
    single-use setup link). File defects; fix nothing."
-7. **L10 (principal-security)** — "Review the auth-adjacent surface before
+7. **Security** — "Review the auth-adjacent surface before
    merge: MCP seller scoping and 401 oracle, setup-link claim (single-use,
    TTL, throttle, no secret in DMs), booking claim transaction. Floor rules;
-   owning rungs remediate."
-8. **L4 (junior-media-writer)** — "Update docs/COMMANDS.md + README command
+   owning teams remediate."
+8. **Docs** — "Update docs/COMMANDS.md + README command
    lists; init CHANGELOG.md (backfill to v1.3); write docs/RELEASING.md; note
    the setup-link flow in docs/EASY_SETUP.md."
 
-Sequencing rule: no rung starts on a contract L9 has not landed in
+Sequencing rule: no team starts on a contract core has not landed in
 `src/db.rs` — the signatures are the interface between domains; drift from
-them is an L3 defect.
+them is a verification defect.

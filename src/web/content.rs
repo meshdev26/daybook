@@ -45,7 +45,7 @@ pub(super) async fn plans_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -101,12 +101,13 @@ pub(super) async fn plans_page(
 pub(super) async fn posts_page(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<SubsQuery>,
 ) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -145,12 +146,20 @@ pub(super) async fn posts_page(
         r#"<div class="table-wrap" tabindex="0" role="region" aria-label="Recent posts"><table aria-label="Recent posts"><thead><tr><th scope="col">ID</th><th scope="col">Channel</th><th scope="col">Kind</th><th scope="col">Content</th><th scope="col">Created</th></tr></thead><tbody>{}</tbody></table></div>"#,
         rows
     );
+    // M2: the gate refuses held edits before transport; the only feedback is
+    // this opaque, content-free status line (no held body, no buyer presence).
+    let held_banner = if q.held.as_deref() == Some("1") {
+        r#"<div class="alert alert-warn" role="status" aria-live="polite">The edit was held by the content policy. Nothing was changed.</div>"#
+    } else {
+        ""
+    };
     let body = format!(
         r#"<h1>Posts <span class="sub">recent sends</span></h1>
-<p class="help">Use the <a href="{}">dashboard form</a> to create a post.</p>
+{held_banner}<p class="help">Use the <a href="{}">dashboard form</a> to create a post.</p>
 {}"#,
         state.url("/dashboard"),
-        table
+        table,
+        held_banner = held_banner
     );
     Html(html_page(&state, Some(&session), "Posts", &body)).into_response()
 }
@@ -336,16 +345,16 @@ pub(super) async fn create_post(
     if !may_post_to_channel(&state, &session, &ch) {
         return forbidden_page(&state, "Posts", "Posts");
     }
-    // Sender resolution (L11 decision 1, IDENTITY_SENDER_UX_SPEC §1): the
+    // Sender resolution (architecture decision 1, IDENTITY_SENDER_UX_SPEC §1): the
     // channel binding decides who posts — before any Telegram traffic, with
     // no fallback. A user-bound channel that fails fails as a user-bound
     // send (§3 honesty).
     let sender = state.bots.for_channel_sender(&ch);
-    // Personal-identity posting is owner-only (L10 finding 1): a non-owner
+    // Personal-identity posting is owner-only (security finding 1): a non-owner
     // session whose target resolves to the operator's personal account is
     // refused BEFORE any Telegram traffic — no bot fallback, no send, no
     // log_post row. Fail-closed on every non-owner role.
-    if !sender.is_bot() && session.role != "owner" {
+    if !sender.is_bot() && !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Posts", "Personal-identity posting");
     }
     let sender_word = if sender.is_bot() { "bot" } else { "user" };
@@ -486,7 +495,7 @@ pub(super) async fn delete_plan_by_id(
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
     if let Some((sid, price, asset, name, days, channel)) = state.db.get_plan_by_id(id) {
-        if session.role == "seller" && session.seller_id != Some(sid) {
+        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
             return Redirect::to(&state.url("/plans")).into_response();
         }
         let _ = (price, asset, days, channel);
@@ -547,7 +556,7 @@ pub(super) async fn products_page(
 /// create-product DB-error path can re-render in place (EDIT_FLOW_SPEC E3 —
 /// the typed form's context stays instead of a bare dead-end page).
 fn products_body(state: &WebState, session: &Session, banner: &str) -> String {
-    let seller_scope = if session.role == "seller" {
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

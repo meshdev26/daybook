@@ -1,4 +1,9 @@
 use super::*;
+use crate::db::ReconciliationRow;
+use crate::handlers::money::{
+    all_reconciliation_rows, format_digest, paid_ungranted_escalation_cutoff,
+    reconciliation_cutoffs, should_run_digest,
+};
 // ---------- Finance ----------
 
 #[derive(Deserialize)]
@@ -14,6 +19,7 @@ pub(super) struct FinanceQuery {
     pub(super) refund_approved: Option<String>,
     pub(super) payout_executed: Option<String>,
     pub(super) refund_executed: Option<String>,
+    pub(super) reconciliation_resolved: Option<String>,
     pub(super) warn: Option<String>,
     pub(super) error: Option<String>,
     pub(super) detail: Option<String>,
@@ -82,32 +88,10 @@ pub(super) fn crypto_token(state: &WebState) -> Option<String> {
         .or_else(|| state.db.get_config("crypto_token"))
 }
 
-/// Whether a CryptoPay `transfer` error is a definite API rejection — the
-/// request completed a round trip and the API refused, so no money moved and
-/// the claimed row can safely go back to 'approved' for retry — versus an
-/// ambiguous transport outcome (timeout, network failure, garbled or gateway
-/// response) where the transfer state is unknown. `CryptoPay::call` surfaces
-/// errors as strings in three shapes: reqwest transport failures ("error
-/// sending request…", "error decoding response body…", "builder error…"),
-/// non-2xx responses ("HTTP <status> - <body>"), and the API's own `ok:false`
-/// error name for a parsed rejection (no prefix). Only the last is always a
-/// refusal; of the "HTTP" shape only a 4xx other than 408 proves it — a 5xx
-/// means an intermediary may have dropped a transfer the API actually
-/// processed, and 408 is a timeout by definition. Ambiguous outranks
-/// definite on doubt: reverting an executed transfer to 'approved' invites a
-/// double payout, while a stuck 'executing' row only costs a manual check of
-/// the queue.
-pub(super) fn transfer_rejected_definitely(e: &str) -> bool {
-    if let Some(rest) = e.strip_prefix("HTTP ") {
-        let code = rest.split([' ', '-']).next().unwrap_or_default();
-        return code.starts_with('4') && code != "408";
-    }
-    !e.starts_with("error sending request")
-        && !e.starts_with("error decoding response body")
-        && !e.starts_with("error reading a body")
-        && !e.starts_with("builder error")
-}
-
+// §4.2: the web page has NO transfer classifier of its own. All execution
+// actions call `execute_guarded_transfer`, which uses
+// `handlers::money::classify_transfer_error` (fail-closed); the page only
+// renders the resulting banner/error code.
 fn finance_page_banners(q: &FinanceQuery) -> Option<String> {
     // Banners (already-escaped HTML); several can apply at once.
     let mut banners: Vec<String> = Vec::new();
@@ -115,7 +99,7 @@ fn finance_page_banners(q: &FinanceQuery) -> Option<String> {
         banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite">Payout requested. It stays pending until the owner approves it.</div>"#.to_string());
     }
     if q.refund_created.as_deref() == Some("1") {
-        banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite">Refund created. It stays pending until an admin or the owner approves it.</div>"#.to_string());
+        banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite">Refund created. It stays pending until the owner approves it.</div>"#.to_string());
     }
     if q.payout_approved.as_deref() == Some("1") {
         banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite">Payout approved. Execute the transfer when ready.</div>"#.to_string());
@@ -127,7 +111,10 @@ fn finance_page_banners(q: &FinanceQuery) -> Option<String> {
         banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite"><strong>Payout executed.</strong> The Crypto Pay transfer completed and the payout is marked paid.</div>"#.to_string());
     }
     if q.refund_executed.as_deref() == Some("1") {
-        banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite"><strong>Refund executed.</strong> The Crypto Pay transfer completed; the invoice is marked refunded and the buyer's subscription revoked.</div>"#.to_string());
+        banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite"><strong>Refund executed.</strong> The Crypto Pay transfer completed; a full refund marks the invoice refunded and revokes the buyer's subscription.</div>"#.to_string());
+    }
+    if q.reconciliation_resolved.as_deref() == Some("1") {
+        banners.push(r#"<div class="alert alert-success" role="status" aria-live="polite"><strong>Reconciliation resolved.</strong> The decision and its reason are recorded in the audit log.</div>"#.to_string());
     }
     if q.warn.as_deref() == Some("kick") {
         banners.push(r#"<div class="alert alert-warn" role="alert" aria-live="polite">The transfer succeeded, but removing the buyer from the channel failed — check the bot's admin rights there and remove access manually.</div>"#.to_string());
@@ -177,6 +164,55 @@ fn finance_page_banners(q: &FinanceQuery) -> Option<String> {
                 "Transfer failed — the record stays approved and can be retried.".to_string(),
                 true,
             ),
+            "transfer_not_attempted" => (
+                "Transfer aborted before dispatch — no money was sent; the money row was not settled.".to_string(),
+                true,
+            ),
+            "refund_cap_exceeded" => (
+                "Refund refused — cumulative refunds would exceed the invoiced amount. No refund was created.".to_string(),
+                false,
+            ),
+            "refund_in_flight" => (
+                "Refund refused — another refund is already in flight for this invoice.".to_string(),
+                false,
+            ),
+            "unquantifiable_legacy" => (
+                "Refund refused — a stored money amount cannot be quantified; an owner must resolve it first.".to_string(),
+                false,
+            ),
+            "idem_unavailable" => (
+                "Refund refused — no idempotency key could be minted, so no money was moved.".to_string(),
+                true,
+            ),
+            "refund_create_failed" => (
+                "Refund creation failed — no refund was created.".to_string(),
+                false,
+            ),
+            "ungranted_hold" => (
+                "Payout refused — this seller has an unresolved ungranted liability past the 72h internal target. Resolve the queued refund first.".to_string(),
+                false,
+            ),
+            "reason_required" => (
+                "A non-empty reason is required for a reconciliation decision.".to_string(),
+                false,
+            ),
+            "invalid_reconciliation" => (
+                "Invalid reconciliation decision.".to_string(),
+                false,
+            ),
+            "reconcile_notfound" => ("Money row not found.".to_string(), false),
+            "reconcile_notdue" => (
+                "That row is not awaiting reconciliation.".to_string(),
+                false,
+            ),
+            "reconcile_already" => (
+                "That row was already resolved; resolutions are append-only.".to_string(),
+                false,
+            ),
+            "reconcile_failed" => (
+                "The resolution could not be recorded — try again.".to_string(),
+                false,
+            ),
             _ => (String::new(), false),
         };
         if !msg.is_empty() {
@@ -197,6 +233,84 @@ fn finance_page_banners(q: &FinanceQuery) -> Option<String> {
     }
 }
 
+/// §3.5: blocking banner when a seller carries a paid-but-ungranted invoice
+/// past the escalation cutoff whose auto-refund has not executed. Takes the
+/// resolved invoice list so the state predicate is testable independently.
+pub(super) fn finance_ungranted_banner(invoices: &[String]) -> Option<String> {
+    if invoices.is_empty() {
+        return None;
+    }
+    Some(format!(
+        r#"<div class="alert alert-error" role="alert" aria-live="polite"><strong>Blocking: unresolved ungranted liability.</strong> {} invoice(s) are paid but ungranted past the internal 72h target without an executed refund. New payouts are blocked until they are resolved; this notice cannot be dismissed here.</div>"#,
+        invoices.len()
+    ))
+}
+
+/// §5.1/§5.2: an overdue reconciliation row is a blocking owner alert; a
+/// young executing/reconciling row is advisory only (a timeout is never
+/// evidence of money movement, so nothing is auto-settled).
+pub(super) fn finance_reconciliation_banner(rows: &[ReconciliationRow]) -> Option<String> {
+    let overdue = rows.iter().filter(|r| r.overdue).count();
+    if overdue > 0 {
+        return Some(format!(
+            r#"<div class="alert alert-error" role="alert" aria-live="polite"><strong>Blocking: {} transfer(s) past the 24h owner-decision deadline.</strong> Open Reconciliation below and record a decision with a reason.</div>"#,
+            overdue
+        ));
+    }
+    if !rows.is_empty() {
+        return Some(format!(
+            r#"<div class="alert alert-warn" role="status" aria-live="polite">{} transfer(s) are executing or awaiting reconciliation. Their outcome is unknown — do not retry them blind; see Reconciliation below.</div>"#,
+            rows.len()
+        ));
+    }
+    None
+}
+
+/// Resolve the page's blocking/advisory banners from current DB state. Seller
+/// sessions see only their own liability; owner/admin sessions aggregate the
+/// sellers in their bot scope, so one tenant cannot trigger another's banner.
+pub(super) fn finance_state_banners(state: &WebState, session: &Session) -> Option<String> {
+    let role = Role::from_role_str(&session.role);
+    let seller_ids: Vec<i64> = if role == Role::Seller {
+        session.seller_id.into_iter().collect()
+    } else {
+        let scope = bot_scope_sellers(state, session);
+        state
+            .db
+            .list_sellers()
+            .into_iter()
+            .filter(|s| in_bot_scope(&scope, *s))
+            .collect()
+    };
+    let cutoff = paid_ungranted_escalation_cutoff(chrono::Utc::now());
+    let ungranted: Vec<String> = seller_ids
+        .iter()
+        .flat_map(|sid| state.db.unresolved_ungranted_invoices(*sid, &cutoff))
+        .collect();
+    let (due, overdue) = reconciliation_cutoffs(chrono::Utc::now());
+    // The reconciliation desk stays owner-only, but its banner is a count on
+    // every finance page — scope it to the same seller set as the ungranted
+    // banner above so one tenant's in-flight transfers never inflate another
+    // tenant's count. Privileged tiers resolve to every in-scope seller, so
+    // their global count is unchanged.
+    let rows: Vec<ReconciliationRow> = all_reconciliation_rows(&state.db, &due, &overdue)
+        .into_iter()
+        .filter(|r| seller_ids.contains(&r.seller_id))
+        .collect();
+    let mut parts = Vec::new();
+    if let Some(b) = finance_ungranted_banner(&ungranted) {
+        parts.push(b);
+    }
+    if let Some(b) = finance_reconciliation_banner(&rows) {
+        parts.push(b);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn finance_page(
     State(state): State<WebState>,
@@ -210,15 +324,23 @@ pub(super) async fn finance_page(
     // Seller-or-admin, the same population the REST finance list endpoints
     // serve; a seller without a seller profile is the REST `not_a_seller`
     // case.
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role) != Role::Seller
+        && !Role::from_role_str(&session.role).has_level(Role::Admin)
+    {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
-    if session.role == "seller" && session.seller_id.is_none() {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id.is_none() {
         return forbidden_page(&state, "Finance", "Finance").into_response();
     }
     let filter = normalize_finance_status(q.status.clone());
 
-    let banner_html = finance_page_banners(&q);
+    let mut banner_html = finance_page_banners(&q);
+    if let Some(state_banner) = finance_state_banners(&state, &session) {
+        banner_html = Some(match banner_html {
+            Some(action_banner) => format!("{state_banner}\n{action_banner}"),
+            None => state_banner,
+        });
+    }
 
     // Prefill the refund form when arriving from an Orders page link.
     let refund_prefill = q
@@ -346,9 +468,9 @@ fn finance_payout_row(
 }
 
 fn finance_payout_table(state: &WebState, session: &Session, filter: &str) -> String {
-    let is_admin = is_admin_role(&session.role);
-    let is_owner = session.role == "owner";
-    let scope = if session.role == "seller" {
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -412,7 +534,13 @@ type RefundRow = (
     String,
 );
 
-fn finance_refund_row(state: &WebState, is_admin: bool, r: &RefundRow) -> String {
+fn finance_refund_row(
+    state: &WebState,
+    is_admin: bool,
+    is_owner: bool,
+    creator_owned: bool,
+    r: &RefundRow,
+) -> String {
     let (id, seller, invoice_id, _user, amount, asset, reason, status) = r;
     let seller_cell = if is_admin {
         format!(r#"<td>{}</td>"#, seller)
@@ -435,9 +563,12 @@ fn finance_refund_row(state: &WebState, is_admin: bool, r: &RefundRow) -> String
         finance_badge(status),
         esc(status)
     );
-    let actions = if *status == "pending" && is_admin {
+    let actions = if creator_owned {
+        // §2: never render a control that the server would refuse anyway.
+        r#"<span class="help">You created this refund — another owner must approve and execute it.</span>"#.to_string()
+    } else if *status == "pending" && is_owner {
         format!(
-            r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Approve refund {}" onclick="return confirm('Approve refund #{} for {} {}?')">Approve</button></form>"#,
+            r#"<form method="post" action="{}" class="inline-form"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-secondary btn-sm" aria-label="Approve refund {}" onclick="return confirm('Approve refund #{} for {} {}? This records your approval as the owner.')">Approve</button></form>"#,
             state.url("/finance/refund/approve"),
             id,
             id,
@@ -445,7 +576,7 @@ fn finance_refund_row(state: &WebState, is_admin: bool, r: &RefundRow) -> String
             esc(amount),
             esc(asset)
         )
-    } else if *status == "approved" && is_admin {
+    } else if *status == "approved" && is_owner {
         format!(
             r#"<form method="post" action="{}" class="inline-form" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Execute refund {}" onclick="return confirm('Execute refund #{}? This sends {} {} back to the buyer via Crypto Pay — real money.')">Execute</button></form>"#,
             state.url("/finance/refund/execute"),
@@ -471,8 +602,9 @@ fn finance_refund_row(state: &WebState, is_admin: bool, r: &RefundRow) -> String
 }
 
 fn finance_refund_table(state: &WebState, session: &Session, filter: &str) -> String {
-    let is_admin = is_admin_role(&session.role);
-    let scope = if session.role == "seller" {
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    let is_owner = Role::from_role_str(&session.role) == Role::Owner;
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -508,14 +640,20 @@ fn finance_refund_table(state: &WebState, session: &Session, filter: &str) -> St
     } else {
         refunds
             .iter()
-            .map(|r| finance_refund_row(state, is_admin, r))
+            .map(|r| {
+                // §2: hide the controls from the human creator as well as
+                // from non-owners; the server enforces the same gate.
+                let creator_owned =
+                    crate::handlers::money::creator_owns_refund(&state.db, session.account_id, r.0);
+                finance_refund_row(state, is_admin, is_owner, creator_owned, r)
+            })
             .collect::<Vec<_>>()
             .join("")
     };
-    let refund_note = if is_admin {
+    let refund_note = if is_owner {
         String::new()
     } else {
-        r#"<p class="help">Refund approval and execution require admin or owner.</p>"#.to_string()
+        r#"<p class="help">Refund approval and execution are owner actions.</p>"#.to_string()
     };
     format!(
         r#"{note}<div class="table-wrap" tabindex="0" role="region" aria-label="Refunds"><table aria-label="Refunds"><caption class="sr-only">Refunds</caption><thead>{head}</thead><tbody>{rows}</tbody></table></div>"#,
@@ -563,6 +701,91 @@ fn finance_filter_nav(state: &WebState, filter: &str) -> String {
     )
 }
 
+/// §5 owner reconciliation desk: one form per executing/reconciling row,
+/// with a mandatory audited reason, plus the same content the 09:00 UTC
+/// digest reports. Server-rendered so no JS or inline secret is required.
+fn finance_reconciliation_section(state: &WebState, session: &Session) -> String {
+    if Role::from_role_str(&session.role) != Role::Owner {
+        return String::new();
+    }
+    let now = chrono::Utc::now();
+    let (due, overdue) = reconciliation_cutoffs(now);
+    let rows = all_reconciliation_rows(&state.db, &due, &overdue);
+    let form_rows = rows
+        .iter()
+        .map(|r| {
+            let key = format!("{}-{}", r.row_type, r.id);
+            let badge = if r.overdue {
+                r#"<span class="badge badge-danger">overdue — owner decision required</span>"#
+            } else {
+                r#"<span class="badge badge-warning">awaiting decision</span>"#
+            };
+            let spend = format!(
+                r#"<span class="mono">{}</span>"#,
+                esc(r.spend_id.as_deref().unwrap_or("—"))
+            );
+            format!(
+                r#"<article class="panel">
+<h3>{} #{} {} {}</h3>
+<p class="help">Seller {} · {} {} · spend_id {} · since {}</p>
+<form method="post" action="{}" class="stack">
+<input type="hidden" name="row_type" value="{}">
+<input type="hidden" name="id" value="{}">
+<label for="outcome-{}">Decision</label>
+<select id="outcome-{}" name="outcome" required>
+<option value="executed">Executed — receipt checked</option>
+<option value="reverted_to_approved">Reverted — transfer never landed</option>
+<option value="void">Void — cancel with reason</option>
+</select>
+<label for="reason-{}">Reason (required, written to the audit log)</label>
+<input id="reason-{}" type="text" name="reason" required maxlength="500" autocomplete="off">
+<button type="submit" class="btn btn-danger btn-sm">Record decision</button>
+</form>
+</article>"#,
+                esc(&r.row_type),
+                r.id,
+                esc(&r.status),
+                badge,
+                r.seller_id,
+                esc(&r.amount),
+                esc(&r.asset),
+                spend,
+                esc(&r.since),
+                state.url("/finance/reconciliation/resolve"),
+                esc(&r.row_type),
+                r.id,
+                esc(&key),
+                esc(&key),
+                esc(&key),
+                esc(&key),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let list = if form_rows.is_empty() {
+        r#"<p class="empty"><b>Nothing to reconcile.</b> No transfer is stuck in an unknown state.</p>"#
+            .to_string()
+    } else {
+        form_rows
+    };
+    let digest = esc(&format_digest(&rows, now));
+    let window_note = if should_run_digest(now) {
+        r#"<p class="help">The 09:00 UTC digest window is open; the content below is the same list sent to the owner.</p>"#
+    } else {
+        r#"<p class="help">This is the same list the 09:00 UTC owner digest reports.</p>"#
+    };
+    format!(
+        r#"<section aria-labelledby="reconciliation-heading"><h2 id="reconciliation-heading">Reconciliation <span class="sub">owner decisions</span></h2>
+<p class="help">A timeout is never evidence of money movement. Rows stay in their current state until you record a decision with a reason.</p>
+{list}
+<details><summary>09:00 UTC digest</summary>{window_note}<pre class="mono">{digest}</pre></details>
+</section>"#,
+        list = list,
+        window_note = window_note,
+        digest = digest,
+    )
+}
+
 pub(super) fn finance_body(
     state: &WebState,
     session: &Session,
@@ -571,13 +794,14 @@ pub(super) fn finance_body(
     refund_prefill: Option<String>,
 ) -> String {
     let banners = banners.unwrap_or_default();
-    let is_admin = is_admin_role(&session.role);
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
     let payout_form = finance_payout_form(state, is_admin);
     let refund_form = finance_refund_form(state, refund_prefill);
     let payout_table = finance_payout_table(state, session, filter);
     let refund_table = finance_refund_table(state, session, filter);
+    let reconciliation_section = finance_reconciliation_section(state, session);
     let filter_nav = finance_filter_nav(state, filter);
-    let scoping_note = if session.role == "seller" {
+    let scoping_note = if Role::from_role_str(&session.role) == Role::Seller {
         "Showing payouts and refunds for your seller account."
     } else {
         "Showing payouts and refunds for all sellers."
@@ -596,13 +820,15 @@ pub(super) fn finance_body(
 </section>
 <section aria-labelledby="refunds-heading"><h2 id="refunds-heading">Refunds</h2>
 {refund_table}
-</section>"#,
+</section>
+{reconciliation_section}"#,
         banners = banners,
         scoping_note = scoping_note,
         filter_nav = filter_nav,
         payout_form = payout_form,
         refund_form = refund_form,
         payout_table = payout_table,
-        refund_table = refund_table
+        refund_table = refund_table,
+        reconciliation_section = reconciliation_section
     )
 }

@@ -1,0 +1,15 @@
+{
+  "name": "telegram-agent-assets",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dev-only type check and test harness for the dashboard client JS.",
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "node --test test/app-js.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.4"
+  }
+}

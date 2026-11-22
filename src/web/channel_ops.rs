@@ -18,7 +18,7 @@ pub(super) async fn post_schedule(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -99,6 +99,33 @@ pub(super) async fn post_edit(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    // M2: an edit replaces already-published message text, so it is a
+    // content-bearing outbound send. Decide it with the central gate BEFORE any
+    // Telegram transport call (the shared row-op helper always calls
+    // edit_message_text when the message id is non-zero). Scope follows the
+    // acting principal; the bot is the one bound to the target channel — the
+    // same context the transport would use.
+    let policy_seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
+        0i64
+    } else {
+        session.seller_id.unwrap_or(0)
+    };
+    let policy_bot_id = Some(state.bots.for_channel(&f.chat_id).id);
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        policy_seller_id,
+        policy_bot_id,
+        &f.text,
+    ) {
+        // Only the opaque marker and numeric scope are logged — never text.
+        tracing::warn!(
+            seller_id = policy_seller_id,
+            bot_id = ?policy_bot_id,
+            outcome = %hold,
+            "post edit held before transport"
+        );
+        return Redirect::to(&state.url("/posts?held=1")).into_response();
+    }
     run_post_row_op(
         &state,
         &session,
@@ -205,7 +232,7 @@ pub(super) async fn channel_invite(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Channels", "Invite links");
     }
     let chat_id = f.chat_id.trim().to_string();

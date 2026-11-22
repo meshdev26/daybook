@@ -1,6 +1,6 @@
 //! Raw-TL wrapper for the personal-account identity (the ONLY place
 //! version-pinned raw grammers calls may live — ratified user-identity
-//! design §7, L9 feasibility verdict).
+//! design §7, core feasibility verdict).
 //!
 //! grammers 0.11 has no high-level discussion-thread iterator, so thread
 //! replies go through `messages.getReplies` (pinned `=0.11.0` in Cargo.toml;

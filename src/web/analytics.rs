@@ -22,7 +22,7 @@ pub(super) struct AnalyticsMetrics {
 }
 
 fn analytics_seller_ids(state: &WebState, session: &Session) -> Vec<i64> {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id.into_iter().collect()
     } else {
         // Bot scoping (web-bot-scoping N1): a global owner with a selected
@@ -218,8 +218,8 @@ fn analytics_chart_section(m: &AnalyticsMetrics, export_url: &str) -> String {
     format!(
         r#"<section aria-labelledby="top-products-heading"><h2 id="top-products-heading">Top products</h2>
 <article class="panel"><div class="table-wrap" tabindex="0" role="region" aria-label="Top products"><table aria-label="Top products"><thead><tr><th scope="col">Product</th><th scope="col" class="num">Sales</th></tr></thead><tbody>{top_rows}</tbody></table></div>
-<canvas id="topProductsChart" width="400" height="200" role="img" aria-label="Bar chart of sales by product; the table above lists the same data"></canvas></article></section>
-<p class="help"><a href="{export_url}">Export CSV</a></p>
+<canvas id="topProductsChart" width="400" height="200" role="img" aria-label="Bar chart of sales by product; the table above lists the same data"></canvas>
+<p class="help"><a href="{export_url}">Export CSV</a></p></article></section>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 (function() {{
@@ -298,7 +298,7 @@ pub(super) async fn analytics_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_ids: Vec<i64> = if session.role == "seller" {
+    let seller_ids: Vec<i64> = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id.into_iter().collect()
     } else {
         let mut ids = state.db.list_sellers();
@@ -376,8 +376,8 @@ pub(super) async fn usage_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let is_owner = session.role == "owner";
-    let seller_scope = if session.role == "seller" {
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
+    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None

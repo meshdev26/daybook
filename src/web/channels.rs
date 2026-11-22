@@ -53,7 +53,7 @@ pub(super) fn channels_error_copy(e: &str, state: &WebState, session: &Session) 
                 .to_string()
         }
         "posting" => {
-            if session.role == "owner" {
+            if Role::from_role_str(&session.role).has_level(Role::Owner) {
                 format!(
                     "Posting as your personal account isn't enabled yet. Enable it on the <a href=\"{}\">Identity page</a> first.",
                     state.url("/identity")
@@ -64,7 +64,7 @@ pub(super) fn channels_error_copy(e: &str, state: &WebState, session: &Session) 
         }
         "locked" => "Your identity is locked — unlock it in the banner above.".to_string(),
         "identity" => {
-            if session.role == "owner" {
+            if Role::from_role_str(&session.role).has_level(Role::Owner) {
                 format!(
                     "The personal identity isn't connected — finish connecting it on the <a href=\"{}\">Identity page</a> first.",
                     state.url("/identity")
@@ -101,9 +101,10 @@ pub(super) fn channels_banners(
         if !anchored {
             if q.notitle.as_deref() == Some("1") {
                 // Honest add (CHANNELS_TITLE_UX_SPEC §3): resolution failed, say so.
-                let tail = match session.role.as_str() {
-                    "owner" => " Open Manage to name it.",
-                    _ => "",
+                let tail = if Role::from_role_str(&session.role).has_level(Role::Owner) {
+                    " Open Manage to name it."
+                } else {
+                    ""
                 };
                 banners.push(channels_banner(
                     "info",
@@ -197,7 +198,7 @@ pub(super) fn channels_body(
         .map(|a| channels_banner("error", a))
         .unwrap_or_default();
     let success = success.unwrap_or_default().to_string();
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         return render_seller_channels(state, session, &alert, &success, q);
     }
     render_global_channels(state, session, &alert, &success, q)
@@ -215,7 +216,7 @@ fn render_global_channels(
     success: &String,
     q: Option<&ChannelsQuery>,
 ) -> String {
-    let is_owner = session.role == "owner";
+    let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
     let scope_bot = if is_owner {
         session.selected_bot_id
     } else {
@@ -369,7 +370,7 @@ pub(super) async fn channels_add(
         .map(str::trim)
         .filter(|v| !v.is_empty());
     let user_title = f.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
-    let bot = if session.role == "seller" {
+    let bot = if Role::from_role_str(&session.role) == Role::Seller {
         session
             .seller_id
             .map(|sid| state.bots.for_seller(sid))
@@ -405,7 +406,7 @@ pub(super) async fn channels_add(
     };
     // Sellers adding = setting their own channel (the bot's /setchannel
     // semantics); owners add to the global set (seller_id 0).
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(sid) => {
                 state.db.set_seller_channel(sid, &canonical);
@@ -413,7 +414,7 @@ pub(super) async fn channels_add(
             }
             None => forbidden_page(&state, "Channels", "Your session has no seller profile."),
         }
-    } else if session.role == "owner" {
+    } else if Role::from_role_str(&session.role).has_level(Role::Owner) {
         match state.db.add_channel(&canonical, 0) {
             Ok(()) => {
                 state
@@ -440,7 +441,7 @@ pub(super) async fn channels_default(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Channels", "The default channel");
     }
     let ch = f.channel.trim();
@@ -478,7 +479,7 @@ pub(super) async fn channels_remove(
     // silently break every plan that relies on the fallback, so it is
     // refused until another channel takes over. The check is scope-aware —
     // seller rows are never the global default.
-    if session.role == "owner" {
+    if Role::from_role_str(&session.role).has_level(Role::Owner) {
         if state.db.default_channel().as_deref() == Some(ch) {
             return channels_error(
                 &state,
@@ -490,7 +491,7 @@ pub(super) async fn channels_remove(
             Ok(()) => Redirect::to(&state.url("/channels?removed=1")).into_response(),
             Err(e) => channels_error(&state, &session, &esc(&e)),
         }
-    } else if session.role == "seller" {
+    } else if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(sid) => match state.db.remove_channel(ch, sid) {
                 Ok(()) => Redirect::to(&state.url("/channels?removed=1")).into_response(),
@@ -553,9 +554,9 @@ pub(super) async fn channels_rename(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let sid = if session.role == "owner" {
+    let sid = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
-    } else if session.role == "seller" {
+    } else if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(id) => id,
             None => {
@@ -601,10 +602,12 @@ pub(super) async fn channels_rename(
         )))
         .into_response();
     }
-    match state
-        .db
-        .rename_channel(sid, &old, &new, session.role == "owner")
-    {
+    match state.db.rename_channel(
+        sid,
+        &old,
+        &new,
+        Role::from_role_str(&session.role).has_level(Role::Owner),
+    ) {
         Ok(()) => Redirect::to(&state.url(&format!(
             "/channels/manage?channel={}&renamed=1",
             urlencode_query(&new)
@@ -642,7 +645,7 @@ pub(super) async fn channels_name(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Channels", "Channel names");
     }
     let ch = f.channel.trim();
@@ -706,7 +709,7 @@ pub(super) async fn channels_bind_sender(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Channels", "Channel sender binding");
     }
     let ch = f.channel.trim();

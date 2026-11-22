@@ -1,4 +1,4 @@
-# EDIT_FLOW_SPEC — Console edit-flow audit (L6 senior-design-ux)
+# EDIT_FLOW_SPEC — Console edit-flow audit
 
 Truth: `DESIGN.md` + `assets/app.css`. MASTER.md deprecated. Territory: this
 spec only. All file:line evidence verified 2026-11-01 on the working tree.
@@ -73,7 +73,7 @@ activated | removed | approved | executed | error`. Banner copy pattern:
 
 ---
 
-## 2. Tier 1 — flow breaks (fix in one L7 pass)
+## 2. Tier 1 — flow breaks (fix in one web pass)
 
 Every item: evidence → heuristic broken → prescribed fix (markup/copy) →
 size impact → at-risk tests. URL flash keys are chosen so existing pins stay
@@ -445,7 +445,7 @@ admin users), E8 (refunded divergence), E1 (plans delete/raw keys), E6
   either (a) mirror the exact markup whenever Plans form markup changes, or
   (b) preferred: shrink the dashboard panel to the plans list + a `Create on
   the Plans page` ghost link. (b) removes a duplicate Save from the dashboard
-  — two primaries for one task (heuristic 1). L7 may take (b) as the
+  — two primaries for one task (heuristic 1). the web layer may take (b) as the
   tie-breaker.
 - Size: (a) 0, (b) −8/+2 in dashboard.rs. Tests: none pinned.
 
@@ -506,7 +506,7 @@ admin users), E8 (refunded divergence), E1 (plans delete/raw keys), E6
   - No test pins "Set", "Track", "Deactivate", "Upsert", "Show me", or any
     banner copy touched here (grepped tests/ + src/web/*tests*).
 
-## 6. Suggested pass order for L7 (file-clustered, one pass)
+## 6. Suggested pass order for web (file-clustered, one pass)
 
 1. content.rs (E1-E3, C7) — 635 → ~725.
 2. admin_console.rs (E14-E18) — 505 → ~560.

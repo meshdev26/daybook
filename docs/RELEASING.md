@@ -16,7 +16,6 @@ cargo clippy -- -D warnings
 cargo fmt --check
 cargo audit                     # supply chain
 cargo deny check                # licenses
-python3 scripts/verify-agent-tiers.py
 ```
 
 - The toolchain is pinned in `rust-toolchain.toml` (1.99.1, clippy + rustfmt
@@ -24,7 +23,7 @@ python3 scripts/verify-agent-tiers.py
   resolves to a system cargo, prefix every command: `rustup run stable cargo
   build`, or make sure rustup's cargo comes first in `PATH`.
 - `make test` runs the whole suite in one target (fmt, clippy, test, audit,
-  deny, routing contract) — same target CI runs, so the two cannot drift.
+  deny) — same target CI runs, so the two cannot drift.
 - `make doctor` on a **scratch instance** — a fresh checkout or throwaway
   deploy, not just the dev machine. It checks binary, env, token (getMe), DB
   integrity, dashboard, service. An environment that only works where it was
@@ -39,7 +38,7 @@ may break.
 1. Edit `version` in `Cargo.toml`.
 2. Regenerate `Cargo.lock` (`cargo check` is enough) and commit both — a
    stale lock is a broken build on the next machine.
-3. `1.0.0` is gated separately: zero open P0/P1 data/money defects, L10
+3. `1.0.0` is gated separately: zero open P0/P1 data/money defects, security
    sign-off on `docs/SECURITY.md`, one real seller in production for 30 days.
 
 ## Tag + package
@@ -74,7 +73,6 @@ may break.
 
 ## The two-person rule
 
-External publishing — GitHub push, tag push, release publish — is **T2:
-Escalate** in `AUTO_ROUTE.md` §2. It is always human-approved and
-human-executed; no rung closes its own T2. This runbook documents the steps;
-it does not authorize an agent to run them.
+External publishing — GitHub push, tag push, release publish — requires
+**owner approval**. It is always human-approved and human-executed. This
+runbook documents the steps; it does not grant publishing authority by itself.

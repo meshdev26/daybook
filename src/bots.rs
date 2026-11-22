@@ -78,6 +78,15 @@ impl ContentSender for BotContext {
     }
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<SentMessage, SendError> {
+        // Outbound moderation gate (multibot foundation Step 4.2). This is the
+        // single ContentSender choke point for bot-identity sends; every post,
+        // broadcast, AI draft, delivery DM and admin reply that routes through
+        // it is checked against the receiving bot's effective policy before
+        // any transport work. The gate only READS policy (no floor writes) and
+        // fails closed to a hold when enforcement is degraded.
+        let seller_id = crate::handlers::moderation::outbound_seller_scope(&self.db, self.id);
+        crate::handlers::moderation::gate_outbound(&self.db, seller_id, Some(self.id), text)
+            .map_err(|hold| SendError::Transport(hold.to_string()))?;
         match self
             .bot
             .send_message(teloxide::types::ChatId(chat_id), text)
@@ -139,6 +148,16 @@ impl BotManager {
         self.bots.iter().find(|b| b.id == id).cloned()
     }
 
+    /// Resolve the receiving bot's product type and compiled capability
+    /// (multibot foundation, server). Used once per dispatcher so the inbound
+    /// gate sees the bot that actually received the update, not the seller's
+    /// routing bot. Missing ids fall back to the primary context, whose type
+    /// resolves to the shop default — byte-identical legacy behavior.
+    pub fn capability_for_bot(&self, id: i64) -> crate::handlers::capabilities::BotCapability {
+        let ctx = self.get(id).unwrap_or_else(|| self.primary.clone());
+        crate::handlers::capabilities::BotCapability::for_bot(&self.db, &ctx)
+    }
+
     pub fn for_seller(&self, seller_id: i64) -> Arc<BotContext> {
         if let Some(bid) = self.db.get_seller_bot_id(seller_id)
             && let Some(ctx) = self.get(bid)
@@ -172,7 +191,7 @@ impl BotManager {
     /// - no channel row / column / value `'bot'` → `Sender::Bot`;
     /// - value `'user'` → `Sender::User`, **always** — even when the
     ///   identity is locked or not running. A user-bound send then fails
-    ///   loudly at the caller (`SendError::WritesDisabled` while the L10 T2
+    ///   loudly at the caller (`SendError::WritesDisabled` while the security owner-approval
     ///   "Enable posting" gate is unconfirmed, `SendError::NotAuthorized`
     ///   when the subsystem is not signed in) instead of silently falling
     ///   back to the bot (IDENTITY_SENDER_UX_SPEC).
@@ -309,7 +328,7 @@ mod tests {
         assert!(!sender.is_bot());
         assert_eq!(sender.identity(), SenderIdentity::User);
 
-        // The L10 T2 "Enable posting" gate fires first: posting is not
+        // The security owner-approval "Enable posting" gate fires first: posting is not
         // enabled yet, so the send is refused as WritesDisabled — distinct
         // from the identity state, never a bot fallback.
         let err = sender.send_text(42, "hello").await.unwrap_err();
@@ -344,5 +363,54 @@ mod tests {
         let (_dir, mgr) = setup();
         assert_eq!(mgr.primary.identity(), SenderIdentity::Bot(0));
         assert!(mgr.for_channel_sender("anything").is_bot());
+    }
+
+    /// Outbound moderation gate on the bot-identity `ContentSender` choke
+    /// point: a matching seller term holds the send before ANY transport work
+    /// (wiremock sees zero requests); a clean send passes through unchanged.
+    #[tokio::test]
+    async fn bot_context_send_text_gate_holds_then_passes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::new(dir.path().join("t.db").to_str().unwrap()).unwrap());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1, "date": 0, "chat": { "id": 42, "type": "private" } }
+            })))
+            .mount(&server)
+            .await;
+        let bot = teloxide::Bot::new("9:placeholder")
+            .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+        let ctx = BotContext {
+            id: 9,
+            key: "mod".to_string(),
+            bot,
+            owner_id: 0,
+            shared: Arc::new(test_cfg()),
+            db: db.clone(),
+        };
+
+        assert!(db.add_blocked_word(0, "banned", "hide", true));
+        let err = ctx
+            .send_text(42, "please read banned content")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::Transport(m) if m.contains("moderation_hold")),
+            "got {err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a held send must not reach the transport"
+        );
+
+        assert!(db.remove_blocked_word(0, "banned"));
+        let sent = ctx.send_text(42, "clean content").await.unwrap();
+        assert_eq!(sent.chat_id, 42);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

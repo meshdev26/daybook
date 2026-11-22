@@ -1,3 +1,7 @@
+use crate::handlers::money::{
+    GuardedTransferOutcome, execute_guarded_transfer, reconciliation_cutoffs,
+};
+use crate::roles::Role;
 use crate::web::WebState;
 use axum::{
     Json, Router,
@@ -51,15 +55,59 @@ fn session_or_401(
 }
 
 fn seller_scope(session: &crate::web::Session) -> Option<i64> {
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
     }
 }
 
-fn is_admin_role(role: &str) -> bool {
-    role == "admin" || role == "owner"
+/// §2: every money approval, execution, void and resolution requires the
+/// Owner role (not merely Admin+). Returns the spec's `owner_required` 403.
+fn owner_gate(session: &crate::web::Session) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if Role::from_role_str(&session.role) != Role::Owner {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "owner_required",
+            "owner required",
+        ));
+    }
+    Ok(())
+}
+
+/// §2 separation of duties: the human creator of a refund may never approve
+/// or execute it. System-created refunds have no creator audit event and are
+/// exempt from this check (they still require an Owner approver).
+fn creator_gate(
+    db: &crate::db::Db,
+    refund_id: i64,
+    session: &crate::web::Session,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if let Some((creator_id, _)) = crate::handlers::money::refund_creator(db, refund_id)
+        && creator_id == session.account_id
+    {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "creator_forbidden",
+            "creator cannot approve or execute their own refund",
+        ));
+    }
+    Ok(())
+}
+
+/// Tenant gate for channel-addressed REST mutations. Delegates to the single
+/// shared policy in `handlers::channel_access` so the REST surface and the
+/// console cannot drift. Run before ANY Bot API call or DB row write so one
+/// tenant's session cannot drive another tenant's bot.
+fn api_may_mutate_channel(state: &WebState, session: &crate::web::Session, chat_id: &str) -> bool {
+    crate::handlers::channel_access::may_mutate_channel(
+        &state.db,
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        chat_id,
+    )
 }
 
 /// Extract the invoice array from a Crypto Pay `getInvoices` response,
@@ -181,7 +229,7 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
                 )
                     .into_response();
             }
-            if role == "owner" || role == "admin" {
+            if Role::from_role_str(&role).has_level(Role::Admin) {
                 // The web flow forces TOTP enrollment for privileged roles
                 // before any session exists; enrollment is web-only tonight,
                 // so REST refuses rather than lowering that bar.
@@ -436,7 +484,7 @@ async fn auth_password(
     }
     // Non-owner accounts must prove knowledge of the current password via
     // the same bcrypt verification the login uses.
-    if role != "owner" {
+    if !Role::from_role_str(&role).has_level(Role::Owner) {
         // spawn_blocking hasher is async: awaiting happens here, not in a
         // sync closure (mechanical restructure of the former Option::map).
         let verified = match f.current_password.as_deref() {
@@ -473,7 +521,7 @@ async fn sellers_list(State(state): State<WebState>, headers: HeaderMap) -> impl
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -527,7 +575,7 @@ async fn seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -562,7 +610,9 @@ async fn sellers_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) && session.seller_id != Some(f.user_id) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin)
+        && session.seller_id != Some(f.user_id)
+    {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -640,7 +690,7 @@ async fn seller_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -649,12 +699,12 @@ async fn seller_set_channel(
         .into_response();
     }
     let channel = f.channel.trim().to_string();
-    // Proof of control (L10 BLOCK-3): non-admin callers may only bind a
+    // Proof of control (security BLOCK-3): non-admin callers may only bind a
     // channel they actually control. Admins/owner keep the unvalidated free
     // set — the bootstrap path (first-run channel setup) runs before the bot
     // is a member of any chat, and admin/owner console sessions carry no
     // bound Telegram identity to run the administrators check against.
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         if let Ok(n) = channel.parse::<i64>() {
             if n >= 0 {
                 // Telegram channel/group ids are negative (`-100…` for
@@ -727,7 +777,7 @@ async fn seller_get_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -761,7 +811,7 @@ async fn seller_set_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(user_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -906,7 +956,7 @@ async fn plans_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
         None
@@ -914,7 +964,8 @@ async fn plans_get(
     // find by id via list (no get_plan_by_id scoping helper exists for seller; use get_plan_by_id then check)
     match state.db.get_plan_by_id(id) {
         Some((sid, price, asset, name, days, channel)) => {
-            if session.role == "seller" && session.seller_id != Some(sid) {
+            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
             }
             let _ = scope;
@@ -951,7 +1002,7 @@ async fn plans_update(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     // Re-add plan with merged fields (add_plan is upsert by seller+name)
@@ -1004,7 +1055,7 @@ async fn plans_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     state.db.remove_plan(sid, &name);
@@ -1031,7 +1082,7 @@ async fn plans_active(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(sid) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     if f.active {
@@ -1142,12 +1193,30 @@ async fn subs_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    // Subscription status is a privileged mutation: only the owner may change
+    // it (mirrors the web `subs_revoke` / `subs_expirecheck` owner gates). A
+    // seller session never reaches the mutation, even for its own row.
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
+    }
+    // Resolve the target inside the caller's tenant scope before touching it.
+    // Owner scope is global, but an id that does not exist must still fail
+    // closed (404) rather than mutate an arbitrary row.
+    let scope = seller_scope(&session);
+    let in_scope = state
+        .db
+        .list_subscriptions(scope, 1000)
+        .iter()
+        .any(|s| s.0 == id);
+    if !in_scope {
+        return err(StatusCode::NOT_FOUND, "not_found", "subscription not found").into_response();
+    }
     if let Some(status) = &f.status
         && status == "expired"
     {
         state.db.mark_subscription_expired(id);
     }
-    let _ = (session, f.expires_at);
+    let _ = f.expires_at;
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -1259,7 +1328,9 @@ async fn invoices_get(
     };
     match state.db.get_invoice(&invoice_id) {
         Some((amount, asset, status, desc, plan_id, user_id, seller_id)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1274,6 +1345,8 @@ async fn invoices_get(
 #[derive(Deserialize)]
 struct InvoiceStatusReq {
     status: String,
+    /// Required only for the operator-forced `failed` transition (§3.6).
+    reason: Option<String>,
 }
 async fn invoices_status(
     State(state): State<WebState>,
@@ -1287,22 +1360,74 @@ async fn invoices_status(
     };
     // ownership check
     if let Some((_a, _as, _st, _d, _p, _u, sid)) = state.db.get_invoice(&invoice_id) {
-        if session.role == "seller" && session.seller_id != Some(sid) {
+        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
             return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
         }
     } else {
         return err(StatusCode::NOT_FOUND, "not_found", "invoice not found").into_response();
     }
-    // 'paid' is a verified state, not a manual one: it may only be reached
-    // through the verified webhook or the claim flow.
-    if f.status == "paid" {
+    // 'paid' and 'paid_ungranted' are verified/system states, never manual:
+    // they may only be reached through the webhook, claim or recovery flow
+    // (§3.2/§3.6). Refuse both explicitly.
+    if f.status == "paid" || f.status == "paid_ungranted" {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_status",
-            "paid transitions require verified webhook/claim",
+            "paid/paid_ungranted transitions require verified webhook/claim",
         )
         .into_response();
     }
+    if f.status == "failed" {
+        // §3.6 / D3.6: an operator-forced failure requires the exact Owner
+        // role (not Admin/Seller), a non-empty reason, and an audit event.
+        // 'failed' is legal only from a pre-payment state — never from a paid
+        // or paid_ungranted invoice (§3.1).
+        if Role::from_role_str(&session.role) != Role::Owner {
+            return err(StatusCode::FORBIDDEN, "owner_required", "owner required").into_response();
+        }
+        let reason = f.reason.as_deref().unwrap_or("").trim();
+        if reason.is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "reason_required",
+                "a non-empty reason is required to fail an invoice",
+            )
+            .into_response();
+        }
+        let previous_status = state
+            .db
+            .get_invoice(&invoice_id)
+            .map(|inv| inv.2)
+            .unwrap_or_default();
+        if previous_status == "paid" || previous_status == "paid_ungranted" {
+            return err(
+                StatusCode::CONFLICT,
+                "invalid_status",
+                "cannot fail a paid or paid_ungranted invoice",
+            )
+            .into_response();
+        }
+        state.db.update_invoice_status(&invoice_id, "failed");
+        let meta = serde_json::json!({
+            "reason": reason, "previous_status": previous_status,
+        })
+        .to_string();
+        state.db.log_action(
+            session.account_id,
+            &session.role,
+            "invoice_manual_failed",
+            "invoice",
+            &invoice_id,
+            Some(&meta),
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "status": "failed"})),
+        )
+            .into_response();
+    }
+    // All other transitions keep their prior behaviour (seller may e.g. mark
+    // an unpaid invoice 'expired'/'cancelled' without a reason).
     state.db.update_invoice_status(&invoice_id, &f.status);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -1417,7 +1542,9 @@ async fn codes_get(
     };
     match state.db.get_code(&code) {
         Some((id, seller_id, plan_id, value_days, max_uses, uses, expires_at)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1444,10 +1571,10 @@ async fn codes_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "code not found").into_response();
         }
     };
-    if session.role == "seller" && session.seller_id != Some(seller_id) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
-    // Real delete via the scoped helper (L8 db.rs addition): sellers delete
+    // Real delete via the scoped helper (server db.rs addition): sellers delete
     // only their own codes, admin/owner any. `seller_scope` yields None for
     // admin/owner and Some(id) for sellers.
     if !state
@@ -1536,7 +1663,9 @@ async fn codes_redemptions(
     };
     match state.db.get_code(&code) {
         Some((_id, seller_id, _p, _v, _m, _u, _e)) => {
-            if session.role == "seller" && session.seller_id != Some(seller_id) {
+            if Role::from_role_str(&session.role) == Role::Seller
+                && session.seller_id != Some(seller_id)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
         }
@@ -1606,9 +1735,33 @@ async fn posts_create(
         )
         .into_response();
     }
+    // The target is client-supplied and the send is logged against it. Apply
+    // the console's composer-target policy (owned rows + global rows) before
+    // any moderation check, Bot API call or DB write: a seller must not be able
+    // to post into another seller's channel through REST either.
+    if !crate::handlers::channel_access::may_post_to_channel(
+        &state.db,
+        &session.role,
+        session.seller_id,
+        session.account_id,
+        session.selected_bot_id,
+        &ch,
+    ) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
+    }
     // Sends go out as the session's effective bot (seller → their bot, owner →
     // selected bot, admin → their bot with primary fallback).
     let bot = crate::web::effective_bot(&state, &session);
+    // security outbound gate BEFORE this raw-Bot send. Seller scope comes from the
+    // principal (session), never a global 0, so seller rules apply too.
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        session.seller_id.unwrap_or(0),
+        Some(bot.id),
+        &f.text,
+    ) {
+        return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string()).into_response();
+    }
     let msg_id = match bot
         .bot
         .send_message(crate::util::to_chat_id(&ch), f.text.clone())
@@ -1663,6 +1816,14 @@ async fn posts_schedule(
         )
         .into_response();
     }
+    // F1: the scheduler sends through the bot bound to the TARGET channel
+    // (BotManager::for_channel in main.rs), not the caller's effective bot.
+    // Without this gate a seller could queue text into a foreign channel under
+    // the victim bot's identity while the moderation gate checked the attacker
+    // scope. Authorize before the row write; owner/admin keep the global tier.
+    if !api_may_mutate_channel(&state, &session, &ch) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
+    }
     let seller_id = session.seller_id.unwrap_or(0);
     let id = state
         .db
@@ -1696,7 +1857,8 @@ async fn posts_get(
     let posts = state.db.list_posts(scope, 100000);
     match posts.into_iter().find(|p| p.0 == id) {
         Some(p) => {
-            if session.role == "seller" && session.seller_id != Some(p.1) {
+            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1)
+            {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1728,13 +1890,26 @@ async fn posts_update(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     let new_content = f.content.or(f.text);
     if let Some(c) = &new_content {
+        // security outbound gate BEFORE the raw-Bot edit. A post edit is a
+        // content-bearing send path like any other; without this call it
+        // bypasses the moderation floor that the create/broadcast paths
+        // already honour. Seller scope comes from the session principal.
+        let bot = crate::web::effective_bot(&state, &session);
+        if let Err(hold) = crate::handlers::moderation::gate_outbound(
+            &state.db,
+            session.seller_id.unwrap_or(0),
+            Some(bot.id),
+            c,
+        ) {
+            return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string())
+                .into_response();
+        }
         if p.3 != 0 {
-            let bot = crate::web::effective_bot(&state, &session);
             let _ = bot
                 .bot
                 .edit_message_text(crate::util::to_chat_id(&p.2), MessageId(p.3), c.clone())
@@ -1760,7 +1935,7 @@ async fn posts_delete(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1797,7 +1972,7 @@ async fn posts_pin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1825,7 +2000,7 @@ async fn posts_unpin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if session.role == "seller" && session.seller_id != Some(p.1) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1853,7 +2028,7 @@ async fn broadcasts(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -1861,7 +2036,7 @@ async fn broadcasts(
         )
         .into_response();
     }
-    let recipients = if session.role == "seller" {
+    let recipients = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
             .list_users_for_seller(session.seller_id.unwrap_or(0))
@@ -1871,6 +2046,16 @@ async fn broadcasts(
     let mut sent = 0i64;
     // Broadcasts go out as the session's effective bot.
     let bot = crate::web::effective_bot(&state, &session);
+    // security outbound gate BEFORE the raw-Bot broadcast fan-out. One decision
+    // covers every recipient; seller scope comes from the session principal.
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        session.seller_id.unwrap_or(0),
+        Some(bot.id),
+        &f.text,
+    ) {
+        return err(StatusCode::FORBIDDEN, "moderation_hold", &hold.to_string()).into_response();
+    }
     for uid in recipients {
         if bot
             .bot
@@ -1921,6 +2106,12 @@ async fn channels_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    // H1 tenant gate: a session may only mutate channels inside its own
+    // scope. Without this, patching the path id lets one seller deface
+    // another seller's channel through this raw-Bot path.
+    if !api_may_mutate_channel(&state, &session, &id) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
+    }
     let chat = crate::util::to_chat_id(&id);
     // Channel metadata edits run as the session's effective bot (the bot that
     // owns the seller's channel).
@@ -1958,7 +2149,7 @@ async fn users_get(
     };
     let (uid, username) = state.db.get_user(user_id).unwrap_or((user_id, None));
     let mut resp = serde_json::json!({"user_id": uid, "username": username});
-    if session.role == "seller" {
+    if Role::from_role_str(&session.role) == Role::Seller {
         let scope = session.seller_id;
         let subs = state.db.list_subscriptions(scope, 1000);
         let cnt = subs.iter().filter(|s| s.2 == user_id).count();
@@ -2089,7 +2280,7 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let ids = if session.role == "seller" {
+    let ids = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
             .list_users_for_seller(session.seller_id.unwrap_or(0))
@@ -2195,8 +2386,11 @@ async fn config_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) && session.role != "seller" {
-        return err(StatusCode::FORBIDDEN, "forbidden", "insufficient role").into_response();
+    // The global default channel is owner-only (the web `channels_default`
+    // route carries the same gate). A seller writing it would steer every
+    // tenant's fallback channel, so sellers are refused outright.
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
+        return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.set_config("channel", &f.channel);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
@@ -2311,11 +2505,14 @@ struct FinanceRefundCreateReq {
     invoice_id: String,
     /// Defaults to the invoice's own amount/asset: a refund can never move
     /// money the invoice did not collect. Parsed as f64 (non-numeric is a
-    /// 400); sellers are clamped to the invoice amount and locked to its
-    /// asset — admins/owner (the approvers) may still name the amount.
+    /// 400); every role is clamped to the invoice amount and locked to its
+    /// asset (§1.2).
     amount: Option<String>,
     asset: Option<String>,
     reason: Option<String>,
+    /// Caller-supplied idempotency key. A replay of the same key for the same
+    /// invoice returns the existing row without a second audit money event.
+    idem_key: Option<String>,
 }
 
 async fn finance_revenue_by_seller(
@@ -2326,7 +2523,7 @@ async fn finance_revenue_by_seller(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -2359,7 +2556,7 @@ async fn finance_payouts_list(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => Some(s),
             None => {
@@ -2367,7 +2564,7 @@ async fn finance_payouts_list(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         None
     } else {
         return err(
@@ -2398,7 +2595,7 @@ async fn finance_payouts_create(
         Err(e) => return e.into_response(),
     };
     // Sellers create payouts for themselves; admins must name the seller.
-    let seller_id = if session.role == "seller" {
+    let seller_id = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => {
                 if f.seller_id.is_some() && f.seller_id != Some(s) {
@@ -2416,7 +2613,7 @@ async fn finance_payouts_create(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         match f.seller_id {
             Some(s) => s,
             None => {
@@ -2432,6 +2629,24 @@ async fn finance_payouts_create(
         )
         .into_response();
     };
+    // §3.5: a seller with a paid-but-ungranted invoice older than 72h whose
+    // auto-refund has not executed carries an unresolved liability. New
+    // payouts are blocked until that liability is resolved (the banner cannot
+    // be dismissed by the seller). Internal operational target, not an SLA.
+    let escalation_cutoff =
+        crate::handlers::money::paid_ungranted_escalation_cutoff(chrono::Utc::now());
+    if !state
+        .db
+        .unresolved_ungranted_invoices(seller_id, &escalation_cutoff)
+        .is_empty()
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "unresolved_ungranted_liability",
+            "unresolved ungranted liability: resolve the outstanding refund before creating a payout",
+        )
+        .into_response();
+    }
     if f.amount.trim().is_empty() || f.asset.trim().is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -2470,7 +2685,7 @@ async fn finance_payouts_approve(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2516,38 +2731,9 @@ async fn finance_payouts_approve(
         .into_response()
 }
 
-/// Classify a Crypto Pay `transfer` failure as AMBIGUOUS (true) or a DEFINITE
-/// rejection (false). `CryptoPay::call` flattens every error into a single
-/// String (see src/crypto.rs), so this is a best-effort textual classification:
-///
-/// * DEFINITE — the API received the request and refused it: an `ok:false`
-///   business error (e.g. `TRANSFER_FAILED`, insufficient funds) or an HTTP
-///   4xx status. No money moved; the claim can safely revert to 'approved'.
-/// * AMBIGUOUS — transport-level trouble where the transfer may still have
-///   been applied: reqwest send failures (timeout, connect, reset), HTTP 5xx
-///   (the API failed after possibly committing), or a response body we could
-///   not parse. The row must stay 'executing' for operator reconciliation.
-fn transfer_outcome_ambiguous(e: &str) -> bool {
-    let l = e.to_ascii_lowercase();
-    // reqwest transport failures: "error sending request for url (...):
-    // operation timed out" / "... error trying to connect: ...".
-    l.contains("timed out")
-        || l.contains("timeout")
-        || l.contains("error sending request")
-        || l.contains("error trying to connect")
-        || l.contains("connection")
-        || l.contains("broken pipe")
-        || l.contains("reset by peer")
-        // HTTP status errors arrive as "HTTP {status} - {body}": 4xx means
-        // the API rejected the request, 5xx means it failed server-side with
-        // an unknowable effect.
-        || l.starts_with("http 5")
-        // serde parse failures surface as "{serde error}: {body}".
-        || l.contains("parsing")
-        || l.contains("expected value")
-        || l.contains("trailing characters")
-        || l.contains("invalid type")
-}
+// The REST surface uses the single shared fail-closed classifier in
+// `handlers::money`; the former API-local `transfer_outcome_ambiguous` was
+// deleted because its "unknown ⇒ not ambiguous" default was fail-open.
 
 /// Payout execution: approved -> paid by moving real money through Crypto Pay
 /// `transfer` to the destination Telegram user. Owner only — the execution
@@ -2570,7 +2756,7 @@ async fn finance_payouts_execute(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2635,7 +2821,7 @@ async fn finance_payouts_execute(
             .into_response();
         }
     };
-    let cp = crate::crypto::CryptoPay::new(tok);
+    let cp = std::sync::Arc::new(crate::crypto::CryptoPay::new(tok));
     // Audit the attempt BEFORE claiming the row: an execution attempt is a
     // money event that deserves a trail even when the CAS claim loses a race.
     let meta = serde_json::json!({
@@ -2661,14 +2847,40 @@ async fn finance_payouts_execute(
         };
         return err(StatusCode::CONFLICT, "invalid_state", msg).into_response();
     }
-    match cp.transfer(dest_user, &asset, &amount).await {
-        Ok(receipt) => {
+    // §4.1: the guarded helper persists a fresh spend_id BEFORE the transfer
+    // and passes it to transfer_with_spend_id. No raw transfer() call may be
+    // made on this path. A missing spend_id record is a hard error: no money
+    // leaves the app unless its idempotency key is durable first.
+    let outcome =
+        match execute_guarded_transfer(&state.db, "payout", id, seller_id, None, |spend_id| {
+            let cp = cp.clone();
+            let asset = asset.clone();
+            let amount = amount.clone();
+            async move {
+                cp.transfer_with_spend_id(dest_user, &asset, &amount, &spend_id)
+                    .await
+            }
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "transfer_not_attempted",
+                    &format!("transfer aborted before dispatch: {e}"),
+                )
+                .into_response();
+            }
+        };
+    match outcome {
+        GuardedTransferOutcome::Succeeded { spend_id, receipt } => {
             // Settle the claim: 'executing' -> 'paid' (we own the claim, so
             // this is always the 1-row transition).
             state.db.finish_payout_execution(id, "paid");
             let meta = serde_json::json!({
                 "seller_id": seller_id, "amount": amount, "asset": asset,
-                "destination": dest_user, "receipt": receipt,
+                "destination": dest_user, "spend_id": spend_id, "receipt": receipt,
             })
             .to_string();
             state.db.log_action(
@@ -2685,41 +2897,41 @@ async fn finance_payouts_execute(
             )
                 .into_response()
         }
-        Err(e) => {
+        GuardedTransferOutcome::Ambiguous { spend_id, error } => {
+            // AMBIGUOUS: the transfer may or may not have been applied. The
+            // attempt keeps its spend_id and outcome for the §5 reconciliation
+            // flow; the row stays 'executing' (no fresh-key retry, no guessed
+            // settlement).
             let meta = serde_json::json!({
                 "seller_id": seller_id, "amount": amount, "asset": asset,
-                "destination": dest_user, "error": e.to_string(),
+                "destination": dest_user, "spend_id": spend_id, "error": error,
             })
             .to_string();
-            if transfer_outcome_ambiguous(&e) {
-                // AMBIGUOUS: the transfer may or may not have been applied.
-                // Leave the payout 'executing' (do NOT revert — a retry could
-                // double-pay; do NOT mark paid — we have no receipt). The
-                // operator reconciles from the Finance page before retrying.
-                state.db.log_action(
-                    session.account_id,
-                    &session.role,
-                    "payout_execute_ambiguous",
-                    "payout",
-                    id.to_string(),
-                    Some(&meta),
-                );
-                return err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "execution_ambiguous",
-                    &format!(
-                        "transfer outcome unknown: {}; the payout stays \
-                         'executing' — check the Finance page before retrying",
-                        e
-                    ),
-                )
-                .into_response();
-            }
+            state.db.log_action(
+                session.account_id,
+                &session.role,
+                "payout_execute_ambiguous",
+                "payout",
+                id.to_string(),
+                Some(&meta),
+            );
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_ambiguous",
+                "transfer outcome unknown; the payout stays 'executing' for reconciliation",
+            )
+            .into_response()
+        }
+        GuardedTransferOutcome::DefiniteRejected { spend_id, error } => {
             // DEFINITE rejection: the API refused the transfer, no money
-            // moved. Revert the claim to 'approved' so execution can be
-            // retried; audit the failed attempt (a money transition was
-            // attempted).
+            // moved. Revert the claim to 'approved'; a subsequent retry mints
+            // a NEW spend_id/attempt (§4.1 definite retry is fresh).
             state.db.finish_payout_execution(id, "approved");
+            let meta = serde_json::json!({
+                "seller_id": seller_id, "amount": amount, "asset": asset,
+                "destination": dest_user, "spend_id": spend_id, "error": error,
+            })
+            .to_string();
             state.db.log_action(
                 session.account_id,
                 &session.role,
@@ -2731,7 +2943,7 @@ async fn finance_payouts_execute(
             err(
                 StatusCode::BAD_GATEWAY,
                 "transfer_failed",
-                &format!("transfer failed: {}", e),
+                &format!("transfer failed: {error}"),
             )
             .into_response()
         }
@@ -2754,7 +2966,7 @@ async fn finance_payouts_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2800,7 +3012,7 @@ async fn finance_payouts_process(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let payout = match state.db.get_payout(id.to_string()) {
@@ -2840,11 +3052,14 @@ async fn finance_payouts_process(
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
-/// Refund processing: approved -> processed by marking the invoice refunded,
-/// kicking the buyer from any subscription channel tied to the invoice and
-/// expiring those subscriptions. Admin/owner only — the seller who owes the
-/// money never finalizes their own refund, and a pending refund is never
-/// processed (state machine: create -> approve -> process).
+/// Refund processing (manual mark-as-settled without a Crypto Pay transfer):
+/// approved -> executed, applying the SAME full/partial settlement decision as
+/// the transfer-backed execute and reconciliation paths (§1.3). The legacy
+/// `"processed"` status is forbidden: it bypassed the `is_full_refund` guard
+/// and expired the subscription / kicked the buyer even on a PARTIAL refund
+/// (security F1). This finalizes money, so it is Owner-only with creator separation
+/// just like `finance_refunds_execute` (§2) — an Admin must not be able to
+/// bypass the two-person rule through this path.
 async fn finance_refunds_process(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -2854,13 +3069,11 @@ async fn finance_refunds_process(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
-        return err(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "admin or owner required",
-        )
-        .into_response();
+    if let Err(e) = owner_gate(&session) {
+        return e.into_response();
+    }
+    if let Err(e) = creator_gate(&state.db, id, &session) {
+        return e.into_response();
     }
     let refund = match state.db.get_refund(id.to_string()) {
         Some(r) => r,
@@ -2870,9 +3083,9 @@ async fn finance_refunds_process(
     };
     let (
         _rid,
-        _seller,
+        refund_seller,
         invoice_id,
-        _user_id,
+        refund_user,
         _amount,
         _asset,
         _reason,
@@ -2882,7 +3095,7 @@ async fn finance_refunds_process(
         _pa,
         _pb,
     ) = refund;
-    if status == "executed" {
+    if status == "executed" || status == "processed" {
         return err(
             StatusCode::CONFLICT,
             "invalid_state",
@@ -2898,41 +3111,38 @@ async fn finance_refunds_process(
         )
         .into_response();
     }
+    // Finalize the money row as EXECUTED — never the forbidden legacy
+    // "processed" status. Side-effects go through the single shared
+    // settlement helper so a PARTIAL refund leaves the invoice paid with no
+    // subscription expiry and no channel kick (security F1).
     state
         .db
-        .update_refund_status_by(id, "processed", Some(session.account_id));
-    if let Some(inv) = invoice_id {
-        state.db.update_invoice_status(&inv, "refunded");
-        // optionally revoke subscription access for subscriptions tied to this invoice
-        let subs = state.db.subscriptions_for_invoice(&inv);
-        for (sub_id, sid, uid, ch) in subs {
-            if !ch.is_empty() {
-                let cid = crate::util::to_chat_id(&ch);
-                // The channel belongs to the subscription's seller, so the
-                // kick must be issued by that seller's bot (primary when the
-                // seller has no dedicated bot).
-                let kick_bot = state.bots.for_seller(sid);
-                let _ = kick_bot
-                    .bot
-                    .ban_chat_member(cid.clone(), teloxide::types::UserId(uid as u64))
-                    .await;
-                let _ = kick_bot
-                    .bot
-                    .unban_chat_member(cid, teloxide::types::UserId(uid as u64))
-                    .await;
-            }
-            state.db.mark_subscription_expired(sub_id);
-        }
-    }
+        .update_refund_status_by(id, "executed", Some(session.account_id));
+    let subscription_revoked = apply_refund_settlement(
+        &state,
+        invoice_id.as_deref(),
+        refund_user.unwrap_or(0),
+        refund_seller,
+    )
+    .await;
+    let meta = serde_json::json!({
+        "invoice_id": invoice_id,
+        "subscription_revoked": subscription_revoked,
+    })
+    .to_string();
     state.db.log_action(
         session.account_id,
         &session.role,
         "refund_process",
         "refund",
         id.to_string(),
-        None,
+        Some(&meta),
     );
-    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "status": "executed"})),
+    )
+        .into_response()
 }
 
 async fn finance_refunds_list(
@@ -2943,7 +3153,7 @@ async fn finance_refunds_list(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if session.role == "seller" {
+    let scope = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => Some(s),
             None => {
@@ -2951,7 +3161,7 @@ async fn finance_refunds_list(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         None
     } else {
         return err(
@@ -2974,11 +3184,10 @@ async fn finance_refunds_list(
 
 /// Refund creation: seller-scoped, always rooted in one of the caller's own
 /// paid invoices. Amount/asset default to the invoice's, so a refund can
-/// never move money the invoice did not collect. Sellers are further held to
-/// the invoice's economics — their amount parses as a number, is clamped to
-/// the invoice amount and must be denominated in the invoice asset;
-/// admins/owner (the approvers of whatever gets created here) keep the
-/// looser form.
+/// never move money the invoice did not collect. The §1.2 cap and asset lock
+/// apply to EVERY role (seller, admin and owner) — no unclamped approver
+/// shortcut. Creation goes through `create_refund_guarded` with the real
+/// actor and an idempotency key; the legacy id-0 audit wrapper is never used.
 async fn finance_refunds_create(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -2988,7 +3197,7 @@ async fn finance_refunds_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3013,11 +3222,13 @@ async fn finance_refunds_create(
         }
     };
     let (inv_amount, inv_asset, inv_status, _desc, _plan, inv_user, inv_seller) = inv;
-    if session.role == "seller" && session.seller_id != Some(inv_seller) {
+    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(inv_seller) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
-    // Only settled money can be returned.
-    if inv_status != "paid" {
+    // Only settled money can be returned. `paid_ungranted` is still paid
+    // money; it is a non-terminal recovery state whose auto-refund uses the
+    // same guarded creation path.
+    if inv_status != "paid" && inv_status != "paid_ungranted" {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_state",
@@ -3025,15 +3236,11 @@ async fn finance_refunds_create(
         )
         .into_response();
     }
-    // Same invariant as the request default: a refund can never move money
-    // the invoice did not collect. Sellers are clamped to the invoice's
-    // amount and locked to its asset; admins/owner keep the looser form (they
-    // are the approvers of whatever gets created here).
-    if session.role == "seller"
-        && f.asset
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|a| a != inv_asset)
+    // §1.2: the asset lock applies to ALL roles, including admin/owner.
+    if f.asset
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|a| a != inv_asset)
     {
         return err(
             StatusCode::BAD_REQUEST,
@@ -3054,23 +3261,19 @@ async fn finance_refunds_create(
                 )
                 .into_response();
             };
-            if session.role == "seller" {
-                if requested <= 0.0 {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        "bad_request",
-                        "amount must be positive",
-                    )
-                    .into_response();
-                }
-                if inv_amount_f.is_nan() || requested > inv_amount_f {
-                    // Clamp: never more than the invoice collected (and if the
-                    // stored amount is not parseable, refund exactly that
-                    // amount verbatim rather than trusting the request).
-                    inv_amount.clone()
-                } else {
-                    raw.to_string()
-                }
+            if requested <= 0.0 {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "amount must be positive",
+                )
+                .into_response();
+            }
+            // §1.2: clamp for ALL roles — the cumulative cap in
+            // create_refund_guarded is the authoritative guard; this clamp
+            // keeps the common single-refund case at the documented amount.
+            if inv_amount_f.is_nan() || requested > inv_amount_f {
+                inv_amount.clone()
             } else {
                 raw.to_string()
             }
@@ -3081,32 +3284,102 @@ async fn finance_refunds_create(
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty())
         .unwrap_or(inv_asset);
-    let id = state.db.create_refund(
-        inv_seller,
-        Some(f.invoice_id.trim()),
-        inv_user,
-        &amount,
-        &asset,
-        f.reason.as_deref(),
-    );
-    let meta = serde_json::json!({
-        "invoice_id": f.invoice_id, "amount": amount, "asset": asset,
-        "user_id": inv_user, "reason": f.reason,
-    })
-    .to_string();
-    state.db.log_action(
-        session.account_id,
-        &session.role,
-        "refund_create",
-        "refund",
-        id.to_string(),
-        Some(&meta),
-    );
-    (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
+    let idem_key = match f.idem_key.as_deref().map(str::trim) {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => match crate::handlers::money::fresh_idem_key("api") {
+            Ok(k) => k,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    &format!("could not mint idempotency key: {e}"),
+                )
+                .into_response();
+            }
+        },
+    };
+    let role_str = session.role.clone();
+    let creation = match state.db.create_refund_guarded(crate::db::RefundInput {
+        seller_id: inv_seller,
+        invoice_id: Some(f.invoice_id.trim()),
+        user_id: inv_user,
+        amount: &amount,
+        asset: &asset,
+        reason: f.reason.as_deref(),
+        idem_key: &idem_key,
+        created_by: session.account_id,
+        created_role: &role_str,
+    }) {
+        Ok(creation) => creation,
+        Err(e) => {
+            use crate::db::RefundCreateError;
+            let (status, code, msg) = match e {
+                RefundCreateError::InvoiceNotFound => {
+                    (StatusCode::NOT_FOUND, "not_found", "invoice not found")
+                }
+                RefundCreateError::InvoiceNotPaid => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_state",
+                    "only paid invoices can be refunded",
+                ),
+                RefundCreateError::AssetMismatch => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_asset",
+                    "refund asset must match the invoice asset",
+                ),
+                RefundCreateError::UnquantizableLegacy => (
+                    StatusCode::CONFLICT,
+                    "unquantifiable_legacy_refund",
+                    "stored money amount cannot be quantized; owner must resolve it",
+                ),
+                RefundCreateError::CapExceeded => (
+                    StatusCode::CONFLICT,
+                    "refund_cap_exceeded",
+                    "cumulative refunds would exceed the invoiced amount",
+                ),
+                RefundCreateError::InFlight => (
+                    StatusCode::CONFLICT,
+                    "refund_in_flight",
+                    "another refund is already in flight for this invoice",
+                ),
+                RefundCreateError::Database(err) => {
+                    tracing::error!("refund creation failed: {}", err);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "refund creation failed",
+                    )
+                }
+            };
+            return err(status, code, msg).into_response();
+        }
+    };
+    // An idempotent replay is the SAME money movement: never emit a second
+    // audit event (§1.2 step 5).
+    if creation.created_new {
+        let meta = serde_json::json!({
+            "invoice_id": f.invoice_id, "amount": amount, "asset": asset,
+            "user_id": inv_user, "reason": f.reason, "idem_key": idem_key,
+        })
+        .to_string();
+        state.db.log_action(
+            session.account_id,
+            &session.role,
+            "refund_create",
+            "refund",
+            creation.id.to_string(),
+            Some(&meta),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"id": creation.id, "created": creation.created_new})),
+    )
+        .into_response()
 }
 
-/// Refund approval: pending -> approved. Owner/admin only — the seller who
-/// owes the money never approves their own refund.
+/// Refund approval: pending -> approved. Owner only (§2) — the creator of a
+/// refund (seller, admin or owner) may never approve their own money row.
 async fn finance_refunds_approve(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -3116,13 +3389,11 @@ async fn finance_refunds_approve(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
-        return err(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "admin or owner required",
-        )
-        .into_response();
+    if let Err(e) = owner_gate(&session) {
+        return e.into_response();
+    }
+    if let Err(e) = creator_gate(&state.db, id, &session) {
+        return e.into_response();
     }
     let refund = match state.db.get_refund(id.to_string()) {
         Some(r) => r,
@@ -3168,6 +3439,55 @@ async fn finance_refunds_approve(
         .into_response()
 }
 
+/// §1.3: apply the money-success effects of a refund. A full refund flips the
+/// invoice to `refunded` and revokes the subscription (+ channel kick); a
+/// partial refund leaves the invoice `paid` with no kick. Called only after a
+/// transfer receipts, or after the owner proves one landed in reconciliation.
+async fn apply_refund_settlement(
+    state: &WebState,
+    invoice_id: Option<&str>,
+    user_id: i64,
+    seller_id: i64,
+) -> bool {
+    let Some(inv) = invoice_id else {
+        return false;
+    };
+    if !crate::handlers::money::is_full_refund(&state.db, inv) {
+        return false;
+    }
+    state.db.update_invoice_status(inv, "refunded");
+    let Some((sub_id, channel)) = state.db.subscription_by_invoice(inv) else {
+        return false;
+    };
+    state.db.set_subscription_status(sub_id, "refunded");
+    if !channel.is_empty() {
+        let cid = crate::util::to_chat_id(&channel);
+        let kick_bot = state.bots.for_seller(seller_id);
+        let _ = kick_bot
+            .bot
+            .ban_chat_member(cid.clone(), teloxide::types::UserId(user_id as u64))
+            .await;
+        let _ = kick_bot
+            .bot
+            .unban_chat_member(cid, teloxide::types::UserId(user_id as u64))
+            .await;
+    }
+    // §3: the buyer hears "refund sent" only on this terminal outcome (never
+    // at refund creation or at the 24h "queued" alert). Best-effort DM through
+    // the seller's bot; gate_outbound keeps held surfaces silent.
+    let notice = format!("Your refund for invoice {inv} has been sent.");
+    let kick_bot = state.bots.for_seller(seller_id);
+    if crate::handlers::moderation::gate_outbound(&state.db, seller_id, Some(kick_bot.id), &notice)
+        .is_ok()
+    {
+        let _ = kick_bot
+            .bot
+            .send_message(teloxide::types::ChatId(user_id), notice)
+            .await;
+    }
+    true
+}
+
 /// Refund execution: approved -> executed by transferring real money back to
 /// the buyer through Crypto Pay `transfer`. The row is FIRST atomically
 /// claimed 'approved' -> 'executing' via the DB CAS `begin_refund_execution`
@@ -3179,6 +3499,7 @@ async fn finance_refunds_approve(
 /// 'approved' for retry; an AMBIGUOUS failure (timeout / network, money
 /// state unknown) deliberately leaves the row 'executing' with an audit
 /// trail for the operator to reconcile on the Finance page before any retry.
+/// Owner only, with creator separation (§2).
 async fn finance_refunds_execute(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -3188,13 +3509,11 @@ async fn finance_refunds_execute(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
-        return err(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "admin or owner required",
-        )
-        .into_response();
+    if let Err(e) = owner_gate(&session) {
+        return e.into_response();
+    }
+    if let Err(e) = creator_gate(&state.db, id, &session) {
+        return e.into_response();
     }
     let refund = match state.db.get_refund(id.to_string()) {
         Some(r) => r,
@@ -3259,7 +3578,7 @@ async fn finance_refunds_execute(
             .into_response();
         }
     };
-    let cp = crate::crypto::CryptoPay::new(tok);
+    let cp = std::sync::Arc::new(crate::crypto::CryptoPay::new(tok));
     // Audit the attempt BEFORE claiming the row: an execution attempt is a
     // money event that deserves a trail even when the CAS claim loses a race.
     let meta = serde_json::json!({
@@ -3293,44 +3612,42 @@ async fn finance_refunds_execute(
         };
         return err(StatusCode::CONFLICT, "invalid_state", msg).into_response();
     }
-    match cp.transfer(refund_user, &asset, &amount).await {
-        Ok(receipt) => {
+    // §4.1: persist a fresh spend_id before dispatch; no raw transfer() call.
+    let outcome =
+        match execute_guarded_transfer(&state.db, "refund", id, refund_seller, None, |spend_id| {
+            let cp = cp.clone();
+            let asset = asset.clone();
+            let amount = amount.clone();
+            async move {
+                cp.transfer_with_spend_id(refund_user, &asset, &amount, &spend_id)
+                    .await
+            }
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "transfer_not_attempted",
+                    &format!("transfer aborted before dispatch: {e}"),
+                )
+                .into_response();
+            }
+        };
+    match outcome {
+        GuardedTransferOutcome::Succeeded { spend_id, receipt } => {
             // Settle the claim: 'executing' -> 'executed' (we own the claim,
             // so this is always the 1-row transition). Invoice/subscription
             // side-effects stay below, best-effort after the status flip.
             state.db.finish_refund_execution(id, "executed");
-            let mut subscription_revoked = false;
-            if let Some(inv) = invoice_id.as_deref() {
-                state.db.update_invoice_status(inv, "refunded");
-                if let Some((sub_id, channel)) = state.db.subscription_by_invoice(inv) {
-                    state.db.set_subscription_status(sub_id, "refunded");
-                    subscription_revoked = true;
-                    if !channel.is_empty() {
-                        // Kick (ban+unban) so the refunded buyer loses channel
-                        // access immediately. Best-effort: the status flip is
-                        // the source of truth. The channel belongs to the
-                        // refund's seller, so that seller's bot does the kick
-                        // (primary when they have no dedicated bot).
-                        let cid = crate::util::to_chat_id(&channel);
-                        let kick_bot = state.bots.for_seller(refund_seller);
-                        let _ = kick_bot
-                            .bot
-                            .ban_chat_member(
-                                cid.clone(),
-                                teloxide::types::UserId(refund_user as u64),
-                            )
-                            .await;
-                        let _ = kick_bot
-                            .bot
-                            .unban_chat_member(cid, teloxide::types::UserId(refund_user as u64))
-                            .await;
-                    }
-                }
-            }
+            let subscription_revoked =
+                apply_refund_settlement(&state, invoice_id.as_deref(), refund_user, refund_seller)
+                    .await;
             let meta = serde_json::json!({
                 "invoice_id": invoice_id, "amount": amount, "asset": asset,
                 "user_id": refund_user, "subscription_revoked": subscription_revoked,
-                "receipt": receipt,
+                "spend_id": spend_id, "receipt": receipt,
             })
             .to_string();
             state.db.log_action(
@@ -3347,43 +3664,38 @@ async fn finance_refunds_execute(
             )
                 .into_response()
         }
-        Err(e) => {
+        GuardedTransferOutcome::Ambiguous { spend_id, error } => {
+            // AMBIGUOUS: keep the row 'executing' with its persisted spend_id
+            // and outcome for operator reconciliation; no settlement effects.
             let meta = serde_json::json!({
                 "invoice_id": invoice_id, "amount": amount, "asset": asset,
-                "user_id": refund_user, "error": e.to_string(),
+                "user_id": refund_user, "spend_id": spend_id, "error": error,
             })
             .to_string();
-            if transfer_outcome_ambiguous(&e) {
-                // AMBIGUOUS: the transfer may or may not have been applied.
-                // Leave the refund 'executing' (do NOT revert — a retry could
-                // double-refund; do NOT mark executed — we have no receipt).
-                // The operator reconciles from the Finance page. Invoice /
-                // subscription side-effects are NOT run: they follow the
-                // money, which is unconfirmed.
-                state.db.log_action(
-                    session.account_id,
-                    &session.role,
-                    "refund_execute_ambiguous",
-                    "refund",
-                    id.to_string(),
-                    Some(&meta),
-                );
-                return err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "execution_ambiguous",
-                    &format!(
-                        "transfer outcome unknown: {}; the refund stays \
-                         'executing' — check the Finance page before retrying",
-                        e
-                    ),
-                )
-                .into_response();
-            }
-            // DEFINITE rejection: the API refused the transfer, no money
-            // moved. Revert the claim to 'approved' so execution can be
-            // retried; audit the failed attempt (a money transition was
-            // attempted).
+            state.db.log_action(
+                session.account_id,
+                &session.role,
+                "refund_execute_ambiguous",
+                "refund",
+                id.to_string(),
+                Some(&meta),
+            );
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_ambiguous",
+                "transfer outcome unknown; the refund stays 'executing' for reconciliation",
+            )
+            .into_response()
+        }
+        GuardedTransferOutcome::DefiniteRejected { spend_id, error } => {
+            // DEFINITE rejection: no money moved, revert to 'approved'. A
+            // retry mints a fresh spend_id/attempt (§4.1).
             state.db.finish_refund_execution(id, "approved");
+            let meta = serde_json::json!({
+                "invoice_id": invoice_id, "amount": amount, "asset": asset,
+                "user_id": refund_user, "spend_id": spend_id, "error": error,
+            })
+            .to_string();
             state.db.log_action(
                 session.account_id,
                 &session.role,
@@ -3395,9 +3707,189 @@ async fn finance_refunds_execute(
             err(
                 StatusCode::BAD_GATEWAY,
                 "transfer_failed",
-                &format!("transfer failed: {}", e),
+                &format!("transfer failed: {error}"),
             )
             .into_response()
+        }
+    }
+}
+
+// ---------- Decision 5: reconciliation (owner-only) ----------
+
+#[derive(Deserialize)]
+struct ReconciliationResolveReq {
+    /// `executed`, `reverted_to_approved` or `void` (§5.3).
+    outcome: String,
+    /// Human reason — required and persisted in the audit trail.
+    reason: String,
+}
+
+/// §5.4 owner view of every executing/needs-reconciliation row with its
+/// spend_id and overdue flag. Read-only; no state is guessed or mutated.
+async fn finance_reconciliation_list(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match session_or_401(&state, &headers) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = owner_gate(&session) {
+        return e.into_response();
+    }
+    let (due, overdue) = reconciliation_cutoffs(chrono::Utc::now());
+    let items: Vec<serde_json::Value> =
+        crate::handlers::money::all_reconciliation_rows(&state.db, &due, &overdue)
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "row_type": r.row_type, "id": r.id, "seller_id": r.seller_id,
+                    "amount": r.amount, "asset": r.asset, "status": r.status,
+                    "since": r.since, "spend_id": r.spend_id, "overdue": r.overdue,
+                })
+            })
+            .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"items": items, "total": items.len()})),
+    )
+        .into_response()
+}
+
+/// §5.3 owner resolution of one `needs_reconciliation` row. Exactly three
+/// outcomes, each with a non-empty audited reason. The DB CAS makes
+/// resolution append-only: a second attempt is rejected (409).
+async fn finance_reconciliation_resolve(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path((row_type, id)): Path<(String, i64)>,
+    Json(body): Json<ReconciliationResolveReq>,
+) -> impl IntoResponse {
+    let session = match session_or_401(&state, &headers) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = owner_gate(&session) {
+        return e.into_response();
+    }
+    if !matches!(row_type.as_str(), "refund" | "payout") {
+        return err(StatusCode::NOT_FOUND, "not_found", "unknown money row type").into_response();
+    }
+    let outcome = match body.outcome.as_str() {
+        "executed" => crate::db::ReconciliationOutcome::Executed,
+        "reverted_to_approved" => crate::db::ReconciliationOutcome::RevertedToApproved,
+        "void" => crate::db::ReconciliationOutcome::Void,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "outcome must be executed, reverted_to_approved or void",
+            )
+            .into_response();
+        }
+    };
+    // security F2: an "executed" resolution of a refund is a manual settlement, so
+    // the human creator may never resolve their own money row — exactly the
+    // gate the web form applies. Both surfaces call the same shared helper in
+    // `handlers::money` so they cannot drift.
+    if row_type == "refund"
+        && outcome == crate::db::ReconciliationOutcome::Executed
+        && crate::handlers::money::creator_owns_refund(&state.db, session.account_id, id)
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            "creator_forbidden",
+            "creator cannot settle their own refund",
+        )
+        .into_response();
+    }
+    if body.reason.trim().is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "reason_required",
+            "a non-empty resolution reason is required",
+        )
+        .into_response();
+    }
+    // Attach the persisted spend_id before the CAS so an append-only loser
+    // cannot emit a second money event.
+    let spend_id = state
+        .db
+        .latest_transfer_attempt(&row_type, id)
+        .map(|a| a.spend_id);
+    let result =
+        state
+            .db
+            .resolve_reconciliation(&row_type, id, outcome, session.account_id, &body.reason);
+    match result {
+        Ok(()) => {
+            if let Some(ref sid) = spend_id {
+                let outcome_token = match outcome {
+                    crate::db::ReconciliationOutcome::Executed => "executed",
+                    crate::db::ReconciliationOutcome::RevertedToApproved => "reverted_to_approved",
+                    crate::db::ReconciliationOutcome::Void => "void",
+                };
+                state.db.set_transfer_attempt_outcome(sid, outcome_token);
+            }
+            // An "executed" resolution is an operator proof that the transfer
+            // landed: apply the same settlement effects as a receipt.
+            if outcome == crate::db::ReconciliationOutcome::Executed
+                && row_type == "refund"
+                && let Some(r) = state.db.get_refund(id)
+            {
+                apply_refund_settlement(&state, r.2.as_deref(), r.3.unwrap_or(0), r.1).await;
+            }
+            let meta = serde_json::json!({
+                "row_type": row_type, "outcome": body.outcome,
+                "reason": body.reason, "spend_id": spend_id,
+                "actor_id": session.account_id,
+            })
+            .to_string();
+            state.db.log_action(
+                session.account_id,
+                &session.role,
+                "transfer_reconciliation_resolved",
+                &row_type,
+                id.to_string(),
+                Some(&meta),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "outcome": body.outcome})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            use crate::db::ReconcileError;
+            let (status, code, msg) = match e {
+                ReconcileError::NotFound => {
+                    (StatusCode::NOT_FOUND, "not_found", "money row not found")
+                }
+                ReconcileError::NotDue => (
+                    StatusCode::CONFLICT,
+                    "not_due",
+                    "row is not in needs_reconciliation state",
+                ),
+                ReconcileError::AlreadyResolved => (
+                    StatusCode::CONFLICT,
+                    "already_resolved",
+                    "row was already resolved",
+                ),
+                ReconcileError::ReasonRequired => (
+                    StatusCode::BAD_REQUEST,
+                    "reason_required",
+                    "a non-empty resolution reason is required",
+                ),
+                ReconcileError::Database(err) => {
+                    tracing::error!("reconciliation resolution failed: {}", err);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "resolution failed",
+                    )
+                }
+            };
+            err(status, code, msg).into_response()
         }
     }
 }
@@ -3407,7 +3899,7 @@ async fn finance_export(State(state): State<WebState>, headers: HeaderMap) -> im
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3564,7 +4056,7 @@ async fn products_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = if session.role == "seller" {
+    let seller_id = if Role::from_role_str(&session.role) == Role::Seller {
         match session.seller_id {
             Some(s) => s,
             None => {
@@ -3572,7 +4064,7 @@ async fn products_delete(
                     .into_response();
             }
         }
-    } else if is_admin_role(&session.role) {
+    } else if Role::from_role_str(&session.role).has_level(Role::Admin) {
         // Resolve the owning seller by name; products are unique per
         // (seller, name), not globally.
         let owners: Vec<i64> = state
@@ -3652,7 +4144,7 @@ async fn admin_sellers(State(state): State<WebState>, headers: HeaderMap) -> imp
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3681,7 +4173,7 @@ async fn admin_stats(State(state): State<WebState>, headers: HeaderMap) -> impl 
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3715,7 +4207,7 @@ async fn admin_web_accounts(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let accounts = state.db.list_web_accounts_full();
@@ -3761,7 +4253,7 @@ async fn admin_seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3791,7 +4283,7 @@ async fn admin_seller_patch(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -3818,7 +4310,7 @@ async fn admin_admins_list(State(state): State<WebState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     let admins = state.db.list_admins_detail();
@@ -3842,7 +4334,7 @@ async fn admin_admins_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.add_admin(f.user_id, f.username.as_deref());
@@ -3866,7 +4358,7 @@ async fn admin_admins_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.remove_admin(user_id);
@@ -3890,7 +4382,7 @@ async fn admin_web_accounts_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     match state
@@ -3922,7 +4414,7 @@ async fn admin_web_accounts_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     state.db.delete_web_account(id);
@@ -3947,7 +4439,7 @@ async fn admin_web_accounts_password(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return err(StatusCode::FORBIDDEN, "forbidden", "owner required").into_response();
     }
     if f.password.len() < 6 {
@@ -3983,7 +4475,7 @@ async fn admin_audit_log(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4015,7 +4507,7 @@ async fn api_keys_list(State(state): State<WebState>, headers: HeaderMap) -> imp
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4043,7 +4535,7 @@ async fn api_keys_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4079,7 +4571,7 @@ async fn api_keys_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.role != "seller" && !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Seller) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -4088,7 +4580,7 @@ async fn api_keys_delete(
         .into_response();
     }
     // ownership check for non-admin
-    if !is_admin_role(&session.role) {
+    if !Role::from_role_str(&session.role).has_level(Role::Admin) {
         let own = state
             .db
             .list_api_keys(session.account_id)
@@ -4130,8 +4622,11 @@ async fn invoices_claim(
         }
     };
     let (_amount, _asset, status, _desc, plan_id, user_id, seller_id) = inv;
-    let admin = is_admin_role(&session.role);
-    if !admin && session.role == "seller" && session.seller_id != Some(seller_id) {
+    let admin = Role::from_role_str(&session.role).has_level(Role::Admin);
+    if !admin
+        && Role::from_role_str(&session.role) == Role::Seller
+        && session.seller_id != Some(seller_id)
+    {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
     // Invoice user binding (identical to /paid): an invoice bound to a user
@@ -4247,6 +4742,9 @@ async fn invoices_claim(
                         &kind,
                         &pname,
                         delivery.as_deref(),
+                        &state.db,
+                        seller_id,
+                        Some(invoice_bot.id),
                     )
                     .await
                     {
@@ -4353,13 +4851,22 @@ async fn invoices_claim(
                 .ok()
                 .map(|l| l.invite_link);
             if let Some(l) = link {
-                let _ = invoice_bot
-                    .bot
-                    .send_message(
-                        teloxide::types::ChatId(target_user),
-                        format!("Payment confirmed. Access granted.\nInvite: {}", l),
-                    )
-                    .await;
+                let grant_text = format!("Payment confirmed. Access granted.\nInvite: {}", l);
+                // security outbound gate before this raw-Bot DM (the grant row is
+                // already durable; only the notice is skipped while held).
+                if crate::handlers::moderation::gate_outbound(
+                    &state.db,
+                    seller_id,
+                    Some(invoice_bot.id),
+                    &grant_text,
+                )
+                .is_ok()
+                {
+                    let _ = invoice_bot
+                        .bot
+                        .send_message(teloxide::types::ChatId(target_user), grant_text)
+                        .await;
+                }
             }
             granted = true;
         }
@@ -4612,6 +5119,15 @@ pub fn router(state: WebState) -> Router {
             post(finance_refunds_execute),
         )
         .route("/api/v1/finance/export", get(finance_export))
+        // decision 5 — reconciliation (owner-only)
+        .route(
+            "/api/v1/finance/reconciliation",
+            get(finance_reconciliation_list),
+        )
+        .route(
+            "/api/v1/finance/reconciliation/{row_type}/{id}/resolve",
+            post(finance_reconciliation_resolve),
+        )
         // admin
         .route("/api/v1/admin/sellers", get(admin_sellers))
         .route(

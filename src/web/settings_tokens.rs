@@ -71,7 +71,7 @@ pub(super) struct TokenWrite {
     pub(super) bot_name: String,
 }
 
-/// Manual `Debug` in place of the derive (L3 P3-1): `value` carries a raw
+/// Manual `Debug` in place of the derive (verification P3-1): `value` carries a raw
 /// bot token, so the derived render would make a future
 /// `tracing::debug!(?writes)` a secret-leak waiting to happen. The value is
 /// redacted unconditionally — no verbosity flag ever turns it back on.

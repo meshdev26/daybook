@@ -1,6 +1,6 @@
 # Design System Application Plan — Web Dashboard
 
-Chief Design Officer (L6) review. Source of truth: `design-system/telegram-agent/MASTER.md`.
+Design review. Source of truth: `design-system/telegram-agent/MASTER.md`.
 Target: server-rendered UI in `src/web.rs` (`html_page()`), single-binary, no build step.
 
 ## 1. Strategy

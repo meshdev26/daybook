@@ -1,6 +1,6 @@
 //! Encrypted at-rest storage for the personal-account MTProto session blob.
 //!
-//! L10 security contract (ratified user-identity design, §5): the grammers
+//! Security contract (ratified user-identity design, §5): the grammers
 //! session is an account-password-equivalent credential. It is stored ONLY as
 //! one AES-256-GCM blob at `data_dir()/identity/session.bin`, mode 0600,
 //! written through a sibling temp file + atomic rename (the same pattern as
@@ -8,7 +8,7 @@
 //! `backups/` scripts, or the logs.
 //!
 //! Key handling: the AEAD key is derived from an operator-entered unlock
-//! passphrase (PBKDF2-HMAC-SHA256, 600k iterations — the L10 normative
+//! passphrase (PBKDF2-HMAC-SHA256, 600k iterations — the security normative
 //! floor, with a fresh random 16-byte salt per save). The passphrase itself
 //! is never persisted anywhere; a restart re-prompts via the unlock banner.
 //! The derived key is zeroized after each operation.
@@ -51,7 +51,7 @@ const NONCE_LEN: usize = 12; // GCM's standard 96-bit nonce
 const KEY_LEN: usize = 32; // AES-256
 const GCM_TAG_LEN: usize = 16; // GCM's 128-bit authentication tag
 
-/// L10 normative floor for passphrase stretching.
+/// security normative floor for passphrase stretching.
 const PBKDF2_ITERATIONS: u32 = 600_000;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -177,7 +177,7 @@ impl SessionStore {
         blob.extend_from_slice(&ciphertext);
         self.write_atomically(&blob)?;
         // Path and size only — never the passphrase, the key, or any session
-        // material (L10: session material must never reach the logs).
+        // material (security: session material must never reach the logs).
         tracing::info!(
             path = %self.path.display(),
             bytes = blob.len(),

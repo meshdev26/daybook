@@ -158,6 +158,7 @@ async fn make_state_multi_bot() -> (WebState, TempDir) {
             owner_id: 1,
             default_channel: None,
             token_env: Some("BOT_PRIMARY".to_string()),
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
         crate::config::BotConfig {
             key: "proxy26_bot".to_string(),
@@ -166,6 +167,7 @@ async fn make_state_multi_bot() -> (WebState, TempDir) {
             owner_id: 0,
             default_channel: None,
             token_env: Some("BOT_PROXY26_BOT".to_string()),
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
     ];
     state.cfg.bots_legacy = false;
@@ -311,7 +313,7 @@ async fn settings_multi_bot_token_debug_redacts_value() {
         "test-token-placeholder".to_string(),
     );
     let writes = token_env_updates(&state, &form).expect("compose succeeds");
-    // L3 P3-1: the Debug render is a redaction surface — a future
+    // verification P3-1: the Debug render is a redaction surface — a future
     // `tracing::debug!(?writes)` can never leak the token value.
     let dbg = format!("{:?}", writes);
     assert!(dbg.contains("<redacted>"), "{dbg}");

@@ -24,6 +24,52 @@ pub mod services;
 pub mod util;
 pub mod web;
 
+#[cfg(feature = "automation")]
+pub use handlers::capabilities::automation as automation_capability;
+#[cfg(feature = "file_share")]
+pub use handlers::capabilities::file_share as file_share_capability;
+#[cfg(feature = "movie_bot")]
+pub use handlers::capabilities::movie_bot as movie_bot_capability;
+#[cfg(feature = "reply_bot")]
+pub use handlers::capabilities::reply_bot as reply_bot_capability;
+#[cfg(feature = "service")]
+pub use handlers::capabilities::service as service_capability;
+/// Capability catalog and bot-type dispatcher (multibot foundation, server).
+///
+/// The catalog itself is always compiled so an uncompiled/unknown bot type
+/// can still produce an explicit refusal. Each per-capability module is
+/// `#[cfg(feature = "...")]`-gated in `handlers::capabilities`; these
+/// crate-root re-exports expose exactly the capability modules compiled into
+/// this build, keeping the feature flags and runtime type catalog in sync.
+#[cfg(feature = "shop_bot")]
+pub use handlers::capabilities::shop_bot as shop_bot_capability;
+#[cfg(feature = "web_app")]
+pub use handlers::capabilities::web_app as web_app_capability;
+
+// core feature-optionalization investigation (complete): the capability
+// features are inert markers today and no dependency is optionalizable from
+// this crate root. Verified with `cargo tree --depth 1`: the default and
+// `--no-default-features --features movie_bot` direct dependency sets are
+// identical. Every crate in `[dependencies]` is referenced by a module that
+// compiles for every feature set:
+//   * src/web/**, src/api.rs, src/auth.rs, src/embed.rs, src/mcp/**,
+//     src/bots.rs, src/services/** -> axum/reqwest/serde/tokio/tracing/
+//     chrono/sha2/cookie/bcrypt/getrandom;
+//   * src/ai/**, src/crypto.rs -> reqwest/async-trait;
+//   * src/identity/** -> grammers-*/aes-gcm/pbkdf2/zeroize/thiserror, and it
+//     is wired into WebState by web/identity.rs so it cannot be cfg-gated here;
+//   * src/db.rs -> rusqlite; src/config.rs + web/bots_*.rs -> toml;
+//   * src/main.rs (binary) builds the shop command/dialogue tree from
+//     handlers::commands / messages / callbacks unconditionally and needs
+//     teloxide's sqlite-storage feature for every dispatcher.
+// The capability modules re-exported above are stub `Descriptor` constants
+// with no dependency of their own, and every crate-root module below is
+// shared infrastructure. Gating any of them requires edits to web (web/api/
+// auth/embed) and server (handlers core, main.rs) files — out of core territory.
+// Until those areas gate their modules there is no safe `#[cfg(feature=...)]`
+// addition here and no safe `optional = true` / `dep:` mapping in Cargo.toml;
+// both builds stay green and the default build stays byte-identical.
+
 use teloxide::prelude::*;
 
 /// Revoke every expired subscription: kick the member out of the channel

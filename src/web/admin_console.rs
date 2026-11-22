@@ -20,7 +20,7 @@ pub(super) async fn subs_grant(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = if session.role == "owner" {
+    let seller_id = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         0i64
     } else {
         match session.seller_id {
@@ -91,6 +91,10 @@ pub(super) async fn broadcast_page(
         .iter()
         .find(|(k, _)| k == "sent")
         .map(|(_, v)| v.clone());
+    // Pre-transport moderation hold: the send handler redirects here with
+    // `held=1` when the central outbound gate refuses the text. No message
+    // body is echoed — only the content-free outcome is reported.
+    let held = pairs.iter().any(|(k, v)| k == "held" && v == "1");
     let segments: Vec<String> = pairs
         .iter()
         .filter(|(k, _)| k == "segment")
@@ -99,28 +103,36 @@ pub(super) async fn broadcast_page(
     // Outcome banner from the ?sent={n} redirect (PRG). The count is what the
     // send actually delivered; 0 is a failure, not a success — nothing went
     // out.
-    let banner = match sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
-        Some(0) => Some(
-            r#"<div class="alert alert-error" role="alert">No users matched — nothing was sent.</div>"#
+    let banner = if held {
+        Some(
+            r#"<div class="alert alert-error" role="status" aria-live="polite">The broadcast was held by the content policy. Nothing was sent.</div>"#
                 .to_string(),
-        ),
-        Some(n) => Some(format!(
-            r#"<div class="alert alert-success" role="status" aria-live="polite">Sent to {} users.</div>"#,
-            n
-        )),
-        None => None,
+        )
+    } else {
+        match sent.as_deref().and_then(|s| s.parse::<usize>().ok()) {
+            Some(0) => Some(
+                r#"<div class="alert alert-error" role="alert">No users matched — nothing was sent.</div>"#
+                    .to_string(),
+            ),
+            Some(n) => Some(format!(
+                r#"<div class="alert alert-success" role="status" aria-live="polite">Sent to {} users.</div>"#,
+                n
+            )),
+            None => None,
+        }
     };
     let segment = resolve_segment(&segments);
     // Recipient scope (review P1-1, fail closed): owner → global (None);
     // a non-owner carries their seller_id; a non-owner with NO seller scope
     // must see and reach zero recipients — passing None from here would
     // mean "all platform users".
-    let seller_scope = if session.role == "owner" {
+    let seller_scope = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         None
     } else {
         session.seller_id
     };
-    let no_seller_scope = session.role != "owner" && seller_scope.is_none();
+    let no_seller_scope =
+        !Role::from_role_str(&session.role).has_level(Role::Owner) && seller_scope.is_none();
     let users = if no_seller_scope {
         Vec::new()
     } else {
@@ -235,20 +247,51 @@ pub(super) async fn broadcast_send(
     if f.text.trim().is_empty() {
         return Redirect::to(&state.url("/broadcast")).into_response();
     }
+    // Outbound moderation (security residual gap): a content-bearing broadcast
+    // must be decided BEFORE any Telegram transport call. Scope follows the
+    // acting principal — the owner is the global floor (seller 0, no bot),
+    // while a seller/admin carries the session seller id and resolved bot id.
+    // A scopeless non-owner already reaches zero recipients below; gate them
+    // against the global floor rather than widening to all sellers.
+    let (policy_seller_id, policy_bot_id) =
+        if Role::from_role_str(&session.role).has_level(Role::Owner) {
+            (0i64, None)
+        } else {
+            (
+                session.seller_id.unwrap_or(0),
+                Some(effective_bot(&state, &session).id),
+            )
+        };
+    if let Err(hold) = crate::handlers::moderation::gate_outbound(
+        &state.db,
+        policy_seller_id,
+        policy_bot_id,
+        &f.text,
+    ) {
+        // Only the opaque marker and numeric scope are logged — never text.
+        tracing::warn!(
+            seller_id = policy_seller_id,
+            bot_id = ?policy_bot_id,
+            outcome = %hold,
+            "broadcast held before transport"
+        );
+        return Redirect::to(&state.url("/broadcast?held=1")).into_response();
+    }
     let segment = f.segment.clone().unwrap_or_else(|| "all".to_string());
     // Recipient scope (review P1-1, fail closed): owner → global (None);
     // a non-owner carries their seller_id; a non-owner with NO seller scope
     // delivers to nobody — None here would mean "all platform users".
-    let seller_scope = if session.role == "owner" {
+    let seller_scope = if Role::from_role_str(&session.role).has_level(Role::Owner) {
         None
     } else {
         session.seller_id
     };
-    let users = if session.role != "owner" && seller_scope.is_none() {
-        Vec::new()
-    } else {
-        crate::services::broadcast::filter_broadcast_users(&state.db, seller_scope, &segment)
-    };
+    let users =
+        if !Role::from_role_str(&session.role).has_level(Role::Owner) && seller_scope.is_none() {
+            Vec::new()
+        } else {
+            crate::services::broadcast::filter_broadcast_users(&state.db, seller_scope, &segment)
+        };
     let sent =
         crate::broadcast_to_users(&effective_bot(&state, &session).bot, &users, &f.text).await;
     Redirect::to(&state.url(&format!("/broadcast?sent={}", sent))).into_response()
@@ -273,7 +316,7 @@ pub(super) async fn crypto_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     let banner = if q.saved.as_deref() == Some("1") {
@@ -337,7 +380,7 @@ pub(super) async fn crypto_setup(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     if let Some(t) = f.token.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -371,7 +414,7 @@ pub(super) async fn crypto_me(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     let token = state.db.get_config("crypto_token").unwrap_or_default();
@@ -436,7 +479,7 @@ pub(super) async fn admins_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     let admins = state.db.list_admins_detail();
@@ -506,7 +549,7 @@ pub(super) async fn admins_add(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -528,7 +571,7 @@ pub(super) async fn admins_remove(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Admins", "Admins").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -571,7 +614,7 @@ pub(super) async fn sellers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     let sellers = state.db.list_sellers();
@@ -655,7 +698,7 @@ pub(super) async fn sellers_upsert(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     match f.user_id.trim().parse::<i64>() {
@@ -679,7 +722,7 @@ pub(super) async fn sellers_channel(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Sellers", "Sellers").into_response();
     }
     match f.user_id.trim().parse::<i64>() {

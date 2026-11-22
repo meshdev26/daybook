@@ -1,9 +1,9 @@
-# Web Console IA Redesign — Implementation Plan (L7)
+# Web Console IA Redesign — Implementation Plan
 
 **Spec:** `design-system/telegram-agent/IA_REDESIGN_SPEC.md` (committed as `d03525f`)
-**Implementation owner:** L7 `staff-client-platforms` — all source edits are in L7 territory.
-**Verification:** L3 `associate-verification` — mandatory before any completion claim.
-**Sign-offs:** L6-C coherence before merge; L11/human AA-vs-AAA wording before ship.
+**Implementation owner:** the web layer — all source edits are in web territory.
+**Verification:** mandatory before any completion claim.
+**Sign-offs:** design coherence before merge; owner AA-vs-AAA wording before ship.
 **Status:** not started. No code has been changed in this session.
 
 ## Constraints (from the spec)
@@ -11,7 +11,7 @@
 - Every URL path in the spec's §2 stays byte-identical; `src/web/mod.rs` route table is **untouched**.
 - No new page gate, no schema/DB change, no env change.
 - All links keep going through `state.url()` (base-path safe); skip link stays.
-- Documentation-drift fixes are prose-only and listed as step 5 (L7-owned trees).
+- Documentation-drift fixes are prose-only and listed as step 5 (web-owned trees).
 
 ## Step 1 — Add the declarative nav table (`src/web/html.rs`)
 
@@ -45,14 +45,15 @@
 
 ## Step 5 — Documentation drift (routing corrected)
 
-- L4's permission map covers `docs/**` only, so L4 **cannot** edit these files. Both stale items are in L7-owned territory (`src/web/**` and `design-system/**` are both in L7's allow list), so **L7 fixes both in the same PR**:
+- Documentation changes are limited to `docs/**`. Both stale items are in web-owned territory
+  (`src/web/**` and `design-system/**`), so **the web layer fixes both in the same PR**:
   - the comment at `src/web/tests/bots.rs:652-653` ("Bots rides in the Operate rail group");
   - the matching prose in `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md`.
-- Both must say Bots now lives in **Offerings**. No L4 dispatch is needed for this change.
+- Both must say Bots now lives in **Offerings**. No separate documentation handoff is needed for this change.
 
-## Step 6 — L7 self-check, then hand to L3
+## Step 6 — web self-check, then hand to verification
 
-L7 runs locally (records output; does not claim its own verification):
+Web runs locally (records output; does not claim its own verification):
 
 ```bash
 cargo fmt --check
@@ -62,16 +63,16 @@ cargo build
 git diff --stat -- src/web/mod.rs   # must be empty — proves paths unchanged
 ```
 
-Then dispatch **L3** to verify, with the spec's §10 acceptance criteria and §11 test plan as the checklist. L3 runs the full gate set including `cargo audit`, `cargo deny check`, and `python3 scripts/verify-agent-tiers.py`, confirms no route changed, and records the result. No completion claim before L3 signs off.
+Then run **verification**, with the spec's §10 acceptance criteria and §11 test plan as the checklist. Verification runs the full gate set including `cargo audit`, `cargo deny check`, confirms no route changed, and records the result. No completion claim before verification signs off.
 
 ## Step 7 — Manual visual check
 
-At 1440 / 1024 / 768 / 375 px: group order, Utilities visibility, current-group auto-expand on phone, keyboard tab order + Enter/Space toggles, `aria-current`, focus rings, skip link, and `prefers-reduced-motion`. L3 records results.
+At 1440 / 1024 / 768 / 375 px: group order, Utilities visibility, current-group auto-expand on phone, keyboard tab order + Enter/Space toggles, `aria-current`, focus rings, skip link, and `prefers-reduced-motion`. Verification records results.
 
 ## Open items (not blocking implementation)
 
-- **Floor: WCAG 2.2 AA** — ruled by L11 on 2026-11-18; recorded in `IA_REDESIGN_SPEC.md` §8. No AAA upgrade, no color changes.
-- **L6-C:** coherence sign-off on the new group/label set before merge.
+- **Floor: WCAG 2.2 AA** — ruled on 2026-11-18; recorded in `IA_REDESIGN_SPEC.md` §8. No AAA upgrade, no color changes.
+- **Design:** coherence sign-off on the new group/label set before merge.
 
 ## Rollback
 

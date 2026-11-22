@@ -3,6 +3,17 @@ use super::*;
 
 // ---------- MFA / TOTP ----------
 
+/// One markup contract for freshly issued recovery codes: a compact,
+/// two-column chip grid (`.recovery-codes`), escape every code. Shared by the
+/// post-enroll page and the settings rotation banner.
+pub(super) fn recovery_codes_html(codes: &[String]) -> String {
+    codes
+        .iter()
+        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 pub(super) fn pending_from_headers(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -243,14 +254,10 @@ pub(super) async fn mfa_enroll_submit(
         None,
     ));
     let token = state.db.create_web_session(id, &role, seller_id, 7);
-    let codes_html = plain
-        .iter()
-        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
-        .collect::<Vec<_>>()
-        .join("");
+    let codes_html = recovery_codes_html(&plain);
     let body = format!(
         r#"<h1>MFA enabled</h1><div class="alert alert-warn" role="status" aria-live="polite">Save these recovery codes; they will not be shown again.</div>
-<ul>{}</ul>
+<ul class="recovery-codes" aria-label="Recovery codes">{}</ul>
 <p><a href="{}">Continue to dashboard</a></p>"#,
         codes_html,
         state.url("/dashboard")
@@ -581,13 +588,9 @@ pub(super) async fn settings_mfa_recovery(
     // replace existing recovery codes only
     let _ = state.db.delete_recovery_codes(session.account_id);
     let _ = state.db.create_recovery_codes(session.account_id, hashed);
-    let codes_html = plain
-        .iter()
-        .map(|c| format!("<li><code class=\"copyable\">{}</code></li>", esc(c)))
-        .collect::<Vec<_>>()
-        .join("");
+    let codes_html = recovery_codes_html(&plain);
     let body = format!(
-        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once):<ul>{}</ul></div>"#,
+        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once):<ul class="recovery-codes" aria-label="New recovery codes">{}</ul></div>"#,
         codes_html
     );
     Html(html_page(&state, Some(&session), "Settings", &body)).into_response()
@@ -648,7 +651,7 @@ pub(super) async fn webusers_resetmfa(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
@@ -697,7 +700,7 @@ pub(super) async fn webusers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     let accounts = state.db.list_web_accounts_full();
@@ -723,7 +726,7 @@ pub(super) async fn webusers_page(
             let rmf = state.url("/webusers/resetmfa");
             let toggle = SECRET_TOGGLE;
             format!(
-                r#"<tr><td class="mono">{id}</td><td>{u}</td><td>{role}</td><td class="mono">{seller_cell}</td><td>{mfa}</td><td>
+                r#"<tr><td class="mono">{id}</td><td>{u}</td><td>{role}</td><td class="mono">{seller_cell}</td><td>{mfa}</td><td class="actions">
 <form method="post" action="{pw}" class="inline-form"><input type="hidden" name="id" value="{id}"><span class="secret-field"><input type="password" name="password" placeholder="new password" aria-label="New password for {u}">{toggle}</span><button type="submit" class="btn btn-sm">Reset</button></form>
 <form method="post" action="{del}" class="inline-form" onsubmit="var b=this.querySelector('button[type=submit]');if(b){{b.disabled=true;b.setAttribute('aria-busy','true');}}"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" aria-label="Delete account {u}" onclick="return confirm('Delete account {u}? Their sessions end immediately.')">Delete</button></form>
 <form method="post" action="{rmf}" class="inline-form"><input type="hidden" name="id" value="{id}"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Reset MFA for {u}? They will sign in with password only until they enroll again.')">Reset MFA</button></form>
@@ -793,10 +796,14 @@ pub(super) async fn webusers_create(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
-    let role = if f.role == "owner" { "owner" } else { "seller" };
+    let role = if Role::from_role_str(&f.role) == Role::Owner {
+        "owner"
+    } else {
+        "seller"
+    };
     // E13: empty seller_id stays None (platform-level) — the select's first
     // option submits "" and the parse here already maps that to None.
     let seller_id = f
@@ -827,7 +834,7 @@ pub(super) async fn webusers_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {
@@ -847,7 +854,7 @@ pub(super) async fn webusers_password(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Web users", "Web users").into_response();
     }
     if let Ok(id) = f.id.trim().parse::<i64>() {

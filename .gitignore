@@ -5,6 +5,9 @@
 /fuzz/corpus
 /fuzz/artifacts
 
+# Dev-only Node tooling (never committed, never shipped)
+/assets/node_modules/
+
 # Live data — never commit business state or secrets
 /data
 /backups
@@ -14,14 +17,8 @@
 !.env.example
 /docs/plans
 
-# Local agent tooling — internal workflow, not published. EXCEPTION: the
-# agent charters under agents/ ARE published — verify-agent-tiers.py (part
-# of `make test`) machine-checks the ladder against them, so they travel
-# with the repo.
-/.opencode/*
-!/.opencode/agents
-/.commandcode
-/.mimosa
+# Local bot registry — machine-specific configuration, not published.
+/bots.toml
 
 # Vendored dependency sources — only the PATCHED crates are tracked (see
 # [patch.crates-io] in Cargo.toml: the teloxide fork strips aquamarine and

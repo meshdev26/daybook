@@ -587,7 +587,7 @@ fn test_revenue_by_asset_per_asset_lines() {
         vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 70.0)]
     );
     // revenue_total's cross-asset behavior is deliberately unchanged
-    // (L5 ruling 5: the sum is a display defect handled at the callers)
+    // (finance ruling 5: the sum is a display defect handled at the callers)
     assert!((db.revenue_total(None) - 70.5).abs() < 1e-9);
 }
 
@@ -2366,7 +2366,7 @@ async fn test_claim_code_cleared_when_owner_exists() {
     assert!(db2.ensure_claim_code().is_none());
 }
 
-// ---- L9 coverage: config / web accounts / totp / api keys / mcp approvals / audit / plans / channels ----
+// ---- core coverage: config / web accounts / totp / api keys / mcp approvals / audit / plans / channels ----
 
 #[test]
 fn test_config_roundtrip() {
@@ -3053,6 +3053,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             owner_id: 100,
             default_channel: None,
             token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
         crate::config::BotConfig {
             key: "shop_bot".to_string(),
@@ -3061,6 +3062,7 @@ fn backfill_bots_at_startup_carries_config_names() {
             owner_id: 101,
             default_channel: None,
             token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
         },
     ];
     db.backfill_bots_at_startup(&bots);
@@ -3074,6 +3076,142 @@ fn backfill_bots_at_startup_carries_config_names() {
         "",
         "empty config name stays empty (show the key)"
     );
+}
+
+/// The multibot-foundation `bot_type` migration is additive: a legacy
+/// database with no such column gains it on `Db::new`, existing rows read
+/// back as 'shop_bot' via the NOT NULL DEFAULT (no destructive rewrite),
+/// and the new column is writable afterwards. Reopening is idempotent.
+#[test]
+fn bots_bot_type_migration_backfills_legacy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bots_legacy_type.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE bots (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bots(key, owner_user_id, created_at) VALUES('legacy_a', 100, '2026-01-01T00:00:00+00:00'), ('legacy_b', 101, '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+    }
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    for key in ["legacy_a", "legacy_b"] {
+        assert_eq!(
+            db.get_bot_by_key(key).expect("legacy row kept").bot_type,
+            crate::config::DEFAULT_BOT_TYPE,
+            "NOT NULL DEFAULT backfills existing rows"
+        );
+    }
+    drop(db);
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        db.list_bots_of_type("shop_bot").len(),
+        2,
+        "idempotent reopen"
+    );
+
+    let id = db.get_bot_by_key("legacy_a").unwrap().id;
+    db.set_bot_type(id, "movie_bot").unwrap();
+    assert_eq!(db.get_bot(id).unwrap().bot_type, "movie_bot");
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 1);
+    assert_eq!(db.list_bots_of_type("shop_bot").len(), 1);
+}
+
+/// Typed listing is parameterized (a quote cannot widen the query), returns
+/// an empty vec for unknown/disabled types, and the enabled-only variant
+/// mirrors `list_bots_enabled`. `create_bot` still defaults to `shop_bot`.
+#[test]
+fn bot_type_typed_listing_is_parameterized_and_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bot_type_list.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let shop = db.create_bot("shop-1", 100, None, "");
+    let movie = db.create_bot_with_type("movie-1", 101, None, "", "movie_bot");
+    let movie2 = db.create_bot_with_type("movie-2", 102, None, "", "movie_bot");
+    assert!(shop > 0 && movie > 0 && movie2 > 0);
+
+    assert_eq!(db.get_bot(shop).unwrap().bot_type, "shop_bot");
+    assert_eq!(db.get_bot_by_key("movie-1").unwrap().bot_type, "movie_bot");
+    assert!(db.list_bots().iter().any(|b| b.bot_type == "movie_bot"));
+
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 2);
+    assert_eq!(db.list_bots_of_type("shop_bot").len(), 1);
+    assert!(db.list_bots_of_type("reply_bot").is_empty());
+    assert!(db.list_bots_of_type("movie_bot' OR 1=1 --").is_empty());
+
+    db.set_bot_enabled(movie2, false);
+    assert_eq!(db.list_bots_of_type_enabled("movie_bot").len(), 1);
+    assert_eq!(db.list_bots_of_type("movie_bot").len(), 2);
+
+    // Empty/whitespace is normalized to the default; unknown id refused.
+    db.set_bot_type(movie, "  ").unwrap();
+    assert_eq!(db.get_bot(movie).unwrap().bot_type, "shop_bot");
+    assert!(db.set_bot_type(999_999, "movie_bot").is_err());
+}
+
+/// The seller-scoped listing uses the same COALESCE(bot_id, primary) rule as
+/// `sellers_for_bot`, binds both parameters, and never leaks another
+/// seller's typed bots.
+#[test]
+fn bot_type_listing_for_seller_is_seller_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bot_type_seller.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    db.create_bot("primary", 1, None, "");
+    let movie = db.create_bot_with_type("movie", 2, None, "", "movie_bot");
+    db.upsert_seller(10, Some("s10"), None); // NULL bot_id -> primary
+    db.upsert_seller_bot_id(11, Some(movie));
+    db.upsert_seller(12, Some("s12"), None); // NULL bot_id -> primary
+
+    assert_eq!(db.list_bots_of_type_for_seller(10, "shop_bot").len(), 1);
+    assert!(db.list_bots_of_type_for_seller(10, "movie_bot").is_empty());
+    assert_eq!(db.list_bots_of_type_for_seller(11, "movie_bot").len(), 1);
+    assert!(db.list_bots_of_type_for_seller(11, "shop_bot").is_empty());
+    assert!(db.list_bots_of_type_for_seller(999, "shop_bot").is_empty());
+    assert!(
+        db.list_bots_of_type_for_seller(10, "movie_bot' OR 1=1 --")
+            .is_empty()
+    );
+}
+
+/// Startup backfill carries each configured `BotConfig.bot_type` into the
+/// freshly created row, not just its name.
+#[test]
+fn backfill_bots_at_startup_carries_config_bot_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bots_backfill_type.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let bots = vec![
+        crate::config::BotConfig {
+            key: "movie-bot".to_string(),
+            name: "Movie".to_string(),
+            token: String::new(),
+            owner_id: 100,
+            default_channel: None,
+            token_env: None,
+            bot_type: "movie_bot".to_string(),
+        },
+        crate::config::BotConfig {
+            key: "shop-bot".to_string(),
+            name: String::new(),
+            token: String::new(),
+            owner_id: 101,
+            default_channel: None,
+            token_env: None,
+            bot_type: crate::config::DEFAULT_BOT_TYPE.to_string(),
+        },
+    ];
+    db.backfill_bots_at_startup(&bots);
+    assert_eq!(
+        db.get_bot_by_key("movie-bot").unwrap().bot_type,
+        "movie_bot"
+    );
+    assert_eq!(db.get_bot_by_key("shop-bot").unwrap().bot_type, "shop_bot");
 }
 
 /// `set_bot_name` persists the trimmed name, allows the empty string (show
@@ -3104,4 +3242,1528 @@ fn set_bot_name_trims_persists_and_allows_empty() {
 
     // Unknown bot id: honest Err, nothing to update.
     assert!(db.set_bot_name(999_999, "Ghost").is_err());
+}
+
+#[cfg(test)]
+mod moderation_tests {
+    use super::*;
+
+    fn test_db(name: &str) -> Db {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the directory alive for the test (Db::new opens the file by
+        // path); `keep` is the non-deprecated form of the old `into_path`.
+        let path = dir.keep().join(name);
+        Db::new(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn moderation_seller_isolation() {
+        let db = test_db("mod_seller.db");
+        let (a, b) = (11_i64, 22_i64);
+
+        assert!(db.add_blocked_word(a, "spam", "hide", true));
+        assert!(db.add_allow_word(a, "legit"));
+        // Seller B sees none of seller A's rows.
+        assert!(db.list_blocked_words(b).is_empty());
+        assert!(db.get_blocked_word(b, "spam").is_none());
+        assert!(db.list_allow_words(b).is_empty());
+        // Seller B cannot mutate or delete A's rows by name/id.
+        assert!(!db.set_blocked_word_mode(b, "spam", "warn"));
+        assert!(!db.set_blocked_word_enabled(b, "spam", false));
+        assert!(!db.remove_blocked_word(b, "spam"));
+        assert!(!db.remove_allow_word(b, "legit"));
+        assert_eq!(db.get_blocked_word(a, "spam").unwrap().mode, "hide");
+
+        // Appeals and decisions are seller-scoped too.
+        let appeal = db
+            .create_moderation_appeal(a, None, None, "opaque:1", Some("please review"))
+            .unwrap();
+        db.log_moderation_decision(
+            a,
+            None,
+            Some("spam"),
+            "hide",
+            Some("matched"),
+            Some("opaque:1"),
+        )
+        .unwrap();
+        assert!(db.get_moderation_appeal(b, appeal).is_none());
+        assert_eq!(db.get_moderation_appeal(a, appeal).unwrap().seller_id, a);
+        assert!(!db.set_moderation_appeal_status(b, appeal, "approved"));
+        assert!(db.set_moderation_appeal_status(a, appeal, "approved"));
+        assert_eq!(
+            db.get_moderation_appeal(a, appeal).unwrap().status,
+            "approved"
+        );
+        assert!(db.list_moderation_appeals(b, None).is_empty());
+        assert_eq!(db.list_moderation_appeals(a, None).len(), 1);
+        assert!(db.list_moderation_decisions(b, 10).is_empty());
+        assert_eq!(db.list_moderation_decisions(a, 10).len(), 1);
+    }
+
+    #[test]
+    fn moderation_bot_override_scoped_by_both_ids() {
+        let db = test_db("mod_bot_scope.db");
+        let (a, b) = (101_i64, 202_i64);
+        let bot_a1 = db.create_bot("mod-bot-a1", a, None, "");
+        let bot_a2 = db.create_bot("mod-bot-a2", a, None, "");
+        let bot_b1 = db.create_bot("mod-bot-b1", b, None, "");
+
+        // Inheritance is the default for every scope.
+        assert!(db.bot_override_inherits(a, bot_a1));
+        // Adding a custom term activates custom rules for (a, bot_a1) ONLY.
+        assert!(db.add_bot_override_term(a, bot_a1, "spoiler", "hide"));
+        assert!(!db.bot_override_inherits(a, bot_a1));
+        assert!(db.bot_override_inherits(a, bot_a2));
+        assert!(db.bot_override_inherits(b, bot_b1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(db.list_bot_override_terms(a, bot_a2).is_empty());
+        assert!(db.list_bot_override_terms(b, bot_b1).is_empty());
+
+        // Same bot id under a different seller, and a different bot under the
+        // same seller, are disjoint namespaces for reads AND writes.
+        assert!(!db.remove_bot_override_term(a, bot_a2, "spoiler"));
+        assert!(!db.remove_bot_override_term(b, bot_b1, "spoiler"));
+        assert!(db.get_bot_override_term(a, bot_a1, "spoiler").is_some());
+        let pa = db.resolve_effective_policy(a, Some(bot_a1));
+        let pb = db.resolve_effective_policy(a, Some(bot_a2));
+        assert!(pa.bot_override_active);
+        assert!(!pb.bot_override_active);
+        assert_eq!(pa.terms.len(), 1);
+        assert!(pb.terms.is_empty());
+
+        // Restoring inheritance is non-destructive: terms stay stored but are
+        // ignored while inheriting.
+        assert!(db.set_bot_override_inherits(a, bot_a1, true));
+        assert!(db.bot_override_inherits(a, bot_a1));
+        assert_eq!(db.list_bot_override_terms(a, bot_a1).len(), 1);
+        assert!(
+            db.resolve_effective_policy(a, Some(bot_a1))
+                .terms
+                .is_empty()
+        );
+
+        // Removal is scoped by both ids.
+        assert!(db.remove_bot_override_term(a, bot_a1, "spoiler"));
+        assert!(db.list_bot_override_terms(a, bot_a1).is_empty());
+    }
+
+    #[test]
+    fn moderation_precedence_stricter_only_allowlist_and_floor() {
+        // Floor 'hide' with a baseline term: nothing may be weaker than hide,
+        // and the allow-list may not delete a floor term.
+        let floor_terms = vec![ModerationTermInput {
+            term: "floorword".into(),
+            mode: "hide".into(),
+        }];
+        let seller = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "soft".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "mid".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "allowed".into(),
+                mode: "hide".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "floorword".into(),
+                mode: "warn".into(),
+            },
+            ModerationTermInput {
+                term: "extra".into(),
+                mode: "review".into(),
+            },
+        ];
+        let allow = vec![
+            "allowed".to_string(),
+            "floorword".to_string(),
+            "extra".to_string(),
+        ];
+        let effective = apply_moderation_precedence("hide", &floor_terms, &seller, &bot, &allow);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("allowed"), None); // allow-list wins over seller
+        assert_eq!(mode_of("extra"), None); // allow-list wins over bot
+        assert_eq!(mode_of("floorword"), Some("hide")); // floor term survives allow
+        assert_eq!(mode_of("soft"), Some("hide")); // seller term raised to floor
+        assert_eq!(mode_of("mid"), Some("hide")); // seller term raised to floor
+        assert_eq!(effective.len(), 3);
+        assert!(effective.windows(2).all(|w| w[0].term < w[1].term)); // deterministic
+
+        // Floor 'warn' does not force every term to hide: here the stricter-only
+        // rule between seller and bot layers is exercised directly.
+        let seller = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "review".into(),
+            },
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let bot = vec![
+            ModerationTermInput {
+                term: "s1".into(),
+                mode: "warn".into(),
+            }, // weaker -> stays review
+            ModerationTermInput {
+                term: "s2".into(),
+                mode: "hide".into(),
+            }, // stricter -> raised to hide
+            ModerationTermInput {
+                term: "s3".into(),
+                mode: "review".into(),
+            },
+        ];
+        let effective = apply_moderation_precedence("warn", &[], &seller, &bot, &[]);
+        let mode_of = |t: &str| {
+            effective
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("s1"), Some("review"));
+        assert_eq!(mode_of("s2"), Some("hide"));
+        assert_eq!(mode_of("s3"), Some("review"));
+    }
+
+    #[test]
+    fn moderation_db_resolution_wiring() {
+        let db = test_db("mod_resolve.db");
+        let seller = 303_i64;
+        let bot = db.create_bot("mod-resolve", seller, None, "");
+        assert!(db.add_blocked_word(seller, "spam", "warn", true));
+        assert!(db.add_blocked_word(seller, "disabled", "hide", false));
+        assert!(db.add_allow_word(seller, "spam"));
+        assert!(db.add_bot_override_term(seller, bot, "bot-only", "review"));
+        // Adding a custom term auto-activates "Custom rules for this bot";
+        // restore inheritance to exercise the inherited view first.
+        assert!(db.set_bot_override_inherits(seller, bot, true));
+
+        // While inheriting, bot terms are ignored; allow-list removes "spam";
+        // the disabled word is skipped.
+        let inherited = db.resolve_effective_policy(seller, Some(bot));
+        assert!(!inherited.bot_override_active);
+        assert!(inherited.terms.is_empty());
+
+        // Activating the override brings in the bot's stricter local rule.
+        assert!(db.set_bot_override_inherits(seller, bot, false));
+        let active = db.resolve_effective_policy(seller, Some(bot));
+        assert!(active.bot_override_active);
+        assert_eq!(active.floor_mode, MODERATION_FLOOR_MODE);
+        let mode_of = |t: &str| {
+            active
+                .terms
+                .iter()
+                .find(|e| e.term == t)
+                .map(|e| e.mode.as_str())
+        };
+        assert_eq!(mode_of("bot-only"), Some("review"));
+        assert_eq!(mode_of("spam"), None);
+        assert_eq!(mode_of("disabled"), None);
+
+        // No bot scope: never activates a bot override.
+        let global = db.resolve_effective_policy(seller, None);
+        assert!(!global.bot_override_active);
+        assert!(global.terms.is_empty());
+    }
+
+    #[test]
+    fn moderation_terms_are_data_not_sql() {
+        let db = test_db("mod_injection.db");
+        let payload = "x'; DROP TABLE moderation_blocked_words; --";
+        assert!(db.add_blocked_word(1, payload, "hide", true));
+        // Stored verbatim as data, not executed.
+        assert_eq!(db.get_blocked_word(1, payload).unwrap().term, payload);
+        assert_eq!(db.list_blocked_words(1).len(), 1);
+        // Table still exists; a different seller's writes are unaffected.
+        assert!(db.add_blocked_word(2, "normal", "warn", true));
+        assert_eq!(db.list_blocked_words(2).len(), 1);
+        // Invalid inputs are refused at the boundary.
+        assert!(!db.add_blocked_word(1, "bad\0term", "warn", true));
+        assert!(!db.add_blocked_word(1, "   ", "warn", true));
+        assert!(!db.add_blocked_word(1, &"x".repeat(MODERATION_MAX_TERM_LEN + 1), "warn", true));
+        assert!(!db.add_blocked_word(1, "bad", "DROP", true));
+    }
+
+    #[test]
+    fn moderation_migration_is_additive_over_legacy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod_legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE bots(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, username TEXT, owner_user_id INTEGER NOT NULL, default_channel_id INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
+                 INSERT INTO bots(key, owner_user_id, created_at) VALUES('legacy-bot', 42, '2026-01-01T00:00:00+00:00');
+                 INSERT INTO config(key, value, updated_at) VALUES('channel', '@legacy', '2026-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        // Pre-existing data survives the additive migration.
+        assert_eq!(db.get_config("channel").as_deref(), Some("@legacy"));
+        assert!(db.get_bot_by_key("legacy-bot").is_some());
+        assert_eq!(
+            db.get_bot_by_key("legacy-bot").unwrap().bot_type,
+            "shop_bot"
+        );
+        // New tables are present, empty, and usable.
+        assert!(db.list_blocked_words(42).is_empty());
+        assert!(db.list_allow_words(42).is_empty());
+        assert!(db.list_bot_override_terms(42, 1).is_empty());
+        // The global floor is seeded empty for backward compatibility, and a
+        // legacy DB opens non-degraded (all moderation DDL succeeded).
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(!db.resolve_effective_policy(42, None).enforcement_degraded);
+        assert!(db.add_blocked_word(42, "after-migrate", "warn", true));
+        drop(db);
+        // Reopening is idempotent: no data loss, no duplicate-table error.
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_blocked_words(42).len(), 1);
+    }
+
+    #[test]
+    fn moderation_decisions_and_appeals_store_no_message_content() {
+        let db = test_db("mod_no_content.db");
+        let seller = 404_i64;
+        let decision = db
+            .log_moderation_decision(
+                seller,
+                None,
+                Some("badword"),
+                "hide",
+                Some("matched"),
+                Some("opaque-ref-123"),
+            )
+            .unwrap();
+        let appeal = db
+            .create_moderation_appeal(
+                seller,
+                None,
+                Some(decision),
+                "opaque-ref-123",
+                Some("false positive"),
+            )
+            .unwrap();
+
+        // No content-like column exists on either audit/appeal table.
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            for table in ["moderation_decisions", "moderation_appeals"] {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                assert!(
+                    !cols
+                        .iter()
+                        .any(|c| c == "content" || c == "text" || c == "message"),
+                    "{table} has a content-like column: {cols:?}"
+                );
+            }
+        }
+
+        // Reason is capped; opaque reference is preserved verbatim.
+        let long = "a".repeat(MODERATION_MAX_REASON_LEN + 50);
+        let capped = db
+            .create_moderation_appeal(seller, None, None, "opaque-2", Some(&long))
+            .unwrap();
+        assert_eq!(
+            db.get_moderation_appeal(seller, capped)
+                .unwrap()
+                .reason
+                .unwrap()
+                .len(),
+            MODERATION_MAX_REASON_LEN
+        );
+        assert_eq!(
+            db.get_moderation_appeal(seller, appeal)
+                .unwrap()
+                .message_ref,
+            "opaque-ref-123"
+        );
+    }
+
+    fn mode_of<'a>(policy: &'a EffectiveModerationPolicy, term: &str) -> Option<&'a str> {
+        policy
+            .terms
+            .iter()
+            .find(|e| e.term == term)
+            .map(|e| e.mode.as_str())
+    }
+
+    #[test]
+    fn moderation_global_floor_is_persistent_owner_writable_and_non_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("mod_global_floor.db");
+        let db = Db::new(path.to_str().unwrap()).unwrap();
+        let (seller_a, seller_b) = (501_i64, 502_i64);
+
+        // Fresh install: floor seeded empty, enforcement not degraded.
+        assert!(db.list_moderation_global_floor().is_empty());
+        assert!(
+            !db.resolve_effective_policy(seller_a, None)
+                .enforcement_degraded
+        );
+
+        // Owner writes a global floor term (no seller_id); invalid input is
+        // refused at the boundary (parameterized data, never SQL).
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        assert!(!db.add_moderation_global_floor_term("bad\0term", "hide"));
+        assert!(!db.add_moderation_global_floor_term("banned", "DROP"));
+        assert_eq!(db.list_moderation_global_floor().len(), 1);
+        assert_eq!(db.list_moderation_global_floor()[0].mode, "hide");
+
+        // A seller cannot weaken or allow-list away a floor term: the same term
+        // at a looser seller mode plus a seller allow-list still resolves to
+        // the floor's 'hide'.
+        assert!(db.add_blocked_word(seller_a, "globalban", "warn", true));
+        assert!(db.add_allow_word(seller_a, "globalban"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "globalban"),
+            Some("hide")
+        );
+        // Floor is global: a second tenant inherits it, but stays isolated
+        // from seller A's own rows.
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_b, None), "globalban"),
+            Some("hide")
+        );
+        assert!(db.list_blocked_words(seller_b).is_empty());
+        assert!(db.list_allow_words(seller_b).is_empty());
+
+        // Each floor term's own mode is honored, clamped to >= the global
+        // minimum; re-moding is an upsert, not a second row.
+        assert!(db.add_moderation_global_floor_term("reviewterm", "review"));
+        assert_eq!(
+            mode_of(&db.resolve_effective_policy(seller_a, None), "reviewterm"),
+            Some("review")
+        );
+        assert!(db.add_moderation_global_floor_term("globalban", "review"));
+        assert_eq!(db.list_moderation_global_floor().len(), 2);
+
+        // Persistence across reopen.
+        drop(db);
+        let reopened = Db::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.list_moderation_global_floor().len(), 2);
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            Some("review")
+        );
+
+        // Once the owner removes a term, ordinary seller precedence returns:
+        // seller A's looser rule is now allow-listed away entirely.
+        assert!(reopened.remove_moderation_global_floor_term("globalban"));
+        assert!(!reopened.remove_moderation_global_floor_term("globalban"));
+        assert_eq!(
+            mode_of(
+                &reopened.resolve_effective_policy(seller_a, None),
+                "globalban"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn moderation_floor_per_term_mode_honored_and_clamped() {
+        let floor = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "hide".into(),
+            },
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "warn".into(),
+            },
+        ];
+        let seller = vec![
+            ModerationTermInput {
+                term: "a".into(),
+                mode: "warn".into(),
+            }, // cannot weaken the floor term
+            ModerationTermInput {
+                term: "b".into(),
+                mode: "hide".into(),
+            }, // may raise above its floor mode
+        ];
+        let allow = vec!["a".to_string(), "b".to_string()];
+        let out = apply_moderation_precedence("warn", &floor, &seller, &[], &allow);
+        let mode_of = |t: &str| out.iter().find(|e| e.term == t).map(|e| e.mode.as_str());
+        assert_eq!(mode_of("a"), Some("hide"));
+        assert_eq!(mode_of("b"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_ddl_failure_is_logged_and_fails_closed() {
+        // Force a moderation DDL statement to fail by pre-creating an object
+        // with the same name as one of the indexes (CREATE INDEX IF NOT EXISTS
+        // cannot succeed when a table of that name already exists).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE idx_mod_blocked_seller(x INTEGER);")
+            .unwrap();
+        assert!(Db::migrate_moderation_tables(&conn).is_err());
+        // The helper short-circuits: a later table was never created.
+        let later_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='moderation_decisions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!later_exists);
+
+        // With readiness false, policy resolution surfaces the fail-closed
+        // signal rather than silently returning an empty, permissive policy.
+        let db = test_db("mod_ddl_closed.db");
+        db.moderation_storage_ready.store(false, Ordering::Relaxed);
+        assert!(db.add_moderation_global_floor_term("globalban", "hide"));
+        let policy = db.resolve_effective_policy(9, None);
+        assert!(policy.enforcement_degraded);
+        assert_eq!(mode_of(&policy, "globalban"), Some("hide"));
+    }
+
+    #[test]
+    fn moderation_floor_read_failure_falls_back_and_degrades() {
+        let db = test_db("mod_floor_missing.db");
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute_batch("DROP TABLE moderation_global_floor;")
+                .unwrap();
+        }
+        // No panic; the compile-time default (empty) is used and the policy
+        // is marked degraded so hooks can fail closed.
+        let policy = db.resolve_effective_policy(7, None);
+        assert!(policy.enforcement_degraded);
+        assert!(policy.terms.is_empty());
+        assert_eq!(policy.floor_mode, MODERATION_FLOOR_MODE);
+    }
+
+    #[test]
+    fn moderation_appeals_duplicate_and_concurrent_inserts_are_idempotent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = test_db("mod_appeals_dedup.db");
+        let seller = 700_i64;
+
+        // Sequential duplicate of the same tuple: exactly one row, the second
+        // submission is a no-op and reports "no row created".
+        let first = db
+            .create_moderation_appeal(seller, None, None, "opaque:dup", Some("first"))
+            .expect("first appeal inserts");
+        assert!(
+            db.create_moderation_appeal(seller, None, None, "opaque:dup", Some("second"))
+                .is_none()
+        );
+        assert_eq!(db.list_moderation_appeals(seller, None).len(), 1);
+        assert_eq!(
+            db.get_moderation_appeal(seller, first)
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("first")
+        );
+
+        // Concurrent double-submission (bot-less tuple included): exactly one
+        // of the racing writers wins, so no duplicate rows can be created.
+        let shared = Arc::new(db);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let db = Arc::clone(&shared);
+            handles.push(thread::spawn(move || {
+                db.create_moderation_appeal(seller, None, None, "opaque:race", Some("race"))
+            }));
+        }
+        let ids: Vec<Option<i64>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .collect();
+        assert_eq!(ids.iter().filter(|id| id.is_some()).count(), 1);
+        assert_eq!(shared.list_moderation_appeals(seller, None).len(), 2);
+
+        // Distinct seller / ref / bot are still allowed — dedup is scoped to
+        // the exact (seller_id, bot_id, message_ref) tuple.
+        assert!(
+            shared
+                .create_moderation_appeal(seller + 1, None, None, "opaque:dup", None)
+                .is_some()
+        );
+        assert!(
+            shared
+                .create_moderation_appeal(seller, None, None, "opaque:other", None)
+                .is_some()
+        );
+        let bot = shared.create_bot("appeal-dedup-bot", seller, None, "");
+        assert!(
+            shared
+                .create_moderation_appeal(seller, Some(bot), None, "opaque:dup", None)
+                .is_some()
+        );
+        assert_eq!(shared.list_moderation_appeals(seller, None).len(), 4);
+    }
+
+    #[test]
+    fn moderation_appeals_legacy_duplicates_are_cleaned_up_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("mod_appeals_legacy_dup.db");
+        let path = path.to_str().unwrap().to_owned();
+        let seller = 701_i64;
+        let bot;
+        {
+            let db = Db::new(&path).unwrap();
+            bot = db.create_bot("appeal-legacy-bot", seller, None, "");
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            // Simulate a legacy DB: drop the unique index, then plant the
+            // duplicate rows the old check-then-insert handler could create.
+            conn.execute_batch("DROP INDEX IF EXISTS idx_mod_appeals_dedup;")
+                .unwrap();
+            for (id, reason, bot_id, reference) in [
+                (1_i64, "original", None, "opaque:legacy"),
+                (2_i64, "duplicate-1", None, "opaque:legacy"),
+                (3_i64, "duplicate-2", None, "opaque:legacy"),
+                (4_i64, "other-ref", None, "opaque:distinct"),
+                (5_i64, "other-bot", Some(bot), "opaque:legacy"),
+            ] {
+                conn.execute(
+                    "INSERT INTO moderation_appeals
+                     (id,seller_id,bot_id,decision_id,message_ref,reason,status,created_at,updated_at)
+                     VALUES(?1,?2,?3,NULL,?4,?5,'pending','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    params![id, seller, bot_id, reference, reason],
+                )
+                .unwrap();
+            }
+        }
+        // Reopening runs init_schema (dedup before the unique index) followed
+        // by the idempotent migrate pass — the legacy DB opens with the
+        // duplicates collapsed and every distinct tuple preserved.
+        let reopened = Db::new(&path).unwrap();
+        let rows = reopened.list_moderation_appeals(seller, None);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.message_ref == "opaque:legacy"
+            && r.bot_id.is_none()
+            && r.reason.as_deref() == Some("original")));
+        assert!(
+            rows.iter()
+                .any(|r| r.message_ref == "opaque:distinct" && r.bot_id.is_none())
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.message_ref == "opaque:legacy" && r.bot_id == Some(bot))
+        );
+
+        let indexed: bool = {
+            let conn = reopened.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_mod_appeals_dedup')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(indexed);
+        // The restored index blocks any further duplicate submission.
+        assert!(
+            reopened
+                .create_moderation_appeal(seller, None, None, "opaque:legacy", Some("late"))
+                .is_none()
+        );
+    }
+}
+
+// ---- Money Safety Spec: data-layer tests (decisions 1/3/4/5) ----
+
+fn money_test_db(name: &str) -> (Db, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    // Keep the tempdir alive for the test's lifetime by leaking it; these
+    // are short-lived unit tests and the OS reclaims the directory.
+    std::mem::forget(dir);
+    (db, path)
+}
+
+fn refund_input<'a>(
+    seller_id: i64,
+    invoice_id: Option<&'a str>,
+    amount: &'a str,
+    asset: &'a str,
+    idem_key: &'a str,
+    created_by: i64,
+    created_role: &'a str,
+) -> RefundInput<'a> {
+    RefundInput {
+        seller_id,
+        invoice_id,
+        user_id: None,
+        amount,
+        asset,
+        reason: Some("test refund"),
+        idem_key,
+        created_by,
+        created_role,
+    }
+}
+
+/// §1.1/§1.2: one in-flight refund per invoice; idem replay returns the
+/// same row; a completed partial refund frees the in-flight slot for a
+/// later, distinctly-keyed partial (no blanket UNIQUE(invoice_id)).
+#[test]
+fn money_refund_inflight_uniqueness_and_partial_after_completion() {
+    let (db, _path) = money_test_db("refund_inflight.db");
+    db.save_invoice(
+        "inv-u1",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let first = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "4",
+            "USDT",
+            "key-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(first.created_new);
+
+    let replay = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "4",
+            "USDT",
+            "key-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert_eq!(replay.id, first.id);
+    assert!(!replay.created_new);
+    assert_eq!(db.list_refunds(Some(1)).len(), 1);
+
+    let blocked = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "1",
+            "USDT",
+            "key-2",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(blocked, RefundCreateError::InFlight);
+
+    db.set_refund_status(first.id, "executed");
+    let second = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-u1"),
+            "3",
+            "USDT",
+            "key-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(second.created_new);
+    assert_ne!(second.id, first.id);
+    assert_eq!(db.list_refunds(Some(1)).len(), 2);
+}
+
+/// §1.2 step 3/4: the cap counts every non-void row (including terminal
+/// `executed` and the legacy `processed` alias); `void` is not counted.
+#[test]
+fn money_refund_cumulative_cap_across_states() {
+    let (db, path) = money_test_db("refund_cap.db");
+    db.save_invoice(
+        "inv-cap",
+        1,
+        "10.00000001",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let r1 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "6",
+            "USDT",
+            "cap-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    db.set_refund_status(r1.id, "executed");
+    // 6 + 4.00000001 == the invoiced amount: allowed to the last minor unit.
+    let r2 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "4.00000001",
+            "USDT",
+            "cap-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(r2.created_new);
+    // One more minor unit exceeds the cap.
+    db.set_refund_status(r2.id, "executed");
+    let err = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-cap"),
+            "0.00000001",
+            "USDT",
+            "cap-3",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(err, RefundCreateError::CapExceeded);
+
+    // A `void` row is excluded from the cumulative sum and the in-flight set.
+    let voided = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "1",
+            "USDT",
+            "void-1",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(voided, RefundCreateError::InvoiceNotFound);
+    db.save_invoice(
+        "inv-void",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let r3 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "5",
+            "USDT",
+            "void-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    db.set_refund_status(r3.id, "void");
+    let r4 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-void"),
+            "5",
+            "USDT",
+            "void-2",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    assert!(
+        r4.created_new,
+        "void must not consume cap or in-flight slot"
+    );
+
+    // Legacy `processed` alias on a fresh row is still counted (read-only).
+    db.save_invoice(
+        "inv-processed",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,idem_key,created_by,created_role,created_at,updated_at) VALUES(1,'inv-processed',42,'4','USDT','processed','legacy:900',-1,'unknown','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    let blocked = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-processed"),
+            "2",
+            "USDT",
+            "cap-4",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(blocked, RefundCreateError::CapExceeded);
+}
+
+/// §1.1: asset is locked to the invoice, actor is persisted, and money
+/// columns are immutable even from a raw writer.
+#[test]
+fn money_refund_asset_lock_actor_and_immutability() {
+    let (db, path) = money_test_db("refund_immutable.db");
+    db.save_invoice(
+        "inv-asset",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let mismatch = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-asset"),
+            "5",
+            "TON",
+            "asset-1",
+            7,
+            "Seller",
+        ))
+        .unwrap_err();
+    assert_eq!(mismatch, RefundCreateError::AssetMismatch);
+    let created = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-asset"),
+            "5",
+            "USDT",
+            "asset-2",
+            77,
+            "Owner",
+        ))
+        .unwrap();
+    assert!(created.created_new);
+    let row = db.get_refund(created.id).unwrap();
+    assert_eq!(row.1, 1);
+    assert_eq!(row.5, "USDT");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        let idem: String = conn
+            .query_row(
+                "SELECT idem_key FROM refunds WHERE id=?1",
+                [created.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idem, "asset-2");
+        let actor: (i64, String) = conn
+            .query_row(
+                "SELECT created_by,created_role FROM refunds WHERE id=?1",
+                [created.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor.0, 77);
+        assert_eq!(actor.1, "Owner");
+        assert!(
+            conn.execute("UPDATE refunds SET amount='999' WHERE id=?1", [created.id])
+                .is_err(),
+            "money columns must be immutable"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE refunds SET status='executed' WHERE id=?1",
+                [created.id]
+            )
+            .is_ok(),
+            "status is allowed to change"
+        );
+    }
+}
+
+/// F3: `refund_creator` reads the actor from the persisted refund row written
+/// by `create_refund_guarded` (not the age-limited audit log), so separation
+/// of duties survives on mature DBs; unknown ids resolve to `None`.
+#[test]
+fn money_refund_creator_returns_persisted_actor() {
+    let (db, _path) = money_test_db("refund_creator.db");
+    db.save_invoice(
+        "inv-creator",
+        1,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let created = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-creator"),
+            "3",
+            "USDT",
+            "creator-key",
+            88,
+            "Owner",
+        ))
+        .unwrap();
+    assert!(created.created_new);
+    assert_eq!(
+        db.refund_creator(created.id),
+        Some((88, "Owner".to_string()))
+    );
+    assert_eq!(db.refund_creator(created.id + 9999), None);
+}
+
+/// §1.4 + §2.7 legacy migration: columns backfilled idempotently, audit
+/// actor recovered where present, sentinels otherwise, no row deletions.
+#[test]
+fn money_migration_legacy_is_additive_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_money.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id TEXT NOT NULL UNIQUE, seller_id INTEGER NOT NULL DEFAULT 0, amount TEXT NOT NULL, asset TEXT NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'active', pay_url TEXT, plan_id TEXT, user_id INTEGER, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, invoice_id TEXT, user_id INTEGER, amount TEXT NOT NULL, asset TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, amount TEXT NOT NULL, asset TEXT NOT NULL, destination TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT, metadata TEXT, created_at TEXT NOT NULL);
+             INSERT INTO invoices(invoice_id,seller_id,amount,asset,status,created_at,updated_at) VALUES('old-inv',3,'2.5','USDT','paid','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(3,'old-inv',42,'2.5','USDT','executed','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,metadata,created_at) VALUES(55,'Owner','refund_create','refund','1','{}','2020-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    // First open migrates; a second open is byte-identical (idempotent).
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let reopened = Db::new(path.to_str().unwrap()).unwrap();
+    for db in [&db, &reopened] {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (idem, actor, role): (String, i64, String) = conn
+            .query_row(
+                "SELECT idem_key,created_by,created_role FROM refunds WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(idem, "legacy:1");
+        assert_eq!(actor, 55, "actor comes from the refund_create audit row");
+        assert_eq!(role, "Owner");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refunds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "migration deletes no money rows");
+    }
+}
+
+/// §1.4: legacy DBs with two in-flight refunds for one invoice fail closed
+/// with the offending ids; after an audited void leaves one survivor the
+/// same DB opens and the unique index is present.
+#[test]
+fn money_migration_fails_closed_on_duplicate_inflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_duplicate.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, invoice_id TEXT, user_id INTEGER, amount TEXT NOT NULL, asset TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(1,'dup',42,'1','USDT','pending','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');
+             INSERT INTO refunds(seller_id,invoice_id,user_id,amount,asset,status,created_at,updated_at) VALUES(1,'dup',42,'1','USDT','approved','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let err = match Db::new(path.to_str().unwrap()) {
+        Ok(_) => panic!("legacy duplicate in-flight refunds must fail closed"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("money-safety migration refused"), "{msg}");
+    assert!(msg.contains("dup"), "{msg}");
+    // Audited void resolution leaves one survivor; no money row is deleted.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE refunds SET status='void' WHERE id=2", [])
+            .unwrap();
+    }
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let indexed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='uq_refunds_invoice_inflight')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(indexed);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM refunds", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "both historical rows survive resolution");
+}
+
+/// §3: paid_ungranted is non-terminal, stamped once, retryable back to
+/// paid, and never becomes `failed` after payment. 72h rows with no
+/// executed auto-refund block the seller.
+#[test]
+fn money_paid_ungranted_transitions_and_failed_guard() {
+    let (db, path) = money_test_db("paid_ungranted.db");
+    db.save_invoice(
+        "inv-ung",
+        9,
+        "3",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    assert!(db.mark_invoice_paid_ungranted("inv-ung"));
+    let stamp = db.invoice_paid_ungranted_at("inv-ung").unwrap();
+    assert!(!stamp.is_empty());
+    // The DB trigger refuses `failed` from a paid state (best-effort callers
+    // see no write; a raw writer sees a hard error).
+    db.update_invoice_status("inv-ung", "failed");
+    assert_eq!(db.get_invoice("inv-ung").unwrap().2, "paid_ungranted");
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE invoices SET status='failed' WHERE invoice_id='inv-ung'",
+                []
+            )
+            .is_err()
+        );
+    }
+
+    // Injected clock boundaries.
+    assert_eq!(db.paid_ungranted_before("2999-01-01T00:00:00Z").len(), 1);
+    assert!(db.paid_ungranted_before("2000-01-01T00:00:00Z").is_empty());
+    assert_eq!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .len(),
+        1
+    );
+
+    // Successful retry returns to paid and clears the clock.
+    assert!(db.finalize_invoice_grant_retry("inv-ung"));
+    assert_eq!(db.get_invoice("inv-ung").unwrap().2, "paid");
+    assert!(db.invoice_paid_ungranted_at("inv-ung").is_none());
+    // A fresh ungranted event starts a fresh window.
+    assert!(db.mark_invoice_paid_ungranted("inv-ung"));
+    assert_ne!(db.invoice_paid_ungranted_at("inv-ung").unwrap(), stamp);
+
+    // The auto-refund (documented idem key) clears the blocking liability
+    // only once it is executed.
+    let auto = db
+        .create_refund_guarded(refund_input(
+            9,
+            Some("inv-ung"),
+            "3",
+            "USDT",
+            "auto:ungranted:inv-ung",
+            -1,
+            "system",
+        ))
+        .unwrap();
+    assert!(auto.created_new);
+    assert_eq!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .len(),
+        1
+    );
+    db.set_refund_status(auto.id, "executed");
+    assert!(
+        db.unresolved_ungranted_invoices(9, "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+    // Other sellers are never blocked by this seller's liability.
+    assert!(
+        db.unresolved_ungranted_invoices(10, "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+}
+
+/// §4.1: spend_id is persisted before transfer, attempt_no is monotonic,
+/// duplicate keys are hard errors, and ambiguous retries can look up the
+/// same key.
+#[test]
+fn money_transfer_attempt_spend_id_persistence() {
+    let (db, _path) = money_test_db("spend_id.db");
+    let a1 = db
+        .record_transfer_attempt("refund", 11, 3, "spend-aaa")
+        .unwrap();
+    let a2 = db
+        .record_transfer_attempt("refund", 11, 3, "spend-bbb")
+        .unwrap();
+    assert!(a2 > a1);
+    let first = db.get_transfer_attempt("spend-aaa").unwrap();
+    let second = db.get_transfer_attempt("spend-bbb").unwrap();
+    assert_eq!(first.attempt_no, 1);
+    assert_eq!(second.attempt_no, 2);
+    assert_eq!(second.row_type, "refund");
+    assert_eq!(second.row_id, 11);
+    assert_eq!(second.seller_id, 3);
+    assert!(db.get_transfer_attempt("spend-nope").is_none());
+    assert!(
+        db.record_transfer_attempt("refund", 12, 3, "spend-aaa")
+            .is_err()
+    );
+    assert!(
+        db.record_transfer_attempt("bogus", 12, 3, "spend-ccc")
+            .is_err()
+    );
+    assert!(db.record_transfer_attempt("payout", 12, 3, "").is_err());
+
+    let latest = db.latest_transfer_attempt("refund", 11).unwrap();
+    assert_eq!(latest.spend_id, "spend-bbb");
+    assert!(db.latest_transfer_attempt("refund", 99).is_none());
+
+    assert!(db.set_transfer_attempt_outcome("spend-aaa", "ambiguous"));
+    let resolved = db.get_transfer_attempt("spend-aaa").unwrap();
+    assert_eq!(resolved.outcome.as_deref(), Some("ambiguous"));
+    assert!(resolved.resolved_at.is_some());
+}
+
+/// §5.1-§5.4: executing stamps a clock, the sweeper moves due rows to
+/// needs_reconciliation, the three owner outcomes are append-only, and
+/// the digest carries the persisted spend_id.
+#[test]
+fn money_reconciliation_state_transitions() {
+    let (db, path) = money_test_db("reconcile.db");
+    db.save_invoice(
+        "inv-rec",
+        4,
+        "10",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let refund = db
+        .create_refund_guarded(refund_input(
+            4,
+            Some("inv-rec"),
+            "10",
+            "USDT",
+            "rec-1",
+            7,
+            "Seller",
+        ))
+        .unwrap();
+    let payout = db.create_payout(4, "2", "USDT", Some("@dest"));
+    db.set_refund_status(refund.id, "approved");
+    db.set_payout_status(payout, "approved");
+    assert!(db.begin_refund_execution(refund.id));
+    assert!(db.begin_payout_execution(payout));
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (table, id) in [("refunds", refund.id), ("payouts", payout)] {
+            let since: Option<String> = conn
+                .query_row(
+                    &format!("SELECT executing_since FROM {table} WHERE id=?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(since.is_some(), "CAS must stamp executing_since");
+        }
+    }
+
+    // Nothing is due before the injected cutoff; everything is due after it.
+    assert!(
+        db.reconciliation_rows("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+            .is_empty()
+    );
+    assert!(
+        db.record_transfer_attempt("refund", refund.id, 4, "rec-spend")
+            .is_ok()
+    );
+    let rows = db.reconciliation_rows("2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|r| r.spend_id.as_deref() == Some("rec-spend"))
+    );
+
+    assert!(db.mark_needs_reconciliation("refund", refund.id, "2999-01-01T00:00:00Z"));
+    assert!(!db.mark_needs_reconciliation("refund", refund.id, "2999-01-01T00:00:00Z"));
+    assert_eq!(db.get_refund(refund.id).unwrap().7, "needs_reconciliation");
+
+    // Reason is mandatory; already-final rows cannot be resolved.
+    assert_eq!(
+        db.resolve_reconciliation(
+            "refund",
+            refund.id,
+            ReconciliationOutcome::Executed,
+            99,
+            "  "
+        ),
+        Err(ReconcileError::ReasonRequired)
+    );
+    assert_eq!(
+        db.resolve_reconciliation(
+            "payout",
+            payout,
+            ReconciliationOutcome::Executed,
+            99,
+            "receipt checked"
+        ),
+        Err(ReconcileError::NotDue)
+    );
+    db.resolve_reconciliation(
+        "refund",
+        refund.id,
+        ReconciliationOutcome::Executed,
+        99,
+        "receipt checked",
+    )
+    .unwrap();
+    let resolution = db.money_resolution("refund", refund.id).unwrap();
+    assert_eq!(resolution.0, "executed");
+    assert_eq!(resolution.1, "receipt checked");
+    assert_eq!(resolution.2, 99);
+    assert_eq!(
+        db.resolve_reconciliation(
+            "refund",
+            refund.id,
+            ReconciliationOutcome::Void,
+            99,
+            "second try"
+        ),
+        Err(ReconcileError::AlreadyResolved)
+    );
+    // Append-only is enforced by the trigger too, not just the method CAS.
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE refunds SET resolution='tampered' WHERE id=?1",
+                [refund.id]
+            )
+            .is_err()
+        );
+    }
+
+    // The other two outcomes map to `approved` and `void`.
+    assert!(db.mark_needs_reconciliation("payout", payout, "2999-01-01T00:00:00Z"));
+    db.resolve_reconciliation(
+        "payout",
+        payout,
+        ReconciliationOutcome::RevertedToApproved,
+        99,
+        "transfer never landed",
+    )
+    .unwrap();
+    assert_eq!(db.get_payout_status(payout).as_deref(), Some("approved"));
+    assert!(
+        db.resolve_reconciliation(
+            "payout",
+            payout,
+            ReconciliationOutcome::Void,
+            99,
+            "too late"
+        )
+        .is_err()
+    );
+}
+
+/// Every new money record is seller-scoped; listings and digest rows never
+/// cross tenant boundaries.
+#[test]
+fn money_safety_seller_isolation() {
+    let (db, _path) = money_test_db("scope.db");
+    db.save_invoice(
+        "inv-s1",
+        1,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(11),
+        None,
+    );
+    db.save_invoice(
+        "inv-s2",
+        2,
+        "5",
+        "USDT",
+        None,
+        "paid",
+        None,
+        None,
+        Some(22),
+        None,
+    );
+    let r1 = db
+        .create_refund_guarded(refund_input(
+            1,
+            Some("inv-s1"),
+            "5",
+            "USDT",
+            "s1-key",
+            1,
+            "Seller",
+        ))
+        .unwrap();
+    let r2 = db
+        .create_refund_guarded(refund_input(
+            2,
+            Some("inv-s2"),
+            "5",
+            "USDT",
+            "s2-key",
+            2,
+            "Seller",
+        ))
+        .unwrap();
+    assert_eq!(db.list_refunds(Some(1)).len(), 1);
+    assert_eq!(db.list_refunds(Some(2)).len(), 1);
+    assert_eq!(db.list_refunds(Some(3)).len(), 0);
+    assert_eq!(db.get_refund(r1.id).unwrap().1, 1);
+    assert_eq!(db.get_refund(r2.id).unwrap().1, 2);
+
+    db.record_transfer_attempt("refund", r1.id, 1, "s1-spend")
+        .unwrap();
+    db.record_transfer_attempt("refund", r2.id, 2, "s2-spend")
+        .unwrap();
+    assert_eq!(db.get_transfer_attempt("s1-spend").unwrap().seller_id, 1);
+    assert_eq!(db.get_transfer_attempt("s2-spend").unwrap().seller_id, 2);
+}
+
+/// G3 (deferred decision 8 guard): no NEW REAL/DOUBLE/FLOAT money column,
+/// and all §1/§4/§5 columns exist with the expected shapes.
+#[test]
+fn money_safety_schema_shape() {
+    let (db, _path) = money_test_db("shape.db");
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    for table in ["invoices", "refunds", "payouts", "transfer_attempts"] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let info: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for (name, ty) in &info {
+            let ty = ty.to_ascii_uppercase();
+            assert!(
+                !matches!(ty.as_str(), "REAL" | "DOUBLE" | "FLOAT"),
+                "{table}.{name} is a forbidden floating money column"
+            );
+        }
+        let names: Vec<&str> = info.iter().map(|(n, _)| n.as_str()).collect();
+        match table {
+            "refunds" => {
+                for expected in [
+                    "idem_key",
+                    "created_by",
+                    "created_role",
+                    "executing_since",
+                    "reconciliation_since",
+                    "resolution",
+                    "resolved_by",
+                    "resolved_at",
+                ] {
+                    assert!(names.contains(&expected), "refunds.{expected} missing");
+                }
+            }
+            "payouts" => {
+                for expected in [
+                    "executing_since",
+                    "reconciliation_since",
+                    "resolution",
+                    "resolved_by",
+                    "resolved_at",
+                ] {
+                    assert!(names.contains(&expected), "payouts.{expected} missing");
+                }
+            }
+            "invoices" => assert!(names.contains(&"paid_ungranted_at")),
+            "transfer_attempts" => {
+                for expected in [
+                    "spend_id",
+                    "attempt_no",
+                    "seller_id",
+                    "outcome",
+                    "resolved_at",
+                ] {
+                    assert!(
+                        names.contains(&expected),
+                        "transfer_attempts.{expected} missing"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let index_names: Vec<String> = conn
+        .prepare("PRAGMA index_list(refunds)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        index_names
+            .iter()
+            .any(|n| n == "uq_refunds_invoice_inflight")
+    );
+    assert!(index_names.iter().any(|n| n == "uq_refunds_invoice_idem"));
 }

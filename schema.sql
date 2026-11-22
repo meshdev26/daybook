@@ -38,8 +38,23 @@ CREATE TABLE IF NOT EXISTS invoices (
     user_id      INTEGER,
     attempts     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    -- Money Safety Spec §3 (Decision 3): paid-but-ungranted recovery clock.
+    -- Non-money TEXT timestamp; NULL unless the invoice entered that state.
+    -- Legacy DBs gain it via the additive ALTER in Db::migrate_money_safety.
+    paid_ungranted_at TEXT
 );
+
+-- Decision 3.1: 'failed' is never terminal once money was confirmed paid.
+-- The trigger is declared here (it only reads the pre-existing `status`
+-- column, so it is safe to create on a legacy DB during init_schema) and
+-- mirrored in Db::migrate_money_safety for completeness. The server implementation owns the audit
+-- event `invoice_failed_after_paid_blocked`; the DB owns the hard refusal.
+CREATE TRIGGER IF NOT EXISTS trg_invoice_no_failed_after_paid
+BEFORE UPDATE ON invoices
+FOR EACH ROW
+WHEN OLD.status IN ('paid','paid_ungranted') AND NEW.status = 'failed'
+BEGIN SELECT RAISE(ABORT, 'invoice_failed_after_paid_blocked'); END;
 
 -- Admin allow-list (superadmin always admin)
 CREATE TABLE IF NOT EXISTS admins (
@@ -219,6 +234,14 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 );
 
 -- Refunds
+-- Money Safety Spec §1 (Decision 1) + §5 (Decision 5). All new columns are
+-- TEXT/INTEGER (G3: no new REAL money column). Amount/asset stay untouched.
+-- The partial-unique indexes, asset-match trigger, immutability trigger and
+-- resolution append-only trigger are created in Db::migrate_money_safety
+-- (AFTER the additive ALTERs that give legacy DBs these columns) — declaring
+-- them here would fail init_schema on a legacy DB whose refunds table predates
+-- these columns. Defaults exist only so legacy ALTER TABLE ADD COLUMN works
+-- with rows present; all INSERTs in db.rs supply explicit values.
 CREATE TABLE IF NOT EXISTS refunds (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id   INTEGER NOT NULL,
@@ -229,10 +252,19 @@ CREATE TABLE IF NOT EXISTS refunds (
     reason      TEXT,
     status      TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    idem_key    TEXT NOT NULL DEFAULT '',
+    created_by  INTEGER NOT NULL DEFAULT -1,
+    created_role TEXT NOT NULL DEFAULT 'unknown',
+    executing_since TEXT,
+    reconciliation_since TEXT,
+    resolution  TEXT,
+    resolved_by INTEGER,
+    resolved_at TEXT
 );
 
--- Payouts
+-- Payouts (Decision 5 columns mirror refunds; Decision 1 cap/idempotency
+-- is refund-only per the spec).
 CREATE TABLE IF NOT EXISTS payouts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id    INTEGER NOT NULL,
@@ -241,7 +273,12 @@ CREATE TABLE IF NOT EXISTS payouts (
     destination  TEXT,
     status       TEXT NOT NULL DEFAULT 'pending',
     created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    executing_since TEXT,
+    reconciliation_since TEXT,
+    resolution  TEXT,
+    resolved_by INTEGER,
+    resolved_at TEXT
 );
 
 -- Audit log
@@ -428,8 +465,10 @@ CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_seller ON mcp_tokens(seller_id);
 
 -- Multi-bot (v1.6): one row per configured bot. `name` is the console
--- display name (v1.7); '' falls back to the key. Declared last so legacy
--- (ALTERed) and fresh layouts match.
+-- display name (v1.7); '' falls back to the key. `bot_type` (multibot
+-- foundation) is the product/capability type of the bot; the DEFAULT
+-- backfills every legacy row to 'shop_bot' with no destructive rewrite.
+-- Declared last so legacy (ALTERed) and fresh layouts match.
 CREATE TABLE IF NOT EXISTS bots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     key               TEXT NOT NULL UNIQUE,
@@ -438,9 +477,12 @@ CREATE TABLE IF NOT EXISTS bots (
     default_channel_id INTEGER,
     enabled           INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL,
-    name              TEXT NOT NULL DEFAULT ''
+    name              TEXT NOT NULL DEFAULT '',
+    bot_type          TEXT NOT NULL DEFAULT 'shop_bot'
 );
 CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_user_id);
+-- idx_bots_type is created in Db::migrate, after the additive bot_type
+-- ALTER: a legacy bots table has no such column when schema.sql runs.
 
 -- AI-assisted post drafts
 CREATE TABLE IF NOT EXISTS ai_post_drafts (
@@ -582,3 +624,158 @@ CREATE TABLE IF NOT EXISTS reviews (
     UNIQUE (buyer_id, product_id)
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(seller_id, product_id);
+
+-- ===========================================================================
+-- Cross-cutting moderation (multibot foundation, Step 4 storage).
+--
+-- Every record is scoped by seller_id (the house tenant key, intentionally
+-- WITHOUT an FK so callers may scope writes before a seller row exists —
+-- this matches posts/plans/invoices). Per-bot overrides are scoped by BOTH
+-- seller_id and bot_id. bot_id carries a real FK to bots: deleting a bot
+-- cascades its local overrides and nulls the optional reference on appeals
+-- and decisions so the append-only audit trail survives bot deletion.
+--
+-- PRIVACY CONTRACT (security floor): these tables hold policy TERMS and OPAQUE
+-- references only. There is deliberately NO message-content column.
+-- `message_ref` is an opaque caller token (e.g. "c:123/m:456"); `reason` is
+-- the short appeal justification / decision code, never the filtered body.
+-- Length caps are enforced in the Db write methods as a second line of
+-- defence. Do not add a content column here without a security review.
+-- ===========================================================================
+
+-- (a) Owner-enforced GLOBAL content-policy floor. Unlike every other table in
+-- this section there is deliberately NO seller_id: these terms apply to every
+-- seller and bot, and can never be removed or weakened by any seller's
+-- allow-list or per-bot override. Writes go only through the explicit
+-- `add_moderation_global_floor_term` / `remove_moderation_global_floor_term`
+-- Db methods, which the web layer MUST gate to the owner. Seeded empty for
+-- backward compatibility — the compile-time constants in db.rs are only a
+-- fallback when this table is unreadable. Keys/terms only, no message content.
+CREATE TABLE IF NOT EXISTS moderation_global_floor (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    term        TEXT NOT NULL UNIQUE,
+    mode        TEXT NOT NULL CHECK (mode IN ('hide','warn','review')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+-- (b) Seller-wide "Blocked words". One row per (seller, term); mode is the
+-- plain-language hide / warn / review action. `enabled` lets the console keep
+-- a word without enforcing it (inline status toggle), additive to the floor.
+CREATE TABLE IF NOT EXISTS moderation_blocked_words (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    term        TEXT NOT NULL,
+    mode        TEXT NOT NULL DEFAULT 'warn' CHECK (mode IN ('hide','warn','review')),
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (seller_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_mod_blocked_seller ON moderation_blocked_words(seller_id);
+
+-- (b) "Always allow" list: seller-scoped exemptions that take precedence over
+-- that seller's Blocked words, but never over the owner floor terms.
+CREATE TABLE IF NOT EXISTS moderation_allow_words (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    term        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (seller_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_mod_allow_seller ON moderation_allow_words(seller_id);
+
+-- (c) Per-bot override. One sentinel row (term = '', mode = NULL) per
+-- (seller_id, bot_id) holds the inheritance flag: 1 = "Using your shop's
+-- rules" (default), 0 = "Custom rules for this bot". Custom-term rows (term
+-- <> '') carry stricter local rules and are ignored while inheriting. The
+-- CHECK keeps the two row shapes disjoint; UNIQUE is the idempotency guard.
+CREATE TABLE IF NOT EXISTS moderation_bot_overrides (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    bot_id      INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    term        TEXT NOT NULL DEFAULT '',
+    mode        TEXT CHECK (mode IN ('hide','warn','review')),
+    inherits    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (seller_id, bot_id, term),
+    CHECK ((term = '' AND mode IS NULL) OR (term <> '' AND mode IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_mod_bot_override_scope ON moderation_bot_overrides(seller_id, bot_id);
+
+-- Append-only audit of every moderation decision. `term` is the matched
+-- POLICY term, not the message; `message_ref` is opaque. No content column.
+CREATE TABLE IF NOT EXISTS moderation_decisions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL,
+    bot_id       INTEGER REFERENCES bots(id) ON DELETE SET NULL,
+    term         TEXT,
+    action       TEXT NOT NULL,
+    reason       TEXT,
+    message_ref  TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mod_decisions_seller ON moderation_decisions(seller_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mod_decisions_bot ON moderation_decisions(seller_id, bot_id);
+
+-- Appeal review queue for the console (end-user conversation is bot-side,
+-- server implementation). `decision_id` is an opaque link back to the audited decision.
+CREATE TABLE IF NOT EXISTS moderation_appeals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id    INTEGER NOT NULL,
+    bot_id       INTEGER REFERENCES bots(id) ON DELETE SET NULL,
+    decision_id  INTEGER REFERENCES moderation_decisions(id) ON DELETE SET NULL,
+    message_ref  TEXT NOT NULL,
+    reason       TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','upheld')),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mod_appeals_seller ON moderation_appeals(seller_id, status);
+CREATE INDEX IF NOT EXISTS idx_mod_appeals_bot ON moderation_appeals(seller_id, bot_id);
+
+-- Appeal dedup is enforced by the DB, not by the handler's check-then-insert
+-- (LOW (security): concurrent double-submissions could create duplicate rows).
+-- COALESCE(bot_id, 0) folds the bot-less queue into the same key; bot ids are
+-- AUTOINCREMENT so 0 is never a real bot. The cleanup MUST precede the index
+-- creation: init_schema() executes this file before Db::migrate(), so an
+-- upgrade of a legacy DB that already holds duplicate (seller, bot, ref)
+-- tuples would otherwise fail to open. Keep the oldest row per tuple (lowest
+-- id); distinct tuples are untouched. Idempotent on every subsequent open.
+DELETE FROM moderation_appeals
+WHERE id IN (
+    SELECT d.id FROM moderation_appeals AS d
+    WHERE EXISTS (
+        SELECT 1 FROM moderation_appeals AS k
+        WHERE k.seller_id = d.seller_id
+          AND COALESCE(k.bot_id, 0) = COALESCE(d.bot_id, 0)
+          AND k.message_ref = d.message_ref
+          AND k.id < d.id
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_appeals_dedup
+    ON moderation_appeals(seller_id, COALESCE(bot_id, 0), message_ref);
+
+-- Money Safety Spec §4 (Decision 4): append-only spend-id ledger. One row
+-- per transfer ATTEMPT, persisted in a committed transaction BEFORE any
+-- Crypto Pay call. `spend_id` is globally unique (a duplicate insert is a
+-- hard error, never an overwrite); ambiguous retries reuse the persisted
+-- spend_id, definite rejections mint a fresh one and a fresh attempt_no.
+-- seller_id keeps every new money record tenant-scoped. No REAL column.
+CREATE TABLE IF NOT EXISTS transfer_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_type    TEXT NOT NULL CHECK (row_type IN ('refund','payout')),
+    row_id      INTEGER NOT NULL,
+    attempt_no  INTEGER NOT NULL,
+    spend_id    TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    outcome     TEXT,
+    resolved_at TEXT,
+    seller_id   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (row_type, row_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_attempts_row
+    ON transfer_attempts(row_type, row_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_transfer_attempts_seller
+    ON transfer_attempts(seller_id);

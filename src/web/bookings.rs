@@ -23,12 +23,12 @@ pub(super) fn booking_badge(status: &str) -> &'static str {
 }
 
 /// The console list/write scope (spec §3.7): derived from the session role
-/// only — `is_admin_role`, never a query or form value. `Some(None)` =
+/// only — `Role` level, never a query or form value. `Some(None)` =
 /// admin/owner, unscoped; `Some(Some(sid))` = that seller's rows; `None` =
 /// a seller account with no seller binding, which may list and mutate
 /// nothing (the Db scope `None` would be unscoped, so it must not be passed).
 pub(super) fn booking_seller_scope(session: &Session) -> Option<Option<i64>> {
-    if is_admin_role(&session.role) {
+    if Role::from_role_str(&session.role).has_level(Role::Admin) {
         Some(None)
     } else {
         session.seller_id.map(Some)
@@ -113,7 +113,7 @@ fn bookings_banner_slot(q: &BookingsQuery) -> String {
         };
         if !msg.is_empty() {
             banners.push(format!(
-                r#"<div class="alert alert-error" role="alert" aria-live="polite">{}</div>"#,
+                r#"<div class="alert alert-error" role="alert">{}</div>"#,
                 msg
             ));
         }
@@ -143,10 +143,10 @@ fn bookings_counts(all_rows: &[crate::db::BookingListRow]) -> String {
     let total = all_rows.len() as i64;
     let cards = format!(
         r#"<section aria-labelledby="bookings-counts-heading"><h2 id="bookings-counts-heading">Status counts</h2><div class="grid-stats">
-<div class="panel"><div class="stat"><span class="stat-value">{held}</span><span class="stat-label">Held</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{confirmed}</span><span class="stat-label">Confirmed</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{expired}</span><span class="stat-label">Expired</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-value">{total}</span><span class="stat-label">Total</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Held</span><span class="stat-value">{held}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Confirmed</span><span class="stat-value">{confirmed}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Expired</span><span class="stat-value">{expired}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">Total</span><span class="stat-value">{total}</span></div></div>
 </div></section>"#,
         held = held,
         confirmed = confirmed,
@@ -321,7 +321,7 @@ fn bookings_services_panel(
 }
 
 pub(super) fn bookings_body(state: &WebState, session: &Session, q: &BookingsQuery) -> String {
-    let is_admin = is_admin_role(&session.role);
+    let is_admin = Role::from_role_str(&session.role).has_level(Role::Admin);
     let (scope, may_list) = match booking_seller_scope(session) {
         Some(s) => (s, true),
         None => (None, false),
@@ -415,7 +415,7 @@ pub(super) fn bookings_rows_html(
                 String::new()
             };
             format!(
-                r#"<tr><td class="mono">{}</td>{}<td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td>{}</td></tr>"#,
+                r#"<tr><td class="mono">{}</td>{}<td class="mono">{}</td><td>{}</td><td class="mono">{}</td><td><span class="{}">{}</span></td><td class="mono">{}</td><td class="actions">{}</td></tr>"#,
                 esc(&r.1),
                 seller_cell,
                 r.2,

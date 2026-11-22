@@ -24,6 +24,65 @@ pub async fn callback_handler(
         return Ok(());
     };
     let chat_id = msg.chat.id;
+    if let Some(reference) = crate::handlers::moderation::parse_appeal_callback(data) {
+        // Step 4.4 (server): the only buyer-facing moderation action. The callback
+        // carries the SAME opaque reference the decision audit wrote — no text,
+        // username or content is derived here. Answer the press first, then
+        // verify the reference against a real blocking decision in this
+        // seller/bot scope before accepting a reason.
+        bot.answer_callback_query(q.id.clone()).await?;
+        let presser = q.from.id.0 as i64;
+        let seller_id = crate::handlers::moderation::inbound_seller_scope(&db, bot_ctx.id, presser);
+        let Some(target) =
+            crate::handlers::moderation::find_appeal_target(&db, seller_id, bot_ctx.id, reference)
+        else {
+            crate::handlers::moderation::send_gated_text(
+                &bot,
+                &db,
+                chat_id,
+                seller_id,
+                bot_ctx.id,
+                crate::handlers::moderation::APPEAL_GONE_TEXT,
+            )
+            .await?;
+            return Ok(());
+        };
+        if crate::handlers::moderation::has_appeal_for_ref(
+            &db,
+            seller_id,
+            bot_ctx.id,
+            &target.message_ref,
+        ) {
+            crate::handlers::moderation::send_gated_text(
+                &bot,
+                &db,
+                chat_id,
+                seller_id,
+                bot_ctx.id,
+                crate::handlers::moderation::APPEAL_DUPLICATE_TEXT,
+            )
+            .await?;
+            return Ok(());
+        }
+        dialogue
+            .update(State::AwaitingAppealReason {
+                seller_id: target.seller_id,
+                bot_id: target.bot_id,
+                message_ref: target.message_ref,
+                decision_id: Some(target.decision_id),
+            })
+            .await?;
+        crate::handlers::moderation::send_gated_text(
+            &bot,
+            &db,
+            chat_id,
+            seller_id,
+            bot_ctx.id,
+            crate::handlers::moderation::APPEAL_PROMPT_TEXT,
+        )
+        .await?;
+        return Ok(());
+    }
     if let Some(rest) = data.strip_prefix("aipost:") {
         // format: <action>:<draft_id>
         let mut parts = rest.splitn(2, ':');
@@ -41,7 +100,7 @@ pub async fn callback_handler(
         }
         // The inline keyboard travels with the preview message, so anyone who
         // can see the chat could press it. Load the draft and verify the
-        // presser before acting (AUTO_ROUTE.md principle 2: every business
+        // presser before acting (multi-tenancy principle: every business
         // entity is seller-scoped).
         let Some((_id, seller_id, channel, _template, content, _status, _c, _u, _m)) =
             db.get_ai_post_draft(draft_id)
@@ -76,6 +135,19 @@ pub async fn callback_handler(
                     return Ok(());
                 }
                 bot.answer_callback_query(q.id.clone()).await?;
+                // security outbound gate BEFORE this raw-Bot publish. The draft's
+                // seller id is the authoritative scope (the presser may be an
+                // admin acting on someone else's draft).
+                if crate::handlers::moderation::gate_outbound(
+                    &db,
+                    seller_id,
+                    Some(bot_ctx.id),
+                    &content,
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
                 match bot
                     .send_message(util::to_chat_id(&channel), content.clone())
                     .await
@@ -158,6 +230,13 @@ pub async fn callback_handler(
         _ => "Unknown action.",
     };
     bot.answer_callback_query(q.id.clone()).await?;
+    // security outbound gate on this raw-Bot send path (static menu copy, but
+    // listed as a content-bearing surface). Scope to the presser so seller
+    // rules apply; the gate already audited with an opaque reference.
+    let presser = q.from.id.0 as i64;
+    if crate::handlers::moderation::gate_outbound(&db, presser, Some(bot_ctx.id), text).is_err() {
+        return Ok(());
+    }
     bot.send_message(chat_id, text).await?;
     Ok(())
 }

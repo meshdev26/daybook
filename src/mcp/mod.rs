@@ -380,7 +380,7 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                 );
             }
             // Identity reads are owner-principal ONLY (user-identity design,
-            // L10 decision 6). They operate the operator's personal Telegram
+            // security decision 6). They operate the operator's personal Telegram
             // account, and no per-seller token may drive it — so every
             // principal carrying a seller_id is refused here, mirroring the
             // Sensitive gate above: no execution, not even an arg-validation
@@ -1079,7 +1079,7 @@ mod tests {
 
     // ---- Identity reads: owner-principal only ----
 
-    /// L10 floor: identity tools drive the operator's personal Telegram
+    /// security floor: identity tools drive the operator's personal Telegram
     /// account, so a per-seller token is refused before validation — the
     /// same forbidden envelope for valid and invalid args alike (no
     /// arg-validation oracle), and nothing but the audit rows as traces.
@@ -1596,7 +1596,7 @@ mod tests {
         assert_eq!(state.db.count_posts(None), 0);
     }
 
-    /// A bound channel still needs the L10 T2 "Enable posting" gate; once it
+    /// A bound channel still needs the security owner-approval "Enable posting" gate; once it
     /// is confirmed, the send goes through the identity actor — which, over
     /// an unconnected handle, answers with the honest not-authorized error.
     /// The audit trail records channel + text length, never the text.

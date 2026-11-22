@@ -19,7 +19,7 @@
 - No secrets in code or logs.
 
 ## CSRF
-- Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future requirement (e.g. L10) demands token-based CSRF, implement hidden-field tokens in all POST forms.
+- Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future security requirement demands token-based CSRF, implement hidden-field tokens in all POST forms.
 - All POST forms are cookie-authenticated; SameSite=Strict prevents cross-site submission in modern browsers.
 
 ## Secrets at rest (planned)
@@ -57,3 +57,5 @@
 - **Console accessibility floor (WCAG 2.1 AA):** CSS text tokens held at >= 4.5:1 contrast on their surfaces, labelled form controls and icon buttons, and a skip-to-content link.
 - **One-time setup links replace DM'd passwords:** `/becomeseller` and `/dashboard` DM a single-use claim link (`/setup/claim?token=…`) instead of a plaintext password. The token is a 48-character CSPRNG value, stored only as a SHA-256 hash with a 15-minute TTL, and consumed atomically on POST (`DELETE … RETURNING` — exactly one caller can win; expired, reused, unknown and wrong-purpose tokens all land on one generic no-oracle page). A successful claim sets the password, creates the claimant's session and signs out every other session of the account; the claim POST shares the login throttle (5 attempts / 15 min), and the raw token is never logged or echoed. Accepted with notes: the link holder can set a password without a second factor — strictly less exposure than the prior plaintext-password DM (a TOTP challenge on claim is the noted v1.5 follow-up) — and the token travels in the URL; the app never logs it, but reverse-proxy access logs containing `/setup/claim?token=` are an operator-side consideration (see `docs/RELEASING.md`).
 - **MCP Sensitive tier is owner-only (fail-closed):** per-seller MCP tokens authenticate as seller principals scoped to their own data, but a Sensitive-tier tool call (`gen_codes`, `delete_post`, `broadcast`, `ai_publish_post`) from any non-owner principal is refused with JSON-RPC error `-32001 "sensitive tools require the owner credential"` before anything parks an approval or validates arguments — no side effects, audited as a seller-role failure. The gate is deliberate: the `/approve` flow is requester-blind (it executes whatever is parked), so the benefiting party must never be able to create a pending row; the owner's park → `/approve` → execute flow is unchanged.
+
+**Vulnerability reporting:** a private reporting channel will be enabled before any public launch (human action pending).

@@ -12,6 +12,10 @@ use super::*;
 #[derive(Deserialize)]
 pub(super) struct BotSelectForm {
     pub(super) bot_id: Option<String>,
+    /// The Type facet is client-side and has no `name`, so a real form never
+    /// submits these. Their presence is a forged scope attempt.
+    pub(super) product_type: Option<String>,
+    pub(super) seller_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -22,6 +26,9 @@ pub(super) struct BotSettingsForm {
     pub(super) owner_user_id: String,
     pub(super) default_channel_id: Option<String>,
     pub(super) enabled: Option<String>,
+    /// Product type metadata for the per-type configuration field. Absent
+    /// (older clients) keeps the row's stored value.
+    pub(super) bot_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -91,21 +98,40 @@ pub(super) async fn bot_select(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         // Sellers and admins are pinned to their resolved bot; a crafted
         // switch form must never widen their view.
         return forbidden_page(&state, "Bots", "Bot switching").into_response();
     }
+    // A forged product type or seller id must never ride a scope change:
+    // the shipped form has no fields for them (the Type facet is client-side
+    // and merely narrows the Product list). Presence => 403, fail closed.
+    if f.product_type
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+        || f.seller_id.as_deref().is_some_and(|v| !v.trim().is_empty())
+    {
+        return forbidden_page(&state, "Bots", "Product switching").into_response();
+    }
     let Some(token) = session_token_from_headers(&headers) else {
         return Redirect::to(&state.url("/login")).into_response();
     };
-    let selected = f
-        .bot_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|id| state.db.get_bot(*id).is_some_and(|b| b.enabled));
+    let raw = f.bot_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let selected = match raw {
+        // Empty/absent is the legitimate "All products" reset — byte-identical
+        // widening semantics to the shipped "All bots (primary)" option.
+        None => None,
+        Some(value) => match value
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| state.db.get_bot(id))
+        {
+            Some(b) if b.enabled => Some(b.id),
+            // A non-empty id that is not a live, enabled product is forged:
+            // refuse it rather than silently widening to the global view.
+            _ => return forbidden_page(&state, "Bots", "Product switching").into_response(),
+        },
+    };
     state
         .db
         .set_web_session_selected_bot(&sha256_hex(&token), selected);
@@ -320,6 +346,17 @@ fn bot_card_form(
     // mode, and writes per-bot tokens in multi-bot mode) — say what is true
     // for THIS page and point at the Settings section that edits the token.
     let settings_url = state.url("/settings?section=connection");
+    // IA amendment §3.3: a shared "Product type" field plus a closed-by-default
+    // Advanced disclosure for per-type settings. No new route — both ride the
+    // existing /bots save form so existing paths stay byte-identical.
+    let type_options = product_type_options(Some(&b.bot_type));
+    // IA amendment §4.3: the per-bot moderation override rides this existing
+    // closed-by-default Advanced disclosure — no new configuration route for
+    // the field itself. Its write actions are feature-gated capability routes.
+    #[cfg(feature = "moderation")]
+    let moderation_advanced = bot_override_advanced_html(state, b);
+    #[cfg(not(feature = "moderation"))]
+    let moderation_advanced = String::new();
     let token_line = if multi_bot_mode(state) {
         format!(
             r#"Token: set it in Settings → <a href="{}">{}</a>."#,
@@ -339,6 +376,9 @@ fn bot_card_form(
       <label for="bot-name-{id}">Display name</label>
       <input id="bot-name-{id}" type="text" name="name" value="{name_val}" maxlength="64">
       <span class="help">Shown in the console instead of the bot key. Leave blank to use the key.</span>
+      <label for="bot-type-{id}">Product type</label>
+      <select id="bot-type-{id}" name="bot_type">{type_options}</select>
+      <span class="help">The capability this product provides. Type-specific settings live under Advanced.</span>
       <label for="bot-owner-{id}">Owner user ID</label>
       <input id="bot-owner-{id}" type="number" name="owner_user_id" value="{owner_val}" required>
       <span class="help">Your own Telegram account number (@userinfobot replies with it).</span>
@@ -348,6 +388,11 @@ fn bot_card_form(
       <label class="check"><input type="checkbox" name="enabled"{enabled_attr}> Enabled</label>
       <button type="submit">Save</button>
     </form>
+    <details class="advanced" data-product-type="{type_value}">
+      <summary>Advanced</summary>
+      <p class="help">Type-specific settings for this product type appear here once its capability is enabled. The shared fields above apply to every product.</p>
+      {moderation_advanced}
+    </details>
     <p class="help">Disabling is reversible — the bot stays listed, it just stops after the next restart. Deleting removes its settings from the console.</p>
     <div class="row-actions">
       <form method="post" action="{disable_url}" class="inline-form">
@@ -362,6 +407,9 @@ fn bot_card_form(
 </details>"#,
         id = b.id,
         name_val = esc(&b.name),
+        type_options = type_options,
+        type_value = esc(&b.bot_type),
+        moderation_advanced = moderation_advanced,
         bots_url = state.url("/bots"),
         owner_val = esc(owner_val),
         channel_val = esc(channel_val),
@@ -385,7 +433,7 @@ pub(super) async fn bots_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     Html(bots_page_html(&state, &session, &q, "")).into_response()
@@ -401,7 +449,7 @@ pub(super) async fn bots_save(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // A malformed id or owner never redirects silently: re-render the Bots
@@ -431,13 +479,30 @@ pub(super) async fn bots_save(
             "Display name must be at most 64 characters. Nothing was changed.",
         );
     }
+    // Product type (IA amendment §3.3): absent/blank keeps the stored value;
+    // a submitted value must be a compiled-in type or the row's current type
+    // so an existing config value is never silently rewritten on save.
+    let current_type = state.db.get_bot(id).map(|b| b.bot_type).unwrap_or_default();
+    let raw_type = f.bot_type.as_deref().map(str::trim).unwrap_or("");
+    let chosen_type = if raw_type.is_empty() {
+        current_type.clone()
+    } else if capability_enabled(raw_type) || raw_type == current_type.as_str() {
+        raw_type.to_string()
+    } else {
+        return bots_save_error_page_msg(
+            &state,
+            &session,
+            "Unknown product type. Nothing was changed.",
+        );
+    };
     // An unchecked checkbox is absent from the form body — None means off.
     let enabled = f.enabled.is_some();
-    // Name first (it is the card's title field), then identity settings;
-    // both setters refuse an unknown bot id, so a vanished row still lands
-    // on the focused "nothing was changed" re-render below.
+    // Name first (it is the card's title field), then identity settings and
+    // the type metadata; all setters refuse an unknown bot id, so a vanished
+    // row still lands on the focused "nothing was changed" re-render below.
     if state.db.set_bot_name(id, name).is_err()
         || !state.db.update_bot_settings(id, owner, channel, enabled)
+        || state.db.set_bot_type(id, &chosen_type).is_err()
     {
         return bots_save_error_page(&state, &session);
     }
@@ -481,7 +546,7 @@ pub(super) async fn bots_disable(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // Unknown id: honest no-op (P3-3) — no mutation, no restart flag, no
@@ -525,7 +590,7 @@ pub(super) async fn bots_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.role != "owner" {
+    if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Bots", "Bots").into_response();
     }
     // Unknown id: honest no-op (P3-3) — nothing deleted, no restart flag,

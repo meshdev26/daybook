@@ -1,6 +1,6 @@
 # AGENT.md — AI Engineering Handbook (Big-Tech Grade)
 
-> Task routing, role levels, and skill activation: see `AUTO_ROUTE.md`.
+> This is the single AI-agent instruction file for this repository.
 
 ## 0. Mission
 This repository is a **multi-tenant Telegram business platform**. Any change must preserve:
@@ -27,10 +27,7 @@ src/
   web.rs           # axum HTTP interface
 vendor/
   teloxide/        # patched teloxide (aquamarine removed)
-scripts/
-  verify-agent-tiers.py  # machine-checks the role-level routing contract
 docs/              # user & developer docs
-.opencode/         # agents (role levels) + skills, dispatched via OpenCode
 ```
 
 ## 2. Build & quality gates (must pass before merge)
@@ -41,7 +38,6 @@ cargo clippy -- -D warnings
 cargo fmt --check
 cargo audit
 cargo deny check
-python3 scripts/verify-agent-tiers.py
 ```
 
 ## 3. Coding standards
@@ -52,6 +48,10 @@ python3 scripts/verify-agent-tiers.py
 - Scope all business data by `seller_id`.
 - Use `channel_of(db, cfg, Some(seller_id))` for per-seller channels.
 - Log via `tracing`; never log secrets.
+- UI action placement follows `DESIGN.md` §1 *Action placement* (primary bottom-left, row actions flush right, destructive last).
+- Comments explain the non-obvious WHY (≤ 2 lines; `//!` ≤ 5; `///` = summary + contract), never WHAT or a restatement of the signature. Prefer a name over a comment; section headers only for real invariants.
+- No spec IDs, WCAG numbers, finding IDs, workflow labels, attack-scenario prose, specificity math, emoji, banners, TODO walls, or commented-out code in source comments — those live in `DESIGN.md`, specs, test names, or the commit message.
+- Keep comments true: update or delete them in the same diff as the code they describe. Don't accept code you can't explain.
 
 ## 4. Adding a feature
 1. Update `schema.sql` + `Db::migrate`.
@@ -118,10 +118,10 @@ python3 scripts/verify-agent-tiers.py
   seller channel scoping enforced; XSS escaping; shared login throttle
   (web+api); WAL-safe `make backup`; 6h expiry sweeper; MAX_PLAN_DAYS clamp
   with checked date math.
-- 2026-10-25 plugin architecture (L11 design, L8 implement): `WEB_BASE_PATH`
-  subpath mounting (`web::mount`, cookie/redirect base-prefixing — default ""
-  behavior byte-identical), `embed::AgentAppBuilder` for embedding the
-  dashboard/API into a host axum service, and a compile-time command registry
+- 2026-10-25 plugin architecture: `WEB_BASE_PATH` subpath mounting
+  (`web::mount`, cookie/redirect base-prefixing — default "" behavior
+  byte-identical), `embed::AgentAppBuilder` for embedding the dashboard/API
+  into a host axum service, and a compile-time command registry
   (`handlers::registry`) so new bot commands are trait-registered instead of
   enum edits. Dynamic .so loading explicitly deferred (non-goal). Known issue:
   first-run setup rewrites .env with a fixed key list and drops WEB_BIND/
@@ -132,9 +132,9 @@ python3 scripts/verify-agent-tiers.py
   transfer + audit + grant revoke/kick), .env rewrite preserves unknown keys,
   plan lookups seller-scoped, docs deduped. See
   docs/ARCHITECTURE-SCALE-PLAN.md implementation record.
-- 2026-10-27 v1.4 "Close the loop" architected (L11, docs/ARCHITECTURE-V1.4.md):
+- 2026-10-27 v1.4 "Close the loop" architected (docs/ARCHITECTURE-V1.4.md):
   bookings move to the appointment model (1 slot = 1 booking; slots.booked dead),
-  free-confirmation-only with priced bookings deferred to v1.5 pending the L5
+  free-confirmation-only with priced bookings deferred to v1.5 pending the finance
   ruling (ARCHITECTURE-V1.4.md §2 Q1); slot claiming moves into Db::create_booking
   as one transaction (kills the handler-side TOCTOU); held-booking sweeper DMs
   buyers; MCP per-seller tokens wired into authenticate() (owner env-token keeps
@@ -143,6 +143,10 @@ python3 scripts/verify-agent-tiers.py
   /setup/claim links reusing web_pending_mfa (purpose='setup_link'); console
   /bookings page (bookings actions + read-only services). Trust pack: CHANGELOG.md
   (Keep a Changelog), docs/RELEASING.md, Cargo 0.N.0 tracks milestone vN.
+- Dev-only checked-client-JS boundary: `assets/` carries a Node toolchain
+  (typescript/jsdom) wired to `assets/app.js` via `tsconfig.json` (DOM lib);
+  `make js-check` and required CI job `client-check` gate it. `make test` stays
+  Rust-only; no Node/npm at runtime. No cross-project refs (§3).
 
 ## 12. Contacts
 - Maintainer: repository owner.

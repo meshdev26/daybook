@@ -1,6 +1,6 @@
 //! Channel row, label, and badge rendering — the row-rendering family
-//! extracted move-only from `channels.rs` (CHANNEL_ADD_REDESIGN_SPEC §2,
-//! AUTO_ROUTE.md §8: at the line cap the next change splits first).
+//! extracted move-only from `channels.rs` (CHANNEL_ADD_REDESIGN_SPEC §2;
+//! at the source line cap the next change splits first).
 //! CHANNELS_MASTER_DETAIL_SPEC §4: rows are read-first — label cluster +
 //! state badges + exactly ONE affordance (`Manage →`); every edit control
 //! moved to the detail view (`channels_manage.rs`). The pinned row assertions
@@ -192,7 +192,7 @@ pub(super) fn channels_added_callout(
     channel_added_callout(
         title.as_deref().unwrap_or(ch),
         q.notitle.as_deref() == Some("1"),
-        session.role == "owner",
+        Role::from_role_str(&session.role).has_level(Role::Owner),
     )
 }
 

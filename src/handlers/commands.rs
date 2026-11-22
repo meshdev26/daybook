@@ -22,7 +22,7 @@ use teloxide::{
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-// Re-exports preserved after extraction (L11 refactor).
+// Re-exports preserved after extraction (architecture refactor).
 pub use crate::constants::MAX_PLAN_DAYS;
 pub use crate::services::broadcast::filter_broadcast_users;
 
@@ -170,7 +170,7 @@ pub enum Command {
     ExportData(String),
     /// Delete buyer data: /deletedata <user_id> [confirm] [seller_id].
     DeleteData(String),
-    /// Approve a pending refund (admin/owner): /refundapprove [refund_id].
+    /// Approve a pending refund (OWNER only, §2): /refundapprove [refund_id].
     RefundApprove(String),
     /// Approve a pending payout (admin/owner): /payoutapprove [payout_id].
     PayoutApprove(String),
@@ -260,6 +260,7 @@ pub async fn cmd_handler(
     }
     let role = roles::role_of(&db, user_id, bot_ctx.owner_id);
     let is_admin = role >= roles::Role::Admin;
+    let is_owner = role == roles::Role::Owner;
     let is_seller = role >= roles::Role::Seller;
     let user_cmd = matches!(
         cmd,
@@ -458,7 +459,7 @@ pub async fn cmd_handler(
                 bot.send_message(chat_id, "Usage: /setchannel @channel or id")
                     .await?;
             } else {
-                // Proof of control (L10 BLOCK-3) for non-admin senders: they
+                // Proof of control (security BLOCK-3) for non-admin senders: they
                 // may only bind a channel they actually control (admin of the
                 // chat; the bot a member). Admins/owner keep the unvalidated
                 // bootstrap path.
@@ -485,6 +486,18 @@ pub async fn cmd_handler(
                         return Ok(());
                     }
                 };
+                // security outbound content gate BEFORE transport. This is a raw
+                // `Bot::send_message` path (non-ContentSender); the acting
+                // seller is the best available scope, so seller rules apply
+                // alongside the non-overridable global floor.
+                if crate::handlers::moderation::gate_outbound(&db, user_id, Some(bot_ctx.id), &text)
+                    .is_err()
+                {
+                    // Held: no transport, no log_post. The gate already wrote
+                    // an opaque audit row and a scoped warn log; no body or
+                    // username is logged here.
+                    return Ok(());
+                }
                 match bot.send_message(util::to_chat_id(&ch), text.clone()).await {
                     Ok(sent) => {
                         crate::metrics::bot_sent();
@@ -2453,6 +2466,9 @@ pub async fn cmd_handler(
                                             &kind,
                                             &pname,
                                             delivery.as_deref(),
+                                            &db,
+                                            inv_seller,
+                                            Some(bot_ctx.id),
                                         )
                                         .await
                                         {
@@ -2605,6 +2621,9 @@ pub async fn cmd_handler(
                                                 &kind,
                                                 &pname,
                                                 delivery.as_deref(),
+                                                &db,
+                                                pseller,
+                                                Some(bot_ctx.id),
                                             )
                                             .await
                                             {
@@ -3365,6 +3384,18 @@ pub async fn cmd_handler(
                     bot.send_message(chat_id, "No users to broadcast to (no customers found).")
                         .await?;
                 } else {
+                    // Outbound gate before the raw-Bot broadcast fan-out
+                    // (non-ContentSender path, same shared loop as MCP).
+                    if crate::handlers::moderation::gate_outbound(
+                        &db,
+                        user_id,
+                        Some(bot_ctx.id),
+                        &text,
+                    )
+                    .is_err()
+                    {
+                        return Ok(());
+                    }
                     // Send loop shared with the MCP broadcast tool (crate::broadcast_to_users).
                     let sent = crate::broadcast_to_users(&bot, &users, &text).await;
                     bot.send_message(chat_id, format!("Broadcast sent to {} users.", sent))
@@ -3501,7 +3532,7 @@ pub async fn cmd_handler(
                 .or_else(|| Some(arg.trim().to_string()))
                 .filter(|s| !s.is_empty());
             if let Some(c) = ch {
-                // Proof of control (L10 BLOCK-3) on the seller onboarding
+                // Proof of control (security BLOCK-3) on the seller onboarding
                 // path: /setup registers a seller AND binds their channel, so
                 // it gets the same non-admin rules as /setchannel. The sender
                 // is present in this chat by definition, but the CHANNEL must
@@ -3892,7 +3923,10 @@ pub async fn cmd_handler(
             .await?;
         }
         Command::RefundApprove(arg) => {
-            if !is_admin {
+            // §2: refund approval is Owner-only on every surface. An Admin
+            // (or the seller who created the refund) gets no bot response at
+            // all, matching the REST 403 owner_required.
+            if !is_owner {
                 return Ok(());
             }
             handle_refund_approve(&bot, chat_id, &db, user_id, role, arg.trim()).await?;
@@ -4073,7 +4107,7 @@ fn channel_of(db: &Db, _cfg: &SharedConfig, seller_id: Option<i64>, is_admin: bo
 }
 
 /// Resolve the target channel for a channel-scoped command, enforcing seller
-/// tenancy (AUTO_ROUTE.md principle 2: every business entity is
+/// tenancy (multi-tenancy principle: every business entity is
 /// seller-scoped). A seller may only target their OWN `seller_channel` —
 /// never an arbitrary `@channel` or numeric id the bot happens to be a member
 /// of. Admin/Owner keep the historical behavior: an explicit argument wins
@@ -4684,13 +4718,13 @@ fn audit_role_str(role: roles::Role) -> &'static str {
     }
 }
 
-/// `/refundapprove [refund_id]` — admin/owner approval of pending refunds.
+/// `/refundapprove [refund_id]` — OWNER-ONLY approval of pending refunds (§2).
 /// Mirrors the REST state machine (`api::finance_refunds_approve`) exactly:
-/// not-found reply, executed/invalid-state conflicts, approve only from
-/// pending/approved, and the same `refund_approve` audit event with the same
-/// JSON meta. With no id it lists up to 10 pending refunds. The bot never
-/// moves money: the transfer itself stays on the console Finance page or the
-/// REST execute endpoint.
+/// owner gate, creator separation, not-found reply, executed/invalid-state
+/// conflicts, approve only from pending/approved, and the same
+/// `refund_approve` audit event with the same JSON meta. With no id it lists
+/// up to 10 pending refunds. The bot never moves money: the transfer itself
+/// stays on the console Finance page or the REST execute endpoint.
 async fn handle_refund_approve(
     bot: &Bot,
     chat_id: teloxide::types::ChatId,
@@ -4741,6 +4775,20 @@ async fn handle_refund_approve(
             return Ok(());
         }
     };
+    // §2: the human creator may never approve their own money row. The shared
+    // helper reads the persisted created_by column first (F3), falling back to
+    // the audit event only for legacy sentinel rows; system-created refunds
+    // carry the sentinel and are exempt.
+    if let Some((creator, _)) = crate::handlers::money::refund_creator(db, id)
+        && creator == user_id
+    {
+        bot.send_message(
+            chat_id,
+            "You created this refund; a different Owner must approve it.",
+        )
+        .await?;
+        return Ok(());
+    }
     let (_rid, _seller, ref invoice_id, _user, ref amount, ref asset, _reason, ref status, ..) =
         refund;
     if status == "executed" {

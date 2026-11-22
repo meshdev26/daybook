@@ -1,13 +1,13 @@
-# Design System — Telegram Business Platform
+# Daybook — Design System
 
 ## Perspectives
 This design system is informed by two lenses:
-- **Senior UX Designer**: usability, accessibility, interaction patterns, user research.
-- **Chief Design Officer**: brand coherence, product strategy, design systems at scale.
+- **User experience**: usability, accessibility, interaction patterns, user research.
+- **Design leadership**: brand coherence, product strategy, design systems at scale.
 
 ---
 
-## 1. Senior UX Designer View
+## 1. User Experience View
 
 ### User research insights
 - Sellers are often non-technical; setup must be < 5 minutes.
@@ -33,10 +33,16 @@ This design system is informed by two lenses:
 - Lists: swipe actions on mobile, hover on desktop.
 - Modals: only for destructive confirmations.
 - Loading: skeleton screens, not spinners where possible.
+- **Action placement (console).** Placement follows the action's role, never the page:
+  1. One primary action per screen; a form's submit is a filled button at the bottom-left of its form (`.form-row > button`).
+  2. The page-level CTA is the single exception — it sits at the right edge of the title row (`.page-head .actions`).
+  3. Per-record actions always sit flush right: tables use `<td class="actions">`, ledger rows use `.row-actions` / `margin-left:auto`.
+  4. Within an action cluster, order primary → secondary → destructive left-to-right; destructive is last, uses `.btn-danger`, and carries a confirm.
+  5. Position buttons only with sanctioned classes — no ad-hoc `float:right`, `text-align:right`, or `margin-left:auto` wrappers.
 
 ---
 
-## 2. Chief Design Officer View
+## 2. Design Leadership View
 
 ### Brand identity
 - **Name**: Telegram Business Platform.
@@ -69,12 +75,14 @@ book. Borders lead, shadows whisper, figures sit in mono, status is a dot
 before a word. No hover-lift theatre, no gradient washes. Generous
 whitespace, precise typography, subtle depth, single clear action per screen.
 
+**Brand:** the product is called **Daybook** — a "daybook" is the daily account book itself, so the name makes the ledger metaphor callable; display text only, no token or path changes.
+
 ## 4. Tokens
 
-### Typography (Senior UX + CDO)
+### Typography (UX + design leadership)
 - **Font stack (UI)**: `"Plex Sans", -apple-system, "Segoe UI", "Helvetica Neue", sans-serif` (bundled variable woff2, latin subset). **Data/mono**: `"Plex Mono", ui-monospace, "SF Mono", Menlo, monospace` for figures, ids, and code. No system-font-only claim: the operator console ships bundled Plex fonts from the binary (no CDN).
-- **CDO rationale**: bundled Plex fonts keep the ledger aesthetic consistent across OSes; served from the binary (no CDN, no FOUT beyond `font-display: swap`).
-- **Senior UX rationale**: Plex Sans/Mono are highly legible at small sizes; mono figures aid scanning amounts and ids.
+- **Design rationale**: bundled Plex fonts keep the ledger aesthetic consistent across OSes; served from the binary (no CDN, no FOUT beyond `font-display: swap`).
+- **UX rationale**: Plex Sans/Mono are highly legible at small sizes; mono figures aid scanning amounts and ids.
 - **Type scale** (modular 1.25):
   - Display: 34px / 600 / 1.1
   - H1: 21px / 600 / 1.2
@@ -127,3 +135,10 @@ The tokens live in `assets/app.css` (served from the binary — no CDN). Light i
 the default; `[data-theme="dark"]` mirrors it. Change the tokens there, and the
 whole console follows. The operator console layout: left rail + ledger-style
 tables; setup and sign-in use the focused front-door shell.
+
+## Comment style
+
+`AGENT.md` §3 is the source of truth: comments carry the non-obvious why, names
+carry the what; keep them short and true. Reject play-by-play narration, signature
+echoes, spec/finding IDs, attack prose, emoji/banners, TODO walls, dead code —
+rename, refactor, or move it to a spec. UI/CSS rationale lives here, not inline.
