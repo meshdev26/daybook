@@ -1,22 +1,3 @@
-# CI — the project gate, on every push and pull request.
-#
-# WHY THIS EXISTS: the quality gate has always lived in `make test` (fmt,
-# clippy -D warnings, the test suite, cargo audit, cargo deny). Before this
-# repository was public that gate ran only on the author's machine; nothing
-# stopped an unvetted pull request from landing.
-# CI runs THE SAME Makefile target — not a copy of it — so the two can never
-# drift: if the gate changes, CI follows the Makefile automatically.
-#
-# The two cross-platform jobs exist for one sentence in DESKTOP.md: "the same
-# code runs on Windows, macOS, and Linux". A compile check on each OS keeps
-# that sentence true on every commit instead of discovering a Windows-only
-# break the day a release is tagged. They check, they do not test: the full
-# suite belongs to the ubuntu gate, and the platform jobs exist to catch
-# platform-specific compile breakage cheaply.
-#
-# Note for maintainers: cargo audit / cargo deny fetch the RUSTSEC advisory
-# database over the network — that is expected, not a sandboxing gap.
-
 name: CI
 
 on:
@@ -33,69 +14,103 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect code changes
+        id: filter
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          CHANGED="$(git diff --name-only "$BASE" HEAD 2>/dev/null || true)"
+          if [ -z "$CHANGED" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if printf '%s\n' "$CHANGED" | grep -qE '^(src/|tests/|fuzz/|vendor/|assets/|Cargo\.|schema\.sql|Makefile|rust-toolchain\.toml|build\.rs|\.github/workflows/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   gate:
     name: Gate (fmt, clippy, test, audit, deny)
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Rust
-        # Pinned to rust-toolchain.toml's version: a @stable ref would
-        # override the project's 1.99.1 pin with a newer toolchain.
+        if: needs.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy, rustfmt
-
       - name: Rust Cache
+        if: needs.changes.outputs.code == 'true'
         uses: Swatinem/rust-cache@v2
-
       - name: Install cargo-audit & cargo-deny
-        # Tool passed as an input, never parsed from the @ref — the ref form
-        # can silently install nothing (observed during earlier tool setup, 2026-10-23).
+        if: needs.changes.outputs.code == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-
       - name: Run the project gate
+        if: needs.changes.outputs.code == 'true'
         run: make test
 
   client-check:
-    name: Client JS type check (required)
+    name: Client JS type check
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Node
-        # Pinned: a drifting Node would make this status non-reproducible.
+        if: needs.changes.outputs.code == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22.14.0'
           cache: 'npm'
           cache-dependency-path: assets/package-lock.json
-
       - name: Type-check and test client JS
+        if: needs.changes.outputs.code == 'true'
         run: npm ci --prefix assets && npm run --prefix assets check && npm test --prefix assets
 
   linux-x64:
     name: Compile check (linux-x64)
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+        if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - run: cargo check --all-targets
+        if: needs.changes.outputs.code == 'true'
 
   windows-x64:
     name: Compile check (windows-x64)
+    needs: changes
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+        if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - run: cargo check --all-targets
+        if: needs.changes.outputs.code == 'true'
 
   macos:
     name: Compile check (${{ matrix.target }})
+    needs: changes
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -104,7 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+        if: needs.changes.outputs.code == 'true'
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
       - run: cargo check --all-targets
+        if: needs.changes.outputs.code == 'true'

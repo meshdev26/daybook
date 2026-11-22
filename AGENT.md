@@ -56,6 +56,7 @@ cargo deny check
 - No spec IDs, WCAG numbers, finding IDs, workflow labels, attack-scenario prose, specificity math, emoji, banners, TODO walls, or commented-out code in source comments — those live in `DESIGN.md`, specs, test names, or the commit message.
 - No drafts, templates with placeholders, or announcement text in the repository. Docs state facts, not meta-commentary about what is or isn't kept.
 - Verify before pushing: inspect `git status`, `git diff`, and the files you changed. Never publish unreviewed content.
+- CI skips Rust/JS jobs for docs-only changes; required checks still pass green.
 - Keep comments true: update or delete them in the same diff as the code they describe. Don't accept code you can't explain.
 
 ## 4. Adding a feature
