@@ -37,7 +37,7 @@ encrypted-at-rest placeholders if env is unavailable.
   - Seed owner web account + default channel in DB.
   - Success page states what works right now (the console login) vs. what needs
     the restart (the bot polling), with per-platform restart commands
-    (Desktop: quit and reopen; systemd: `systemctl restart telegram-agent`;
+    (Desktop: quit and reopen; systemd: `systemctl restart daybook`;
     Docker: `docker compose restart`).
 - "Skip for now" closes the first-run gate permanently and says so: the button
   asks for confirmation ("This page won't come back.") and the page points at

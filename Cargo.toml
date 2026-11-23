@@ -1,5 +1,5 @@
 [package]
-name = "telegram-agent"
+name = "daybook"
 version = "0.4.0"
 edition = "2024"
 license = "MIT"
@@ -59,7 +59,7 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# Icon/version embedding for telegram-agent.exe. Scoped to Windows hosts so
+# Icon/version embedding for daybook.exe. Scoped to Windows hosts so
 # other platforms never compile it (keeps mixed-toolchain clippy builds clean);
 # release CI builds the Windows artifact on a Windows runner.
 [target.'cfg(windows)'.build-dependencies]

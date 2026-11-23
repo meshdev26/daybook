@@ -6,12 +6,12 @@ behavior, a11y floor. Flow/honesty/copy were fixed in wave 1
 (`SETUP_UX_POLISH_SPEC.md`) and are NOT re-litigated here.
 
 **Sources of truth (in order):** `DESIGN.md`, then `assets/app.css` (616 lines,
-the real token system). `design-system/telegram-agent/MASTER.md` is
+the real token system). `design-system/daybook/MASTER.md` is
 **non-authoritative and stale**: it specifies a slate/navy palette
 (`#0F172A`, `#16A34A`, …), Fira Code/Fira Sans via a Google Fonts
 `@import` (MASTER.md lines 40–52). The shipped console uses bundled Plex
 Sans/Plex Mono with the ledger-green token set (app.css lines 16–101; DESIGN.md
-§4). Web must treat MASTER.md and `design-system/telegram-agent/pages/*.md` as
+§4). Web must treat MASTER.md and `design-system/daybook/pages/*.md` as
 historical reference only; see §D3.
 
 **Evidence convention:** every claim cites `file:line` as of this writing.
@@ -551,7 +551,7 @@ would fail; if such a page ever ships, the fix is a `--line-strong` darkening
 pass at that time (token change, design again).
 
 **D3. Documentation debt (owner decision, no code):** `MASTER.md` (and
-`design-system/telegram-agent/pages/`) documents a different design system —
+`design-system/daybook/pages/`) documents a different design system —
 slate/navy palette, Fira Code/Fira Sans via Google Fonts CDN — directly
 contradicting `DESIGN.md` §4 and `app.css` (bundled Plex, no CDN; MASTER.md
 lines 40–52). It is marked non-authoritative at the top, but it is the first

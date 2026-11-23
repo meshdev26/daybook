@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# package.sh -- build and package desktop distributions of Telegram Agent.
+# package.sh -- build and package desktop distributions of Daybook.
 #
 #   scripts/package.sh                 # build + bundle for the host platform
 #   scripts/package.sh <rust-triple>   # cross-build for an installed target,
 #                                      # e.g. x86_64-pc-windows-gnu
 #
 # Outputs into dist/:
-#   Linux:   telegram-agent-<ver>-linux-<arch>.tar.gz
-#   Windows: telegram-agent-<ver>-windows-<arch>.zip  (contains telegram-agent.exe)
-#   macOS:   telegram-agent-<ver>-macos-<arch>.zip    (contains TelegramAgent.app)
+#   Linux:   daybook-<ver>-linux-<arch>.tar.gz
+#   Windows: daybook-<ver>-windows-<arch>.zip  (contains daybook.exe)
+#   macOS:   daybook-<ver>-macos-<arch>.zip    (contains Daybook.app)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,12 +20,12 @@ mkdir -p "$DIST"
 # ---------------------------------------------------------------- helpers
 
 stage_name() { # $1=platform $2=arch
-  echo "telegram-agent-${VERSION}-${1}-${2}"
+  echo "daybook-${VERSION}-${1}-${2}"
 }
 
 write_quickstart() { # $1=staging dir, $2=run command
   cat > "$1/QUICKSTART.md" <<EOF
-# Telegram Agent ${VERSION} -- quick start
+# Daybook ${VERSION} -- quick start
 
 1. If you have not configured yet: copy \`.env.example\` to \`.env\` next to this
    file, fill in \`TELEGRAM_BOT_TOKEN\` and \`OWNER_ID\` (from @BotFather and
@@ -37,9 +37,9 @@ Where your data lives:
 - If \`.env\` or a \`data/\` folder sits next to the binary -> portable mode,
   everything stays in that folder.
 - Otherwise -> platform data dir:
-  Windows  %APPDATA%\\telegram-agent
-  macOS    ~/Library/Application Support/telegram-agent
-  Linux    ~/.local/share/telegram-agent
+  Windows  %APPDATA%\\daybook
+  macOS    ~/Library/Application Support/daybook
+  Linux    ~/.local/share/daybook
 
 Security: the dashboard binds to 127.0.0.1 only. To expose it on a network,
 set WEB_BIND=0.0.0.0 and use a reverse proxy with TLS.
@@ -75,14 +75,14 @@ detect() { # sets PLATFORM (linux|windows|macos) and ARCH from triple or uname
 # ---------------------------------------------------------------- build
 
 detect
-echo "=== Telegram Agent ${VERSION} -- packaging for ${PLATFORM} (${ARCH}) ==="
+echo "=== Daybook ${VERSION} -- packaging for ${PLATFORM} (${ARCH}) ==="
 
 if [[ -n "$TRIPLE" ]]; then
   cargo build --release --target "$TRIPLE"
-  BIN="target/${TRIPLE}/release/telegram-agent"
+  BIN="target/${TRIPLE}/release/daybook"
 else
   cargo build --release
-  BIN="target/release/telegram-agent"
+  BIN="target/release/daybook"
 fi
 if [[ "$PLATFORM" == "windows" && ! -f "${BIN}.exe" ]] \
   || [[ "$PLATFORM" != "windows" && ! -f "$BIN" ]]; then
@@ -94,10 +94,10 @@ case "$PLATFORM" in
   linux)
     STAGE="$(stage_name linux "$ARCH")"
     rm -rf "$STAGE"; mkdir -p "$STAGE"
-    cp "$BIN" "$STAGE/telegram-agent"
+    cp "$BIN" "$STAGE/daybook"
     cp .env.example "$STAGE/"
     cp assets/icon.png "$STAGE/" 2>/dev/null || true
-    write_quickstart "$STAGE" "./telegram-agent"
+    write_quickstart "$STAGE" "./daybook"
     make_tarball "$STAGE"
     ;;
   windows)
@@ -105,32 +105,32 @@ case "$PLATFORM" in
     [[ -f "$EXE" ]] || { echo "ERROR: $EXE not found" >&2; exit 1; }
     STAGE="$(stage_name windows "$ARCH")"
     rm -rf "$STAGE"; mkdir -p "$STAGE"
-    cp "$EXE" "$STAGE/telegram-agent.exe"
+    cp "$EXE" "$STAGE/daybook.exe"
     cp .env.example "$STAGE/"
     cp assets/icon.ico "$STAGE/" 2>/dev/null || true
-    write_quickstart "$STAGE" "telegram-agent.exe"
+    write_quickstart "$STAGE" "daybook.exe"
     make_zip "$STAGE"
     ;;
   macos)
-    APP="TelegramAgent.app"
+    APP="Daybook.app"
     STAGE="$(stage_name macos "$ARCH")"
     rm -rf "$APP" "$STAGE"; mkdir -p "$STAGE"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-    cp "$BIN" "$APP/Contents/MacOS/telegram-agent"
-    chmod +x "$APP/Contents/MacOS/telegram-agent"
+    cp "$BIN" "$APP/Contents/MacOS/daybook"
+    chmod +x "$APP/Contents/MacOS/daybook"
     cp assets/icon.icns "$APP/Contents/Resources/icon.icns" 2>/dev/null || true
     cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Telegram Agent</string>
-  <key>CFBundleDisplayName</key><string>Telegram Agent</string>
-  <key>CFBundleIdentifier</key><string>io.github.telegram-agent</string>
+  <key>CFBundleName</key><string>Daybook</string>
+  <key>CFBundleDisplayName</key><string>Daybook</string>
+  <key>CFBundleIdentifier</key><string>io.github.daybook</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleExecutable</key><string>telegram-agent</string>
+  <key>CFBundleExecutable</key><string>daybook</string>
   <key>CFBundleIconFile</key><string>icon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -144,7 +144,7 @@ EOF
     fi
     cp -R "$APP" "$STAGE/"
     cp .env.example "$STAGE/"
-    write_quickstart "$STAGE" "open TelegramAgent.app"
+    write_quickstart "$STAGE" "open Daybook.app"
     make_zip "$STAGE"
     rm -rf "$APP"
     ;;

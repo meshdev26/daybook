@@ -57,7 +57,7 @@ may break.
 1. Finalize the changelog: rename `CHANGELOG.md`'s `[Unreleased]` to
    `[X.Y.Z] - YYYY-MM-DD`, start a fresh `[Unreleased]` above it, commit.
 2. Optional local smoke of the host bundle: `make package` →
-   `dist/telegram-agent-<ver>-<platform>.<zip|tar.gz>`.
+   `dist/daybook-<ver>-<platform>.<zip|tar.gz>`.
 3. Tag. The release CI (`.github/workflows/release.yml`) triggers on a `v*`
    tag push and builds linux x64 + arm64, windows x64, macOS arm64 + x64, then
    creates the GitHub release with generated notes:

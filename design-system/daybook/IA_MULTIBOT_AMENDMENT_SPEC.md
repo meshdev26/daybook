@@ -3,7 +3,7 @@
 **Status:** Proposed amendment — ready for web / server / core implementation after owner approval
 **Date:** 2026-11-18
 **Discipline:** design (owner of this spec); extends the approved `IA_REDESIGN_SPEC.md`
-**Amends:** `design-system/telegram-agent/IA_REDESIGN_SPEC.md` (approved six-group + Utilities console IA)
+**Amends:** `design-system/daybook/IA_REDESIGN_SPEC.md` (approved six-group + Utilities console IA)
 **Territory:** the console navigation projection, the rail scope control, and the moderation configuration surfaces. No existing page path changes; no new auth; no token values change.
 **Sources of truth:** `DESIGN.md` §1 / §3 / §4 and `assets/app.css`; `IA_REDESIGN_SPEC.md`; `BOT_SWITCHING_UX_SPEC.md` (shipped selector semantics); the repository quality gates.
 **Hard constraints:** the six groups and Utilities stay as approved; no seventh group; no per-product consoles; no new route for an existing page; WCAG 2.2 AA is the single accessibility floor; tokens are unchanged (Radix 12-step role semantics over the `DESIGN.md` §4 ledger-green values).

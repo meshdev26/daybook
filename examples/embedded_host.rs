@@ -3,7 +3,7 @@
 //! Run with: `cargo run --example embedded_host`
 
 use axum::{Router, routing::get};
-use telegram_agent::embed::AgentAppBuilder;
+use daybook::embed::AgentAppBuilder;
 
 #[tokio::main]
 async fn main() {

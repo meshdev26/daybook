@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# doctor.sh -- environment diagnostics for Telegram Agent. Read-only; safe to
+# doctor.sh -- environment diagnostics for Daybook. Read-only; safe to
 # run anywhere (desktop, server, container). Exit 0 = healthy, 1 = problems.
 #
 #   scripts/doctor.sh            # check the current environment
@@ -16,13 +16,13 @@ bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 warn() { WARN=$((WARN+1)); echo "  [warn] $1"; }
 hint() { [[ "$FIX_HINTS" == "1" ]] && echo "         fix: $1" || true; }
 
-echo "=== telegram-agent doctor ==="
+echo "=== daybook doctor ==="
 uname -sr | sed 's/^/os:       /'
 
 # --- binary -------------------------------------------------------------
 BIN=""
-for c in "$ROOT/target/release/telegram-agent" "/opt/telegram-agent/telegram-agent" \
-         "$ROOT/target/debug/telegram-agent" "$(command -v telegram-agent || true)"; do
+for c in "$ROOT/target/release/daybook" "/opt/daybook/daybook" \
+         "$ROOT/target/debug/daybook" "$(command -v daybook || true)"; do
   [[ -n "$c" && -x "$c" ]] && { BIN="$c"; break; }
 done
 if [[ -n "$BIN" ]]; then
@@ -34,7 +34,7 @@ fi
 
 # --- configuration ------------------------------------------------------
 ENV_PATH=""
-for f in "$ROOT/.env" "/opt/telegram-agent/.env"; do
+for f in "$ROOT/.env" "/opt/daybook/.env"; do
   [[ -f "$f" ]] && { ENV_PATH="$f"; break; }
 done
 if [[ -n "$ENV_PATH" ]]; then
@@ -115,7 +115,7 @@ if command -v curl >/dev/null; then
     "http://${CURL_HOST}:${PORT}${BASE}/login" 2>/dev/null || echo 000)"
   case "$CODE" in
     200|301|302|303) ok "dashboard: responding (HTTP $CODE) on :$PORT" ;;
-    000) [[ -n "$BIN" ]] && { warn "dashboard: not running on :$PORT"; hint "make run / systemctl start telegram-agent"; } ;;
+    000) [[ -n "$BIN" ]] && { warn "dashboard: not running on :$PORT"; hint "make run / systemctl start daybook"; } ;;
     *) warn "dashboard: HTTP $CODE on :$PORT" ;;
   esac
 else
@@ -124,12 +124,12 @@ fi
 
 # --- service ------------------------------------------------------------
 if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
-  if systemctl is-active --quiet telegram-agent 2>/dev/null; then
+  if systemctl is-active --quiet daybook 2>/dev/null; then
     ok "systemd service: active"
-    ERRS="$(journalctl -u telegram-agent --since -24h -p err --no-pager 2>/dev/null | wc -l)"
+    ERRS="$(journalctl -u daybook --since -24h -p err --no-pager 2>/dev/null | wc -l)"
     [[ "$ERRS" == "0" ]] || warn "$ERRS error-level journal lines in the last 24h"
   else
-    systemctl is-enabled --quiet telegram-agent 2>/dev/null \
+    systemctl is-enabled --quiet daybook 2>/dev/null \
       && warn "systemd service: enabled but not running" \
       || true
   fi

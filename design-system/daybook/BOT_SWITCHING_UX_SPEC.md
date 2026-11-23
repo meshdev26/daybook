@@ -3,7 +3,7 @@
 **Owner:** design — spec of record for the shipped surface; the web layer implemented it in `src/web.rs`.
 **Status:** v1.1 spec (2026-10-28): remaining console pages scoped per N1; no new controls. WCAG 2.1 AA is a release floor and is non-waivable.
 **Audience:** web (implementation), server (handlers/data), security (security review), design (token contract).
-**Related:** `design-system/telegram-agent/MASTER.md` (token contract), `assets/app.css` (`.rail .bot-scope`), `src/web.rs` (`html_page` shell, `bot_scope_control`, `bot_select`, `bots_page`/`bots_save`, `effective_bot`), the web bot-scoping plan (`web-bot-scoping-plan.md`).
+**Related:** `design-system/daybook/MASTER.md` (token contract), `assets/app.css` (`.rail .bot-scope`), `src/web.rs` (`html_page` shell, `bot_scope_control`, `bot_select`, `bots_page`/`bots_save`, `effective_bot`), the web bot-scoping plan (`web-bot-scoping-plan.md`).
 
 ---
 

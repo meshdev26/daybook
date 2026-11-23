@@ -52,7 +52,7 @@ console never renders a current token, in any mode, on any surface.
 | Form extraction is `axum::Form` → **serde_urlencoded**, which does not support `#[serde(flatten)]`; no `axum-extra`/`serde_html_form` in the tree | `Cargo.toml:41-49`; no flatten usage in `src/` |
 | SharedConfig struct literals that a new field breaks (compile) | `src/config.rs:483` (production, updated by the change itself), `src/lib.rs:86`, `src/bots.rs:156`, `src/handlers/commands/tests.rs:134`, `src/web/test_support.rs:14-29` |
 | House idioms this spec reuses (do not invent new ones) | `.secret-field` + `SECRET_TOGGLE`: `src/web/mod.rs:456`, `assets/app.css:350-362`; badge family `assets/app.css:478-496`; alert family `assets/app.css:499-504`; `<details open><summary>` panels `src/web/settings.rs:260,292,314,341`, rules `assets/app.css:532-548`; `esc()` mandatory `src/web/mod.rs:185-191`; display-name sugar `bot_display_name` `src/web/mod.rs:505-507`; button styles `assets/app.css:406-416` |
-| `settings.rs` is 639 lines — the 800 budget is real (bots_admin hit 1128 and was frozen report-only) | `wc -l src/web/settings.rs`; budget flag precedent `design-system/telegram-agent/VISUAL_POLISH_SPEC.md:459-468,578` |
+| `settings.rs` is 639 lines — the 800 budget is real (bots_admin hit 1128 and was frozen report-only) | `wc -l src/web/settings.rs`; budget flag precedent `design-system/daybook/VISUAL_POLISH_SPEC.md:459-468,578` |
 
 ---
 

@@ -23,16 +23,16 @@ jobs:
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          STAGE="telegram-agent-${VERSION}-linux-x64"
+          STAGE="daybook-${VERSION}-linux-x64"
           mkdir -p "$STAGE"
-          cp target/release/telegram-agent "$STAGE/"
+          cp target/release/daybook "$STAGE/"
           cp .env.example "$STAGE/"
           cp assets/icon.png "$STAGE/" 2>/dev/null || true
-          tar -czf "telegram-agent-${VERSION}-linux-x64.tar.gz" "$STAGE"
+          tar -czf "daybook-${VERSION}-linux-x64.tar.gz" "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
-          path: telegram-agent-*.tar.gz
+          path: daybook-*.tar.gz
 
   build-linux-arm64:
     runs-on: ubuntu-24.04-arm
@@ -57,9 +57,9 @@ jobs:
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          STAGE="telegram-agent-${VERSION}-windows-x64"
+          STAGE="daybook-${VERSION}-windows-x64"
           mkdir -p "$STAGE"
-          cp target/release/telegram-agent.exe "$STAGE/"
+          cp target/release/daybook.exe "$STAGE/"
           cp .env.example "$STAGE/"
           cp assets/icon.ico "$STAGE/" 2>/dev/null || true
           powershell Compress-Archive -Path "$STAGE" -DestinationPath "${STAGE}.zip"
@@ -67,7 +67,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: telegram-agent-*.zip
+          path: daybook-*.zip
 
   build-macos:
     runs-on: macos-latest

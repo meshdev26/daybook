@@ -97,7 +97,7 @@ Everything is one `make` away — `make help` lists all targets.
 ```bash
 ./setup.sh                 # interactive: token, owner id, password → .env (0600)
 cargo build --release      # or: docker compose up -d --build
-./target/release/telegram-agent
+./target/release/daybook
 ```
 
 Details: `docs/EASY_SETUP.md` · Operations: `docs/DEPLOYMENT.md` ·
@@ -110,8 +110,8 @@ One codebase, two deployment shapes:
 - **Server** — Docker Compose / systemd; dashboard on `WEB_BIND=0.0.0.0`
   behind a TLS proxy. See `docs/DEPLOYMENT.md`.
 - **Desktop app** — the same binary packaged per platform with
-  `scripts/package.sh`: `telegram-agent.exe` (embedded icon/version resources)
-  on Windows, `TelegramAgent.app` bundle on macOS, tar.gz on Linux. The
+  `scripts/package.sh`: `daybook.exe` (embedded icon/version resources)
+  on Windows, `Daybook.app` bundle on macOS, tar.gz on Linux. The
   dashboard binds `127.0.0.1` and opens in the system browser automatically.
   Data resolves portable-first (`.env`/`data/` beside the binary), else the
   platform dir (`%APPDATA%`, `~/Library/Application Support`, `~/.local/share`).

@@ -33,7 +33,7 @@ form rewrites `.env` with a fixed key list (known issue, tracked).
 The crate is a library: an existing axum service can mount the whole app:
 
 ```rust
-let app = telegram_agent::embed::AgentAppBuilder::new()
+let app = daybook::embed::AgentAppBuilder::new()
     .base_path("/agent")
     .db_path("data/host.db")
     .build()
@@ -63,9 +63,9 @@ After=network.target
 [Service]
 Type=simple
 User=telegram
-WorkingDirectory=/opt/telegram-agent
-EnvironmentFile=/opt/telegram-agent/.env
-ExecStart=/opt/telegram-agent/telegram-agent
+WorkingDirectory=/opt/daybook
+EnvironmentFile=/opt/daybook/.env
+ExecStart=/opt/daybook/daybook
 Restart=always
 
 [Install]
@@ -80,8 +80,8 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/telegram-agent /usr/local/bin/
-CMD ["telegram-agent"]
+COPY --from=builder /app/target/release/daybook /usr/local/bin/
+CMD ["daybook"]
 ```
 
 For a narrow install, build with Cargo features (e.g. `cargo build --release

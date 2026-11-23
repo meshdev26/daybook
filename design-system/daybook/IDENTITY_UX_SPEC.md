@@ -3,7 +3,7 @@
 **Owner:** design — spec only; the web layer implements in `src/web.rs`.
 **Status:** v1 spec, from the ratified identity decision record (2026-10-27), including the supervisor + security amendment (conditional 2FA step). WCAG 2.1 AA is a release floor and is non-waivable.
 **Audience:** web implementation, server handlers/data, core data layer, security review, design token contract.
-**Related:** `DESIGN.md` + `assets/app.css` (token contract), `design-system/telegram-agent/MASTER.md`, `BOT_SWITCHING_UX_SPEC.md` (rail group + bot-scope-pinned idiom), `docs/SETUP_MCP_UX_SPEC.md` (door shell, `SECRET_TOGGLE`, shown-once idiom), `docs/BOOKINGS_UX_SPEC.md` (routes/flash vocabulary). Sibling specs: `IDENTITY_SENDER_UX_SPEC.md`, `IDENTITY_MONITOR_UX_SPEC.md`, `IDENTITY_INBOX_UX_SPEC.md`.
+**Related:** `DESIGN.md` + `assets/app.css` (token contract), `design-system/daybook/MASTER.md`, `BOT_SWITCHING_UX_SPEC.md` (rail group + bot-scope-pinned idiom), `docs/SETUP_MCP_UX_SPEC.md` (door shell, `SECRET_TOGGLE`, shown-once idiom), `docs/BOOKINGS_UX_SPEC.md` (routes/flash vocabulary). Sibling specs: `IDENTITY_SENDER_UX_SPEC.md`, `IDENTITY_MONITOR_UX_SPEC.md`, `IDENTITY_INBOX_UX_SPEC.md`.
 
 ---
 

@@ -8,21 +8,21 @@ Telegram bot answering `/start`).
 |---------|----------|-------------|------------------|
 | **Desktop app** | Personal use, trying it out | `make package` → run the bundle | platform dir, or beside the binary (portable) |
 | **New VPS** | A fresh cloud server | `make setup && make run-release` (or Docker below) | `./data` |
-| **Existing server** | A server that already runs things | `sudo make install` | `/var/lib/telegram-agent` |
+| **Existing server** | A server that already runs things | `sudo make install` | `/var/lib/daybook` |
 | **Docker** | Container hosts, NAS | `docker compose up -d --build` | `./data` bind mount |
 | **ARM (Pi / ARM VPS)** | Raspberry Pi, ARM clouds | `make package` on the device (or grab the arm64 release) | same as host profile |
 
 ## Desktop app (Windows / macOS / Linux)
 
-`make package` produces `dist/telegram-agent-<ver>-<platform>.<zip|tar.gz>`
-(`telegram-agent.exe`, `TelegramAgent.app`, Linux tarball). Unarchive,
+`make package` produces `dist/daybook-<ver>-<platform>.<zip|tar.gz>`
+(`daybook.exe`, `Daybook.app`, Linux tarball). Unarchive,
 double-click; the dashboard opens at `http://127.0.0.1:8080`. Details:
 [`DESKTOP.md`](./DESKTOP.md).
 
 ## New server (nothing installed yet)
 
 ```bash
-git clone <repo> && cd telegram-agent
+git clone <repo> && cd daybook
 ./setup.sh                 # validates your bot token, writes .env (0600)
 make run-release           # or: make install  (systemd, hardened)
 ```
@@ -36,8 +36,8 @@ make run-release           # or: make install  (systemd, hardened)
   reverse-proxy block — it never edits foreign configs), systemd (installs a
   hardened unit: `ProtectSystem=strict`, `NoNewPrivileges`, restart on
   failure).
-- **Installs only what's missing**: the binary to `/opt/telegram-agent`, a
-  dedicated system user, the data dir `/var/lib/telegram-agent`, the service.
+- **Installs only what's missing**: the binary to `/opt/daybook`, a
+  dedicated system user, the data dir `/var/lib/daybook`, the service.
 - **Idempotent**: re-running upgrades the binary in place; data and `.env`
   survive every upgrade.
 

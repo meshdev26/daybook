@@ -305,7 +305,7 @@ async fn dispatch(st: &McpState, principal: &Principal, req: Value) -> Response 
                 json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "telegram-agent", "version": env!("CARGO_PKG_VERSION")}
+                    "serverInfo": {"name": "daybook", "version": env!("CARGO_PKG_VERSION")}
                 }),
             )
         }
@@ -858,7 +858,7 @@ mod tests {
                 "requested {requested}"
             );
             assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], false);
-            assert_eq!(v["result"]["serverInfo"]["name"], "telegram-agent");
+            assert_eq!(v["result"]["serverInfo"]["name"], "daybook");
         }
     }
 

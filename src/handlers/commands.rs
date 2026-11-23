@@ -418,7 +418,7 @@ pub async fn cmd_handler(
         }
         Command::Start => {
             if is_seller || is_admin {
-                bot.send_message(chat_id, "Telegram Agent (owner-only). Use /menu or /help.")
+                bot.send_message(chat_id, "Daybook (owner-only). Use /menu or /help.")
                     .await?;
             } else {
                 // Buyer first touch (P2#10): the shop, not the operator console.

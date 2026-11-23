@@ -105,7 +105,7 @@ in" — correct (the owner web account exists in the DB), but a non-technical ow
 ```
 <div class="alert alert-success" role="status" aria-live="polite">Setup complete — your login works right now.</div>
 <p>The bot itself starts after one restart. The running app keeps the settings it started with.</p>
-<p class="help">Desktop: quit and reopen. Server (systemd): <code>systemctl restart telegram-agent</code>. Docker: <code>docker compose restart</code>.</p>
+<p class="help">Desktop: quit and reopen. Server (systemd): <code>systemctl restart daybook</code>. Docker: <code>docker compose restart</code>.</p>
 <p class="help">After restarting, sign in and follow the dashboard checklist: add a plan, then share your bot with customers.</p>
 <p><a class="btn" href="{login}">Go to sign in</a></p>
 ```

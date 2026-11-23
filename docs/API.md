@@ -211,7 +211,7 @@ Secure default OFF: with `MCP_OWNER_TOKEN` unset or empty the endpoint refuses e
 ### Methods
 | Method | Result |
 |---|---|
-| `initialize` | Echoes the client's `protocolVersion` when it is a known `2024-*`/`2025-*`, else answers with the `2025-06-18` baseline; `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "telegram-agent", version}` |
+| `initialize` | Echoes the client's `protocolVersion` when it is a known `2024-*`/`2025-*`, else answers with the `2025-06-18` baseline; `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "daybook", version}` |
 | `ping` | `{}` |
 | `tools/list` | `{tools: [{name, description, inputSchema, annotations}]}` |
 | `tools/call` | `{name, arguments}` → `{content: [{type: "text", text: "<tool result as JSON>"}], isError}` — tool errors live in the result (`isError: true`), protocol errors in `error` |
@@ -222,7 +222,7 @@ Protocol errors: unparseable body → HTTP 400 `-32700` (`id: null`); unknown/mi
 // initialize
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}
 ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
-   "serverInfo":{"name":"telegram-agent","version":"0.1.0"}}}
+   "serverInfo":{"name":"daybook","version":"0.1.0"}}}
 
 // tools/call of a Sensitive tool: nothing executes, an approval is parked
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"gen_codes","arguments":{"count":3,"days":30}}}

@@ -418,7 +418,7 @@ pub(super) async fn settings_restart(
     });
     let body = format!(
         r#"<h1>Restarting <span class="sub">the app is shutting down</span></h1>
-<div class="alert alert-info" role="status" aria-live="polite">The app is restarting. If it doesn't come back automatically within a few seconds, reopen it (desktop) or run <code>systemctl restart telegram-agent</code> / <code>docker compose restart</code>.</div>
+<div class="alert alert-info" role="status" aria-live="polite">The app is restarting. If it doesn't come back automatically within a few seconds, reopen it (desktop) or run <code>systemctl restart daybook</code> / <code>docker compose restart</code>.</div>
 <p><a class="btn" href="{}">Back to dashboard</a></p>"#,
         state.url("/dashboard")
     );

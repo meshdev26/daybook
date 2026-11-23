@@ -11,7 +11,7 @@ versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 The 2026-10-27 hardening wave plus the v1.4 milestone
 (`docs/ARCHITECTURE-V1.4.md`: bookings, MCP per-seller tokens, setup links),
 and the setup & management UX polish
-(`design-system/telegram-agent/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
+(`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
 - Bookings domain closed end-to-end: console `/bookings` page (seller-scope
@@ -76,7 +76,7 @@ and the setup & management UX polish
 
 ### Changed
 - Setup and management UX polish (per
-  `design-system/telegram-agent/SETUP_UX_POLISH_SPEC.md`): the `/setup`
+  `design-system/daybook/SETUP_UX_POLISH_SPEC.md`): the `/setup`
   wizard groups the form into "Your bot" and "Your console login" with the
   optional fields collapsed under "Optional — add later in Settings",
   validates locally before contacting Telegram, re-renders errors in place

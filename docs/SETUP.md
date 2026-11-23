@@ -22,7 +22,7 @@ cargo build --release
 
 ## 5. Run
 ```bash
-./target/release/telegram-agent
+./target/release/daybook
 ```
 
 ## 6. First use

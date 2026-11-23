@@ -14,7 +14,7 @@ ROOT="$(pwd)"
 # Locate the .env (same lookup as doctor.sh) and parse it WITHOUT sourcing
 # (a crafted .env must never execute; export-assignment is safe).
 ENV_PATH=""
-for f in "$ROOT/.env" "/opt/telegram-agent/.env"; do
+for f in "$ROOT/.env" "/opt/daybook/.env"; do
   [[ -f "$f" ]] && { ENV_PATH="$f"; break; }
 done
 if [[ -n "$ENV_PATH" ]]; then
@@ -42,7 +42,7 @@ if command -v sqlite3 >/dev/null; then
   sqlite3 "$DB" ".backup '$DEST'" || fail "sqlite3 .backup of $DB failed"
 else
   echo "warn: sqlite3 not installed -- falling back to a raw file copy." >&2
-  echo "      Stop the service first (systemctl stop telegram-agent) for a consistent snapshot." >&2
+  echo "      Stop the service first (systemctl stop daybook) for a consistent snapshot." >&2
   cp -- "$DB" "$DEST" || fail "copy of $DB failed"
 fi
 

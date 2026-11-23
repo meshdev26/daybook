@@ -121,7 +121,7 @@ overrides — set at least one floor term before enabling it. Full guide:
 ## Build & run
 ```bash
 cargo build --release
-./target/release/telegram-agent
+./target/release/daybook
 ```
 Web dashboard: http://localhost:8080 (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`.
 
@@ -133,7 +133,7 @@ Set `MCP_OWNER_TOKEN` in `.env` (empty = endpoint disabled, secure default OFF),
 then register the server in your agent's MCP settings:
 
 ```json
-{ "telegram-agent": { "url": "http://127.0.0.1:8080/api/v1/mcp",
+{ "daybook": { "url": "http://127.0.0.1:8080/api/v1/mcp",
                       "headers": { "Authorization": "Bearer <MCP_OWNER_TOKEN>" } } }
 ```
 

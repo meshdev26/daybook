@@ -1,4 +1,4 @@
-# Telegram Agent — one entry point for everything.
+# Daybook — one entry point for everything.
 # Targets are grouped by purpose below.
 
 SHELL := /usr/bin/env bash
@@ -26,7 +26,7 @@ tg: ## Short alias: build and run Daybook locally
 
 .PHONY: run-release
 run-release: ## Build (release) and run locally
-	cargo build --release && ./target/release/telegram-agent
+	cargo build --release && ./target/release/daybook
 
 ## --- quality gates --------------------------------------------------------
 .PHONY: build

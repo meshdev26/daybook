@@ -30,7 +30,7 @@
 /vendor/teloxide/Cargo.lock
 
 # Release bundles — binaries ship as GitHub Releases, not in the tree
-/telegram-agent-*/
+/daybook-*/
 
 # OS noise
 .DS_Store

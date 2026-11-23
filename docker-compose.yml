@@ -1,8 +1,8 @@
 services:
   app:
     build: .
-    image: telegram-agent:latest
-    container_name: telegram-agent
+    image: daybook:latest
+    container_name: daybook
     restart: unless-stopped
     init: true
     ports:

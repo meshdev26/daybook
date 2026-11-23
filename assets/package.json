@@ -1,5 +1,5 @@
 {
-  "name": "telegram-agent-assets",
+  "name": "daybook-assets",
   "private": true,
   "version": "0.0.0",
   "description": "Dev-only type check and test harness for the dashboard client JS.",

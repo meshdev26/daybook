@@ -21,7 +21,7 @@ must never be committed.
 ### Option 1 — `BOTS_CONFIG` (TOML file)
 
 ```toml
-# bots.toml — referenced by BOTS_CONFIG=/etc/telegram-agent/bots.toml
+# bots.toml — referenced by BOTS_CONFIG=/etc/daybook/bots.toml
 [[bots]]
 key = "primary"
 name = "Primary"
@@ -40,7 +40,7 @@ default_channel = "-1001234567890"     # @name or numeric chat id
 ```bash
 export PRIMARY_BOT_TOKEN="..."   # in .env, a systemd EnvironmentFile, or the shell
 export SHOP2_BOT_TOKEN="..."
-export BOTS_CONFIG=/etc/telegram-agent/bots.toml
+export BOTS_CONFIG=/etc/daybook/bots.toml
 ```
 
 `token_env` is the recommended form: the TOML file then contains no secret and
@@ -189,7 +189,7 @@ per-bot endpoints.
 
 ## See also
 
-- `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` — the UX spec of
+- `design-system/daybook/BOT_SWITCHING_UX_SPEC.md` — the UX spec of
   record (scoping table, accessibility floor).
 - `docs/reviews/2026-10-27-bot-scoping-security-review.md` — security review and
   accepted notes.

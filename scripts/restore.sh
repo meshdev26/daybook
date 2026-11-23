@@ -15,7 +15,7 @@ fi
 [[ -f "$SRC" ]] || { echo "ERROR: backup file not found: $SRC" >&2; exit 1; }
 
 ENV_PATH=""
-for f in "$ROOT/.env" "/opt/telegram-agent/.env"; do
+for f in "$ROOT/.env" "/opt/daybook/.env"; do
     [[ -f "$f" ]] && { ENV_PATH="$f"; break; }
 done
 if [[ -n "$ENV_PATH" ]]; then

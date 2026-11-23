@@ -169,7 +169,7 @@ The nav must never show a link whose page would return `forbidden_page`. Filteri
 3. **Label-based nav tests must be updated; path-based tests untouched.** Any test that asserts a nav group label string (e.g. "Operate", "Sell", "Insights", "Manage", "Identity") or a nav item label ("Cart", "Carts", "API keys" as bare link) needs its expected string updated to the new labels/groups. Tests that assert only paths, hrefs, or page presence (e.g. `src/web/tests/bots.rs:633-664` asserts `href="/bots"` presence/absence) survive unchanged. Specifically:
    - `src/web/tests/bots.rs:633-664` (`shell_shows_bot_selector_for_owner_and_pinned_label_for_seller`) survives on path; its comment at `:652-653` becomes stale and must be corrected by web.
    - `src/web/tests/subs.rs:17` (asserts body contains "Subscriptions") survives — label unchanged.
-   - `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by web during implementation.
+   - `design-system/daybook/BOT_SWITCHING_UX_SPEC.md` prose referencing Bots in the Operate group becomes stale and must be updated by web during implementation.
 4. **No data migration, no env changes.** `WEB_BASE_PATH`, cookies, and redirects are unaffected.
 
 ---

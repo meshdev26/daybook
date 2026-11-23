@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use daybook::{api, config::Config, db::Db, util, web, web::WebState};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
-use telegram_agent::{api, config::Config, db::Db, util, web, web::WebState};
 use tower::ServiceExt;
 
 const BASE: &str = "/agent";
@@ -49,17 +49,17 @@ async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         bots_legacy: true,
     };
     let db = Arc::new(db);
-    let bots = Arc::new(telegram_agent::bots::BotManager::placeholder(
+    let bots = Arc::new(daybook::bots::BotManager::placeholder(
         db.clone(),
         Arc::new(cfg.clone()),
-        telegram_agent::identity::IdentityHandle::unconnected(),
+        daybook::identity::IdentityHandle::unconnected(),
     ));
     let state = WebState {
         db: db.clone(),
         cfg,
         bot: teloxide::Bot::new("0:dummy"),
         bots,
-        identity: telegram_agent::identity::IdentityHandle::unconnected(),
+        identity: daybook::identity::IdentityHandle::unconnected(),
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         ai_test_inflight: Arc::new(tokio::sync::Mutex::new(())),
         base_path: base.to_string(),

@@ -6,7 +6,7 @@ the tooling enforces most rules — you just run it.
 ## Setup
 
 ```bash
-git clone <repo> && cd telegram-agent
+git clone <repo> && cd daybook
 cargo build          # Rust 1.99+/edition 2024 (rust-toolchain.toml pins it)
 make test            # the full gate suite
 ```

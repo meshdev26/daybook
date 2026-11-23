@@ -279,7 +279,7 @@ fn bot_snippet_panel(state: &WebState, toml_block: &str) -> String {
         r#"<div class="alert alert-warn" role="status" aria-live="polite">This bot couldn't be added automatically — the configured bot config file is missing, unreadable, or unwritable. Two minutes, two steps:</div>
 <p><b>1.</b> Copy the block below into your bot config file (the path in <code>BOTS_CONFIG</code>), creating it if it doesn't exist.</p>
 <code class="copyable">{toml}</code>
-<p><b>2.</b> Make sure <code>BOTS_CONFIG=/path/to/bots.toml</code> is set in <code>.env</code> and the file is writable, then restart the app. Your bot starts polling after the restart. Restart: desktop quit &amp; reopen; server <code>systemctl restart telegram-agent</code>; Docker <code>docker compose restart</code>.</p>
+<p><b>2.</b> Make sure <code>BOTS_CONFIG=/path/to/bots.toml</code> is set in <code>.env</code> and the file is writable, then restart the app. Your bot starts polling after the restart. Restart: desktop quit &amp; reopen; server <code>systemctl restart daybook</code>; Docker <code>docker compose restart</code>.</p>
 <p><a class="btn btn-secondary" href="{snippet_url}">Download this block as a file</a>
 <a class="btn btn-secondary" href="{bots_url}">Back to Bots</a></p>"#,
         toml = esc(toml_block),
@@ -549,7 +549,7 @@ pub(super) async fn bots_add_submit(
                     String::new()
                 };
                 let body = format!(
-                    r#"<div class="alert alert-success" role="status" aria-live="polite">Bot <span class="mono">{}</span> added — the bot starts polling after the next restart. {}Don't forget to add <code class="mono">{}</code> (your bot token from @BotFather) to <code>.env</code> before restarting. Restart: desktop quit &amp; reopen; server <code>systemctl restart telegram-agent</code>; Docker <code>docker compose restart</code>.</div>"#,
+                    r#"<div class="alert alert-success" role="status" aria-live="polite">Bot <span class="mono">{}</span> added — the bot starts polling after the next restart. {}Don't forget to add <code class="mono">{}</code> (your bot token from @BotFather) to <code>.env</code> before restarting. Restart: desktop quit &amp; reopen; server <code>systemctl restart daybook</code>; Docker <code>docker compose restart</code>.</div>"#,
                     esc(&v.key),
                     restart_hint,
                     esc(&v.token_env)

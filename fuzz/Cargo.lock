@@ -2589,7 +2589,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07dd1d452d2c3dc94a4e1c5c3c9a3cc88c2ef5926674b75881e454c4dc3a14c4"
 
 [[package]]
-name = "telegram-agent"
+name = "daybook"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -2614,12 +2614,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "telegram-agent-fuzz"
+name = "daybook-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "serde_json",
- "telegram-agent",
+ "daybook",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use telegram_agent::{
+use daybook::{
     embed::AgentAppBuilder,
     handlers::registry::{CommandContext, HandlerFuture},
     roles,
@@ -19,8 +19,8 @@ async fn echo_handler(ctx: CommandContext) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn echo_spec() -> telegram_agent::handlers::registry::CommandSpec {
-    telegram_agent::handlers::registry::CommandSpec {
+fn echo_spec() -> daybook::handlers::registry::CommandSpec {
+    daybook::handlers::registry::CommandSpec {
         name: "echo".to_string(),
         description: "Echo the given text back".to_string(),
         min_role: roles::Role::User,

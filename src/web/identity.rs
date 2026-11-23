@@ -2,7 +2,7 @@ use super::*;
 // ---- Personal identity (user-identity Phase 1) -------------------------------
 //
 // Console surfaces for the owner's personal Telegram account, per
-// design-system/telegram-agent/IDENTITY_UX_SPEC.md and
+// design-system/daybook/IDENTITY_UX_SPEC.md and
 // IDENTITY_MONITOR_UX_SPEC.md. Every state question goes to the identity
 // actor per request (`IdentityHandle::status`); the connect wizard is
 // stateless — the actor's state machine IS the wizard state.

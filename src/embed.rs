@@ -2,7 +2,7 @@
 //! registry) as a library component of another axum host.
 //!
 //! ```no_run
-//! use telegram_agent::embed::AgentAppBuilder;
+//! use daybook::embed::AgentAppBuilder;
 //!
 //! # async fn demo() -> Result<(), String> {
 //! let app = AgentAppBuilder::new()

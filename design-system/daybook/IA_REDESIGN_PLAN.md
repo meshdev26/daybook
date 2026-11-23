@@ -1,6 +1,6 @@
 # Web Console IA Redesign — Implementation Plan
 
-**Spec:** `design-system/telegram-agent/IA_REDESIGN_SPEC.md` (committed as `d03525f`)
+**Spec:** `design-system/daybook/IA_REDESIGN_SPEC.md` (committed as `d03525f`)
 **Implementation owner:** the web layer — all source edits are in web territory.
 **Verification:** mandatory before any completion claim.
 **Sign-offs:** design coherence before merge; owner AA-vs-AAA wording before ship.
@@ -48,7 +48,7 @@
 - Documentation changes are limited to `docs/**`. Both stale items are in web-owned territory
   (`src/web/**` and `design-system/**`), so **the web layer fixes both in the same PR**:
   - the comment at `src/web/tests/bots.rs:652-653` ("Bots rides in the Operate rail group");
-  - the matching prose in `design-system/telegram-agent/BOT_SWITCHING_UX_SPEC.md`.
+  - the matching prose in `design-system/daybook/BOT_SWITCHING_UX_SPEC.md`.
 - Both must say Bots now lives in **Offerings**. No separate documentation handoff is needed for this change.
 
 ## Step 6 — web self-check, then hand to verification

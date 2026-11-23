@@ -91,7 +91,7 @@ pub struct AppConfig {
 /// historically called `Config`.
 pub type Config = SharedConfig;
 
-pub const APP_DIR_NAME: &str = "telegram-agent";
+pub const APP_DIR_NAME: &str = "daybook";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopOs {

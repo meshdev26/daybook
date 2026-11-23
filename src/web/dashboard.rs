@@ -7,7 +7,7 @@ use super::*;
 /// once at boot. Read by /dashboard and /settings.
 pub(super) fn restart_required_banner(state: &WebState) -> String {
     if state.db.get_config("restart_required").as_deref() == Some("1") {
-        r#"<div class="alert alert-warn" role="status" aria-live="polite">Settings saved — restart the app to apply. Desktop: quit and reopen. Server (systemd): <code>systemctl restart telegram-agent</code>. Docker: <code>docker compose restart</code>.</div>"#
+        r#"<div class="alert alert-warn" role="status" aria-live="polite">Settings saved — restart the app to apply. Desktop: quit and reopen. Server (systemd): <code>systemctl restart daybook</code>. Docker: <code>docker compose restart</code>.</div>"#
             .to_string()
     } else {
         String::new()

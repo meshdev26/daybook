@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh -- deploy Telegram Agent onto an existing Linux server, installing
+# install.sh -- deploy Daybook onto an existing Linux server, installing
 # only the parts that are missing. Idempotent: safe to re-run (it upgrades in
 # place and never touches your data or .env).
 #
@@ -8,8 +8,8 @@
 #   scripts/install.sh --uninstall      # remove app (data is kept unless --purge)
 #
 # Options:
-#   --prefix DIR     install root          (default /opt/telegram-agent)
-#   --data-dir DIR   database location     (default /var/lib/telegram-agent)
+#   --prefix DIR     install root          (default /opt/daybook)
+#   --data-dir DIR   database location     (default /var/lib/daybook)
 #   --env-file PATH  reuse an existing .env instead of asking questions
 #   --port N         dashboard port        (default 8080, bound to 127.0.0.1)
 #   --no-systemd     skip the service; print a run command instead
@@ -23,14 +23,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-PREFIX="/opt/telegram-agent"
-DATA_DIR="/var/lib/telegram-agent"
+PREFIX="/opt/daybook"
+DATA_DIR="/var/lib/daybook"
 ENV_FILE=""
 PORT="8080"
 NO_SYSTEMD=0
 ACTION="install"
 PURGE=0
-SERVICE="telegram-agent"
+SERVICE="daybook"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,15 +64,15 @@ service_active() { systemctl is-active --quiet "$SERVICE" 2>/dev/null; }
 # ---------------------------------------------------------------- status
 
 if [[ "$ACTION" == "status" ]]; then
-  echo "=== telegram-agent status ==="
-  if [[ -x "$PREFIX/telegram-agent" ]]; then
-    echo "binary:     $PREFIX/telegram-agent (installed)"
-  elif [[ -x "$ROOT/target/release/telegram-agent" ]]; then
-    echo "binary:     $ROOT/target/release/telegram-agent (repo build, not installed)"
+  echo "=== daybook status ==="
+  if [[ -x "$PREFIX/daybook" ]]; then
+    echo "binary:     $PREFIX/daybook (installed)"
+  elif [[ -x "$ROOT/target/release/daybook" ]]; then
+    echo "binary:     $ROOT/target/release/daybook (repo build, not installed)"
   else
     echo "binary:     not found"
   fi
-  for f in "$PREFIX/.env" "$ROOT/.env" "/etc/telegram-agent/env"; do
+  for f in "$PREFIX/.env" "$ROOT/.env" "/etc/daybook/env"; do
     [[ -f "$f" ]] && echo "env:        $f"
   done
   if [[ -f "$DATA_DIR/agent.db" ]]; then
@@ -91,7 +91,7 @@ if [[ "$ACTION" == "status" ]]; then
   # shell-sourcing it (a crafted file must not execute) — same rule as
   # doctor.sh. Normalized: strip trailing "/"s, require a leading "/".
   BASE_PATH=""
-  for f in "$PREFIX/.env" "$ROOT/.env" "/etc/telegram-agent/env"; do
+  for f in "$PREFIX/.env" "$ROOT/.env" "/etc/daybook/env"; do
     [[ -f "$f" ]] || continue
     while IFS='=' read -r k v || [[ -n "$k" ]]; do
       case "$k" in
@@ -121,7 +121,7 @@ if [[ "$ACTION" == "uninstall" ]]; then
   rm -rf "$PREFIX"
   echo "removed $PREFIX"
   if [[ "$PURGE" == "1" ]]; then
-    rm -rf "$DATA_DIR"; rm -f "/etc/telegram-agent/env"
+    rm -rf "$DATA_DIR"; rm -f "/etc/daybook/env"
     echo "purged data ($DATA_DIR) and env"
   else
     echo "kept data ($DATA_DIR) and env — re-run install.sh to restore, or pass --purge"
@@ -135,12 +135,12 @@ fi
 
 # 1. Locate a binary: existing install, release build, or a dist tarball.
 BIN=""
-if [[ -x "$ROOT/target/release/telegram-agent" ]]; then
-  BIN="$ROOT/target/release/telegram-agent"
-elif compgen -G "$ROOT/dist/telegram-agent-*-linux-*.tar.gz" >/dev/null; then
-  TARBALL="$(ls -1 "$ROOT"/dist/telegram-agent-*-linux-*.tar.gz | sort -V | tail -1)"
+if [[ -x "$ROOT/target/release/daybook" ]]; then
+  BIN="$ROOT/target/release/daybook"
+elif compgen -G "$ROOT/dist/daybook-*-linux-*.tar.gz" >/dev/null; then
+  TARBALL="$(ls -1 "$ROOT"/dist/daybook-*-linux-*.tar.gz | sort -V | tail -1)"
   TMP="$(mktemp -d)"; tar -xzf "$TARBALL" -C "$TMP"
-  BIN="$(find "$TMP" -type f -name telegram-agent | head -1)"
+  BIN="$(find "$TMP" -type f -name daybook | head -1)"
   [[ -n "$BIN" ]] || { echo "ERROR: no binary in $TARBALL" >&2; exit 1; }
   trap 'rm -rf "$TMP"' EXIT
 else
@@ -151,21 +151,21 @@ fi
 echo "using binary: $BIN"
 
 # 2. Service user.
-if ! id telegram-agent >/dev/null 2>&1; then
-  useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin telegram-agent
-  echo "created system user telegram-agent"
+if ! id daybook >/dev/null 2>&1; then
+  useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin daybook
+  echo "created system user daybook"
 fi
 
 # 3. Layout: app in $PREFIX, data in $DATA_DIR (kept across upgrades).
 mkdir -p "$PREFIX" "$DATA_DIR"
-if [[ -f "$PREFIX/telegram-agent" ]]; then
+if [[ -f "$PREFIX/daybook" ]]; then
   systemctl stop "$SERVICE" 2>/dev/null || true
-  cp "$BIN" "$PREFIX/telegram-agent.new" && mv "$PREFIX/telegram-agent.new" "$PREFIX/telegram-agent"
+  cp "$BIN" "$PREFIX/daybook.new" && mv "$PREFIX/daybook.new" "$PREFIX/daybook"
 else
-  cp "$BIN" "$PREFIX/telegram-agent"
+  cp "$BIN" "$PREFIX/daybook"
 fi
-chmod 755 "$PREFIX/telegram-agent"
-chown -R telegram-agent:telegram-agent "$DATA_DIR"
+chmod 755 "$PREFIX/daybook"
+chown -R daybook:daybook "$DATA_DIR"
 
 # 4. Environment: reuse existing, copy provided, or create from questions.
 ENV_PATH="$PREFIX/.env"
@@ -193,7 +193,7 @@ OPEN_BROWSER=0
 RUST_LOG=info
 EOF
 fi
-chown telegram-agent:telegram-agent "$ENV_PATH"
+chown daybook:daybook "$ENV_PATH"
 chmod 600 "$ENV_PATH"
 
 # 5. Reverse proxy awareness: if nginx/caddy exist, print matching blocks and
@@ -225,7 +225,7 @@ if have_systemd && [[ "$NO_SYSTEMD" == "0" ]]; then
   # again. ProtectHome=true makes /home, /root, /run/user inaccessible
   # outright — ReadWritePaths CANNOT override it, so an operator pointing
   # --data-dir under $HOME must also drop ProtectHome (the default
-  # /var/lib/telegram-agent needs nothing extra).
+  # /var/lib/daybook needs nothing extra).
   cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=Telegram Business Platform
@@ -234,11 +234,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=telegram-agent
-Group=telegram-agent
+User=daybook
+Group=daybook
 WorkingDirectory=$PREFIX
 EnvironmentFile=$ENV_PATH
-ExecStart=$PREFIX/telegram-agent
+ExecStart=$PREFIX/daybook
 Restart=on-failure
 RestartSec=5
 
@@ -265,13 +265,13 @@ EOF
 else
   echo
   echo "systemd not used. Run the agent with:"
-  echo "  systemctl start telegram-agent  # or: set -a; . $PREFIX/.env; set +a; $PREFIX/telegram-agent"
+  echo "  systemctl start daybook  # or: set -a; . $PREFIX/.env; set +a; $PREFIX/daybook"
 fi
 
 # 7. What the operator should do next.
 echo
 echo "=== installed ==="
-echo "  app:    $PREFIX/telegram-agent"
+echo "  app:    $PREFIX/daybook"
 echo "  data:   $DATA_DIR   (back this up)"
 echo "  env:    $ENV_PATH   (mode 600)"
 have_systemd && echo "  manage: systemctl {status|restart|stop} $SERVICE"

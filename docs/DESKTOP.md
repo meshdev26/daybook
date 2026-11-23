@@ -1,6 +1,6 @@
 # Desktop Distribution (.exe / .app / Linux)
 
-Telegram Agent is a single Rust binary: the same code runs as a server
+Daybook is a single Rust binary: the same code runs as a server
 (Docker/systemd — see `DEPLOYMENT.md`) or as a desktop app on Windows, macOS,
 and Linux. The dashboard opens automatically in your browser.
 
@@ -8,9 +8,9 @@ and Linux. The dashboard opens automatically in your browser.
 
 | Platform | Artifact | Contains |
 |----------|----------|----------|
-| Windows | `telegram-agent-<ver>-windows-x64.zip` | `telegram-agent.exe` (icon + version resources embedded), `.env.example`, quickstart |
-| macOS | `telegram-agent-<ver>-macos-<arch>.zip` | `TelegramAgent.app` bundle (icon, Info.plist, ad-hoc signature) |
-| Linux | `telegram-agent-<ver>-linux-<arch>.tar.gz` | binary, `.env.example`, icon, quickstart |
+| Windows | `daybook-<ver>-windows-x64.zip` | `daybook.exe` (icon + version resources embedded), `.env.example`, quickstart |
+| macOS | `daybook-<ver>-macos-<arch>.zip` | `Daybook.app` bundle (icon, Info.plist, ad-hoc signature) |
+| Linux | `daybook-<ver>-linux-<arch>.tar.gz` | binary, `.env.example`, icon, quickstart |
 
 First run: unarchive, optionally create `.env` next to the binary (or configure
 in the web UI), double-click / run. The dashboard opens at
@@ -22,9 +22,9 @@ in the web UI), double-click / run. The dashboard opens at
   binary, everything (database, `.env`) stays in that folder. This is the
   repo/development layout and the unzipped-bundle layout if you add a `.env`.
 - **Platform mode** — otherwise the app uses the platform convention:
-  - Windows: `%APPDATA%\telegram-agent`
-  - macOS: `~/Library/Application Support/telegram-agent`
-  - Linux: `$XDG_DATA_HOME/telegram-agent` (default `~/.local/share/telegram-agent`)
+  - Windows: `%APPDATA%\daybook`
+  - macOS: `~/Library/Application Support/daybook`
+  - Linux: `$XDG_DATA_HOME/daybook` (default `~/.local/share/daybook`)
 - `DATABASE_DIR` env overrides everything. `DATABASE_URL` still wins for the
   database file itself.
 
@@ -67,7 +67,7 @@ paper-plane glyph) with stdlib Python — no design tooling required:
 
 ## Auto-start on login (optional)
 
-- **Windows:** Task Scheduler → "At log on" → action: path to `telegram-agent.exe`.
-- **macOS:** System Settings → General → Login Items → add `TelegramAgent.app`.
-- **Linux:** `~/.config/autostart/telegram-agent.desktop` with
-  `Exec=/path/to/telegram-agent`, or a systemd **user** service.
+- **Windows:** Task Scheduler → "At log on" → action: path to `daybook.exe`.
+- **macOS:** System Settings → General → Login Items → add `Daybook.app`.
+- **Linux:** `~/.config/autostart/daybook.desktop` with
+  `Exec=/path/to/daybook`, or a systemd **user** service.

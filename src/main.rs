@@ -9,7 +9,7 @@ use teloxide::{
 };
 use tracing_subscriber::EnvFilter;
 
-use telegram_agent::{
+use daybook::{
     ai, api, bots, config,
     config::AppConfig,
     config::Config,
@@ -291,7 +291,7 @@ async fn run() {
 
     let app_cfg = AppConfig::from_env();
     let cfg: Config = app_cfg.shared.clone();
-    // CLI recovery subcommand: `telegram-agent reset-owner ...`. Handled
+    // CLI recovery subcommand: `daybook reset-owner ...`. Handled
     // before any server/bot startup so it works in setup mode (missing
     // bot token / .env). Exits the process when invoked.
     {
@@ -404,7 +404,7 @@ async fn run() {
 
             // No recognized mode.
             eprintln!(
-                "Usage: telegram-agent reset-owner [--print-claim-code] [--delete-owner] [--username X --password Y]"
+                "Usage: daybook reset-owner [--print-claim-code] [--delete-owner] [--username X --password Y]"
             );
             std::process::exit(2);
         }
@@ -1153,7 +1153,7 @@ async fn run() {
             use std::time::Duration;
             loop {
                 tokio::time::sleep(Duration::from_secs(
-                    telegram_agent::db::PAID_UNGRANTED_RETRY_SECONDS as u64,
+                    daybook::db::PAID_UNGRANTED_RETRY_SECONDS as u64,
                 ))
                 .await;
                 let now = chrono::Utc::now();
@@ -1186,20 +1186,17 @@ async fn run() {
                     // and stays subject to the owner-only approval flow.
                     if since <= auto_cutoff {
                         let idem = format!("auto:ungranted:{inv_id}");
-                        let created =
-                            db_bg.create_refund_guarded(telegram_agent::db::RefundInput {
-                                seller_id,
-                                invoice_id: Some(&inv_id),
-                                user_id: None,
-                                amount: &amount,
-                                asset: &asset,
-                                reason: Some(
-                                    "automatic refund: invoice paid but ungranted for 24h",
-                                ),
-                                idem_key: &idem,
-                                created_by: -1,
-                                created_role: "system",
-                            });
+                        let created = db_bg.create_refund_guarded(daybook::db::RefundInput {
+                            seller_id,
+                            invoice_id: Some(&inv_id),
+                            user_id: None,
+                            amount: &amount,
+                            asset: &asset,
+                            reason: Some("automatic refund: invoice paid but ungranted for 24h"),
+                            idem_key: &idem,
+                            created_by: -1,
+                            created_role: "system",
+                        });
                         match created {
                             Ok(c) if c.created_new => {
                                 let meta = serde_json::json!({
@@ -1257,7 +1254,7 @@ async fn run() {
                             }
                             // Replayed key or a manual refund already in
                             // flight: suppressed, no second money event.
-                            Ok(_) | Err(telegram_agent::db::RefundCreateError::InFlight) => {}
+                            Ok(_) | Err(daybook::db::RefundCreateError::InFlight) => {}
                             Err(e) => tracing::warn!(
                                 "invoice {}: auto-refund could not be queued: {:?}",
                                 inv_id,

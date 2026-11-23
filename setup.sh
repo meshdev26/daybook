@@ -65,7 +65,7 @@ if command -v cargo >/dev/null 2>&1; then
   BUILD="${BUILD:-Y}"
   if [[ "$BUILD" =~ ^[Yy]$ ]]; then
     cargo build --release
-    echo "Build complete: ./target/release/telegram-agent"
+    echo "Build complete: ./target/release/daybook"
   fi
 fi
 
@@ -79,4 +79,4 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-echo "Done. Run ./target/release/telegram-agent or 'docker compose up -d'."
+echo "Done. Run ./target/release/daybook or 'docker compose up -d'."
