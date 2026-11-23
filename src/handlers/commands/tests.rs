@@ -463,3 +463,244 @@ fn parse_closeticket() {
     let c = Command::parse("/closeticket 7", "bot").unwrap();
     assert!(matches!(c, Command::CloseTicket(_)));
 }
+
+// ---- /books alias: same parsed command, same handler path as /bookings ----
+
+#[test]
+fn books_alias_resolves_to_bookings() {
+    let alias = Command::parse("/books", "bot").expect("/books must parse");
+    let canonical = Command::parse("/bookings", "bot").expect("/bookings must parse");
+    assert_eq!(alias, Command::Bookings);
+    assert_eq!(canonical, Command::Bookings);
+    assert_eq!(
+        alias, canonical,
+        "both spellings must take the exact same handler path"
+    );
+}
+
+// ---- WEB_URL gate: dashboard setup never DMs a password ----
+
+static WEB_URL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Save/restore WEB_URL even when a test panics. Only the tests in this module
+/// take `WEB_URL_ENV_LOCK`; the value used below is plain http so
+/// `auth::secure_cookies()` stays false for unrelated parallel tests.
+struct WebUrlEnvGuard(Option<String>);
+
+impl WebUrlEnvGuard {
+    fn set(value: Option<&str>) -> Self {
+        let previous = std::env::var("WEB_URL").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("WEB_URL", v) },
+            None => unsafe { std::env::remove_var("WEB_URL") },
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for WebUrlEnvGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => unsafe { std::env::set_var("WEB_URL", v) },
+            None => unsafe { std::env::remove_var("WEB_URL") },
+        }
+    }
+}
+
+fn cmd_test_db() -> (tempfile::TempDir, Arc<Db>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(Db::new(dir.path().join("cmd.db").to_str().unwrap()).unwrap());
+    (dir, db)
+}
+
+/// Drive the real `cmd_handler` against a wiremock Bot API and return the
+/// `text` of every outgoing sendMessage. No Telegram transport is touched.
+async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
+    use teloxide::dispatching::dialogue::{Dialogue, InMemStorage, Storage};
+    use teloxide::types::ChatId;
+
+    const USER: i64 = 42;
+    const OWNER: i64 = 999;
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 1,
+                    "date": 1_700_000_000,
+                    "chat": {"id": USER, "type": "private", "first_name": "T"},
+                    "text": "sent"
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let bot = teloxide::Bot::new("42:placeholder")
+        .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+    let cfg = chan_cfg();
+    let bot_ctx = Arc::new(crate::bots::BotContext {
+        id: 0,
+        key: "primary".to_string(),
+        bot: bot.clone(),
+        owner_id: OWNER,
+        shared: Arc::new(cfg.clone()),
+        db: db.clone(),
+    });
+    let bot_manager = Arc::new(crate::bots::BotManager {
+        bots: vec![bot_ctx.clone()],
+        primary: bot_ctx.clone(),
+        db: db.clone(),
+        identity: crate::identity::IdentityHandle::unconnected(),
+    });
+    let msg: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+        "message_id": 7,
+        "date": 1_700_000_000,
+        "chat": {"id": USER, "type": "private", "first_name": "T"},
+        "from": {"id": USER, "is_bot": false, "first_name": "T", "username": "seller42"},
+        "text": "/command"
+    }))
+    .expect("test Message must deserialize");
+    let dialogue = Dialogue::new(InMemStorage::<State>::new().erase(), ChatId(USER));
+
+    cmd_handler(
+        bot,
+        msg,
+        dialogue,
+        db,
+        cfg,
+        bot_ctx,
+        bot_manager,
+        OWNER,
+        None,
+        None,
+        Arc::new(CommandRegistry::new()),
+        cmd,
+    )
+    .await
+    .expect("command handler must succeed");
+
+    server
+        .received_requests()
+        .await
+        .expect("mock Bot API requests")
+        .iter()
+        .map(|req| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("sendMessage JSON");
+            body["text"].as_str().unwrap_or_default().to_string()
+        })
+        .collect()
+}
+
+/// `cmd_handler` is a very large async state machine; the production runtime
+/// uses a 16 MiB worker stack (main.rs). Test threads default to 2 MiB, so run
+/// handler-driving futures on a comparably sized stack.
+fn on_large_stack<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("cmd_test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(future)
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread must not panic")
+}
+
+#[test]
+fn web_url_gate_is_pure_and_fail_closed() {
+    assert_eq!(dashboard_setup_blocked(None), Some(WEB_URL_REQUIRED_MSG));
+    assert_eq!(
+        dashboard_setup_blocked(Some("")),
+        Some(WEB_URL_REQUIRED_MSG)
+    );
+    assert_eq!(
+        dashboard_setup_blocked(Some("   ")),
+        Some(WEB_URL_REQUIRED_MSG)
+    );
+    // An explicitly configured base proceeds; the bot never invents one.
+    assert_eq!(dashboard_setup_blocked(Some("http://127.0.0.1:8080")), None);
+    let msg = dashboard_setup_blocked(None).expect("must refuse when WEB_URL unset");
+    assert!(msg.contains("WEB_URL"), "{msg}");
+    assert!(msg.contains("owner"), "{msg}");
+    assert!(!msg.to_lowercase().contains("password"), "{msg}");
+}
+
+#[test]
+fn no_plaintext_password_dm_when_web_url_unset() {
+    let _lock = WEB_URL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = WebUrlEnvGuard::set(None);
+
+    on_large_stack(async {
+        for cmd in [Command::BecomeSeller, Command::Dashboard] {
+            let (_dir, db) = cmd_test_db();
+            db.upsert_seller(42, Some("seller42"), None);
+            let texts = run_cmd_with_mock_bot(cmd.clone(), db.clone()).await;
+
+            assert_eq!(texts.len(), 1, "only the refusal may be sent: {texts:?}");
+            assert_eq!(texts[0], WEB_URL_REQUIRED_MSG, "{cmd:?}");
+            for text in &texts {
+                let lower = text.to_lowercase();
+                assert!(!lower.contains("password"), "no password in DM: {text}");
+                assert!(!lower.contains("secret"), "no secret in DM: {text}");
+                assert!(
+                    !text.contains("http"),
+                    "no claim/URL material in DM: {text}"
+                );
+            }
+            assert!(
+                db.get_web_account_by_username("seller42").is_none(),
+                "no account (and therefore no password) may be created when WEB_URL is unset: {cmd:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn claim_link_still_issued_when_web_url_set() {
+    let _lock = WEB_URL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = WebUrlEnvGuard::set(Some("http://127.0.0.1:8080"));
+
+    on_large_stack(async {
+        let (_dir, db) = cmd_test_db();
+        let texts = run_cmd_with_mock_bot(Command::BecomeSeller, db.clone()).await;
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].contains("http://127.0.0.1:8080/setup/claim?token="),
+            "one-time claim link must be issued: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[0].to_lowercase().contains("password:"),
+            "claim DM must not carry a password: {}",
+            texts[0]
+        );
+        assert!(db.get_web_account_by_username("seller42").is_some());
+
+        // The same account's /dashboard path also mints a fresh one-time link.
+        db.upsert_seller(42, Some("seller42"), None);
+        let dashboard_texts = run_cmd_with_mock_bot(Command::Dashboard, db).await;
+        assert_eq!(dashboard_texts.len(), 1, "{dashboard_texts:?}");
+        assert!(
+            dashboard_texts[0].contains("http://127.0.0.1:8080/setup/claim?token="),
+            "{}",
+            dashboard_texts[0]
+        );
+        assert!(
+            !dashboard_texts[0].to_lowercase().contains("password:"),
+            "{}",
+            dashboard_texts[0]
+        );
+    });
+}

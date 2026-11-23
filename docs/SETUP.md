@@ -13,7 +13,7 @@ Chat with @userinfobot to get your numeric user ID.
 cp .env.example .env
 # edit .env
 ```
-Set `TELEGRAM_BOT_TOKEN` and `OWNER_ID`. Optionally `DEFAULT_CHANNEL` and `CRYPTO_PAY_TOKEN`. `MFA_RECOVERY_CODES_ENABLED` defaults to on; `0`, `false`, `no` or `off` disables MFA recovery codes while TOTP sign-in continues to work.
+Set `TELEGRAM_BOT_TOKEN` and `OWNER_ID`. Set `WEB_URL` to a seller-reachable dashboard URL (e.g. `https://shop.example.com`): it is required for `/becomeseller` and `/dashboard` to create accounts and send one-time claim links. With `WEB_URL` unset those commands refuse setup — no account or password is created. Do not use a loopback URL: `127.0.0.1` in a Telegram DM resolves on the recipient's machine, not the bot host. Optionally `DEFAULT_CHANNEL` and `CRYPTO_PAY_TOKEN`. `MFA_RECOVERY_CODES_ENABLED` defaults to on; `0`, `false`, `no` or `off` disables MFA recovery codes while TOTP sign-in continues to work.
 
 To store secrets in the web console (currently the Crypto Pay token), also set `MASTER_KEY` to 32 bytes of key material, encoded as either 64 hexadecimal characters or standard base64 (e.g. generate with `openssl rand -hex 32`). A set-but-invalid key aborts startup. Without `MASTER_KEY`, secret writes are refused with an explicit console error; existing plaintext tokens remain readable but should be re-saved once to encrypt them at rest. Keep a backup of the key offline: changing it makes previously encrypted secrets unreadable.
 

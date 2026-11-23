@@ -9,7 +9,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - **Owner**: admin commands + `/addadmin`, `/removeadmin`, `/admins`, `/webusers`.
 
 ## Web dashboard
-- `/dashboard` — DM a one-time dashboard sign-in link (valid 15 minutes; opening it lets you set a password and signs you in). Creates the account if missing. Legacy plaintext fallback only when `WEB_URL` is unset.
+- `/dashboard` — DM a one-time dashboard sign-in link (valid 15 minutes; opening it lets you set a password and signs you in). Creates the account if missing. Requires `WEB_URL`: when it is unset the bot refuses setup, creates no account and discloses no password.
 - `/setwebpassword <new>` — change web dashboard password.
 
 ## General
@@ -54,7 +54,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/cancelbooking <booking_id>` — cancel one of your own bookings (held or confirmed); the seller is DM'd and the slot is freed. Accepts the token id, the integer id or `#id`. (public)
 - `/serviceadd name | price | asset | duration_minutes [| channel]` — add a bookable service (seller).
 - `/slotadd service | datetime [| capacity]` — add a slot for one of your services (seller). Datetime must be a future UTC time in RFC3339 or `YYYY-MM-DD HH:MM` form; anything else (or a past time) is rejected. `capacity` is accepted for CLI stability but clamped to 1 — one slot holds exactly one booking.
-- `/bookings` — list bookings (seller: own; admin/owner: all). Buyers get pointed at `/mybookings`.
+- `/bookings` (alias `/books`) — list bookings (seller: own; admin/owner: all). Both spellings run the same handler. Buyers get pointed at `/mybookings`.
 - `/bookingconfirm <booking_id>` — confirm a booking (seller; admin/owner are pointed at the web console `/bookings` page instead). The buyer is DM'd; an expired hold can still be confirmed while the slot is free — if it was re-taken, the confirm fails with "the slot is already taken."
 - `/bookingdecline <booking_id>` — decline a booking (seller; admin/owner via the console). The buyer is DM'd and the slot is freed.
 
@@ -74,7 +74,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 
 ## Bot
 - `/setupbot` — configure bot profile/commands. Sets the bot description to: "Telegram shop: digital products, channel memberships, codes and bookings. Browse /shop — buy with /buy."
-- `/becomeseller` — onboard as a seller (creates web dashboard account); DMs a one-time 15-minute setup link instead of a password. Legacy plaintext-password DM only when `WEB_URL` is unset.
+- `/becomeseller` — onboard as a seller; when `WEB_URL` is set, creates a web dashboard account and DMs a one-time 15-minute setup link instead of a password. With `WEB_URL` unset it refuses setup and creates no account or password.
 
 ## Admin (owner-only)
 - `/addadmin <user_id> [username]` — add platform admin.

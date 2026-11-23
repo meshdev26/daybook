@@ -32,7 +32,7 @@ pub use crate::services::broadcast::filter_broadcast_users;
 /// gate (coordinator decision; the spec copy quotes the same number).
 const MCP_TOKEN_CAP: usize = 10;
 
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug, PartialEq, Eq)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
     /// Show help.
@@ -137,6 +137,7 @@ pub enum Command {
     /// Book a service: /book service_name
     Book(String),
     /// List bookings. /bookings
+    #[command(aliases = ["books"])]
     Bookings,
     /// Your bookings: /mybookings
     MyBookings,
@@ -3642,6 +3643,16 @@ pub async fn cmd_handler(
             }
         }
         Command::BecomeSeller => {
+            // Fail closed before ANY account work: without an explicitly
+            // configured WEB_URL the only fallback would be to DM a password.
+            // A loopback default is not safe for claim links (127.0.0.1 in a
+            // Telegram DM points at the recipient's machine), so WEB_URL must
+            // be set by the owner. See `dashboard_setup_blocked`.
+            if let Some(msg) = dashboard_setup_blocked(web_base_url().as_deref()) {
+                warn_dashboard_setup_refused("/becomeseller", user_id, "WEB_URL unset");
+                bot.send_message(chat_id, msg).await?;
+                return Ok(());
+            }
             let uname = msg.from.as_ref().and_then(|u| u.username.clone());
             db.upsert_seller(user_id, uname.as_deref(), None);
             // provision web dashboard account if missing
@@ -3650,8 +3661,8 @@ pub async fn cmd_handler(
                 .unwrap_or_else(|| format!("seller_{}", user_id));
             if db.get_web_account_by_username(&username).is_none() {
                 // The placeholder password is written to the account row but
-                // never displayed when setup links are available (D7): the DM
-                // carries only the one-time claim link.
+                // never displayed: the DM carries only the one-time claim
+                // link.
                 let password = util::gen_token(12);
                 if let Err(e) = db
                     .create_web_account(&username, &password, "seller", Some(user_id))
@@ -3673,17 +3684,15 @@ pub async fn cmd_handler(
                         )).await?;
                         return Ok(());
                     }
-                    // WEB_URL unset: the legacy plaintext fallback, with the
-                    // one-line operator hint (and a warn — the token-less link
-                    // flow is the intended posture). The raw setup token is
-                    // never logged; here none was minted.
-                    tracing::warn!(
-                        "WEB_URL is not set: /becomeseller DM-ed a plaintext dashboard password to account '{username}'; set WEB_URL to receive secure setup links instead of passwords."
+                    // Defensive: the gate above guarantees WEB_URL is set, so
+                    // this is unreachable in practice. Never degrade to a
+                    // password DM if link minting unexpectedly fails.
+                    warn_dashboard_setup_refused(
+                        "/becomeseller",
+                        user_id,
+                        "claim link unavailable",
                     );
-                    let url = cfg.web_url();
-                    bot.send_message(chat_id, format!(
-                        "You are now a seller. Use /setup @channel to link your channel.\n\nWeb dashboard login:\nURL: {url}\nUsername: {username}\nPassword: {password}\nChange with /setwebpassword.\n\nSet WEB_URL to receive secure setup links instead of passwords."
-                    )).await?;
+                    bot.send_message(chat_id, WEB_URL_REQUIRED_MSG).await?;
                     return Ok(());
                 }
             }
@@ -3811,6 +3820,13 @@ pub async fn cmd_handler(
             }
         }
         Command::Dashboard => {
+            // Same fail-closed gate as /becomeseller: no account creation and
+            // no credential disclosure when WEB_URL is unset.
+            if let Some(msg) = dashboard_setup_blocked(web_base_url().as_deref()) {
+                warn_dashboard_setup_refused("/dashboard", user_id, "WEB_URL unset");
+                bot.send_message(chat_id, msg).await?;
+                return Ok(());
+            }
             let uname = msg
                 .from
                 .as_ref()
@@ -3826,17 +3842,14 @@ pub async fn cmd_handler(
                             crate::db::SETUP_LINK_TTL_MINUTES
                         )).await?;
                     } else {
-                        tracing::warn!(
-                            "WEB_URL is not set: /dashboard could not mint a setup link for account '{uname}'; set WEB_URL to receive secure setup links instead of passwords."
+                        // Gate above guarantees WEB_URL is set; never fall
+                        // back to a credential-bearing message.
+                        warn_dashboard_setup_refused(
+                            "/dashboard",
+                            user_id,
+                            "claim link unavailable",
                         );
-                        let url = cfg.web_url();
-                        bot.send_message(
-                            chat_id,
-                            format!(
-                                "Web dashboard: {url}\nUsername: {uname}\n(Use /setwebpassword to change password.)\n\nSet WEB_URL to receive secure setup links instead of passwords."
-                            ),
-                        )
-                        .await?;
+                        bot.send_message(chat_id, WEB_URL_REQUIRED_MSG).await?;
                     }
                 }
                 None => {
@@ -3855,13 +3868,12 @@ pub async fn cmd_handler(
                                     crate::db::SETUP_LINK_TTL_MINUTES
                                 )).await?;
                             } else {
-                                tracing::warn!(
-                                    "WEB_URL is not set: /dashboard DM-ed a plaintext dashboard password to account '{uname}'; set WEB_URL to receive secure setup links instead of passwords."
+                                warn_dashboard_setup_refused(
+                                    "/dashboard",
+                                    user_id,
+                                    "claim link unavailable",
                                 );
-                                let url = cfg.web_url();
-                                bot.send_message(chat_id, format!(
-                                    "Web dashboard created.\nURL: {url}\nUsername: {uname}\nPassword: {password}\n\nSet WEB_URL to receive secure setup links instead of passwords."
-                                )).await?;
+                                bot.send_message(chat_id, WEB_URL_REQUIRED_MSG).await?;
                             }
                         }
                         Err(e) => {
@@ -4311,10 +4323,39 @@ fn rfc3339_date(s: &str) -> String {
         .unwrap_or_else(|_| "—".to_string())
 }
 
+/// User-facing refusal when WEB_URL is unset. This is the ONLY message the
+/// bot is allowed to send in that case: no account is created and no password
+/// is generated or disclosed. The owner fixes this by setting WEB_URL.
+const WEB_URL_REQUIRED_MSG: &str =
+    "Dashboard account setup is unavailable. Ask the owner to set WEB_URL, then try again.";
+
+/// Fail-closed gate shared by `/becomeseller` and `/dashboard`. `Some(msg)`
+/// means setup is refused and `msg` is the only outgoing message; `None`
+/// means WEB_URL is configured and the claim-link path proceeds unchanged.
+/// Pure so the decision is directly testable without touching process env.
+fn dashboard_setup_blocked(web_url: Option<&str>) -> Option<&'static str> {
+    match web_url {
+        Some(u) if !u.trim().is_empty() => None,
+        _ => Some(WEB_URL_REQUIRED_MSG),
+    }
+}
+
+/// Operator warning for the refusal path. Names the command, caller and a
+/// static reason only; no credential or token is ever logged.
+fn warn_dashboard_setup_refused(command: &str, user_id: i64, reason: &str) {
+    tracing::warn!(
+        command = command,
+        user_id = user_id,
+        reason = reason,
+        "refusing dashboard account setup; no password created or sent"
+    );
+}
+
 /// The console base URL for one-time setup links (D7) — `Some` only when
 /// WEB_URL is explicitly configured (same check `Config::web_url` applies).
-/// Without it the bot would DM a localhost link no seller can reach, so the
-/// legacy plaintext-password DM stays the fallback until WEB_URL is set.
+/// Without it dashboard setup is refused: a loopback default would put
+/// 127.0.0.1 in a Telegram DM (the recipient's machine, not the bot host), and
+/// there is deliberately no password fallback. WEB_URL must be explicit.
 /// The raw setup token is NEVER logged — only the caller builds the URL.
 fn web_base_url() -> Option<String> {
     match std::env::var("WEB_URL") {
@@ -4324,9 +4365,10 @@ fn web_base_url() -> Option<String> {
 }
 
 /// Mint a one-time setup link for `account_id` and return the full claim URL
-/// (`{web_base}/setup/claim?token={raw}`); `None` when WEB_URL is unset —
-/// the caller falls back to the legacy password DM. The raw token exists
-/// only inside the returned string (and the DM).
+/// (`{web_base}/setup/claim?token={raw}`); `None` only when WEB_URL is unset.
+/// Callers gate on WEB_URL before reaching here, so a missing base means setup
+/// is refused — never a password DM. The raw token exists only inside the
+/// returned string (and the DM).
 fn setup_claim_url(db: &Db, account_id: i64) -> Option<String> {
     let base = web_base_url()?;
     let raw = db.create_setup_link(account_id);

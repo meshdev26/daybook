@@ -7,13 +7,14 @@
 ```bash
 git clone https://github.com/meshdev26/daybook.git && cd daybook
 cp .env.example .env
-# fill TELEGRAM_BOT_TOKEN, OWNER_ID; optional CRYPTO_PAY_TOKEN
+# fill TELEGRAM_BOT_TOKEN, OWNER_ID, WEB_URL; optional CRYPTO_PAY_TOKEN
 cargo build --release
 ./target/release/daybook
 ```
 
 - `TELEGRAM_BOT_TOKEN` — from @BotFather.
 - `OWNER_ID` — your Telegram user ID (@userinfobot).
+- `WEB_URL` — seller-reachable dashboard URL; required for `/becomeseller` and `/dashboard` (one-time claim links). Do not use `127.0.0.1`: in a Telegram DM it points at the recipient's machine.
 - `CRYPTO_PAY_TOKEN` — optional, from @CryptoBot → Crypto Pay.
 - `MFA_RECOVERY_CODES_ENABLED=0` — disables recovery codes; TOTP still works.
 

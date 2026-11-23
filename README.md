@@ -30,6 +30,11 @@ A self-hosted Telegram bot and web console for selling paid-channel access. The 
 - `/broadcast <text>` sends a message to a seller's customers (admin: all users).
 - Refunds and payouts are **approve-only from the bot**: `/refundapprove <id>` and `/payoutapprove <id>` approve a pending request; the bot never moves money. Transfers run from the web console Finance page or REST, where an ambiguous transfer outcome parks the payout/refund in an `executing` state for operator reconciliation.
 
+### Services & bookings
+- `/services` — list bookable services; `/book <service>` — request a slot.
+- `/mybookings` — your bookings; `/cancelbooking <id>` — cancel one.
+- `/bookings` (alias `/books`) — seller: own bookings; admin/owner: all.
+
 ### Channel management (multi-channel)
 - `/channels` — list known channels.
 - `/setchannel @chan|id` — set default target channel.
@@ -127,7 +132,7 @@ overrides — set at least one floor term before enabling it. Full guide:
 cargo build --release
 ./target/release/daybook
 ```
-Web dashboard: loopback by default (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`. For public access, put a reverse proxy with TLS in front — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (`WEB_BIND`, `WEB_URL`, `WEB_BASE_PATH`).
+Web dashboard: loopback by default (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`. Set `WEB_URL` to a seller-reachable URL so those commands can issue one-time claim links; with it unset they refuse setup and never DM a password. A loopback URL is not a usable default — `127.0.0.1` in a Telegram DM points at the recipient's machine. For public access, put a reverse proxy with TLS in front — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (`WEB_BIND`, `WEB_URL`, `WEB_BASE_PATH`).
 Web MFA issues 10 one-time recovery codes drawn from the BIP-39 English wordlist, bcrypt-hashed at rest and shown once. `MFA_RECOVERY_CODES_ENABLED` defaults to on; setting it to `0`, `false`, `no` or `off` rejects stored codes and removes the recovery UI and route. TOTP sign-in is unaffected, so disabling the feature without a working authenticator can lock an account out.
 
 ## MCP server (AI agents)
@@ -190,7 +195,7 @@ Alpha software; verify these on your own deployment before handling real value:
 - No independent multi-tenant penetration test has been run; seller isolation is self-reviewed only (pre-real-money checklist in issue #1).
 - The SQLite database file itself is not encrypted; filesystem permissions still matter. Sensitive config values are encrypted individually under `MASTER_KEY`, and legacy plaintext values keep working until re-saved. Changing or losing the key makes previously encrypted values unreadable.
 - The web dashboard relies on `SameSite=Strict` cookies for CSRF protection and emits no per-form CSRF tokens.
-- With `WEB_URL` unset (the default), `/becomeseller` and `/dashboard` send a plaintext dashboard password over Telegram; set `WEB_URL` to use one-time claim links.
+- Dashboard account setup requires `WEB_URL`: with it unset, `/becomeseller` and `/dashboard` refuse setup and never DM a password. Set a seller-reachable URL (not loopback) to enable one-time claim links.
 - The signed webhook path (signature, queueing, atomic claim, provider verification and exactly-once grant with replay protection) is covered by a deterministic local-mock integration test; the background granter's Telegram invite and DM side effects are not exercised by that test.
 - Revenue is reported per asset; mixed-asset responses carry a marker instead of a summed float. Never interpret a single money number across denominations.
 

@@ -143,6 +143,13 @@ and the setup & management UX polish
   bot deaf on high-latency routes. Pinned by a loopback black-hole test.
 
 ### Fixed
+- `/books` is an alias of `/bookings`: both spellings parse to the same
+  command and run the same handler.
+- `/becomeseller` and `/dashboard` no longer DM a plaintext dashboard
+  password. With `WEB_URL` unset they refuse setup, create no account, and
+  log only a secret-free warning; the one-time claim-link path with `WEB_URL`
+  set is unchanged. Operators must set a seller-reachable `WEB_URL` — a
+  loopback default is not usable for claim links, so none is injected.
 - Unauthorized bot commands no longer fall into a silent `return` — the bot
   answers with one short neutral line ("This account isn't authorized for
   management commands on this bot.") and leaks no role names; all role
