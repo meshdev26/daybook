@@ -8,12 +8,12 @@ agent; the pushes are human work (see the two-person rule at the bottom).
 
 Before any release, confirm in order:
 - [ ] Gates green (below), clean tree, version aligned (`0.N.0` ↔ milestone vN).
-- [ ] LICENSE holder named (`LICENSE`).
+- [x] LICENSE holder named (`LICENSE`).
 - [ ] Every item in `docs/LEGAL.md` reviewed and signed off by the owner;
       policy drafts in `docs/*_DRAFT.md` published or explicitly deferred.
 - [ ] Data-retention figures confirmed (`docs/RETENTION_DRAFT.md`).
-- [ ] Channel ready for the announcement (`docs/COMMUNITY.md`). Publishing and
-      channel posts are human T2 actions.
+- [x] Channel ready for the announcement (`docs/COMMUNITY.md`) — channel live,
+      v0.4.0 announcement posted. Publishing and channel posts are human T2 actions.
 
 ## Pre-release gates
 
@@ -43,7 +43,7 @@ cargo deny check                # licenses
 ## Version bump
 
 Cargo tracks the milestone (`docs/ARCHITECTURE-V1.4.md` §5, Trust pack):
-milestone vN ships as `0.N.0` — v1.4 → `0.4.0`. `0.x` means pre-1.0; minors
+milestone vN ships as `0.N.0` — v1.4 → `0.4.1-alpha`. `0.x` means pre-1.0; minors
 may break.
 
 1. Edit `version` in `Cargo.toml`.
@@ -63,8 +63,8 @@ may break.
    creates the GitHub release with generated notes:
 
    ```bash
-   git tag v0.4.0
-   git push origin v0.4.0        # HUMAN — external publish
+   git tag v0.4.1-alpha
+   git push origin v0.4.1-alpha  # HUMAN — external publish
    ```
 
 4. Artifact smoke: download the artifacts from the release, run one, `make

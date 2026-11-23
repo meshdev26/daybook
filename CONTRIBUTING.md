@@ -41,7 +41,7 @@ is deliberately outside `make test`, which stays Rust-only. The CI
 `client-check` job runs the same commands; it is a required status and must be
 green before merge.
 
-**Compliance posture:** Daybook is a free MIT library, not a hosted or sold service. The maintainer owes no Terms of Service, refund policy, or EAA statement; each self-hoster owns their instance's legal documents, with templates in `docs/TERMS_DRAFT.md`, `docs/PRIVACY_DRAFT.md`, `docs/REFUND_POLICY_DRAFT.md`, `docs/RETENTION_DRAFT.md`, and `docs/ACCESSIBILITY_DRAFT.md` (see `docs/LEGAL.md`). Contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
+**Compliance posture:** Daybook is a free MIT library, not a hosted or sold service. The maintainer owes no Terms of Service, refund policy, or EAA statement; each self-hoster owns their instance's legal documents, with templates in `docs/TERMS_DRAFT.md`, `docs/PRIVACY_DRAFT.md`, `docs/REFUND_POLICY_DRAFT.md`, `docs/RETENTION_DRAFT.md`, and `docs/ACCESSIBILITY_DRAFT.md` (see `docs/LEGAL.md`). Contributors should not add fee, AI-charging, or promotional money features while the safety guards in `docs/MONEY_SAFETY_SPEC.md` remain deferred.
 
 ## Finding your way around
 
@@ -57,7 +57,7 @@ green before merge.
    destructive; existing rows keep behaving).
 2. `Db` methods + unit tests (property tests for anything money-adjacent).
 3. Wire the surface: bot command (`handlers/commands.rs`), API
-   (`src/api.rs`), or web (`src/web.rs` — escape every dynamic value with
+   (`src/api.rs`), or web (`src/web/` — escape every dynamic value with
    `esc()`, every link via `state.url()`).
 4. Docs: `docs/COMMANDS.md` / `docs/API.md` + a decision-log line in
    `AGENT.md` if it changes a tradeoff.

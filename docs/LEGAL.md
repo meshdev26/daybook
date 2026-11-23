@@ -4,7 +4,7 @@ Daybook is a free, MIT-licensed library for people who work with Telegram. It
 is not sold as a service and the maintainer does not operate an instance or
 collect user data. Legal obligations fall to whoever self-hosts an instance.
 
-> **Alpha:** self-hosted and not independently audited; do not use with real customer money or live customer data without reviewing the code and testing isolation first (see [README.md](../README.md)).
+> **Alpha:** self-hosted and not independently audited; do not use with real customer money or live customer data without reviewing the code and testing isolation first (see [README.md](../README.md); gap checklist: https://github.com/meshdev26/daybook/issues/1).
 
 ## Maintainer obligations
 - [x] **LICENSE** — MIT, `Copyright (c) 2026 meshdev26`.

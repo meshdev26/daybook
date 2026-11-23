@@ -222,7 +222,7 @@ Protocol errors: unparseable body → HTTP 400 `-32700` (`id: null`); unknown/mi
 // initialize
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}
 ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
-   "serverInfo":{"name":"daybook","version":"0.1.0"}}}
+   "serverInfo":{"name":"daybook","version":"0.4.1-alpha"}}}
 
 // tools/call of a Sensitive tool: nothing executes, an approval is parked
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"gen_codes","arguments":{"count":3,"days":30}}}

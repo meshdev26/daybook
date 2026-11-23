@@ -1,4 +1,4 @@
-# Architecture — Telegram Business Platform
+# Architecture — Daybook
 
 Multi-tenant platform for sellers to run subscription businesses on Telegram:
 one Rust binary, three interfaces (bot + web + MCP), one SQLite database.
@@ -13,7 +13,7 @@ before your first change.
 ┌───────────────┐  ┌─────────────────┐  ┌────────────────────┐
 │  Telegram Bot │  │  Web Dashboard  │  │  MCP (AI agents)   │
 │  (teloxide)   │  │  (axum)         │  │  mcp/ (JSON-RPC)   │
-│  handlers/    │  │  web.rs + api.rs│  │  /api/v1/mcp       │
+│  handlers/    │  │  web/ + api.rs  │  │  /api/v1/mcp       │
 └───────┬───────┘  └────────┬────────┘  └─────────┬──────────┘
         │                   │                     │
         └───────────────────┴──────────┬──────────┘
@@ -50,14 +50,14 @@ Sensitive — see PLAN.md) and Sensitive tools never execute without an owner's
 | `src/mcp/` | MCP surface for AI agents — JSON-RPC, tool tiers, approval gate |
 | `src/ai/` | AI providers (OpenAI/Anthropic), cost, rate limits |
 | `src/handlers/` | bot commands, messages, callbacks |
-| `src/web.rs` | axum routes, auth, HTML |
+| `src/web/` | axum routes, auth, HTML |
 
 ## Request flow
 
 **Telegram:** update → `handlers/` dispatch → `roles::role_of()` gate →
 `dialogue.rs` state machine (wizards) → `Db` methods → reply / inline keyboard.
 
-**Web:** request → `web.rs` route → session cookie auth → `Db` methods →
+**Web:** request → `src/web/` route → session cookie auth → `Db` methods →
 server-rendered HTML (no SPA, no client-side state).
 
 **Payment:** `/buy` → invoice row → Crypto Pay → background job polls/verifies

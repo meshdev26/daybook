@@ -1,4 +1,4 @@
-# Product Plan — Telegram Business Platform
+# Product Plan — Daybook
 
 ## Vision
 A **general-purpose, multi-tenant Telegram business platform** that any seller,
@@ -10,7 +10,7 @@ from Telegram and a web dashboard, deployable anywhere.
 **Business types covered:** channel subscriptions/memberships ✅ · activation
 codes ✅ · one-time digital products (link/file/text, auto-delivered) ✅ ·
 physical products with order tracking ✅ · refunds/payouts with owner-approved
-Crypto Pay transfers ✅ · **bookings = the remaining type (v2)**.
+Crypto Pay transfers · **bookings shipped and closed end-to-end — see CHANGELOG.md**.
 
 **Platform:** single Rust binary (lib + bin) — desktop (.exe/.app/tar.gz,
 release CI for win/mac/linux x64+arm64), existing-server installer with
@@ -124,8 +124,8 @@ prepare alongside but should also land on a clean tree before Phase B begins.
 ## Next milestones
 
 ### Product roadmap (from product review, 2026-10-25 — adoption-ranked)
-1. **Front door (blocking):** push to GitHub + tag; README screenshots, 60-second
-   intro, demo. A product without a front door is a private project.
+1. **Front door done:** published on GitHub as the `v0.4.1-alpha` pre-release
+   (tag + artifacts); README screenshots, 60-second intro, demo.
 2. **Owner approvals in Telegram ✅ shipped (approve-only):** `/refundapprove`,
    `/payoutapprove` bot commands (owner/admin-gated) — money decisions belong
    where the owner lives, on their phone. Approval only: the transfer itself
@@ -247,10 +247,12 @@ prepare alongside but should also land on a clean tree before Phase B begins.
   split, connection pooling. Contracts pre-documented in the scale plan.
 
 ### Owner decisions (business, not code)
-1. Go-live with real transfers (owner approval required — small test amount first).
+> **Status:** alpha, not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
+
+1. Payout/refund execution stays a self-hosted operator decision with owner approval on the operator's own instance.
 2. Code-signing certificates (SmartScreen/Gatekeeper).
-3. Hosted/SaaS offering for non-technical sellers.
+3. No hosted/SaaS offering: Daybook is a free MIT library; operators own their instances (see `docs/LEGAL.md`).
 
 ## Success metrics (unchanged)
-- Time to first sale < 10 minutes · zero-config onboarding · 99.9% uptime
-  (hosted version).
+- Time to first sale < 10 minutes · zero-config onboarding · operators measure
+  uptime on instances they run themselves.

@@ -153,8 +153,8 @@ cargo deny check
   (typescript/jsdom) wired to `assets/app.js` via `tsconfig.json` (DOM lib);
   `make js-check` and required CI job `client-check` gate it. `make test` stays
   Rust-only; no Node/npm at runtime. No cross-project refs (§3).
-- Public Daybook updates channel deferred until release gates close; Telegram,
-  announcement-only, human T2 to create. Charter in `docs/COMMUNITY.md`.
+- Public Daybook updates channel is live at https://t.me/daybook26 — Telegram,
+  announcement-only, human T2 to post. Charter in `docs/COMMUNITY.md`.
 - Daybook is a free MIT library, not a hosted or sold service. The maintainer
   owes no ToS/refund/EAA; self-hosters own their legal docs (see `docs/LEGAL.md`,
   templates in `docs/*_DRAFT.md`).

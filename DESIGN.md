@@ -22,6 +22,7 @@ This design system is informed by two lenses:
 - **Empty states**: guide users when there's no data.
 
 ### Accessibility (WCAG 2.2 AA)
+- Floor precedence: the accessibility floor stated here governs; older dated specs retain their historical floor for context.
 - Contrast ratio ≥ 4.5:1 for text.
 - Keyboard navigable; visible focus rings.
 - Semantic HTML (headings, landmarks, labels).
@@ -45,7 +46,7 @@ This design system is informed by two lenses:
 ## 2. Design Leadership View
 
 ### Brand identity
-- **Name**: Telegram Business Platform.
+- **Name**: Daybook.
 - **Tone**: calm, confident, helpful — never loud.
 - **Voice**: clear, concise, human. Avoid jargon.
 
