@@ -195,6 +195,7 @@ see [docs/DEPLOY_PROFILES.md](docs/DEPLOY_PROFILES.md).
 
 ## Documentation
 See `docs/` and root MD files:
+- `QUICKSTART.md` — zero to a running bot in five minutes.
 - `CONTRIBUTING.md` — contributor guide: setup, rules, and how to propose a change.
 - `docs/COMMUNITY.md` — updates-channel decision, platform, and charter.
 - `docs/LEGAL.md` — legal posture (free library; operator responsibilities).

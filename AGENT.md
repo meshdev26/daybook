@@ -55,7 +55,7 @@ cargo deny check
 - Comments explain the non-obvious WHY (≤ 2 lines; `//!` ≤ 5; `///` = summary + contract), never WHAT or a restatement of the signature. Prefer a name over a comment; section headers only for real invariants.
 - No spec IDs, WCAG numbers, finding IDs, workflow labels, attack-scenario prose, specificity math, emoji, banners, TODO walls, or commented-out code in source comments — those live in `DESIGN.md`, specs, test names, or the commit message.
 - No drafts, templates with placeholders, or announcement text in the repository. Docs state facts, not meta-commentary about what is or isn't kept.
-- Verify before pushing: inspect `git status`, `git diff`, and the files you changed. Never publish unreviewed content.
+- Verify before pushing: inspect `git status`, `git diff`, and the files you changed. Never publish unreviewed content. The `.githooks/pre-push` hook enforces this locally; every push must pass it (activate with `git config core.hooksPath .githooks`).
 - CI skips Rust/JS jobs for docs-only changes; required checks still pass green.
 - Keep comments true: update or delete them in the same diff as the code they describe. Don't accept code you can't explain.
 

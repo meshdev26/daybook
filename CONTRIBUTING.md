@@ -11,6 +11,18 @@ cargo build          # Rust 1.99+/edition 2024 (rust-toolchain.toml pins it)
 make test            # the full gate suite
 ```
 
+## Pre-push guard
+
+The `.githooks/pre-push` hook enforces the verify-before-push rule from
+`AGENT.md` locally: a dirty tracked tree, banned comment tokens, DRAFT or
+ANNOUNCEMENT files, and whitespace errors all block the push. It is a fast
+guard, not CI; the full gates still run before merge. The hook is opt-in per
+clone because git config is never committed, so activate it once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## The rules that matter
 
 1. **Read before write** — never propose changes to code you haven't read.
