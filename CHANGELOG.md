@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 (see [`docs/RELEASING.md`](docs/RELEASING.md)).
 
+## [0.4.1-alpha]
+
+Alpha pre-release of the v1.4 milestone. Not independently audited; see the
+notice in `README.md` and the pre-real-money checklist in issue #1.
+
+### Changed
+- Published name is `daybook` across tags, Cargo metadata and release artifacts.
+- Recovery codes use the BIP-39 wordlist and respect `MFA_RECOVERY_CODES_ENABLED`.
+- Dashboard password DM fallback is documented honestly; set `WEB_URL` for one-time links.
+- MCP tools are fully enumerated: 38 across Read/Write/Sensitive tiers.
+- `cookie` upgraded to 0.18.3 (RUSTSEC-2026-0594).
+- Private vulnerability reporting enabled; promotion-blocking doc contradictions fixed.
+
 ## [Unreleased]
 
 The 2026-10-27 hardening wave plus the v1.4 milestone
