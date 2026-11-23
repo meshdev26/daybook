@@ -49,7 +49,7 @@ pub(super) async fn mfa_verify_page(
         "Authenticator code"
     };
     let body = format!(
-        r#"<h1>Verify MFA <span class="sub">enter your authenticator code</span></h1>
+        r#"<h1>Verify MFA <span class="sub">enter your current code</span></h1>
 <article class="panel">
 <form method="post" action="{}">
 <label>{code_label}<input type="text" name="code" required autocomplete="one-time-code"></label>

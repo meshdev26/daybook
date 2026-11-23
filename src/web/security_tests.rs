@@ -90,6 +90,38 @@ async fn settings_mfa_disable_requires_current_factor() {
 
 #[tokio::test]
 #[tracing::instrument(skip_all)]
+async fn settings_mfa_disable_with_totp_when_recovery_codes_disabled() {
+    let (state, _dir) = make_state_with_recovery_codes(false).await;
+    let db = state.db.clone();
+    let (acc_id, _u, _h, _r, _s) = db
+        .get_web_account_by_username("owner")
+        .expect("owner account exists");
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    db.enable_totp(acc_id, SECRET).unwrap();
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let now_ts = chrono::Utc::now().timestamp() as u64;
+    let valid = crate::util::totp_generate(SECRET, now_ts, 6usize, 30u64);
+    let resp = app
+        .oneshot(post_authed_req(
+            "/settings/mfa/disable",
+            &format!("code={valid}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("location").unwrap(),
+        "/settings?mfa=disabled"
+    );
+    assert!(
+        !db.get_totp_state(acc_id).1,
+        "TOTP must work without recovery codes"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
 async fn settings_mfa_recovery_requires_current_factor() {
     let (state, _dir) = make_state().await;
     let db = state.db.clone();

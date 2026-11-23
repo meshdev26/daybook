@@ -43,6 +43,7 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 pub fn gen_recovery_code() -> String {
     let words = bip39::Language::English.word_list();
     let mut buf = [0u8; 8];
+    // 2048 = 2^11, so the mask stays exactly uniform without rejection sampling.
     getrandom::fill(&mut buf).expect("OS entropy unavailable");
     let mut out = String::new();
     for i in 0..4usize {
