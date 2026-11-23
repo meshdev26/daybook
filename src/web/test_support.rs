@@ -58,13 +58,26 @@ pub async fn make_state_with_recovery_codes(enabled: bool) -> (WebState, TempDir
     (state, dir)
 }
 
+/// Append a valid CSRF token to a form body. Test helpers know the session
+/// credential, so they can derive the same token the middleware expects.
+pub fn with_csrf(body: &str, token: &str) -> String {
+    if body.is_empty() {
+        format!("csrf_token={token}")
+    } else if body.ends_with('&') {
+        format!("{body}csrf_token={token}")
+    } else {
+        format!("{body}&csrf_token={token}")
+    }
+}
+
 pub fn pending_post_req(uri: &str, body: &str, raw: &str) -> Request<Body> {
+    let body = with_csrf(body, &anonymous_csrf_token());
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("cookie", format!("mfa_pending={raw}"))
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -106,11 +119,12 @@ pub fn get_req(uri: &str) -> Request<Body> {
 }
 
 pub fn post_req(uri: &str, body: &str) -> Request<Body> {
+    let body = with_csrf(body, &anonymous_csrf_token());
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -123,12 +137,13 @@ pub fn authed_req(uri: &str, token: &str) -> Request<Body> {
 }
 
 pub fn post_authed_req(uri: &str, body: &str, token: &str) -> Request<Body> {
+    let body = with_csrf(body, &csrf_token_for_session(token));
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("cookie", format!("session={}", token))
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap()
 }
 

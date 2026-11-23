@@ -27,6 +27,7 @@ and the setup & management UX polish
 (`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
+- Per-form CSRF tokens in the operator console: every rendered POST form carries a hidden token derived from the session credential, validated in constant time before any mutation; missing, wrong and cross-session tokens get a 403. `SameSite=Strict` stays enabled. REST API, MCP and webhook (bearer/HMAC-authenticated) are exempt.
 - At-rest secret encryption: `MASTER_KEY` (32 bytes as hex or base64) seals sensitive config values with AES-256-GCM into versioned `enc:v1:` envelopes. A set-but-invalid key aborts startup; without a key, secret writes are refused with a clear console error. Legacy plaintext values stay readable and migrate on re-save. Startup logs only whether encryption is active.
 - Deterministic webhook-to-grant integration test: signed webhook, atomic claim, provider stub verification, exactly-once subscription and replay protection, all against local mocks.
 - `MFA_RECOVERY_CODES_ENABLED` (default on): `0`, `false`, `no` or `off` rejects stored recovery codes, removes the recovery route and console UI, and leaves TOTP sign-in working. Stored codes stay in the database and revive if the flag is re-enabled.

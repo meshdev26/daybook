@@ -39,6 +39,7 @@ mod channels_rows;
 mod codes;
 mod common_pages;
 mod content;
+mod csrf;
 mod customers;
 mod dashboard;
 mod finance;
@@ -57,6 +58,8 @@ mod settings_tokens;
 mod subs;
 mod wizard;
 
+#[cfg(test)]
+mod csrf_tests;
 #[cfg(test)]
 mod identity_tests;
 #[cfg(test)]
@@ -88,6 +91,7 @@ use channels_rows::*;
 use codes::*;
 use common_pages::*;
 use content::*;
+use csrf::*;
 use customers::*;
 use dashboard::*;
 use finance::*;
@@ -184,6 +188,10 @@ pub struct Session {
     pub role: String,
     pub seller_id: Option<i64>,
     pub selected_bot_id: Option<i64>,
+    /// Per-session CSRF token, derived from the session credential in
+    /// `crate::auth::try_session`. Rendered into every POST form and checked
+    /// by the CSRF middleware before any state-changing handler runs.
+    pub csrf_token: String,
 }
 
 /// HTML-escapes a dynamic value before it is interpolated into an HTML body
@@ -229,8 +237,16 @@ pub fn router(state: WebState) -> Router {
         // this refreshes the process-wide snapshot before every request and
         // the shell reads it synchronously. See `IDENTITY_SNAPSHOT`.
         .layer(axum::middleware::from_fn_with_state(
-            state_for_layer,
+            state_for_layer.clone(),
             identity_status_refresh,
+        ))
+        // CSRF gate for every browser POST on the console router. Applied
+        // here (inside the web router, before api/mcp routers are merged in
+        // main.rs) so REST /api/v1/**, MCP and the webhook stay exempt: they
+        // are bearer/HMAC authenticated and never carry a session cookie.
+        .layer(axum::middleware::from_fn_with_state(
+            state_for_layer,
+            csrf_middleware,
         ))
 }
 

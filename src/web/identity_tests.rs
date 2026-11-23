@@ -162,12 +162,14 @@ fn identity_status_line_words_per_state() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let seller = Session {
         account_id: 2,
         role: "seller".to_string(),
         seller_id: Some(7),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let st = |state: crate::identity::IdentityState| crate::identity::IdentityStatus {
         state,

@@ -809,6 +809,7 @@ async fn effective_bot_resolution_covers_all_roles() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert_eq!(effective_bot(&state, &owner).key, "primary");
     // Owner, selection → that bot.
@@ -830,6 +831,7 @@ async fn effective_bot_resolution_covers_all_roles() {
         role: "seller".to_string(),
         seller_id: Some(42),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert_eq!(effective_bot(&state, &seller).key, "secondary");
     // Seller with no bot mapping → primary.
@@ -846,6 +848,7 @@ async fn effective_bot_resolution_covers_all_roles() {
         role: "admin".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert_eq!(effective_bot(&state, &admin).key, "primary");
 }

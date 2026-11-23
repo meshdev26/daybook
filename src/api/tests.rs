@@ -1965,7 +1965,10 @@ async fn crypto_form_uses_secret_setter() {
                 .uri("/crypto/setup")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("cookie", format!("session={token}"))
-                .body(Body::from("token=form-token-123"))
+                .body(Body::from(format!(
+                    "token=form-token-123&csrf_token={}",
+                    crate::auth::csrf_token_for_session(&token)
+                )))
                 .unwrap(),
         )
         .await

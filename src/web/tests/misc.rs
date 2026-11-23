@@ -173,7 +173,10 @@ async fn login_valid_sets_cookie_and_redirects() {
         .method("POST")
         .uri("/login")
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from("username=owner&password=secret"))
+        .body(Body::from(with_csrf(
+            "username=owner&password=secret",
+            &crate::auth::anonymous_csrf_token(),
+        )))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert!(resp.status().is_redirection());
@@ -189,7 +192,10 @@ async fn login_invalid_returns_error() {
         .method("POST")
         .uri("/login")
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from("username=owner&password=wrong"))
+        .body(Body::from(with_csrf(
+            "username=owner&password=wrong",
+            &crate::auth::anonymous_csrf_token(),
+        )))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

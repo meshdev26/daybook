@@ -187,6 +187,7 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 - Sensitive config secrets (e.g. the Crypto Pay token saved in the console) are encrypted at rest with AES-256-GCM under `MASTER_KEY`; set it before saving secrets. Without it, secret writes are refused.
 - Validate payments via Crypto Pay API before granting access.
 - Expired access is revoked in-process by a 6h sweeper; the 30s loop verifies invoice payments. `/expirecheck` is a manual trigger.
+- Console POST forms carry a per-session CSRF token validated before any state change; `SameSite=Strict` cookies remain enabled.
 
 ## Known limitations
 
@@ -194,7 +195,7 @@ Alpha software; verify these on your own deployment before handling real value:
 
 - No independent multi-tenant penetration test has been run; seller isolation is self-reviewed only (pre-real-money checklist in issue #1).
 - The SQLite database file itself is not encrypted; filesystem permissions still matter. Sensitive config values are encrypted individually under `MASTER_KEY`, and legacy plaintext values keep working until re-saved. Changing or losing the key makes previously encrypted values unreadable.
-- The web dashboard relies on `SameSite=Strict` cookies for CSRF protection and emits no per-form CSRF tokens.
+- The web dashboard emits per-session CSRF tokens in every console POST form and validates them before mutation; `SameSite=Strict` is retained as defense in depth. Pre-session doors (login/setup/MFA) use an anonymous token plus `SameSite=Strict`; the REST API, MCP endpoint and webhook are bearer/HMAC-authenticated and exempt.
 - Dashboard account setup requires `WEB_URL`: with it unset, `/becomeseller` and `/dashboard` refuse setup and never DM a password. Set a seller-reachable URL (not loopback) to enable one-time claim links.
 - The signed webhook path (signature, queueing, atomic claim, provider verification and exactly-once grant with replay protection) is covered by a deterministic local-mock integration test; the background granter's Telegram invite and DM side effects are not exercised by that test.
 - Revenue is reported per asset; mixed-asset responses carry a marker instead of a summed float. Never interpret a single money number across denominations.

@@ -603,6 +603,7 @@ async fn finance_state_banners_scope_reconciliation_count_to_seller() {
         role: "seller".to_string(),
         seller_id: Some(7),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     // Assert on the count, not the blocking/advisory wording: a row without
     // an explicit reconciliation_since is treated as overdue, and both banner

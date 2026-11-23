@@ -1,5 +1,5 @@
 use super::tests::{
-    authed_req, body_string, make_state, owner_session, post_authed_req, seller_session,
+    authed_req, body_string, make_state, owner_session, post_authed_req, seller_session, with_csrf,
 };
 use super::*;
 use axum::body::Body;
@@ -12,11 +12,12 @@ fn get_req(uri: &str) -> Request<Body> {
 }
 
 fn post_req(uri: &str, body: &str) -> Request<Body> {
+    let body = with_csrf(body, &anonymous_csrf_token());
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -576,12 +577,14 @@ async fn channel_title_and_desc_are_tenant_scoped() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let admin = Session {
         account_id: 2,
         role: "admin".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert!(may_mutate_channel(&state, &owner, "@other"));
     assert!(may_mutate_channel(&state, &admin, "@other"));
@@ -593,6 +596,7 @@ async fn channel_title_and_desc_are_tenant_scoped() {
         role: "seller".to_string(),
         seller_id: Some(42),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert!(may_mutate_channel(&state, &seller42, "@MINE"));
     assert!(may_mutate_channel(&state, &seller42, "mine"));
@@ -606,6 +610,7 @@ async fn channel_title_and_desc_are_tenant_scoped() {
         role: "seller".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     assert!(!may_mutate_channel(&state, &profileless, "@mine"));
     assert!(!may_mutate_post(&state, &seller42, Some(999_999)));

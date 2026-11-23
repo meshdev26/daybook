@@ -126,6 +126,7 @@ async fn nav_role_visibility_owner() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
     // owner sees all incl. Settings in utilities
@@ -168,6 +169,7 @@ async fn nav_role_visibility_seller() {
         role: "seller".to_string(),
         seller_id: Some(42),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
     // seller sees finance, api keys, abandoned carts and the Blocked words
@@ -218,6 +220,7 @@ async fn nav_role_visibility_admin() {
         role: "admin".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
     // Admin outranks Seller: same non-owner tier, including Blocked words.
@@ -279,6 +282,7 @@ async fn nav_role_visibility_buyer() {
         role: "user".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
     let expected = [
@@ -342,6 +346,7 @@ async fn nav_markup_basics() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Dashboard", Some(&sess));
     // skip link is in html_page, not rail; check aria attrs
@@ -438,6 +443,7 @@ async fn product_scope_owner_has_type_facet_and_optgroups() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
     assert!(
@@ -500,6 +506,7 @@ async fn product_scope_seller_pinned_buyer_absent() {
         role: "seller".to_string(),
         seller_id: Some(42),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let seller_body = html_page(&state, Some(&seller), "Dashboard", "<p>x</p>");
     assert!(
@@ -525,6 +532,7 @@ async fn product_scope_seller_pinned_buyer_absent() {
         role: "user".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let buyer_body = html_page(&state, Some(&buyer), "Dashboard", "<p>x</p>");
     assert!(!buyer_body.contains("bot-scope"), "{buyer_body}");
@@ -540,6 +548,7 @@ async fn scope_control_375px_stacked_markup_and_css() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = html_page(&state, Some(&sess), "Dashboard", "<p>x</p>");
     // Two labeled selects + a full-width Switch: the markup a 375px stack
@@ -612,6 +621,7 @@ async fn moderation_nav_placement_and_active_state() {
         role: "owner".to_string(),
         seller_id: None,
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let body = rail_nav(&state, "Content policy", Some(&sess));
     let bots = body.find(">Bots</a>").unwrap();
@@ -664,6 +674,7 @@ async fn mobile_375px_nav_links_are_never_inert_or_hidden() {
         role: "seller".to_string(),
         seller_id: Some(41),
         selected_bot_id: None,
+        csrf_token: String::new(),
     };
     let nav = rail_nav(&state, "Dashboard", Some(&sess));
 

@@ -6,7 +6,75 @@
 
 use crate::web::{Session, WebState};
 use axum::http::HeaderMap;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Process-wide secret for CSRF token derivation. Filled once from the OS
+/// CSPRNG (the same `getrandom::fill` pattern login/MFA already use). The
+/// secret is never persisted or logged: tokens are derived from it and the
+/// session credential, so each session gets a distinct, unpredictable value
+/// without a database schema change (the DB is owned by another phase).
+static CSRF_SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+
+fn csrf_secret() -> &'static [u8; 32] {
+    CSRF_SECRET.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("OS CSPRNG failed while initializing CSRF secret");
+        key
+    })
+}
+
+/// HMAC-SHA256 over a fixed-size block, built directly on `sha2` (already a
+/// direct dependency) so no new crate is introduced. Used only for CSRF
+/// derivation.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha256::digest([ipad.as_slice(), data].concat());
+    let outer = Sha256::digest([opad.as_slice(), inner.as_slice()].concat());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer);
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The per-session CSRF token: HMAC(secret, `session=<raw cookie token>`).
+/// Stable for the lifetime of the session credential, different for every
+/// session, and unguessable without the server secret.
+pub fn csrf_token_for_session(session_token: &str) -> String {
+    hex(&hmac_sha256(
+        csrf_secret(),
+        format!("session={session_token}").as_bytes(),
+    ))
+}
+
+/// Token for browser forms rendered before a session exists (login, claim,
+/// setup, MFA challenge/enroll). No session credential is available there, so
+/// the value is derived from the process secret alone and is still an
+/// unpredictable secret to any cross-origin attacker. `SameSite=Strict`
+/// remains the primary defense on these doors.
+pub fn anonymous_csrf_token() -> String {
+    hex(&hmac_sha256(csrf_secret(), b"anonymous"))
+}
 
 /// Canonical key for the shared login failure bucket.
 ///
@@ -101,6 +169,7 @@ fn try_session(state: &WebState, token: &str) -> Option<Session> {
         role,
         seller_id,
         selected_bot_id,
+        csrf_token: csrf_token_for_session(token),
     })
 }
 

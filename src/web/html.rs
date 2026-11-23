@@ -1,4 +1,6 @@
-use super::{Session, WebState, capability_enabled, effective_bot};
+use super::{
+    Session, WebState, anonymous_csrf_token, capability_enabled, effective_bot, inject_csrf_fields,
+};
 use crate::roles::Role;
 use axum::{
     http::header,
@@ -103,7 +105,7 @@ pub(super) fn html_page(
         super::bot_scope_control(state, session),
         identity_line
     );
-    format!(
+    let page = format!(
         r##"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <link rel="preload" href="{base}/assets/fonts/IBMPlexSans-var.woff2" as="font" type="font/woff2" crossorigin>
@@ -130,7 +132,14 @@ pub(super) fn html_page(
         nav = rail_nav(state, title, session),
         unlock_banner = unlock_banner,
         identity_flash = identity_flash,
-    )
+    );
+    // One render wrapper covers every POST form in the shell, including the
+    // product-scope form in the rail. An empty token (render-only tests that
+    // hand-build a Session) leaves the page untouched.
+    let csrf = session
+        .and_then(|s| (!s.csrf_token.is_empty()).then_some(s.csrf_token.as_str()))
+        .unwrap_or_default();
+    inject_csrf_fields(&page, csrf)
 }
 
 pub(super) fn html_page_bare(base: &str, title: &str, body: &str) -> String {
@@ -143,7 +152,7 @@ pub(super) fn html_page_bare_panel(
     body: &str,
     panel_class: &str,
 ) -> String {
-    format!(
+    let page = format!(
         r#"<!DOCTYPE html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t} — Daybook</title>
 <link rel="stylesheet" href="{base}/assets/app.css">
 <script>(function(){{var s=localStorage.getItem('theme');var d=window.matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.setAttribute('data-theme',s||(d?'dark':'light'));}})();</script>
@@ -161,7 +170,10 @@ pub(super) fn html_page_bare_panel(
         b = body,
         plane = PLANE_SVG,
         panel_class = panel_class,
-    )
+    );
+    // Pre-session doors (login, claim, setup, MFA) have no session token;
+    // they carry the anonymous token instead, checked by the same middleware.
+    inject_csrf_fields(&page, &anonymous_csrf_token())
 }
 
 #[derive(Clone, Copy)]

@@ -18,6 +18,28 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use daybook::{api, config::Config, db::Db, util, web, web::WebState};
 use http_body_util::BodyExt;
+
+/// Console POSTs carry the per-form CSRF token. These tests walk the real
+/// web router, so pre-auth doors use the anonymous token and authenticated
+/// forms derive it from the session cookie.
+fn form_csrf(body: &str, token: &str) -> String {
+    if body.is_empty() {
+        format!("csrf_token={token}")
+    } else {
+        format!("{body}&csrf_token={token}")
+    }
+}
+
+fn session_csrf(cookie: &str) -> String {
+    let raw = cookie
+        .strip_prefix("session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .trim();
+    daybook::auth::csrf_token_for_session(raw)
+}
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
@@ -168,7 +190,10 @@ async fn login_and_enroll(app: axum::Router, db: &Db, base: &str) -> String {
                 .method("POST")
                 .uri(format!("{base}/login"))
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("username=owner&password=secret"))
+                .body(Body::from(form_csrf(
+                    "username=owner&password=secret",
+                    &daybook::auth::anonymous_csrf_token(),
+                )))
                 .unwrap(),
         )
         .await
@@ -248,7 +273,10 @@ async fn login_and_enroll(app: axum::Router, db: &Db, base: &str) -> String {
                 .uri(format!("{base}/mfa/enroll"))
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("cookie", pending_pair)
-                .body(Body::from(format!("code={code}")))
+                .body(Body::from(form_csrf(
+                    &format!("code={code}"),
+                    &daybook::auth::anonymous_csrf_token(),
+                )))
                 .unwrap(),
         )
         .await
@@ -386,6 +414,7 @@ async fn invalid_plan_redirects_to_base_plans() {
     // Session via the mandatory first-login MFA enrollment.
     let session = login_and_enroll(app.clone(), &db, BASE).await;
 
+    let csrf = session_csrf(&session);
     let resp = app
         .oneshot(
             Request::builder()
@@ -393,9 +422,10 @@ async fn invalid_plan_redirects_to_base_plans() {
                 .uri(format!("{BASE}/plan"))
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("cookie", session)
-                .body(Body::from(
+                .body(Body::from(form_csrf(
                     "name=bronze&price=10&asset=TON&duration_days=notanumber",
-                ))
+                    &csrf,
+                )))
                 .unwrap(),
         )
         .await
@@ -490,7 +520,10 @@ async fn every_redirect_stays_under_base() {
                 .method("POST")
                 .uri(format!("{BASE}/login"))
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("username=owner&password=secret"))
+                .body(Body::from(form_csrf(
+                    "username=owner&password=secret",
+                    &daybook::auth::anonymous_csrf_token(),
+                )))
                 .unwrap(),
         )
         .await

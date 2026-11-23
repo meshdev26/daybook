@@ -30,8 +30,11 @@
 - No secrets in code or logs.
 
 ## CSRF
-- Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future security requirement demands token-based CSRF, implement hidden-field tokens in all POST forms.
-- All POST forms are cookie-authenticated; SameSite=Strict prevents cross-site submission in modern browsers.
+- The console emits a per-session CSRF token in every rendered POST form as a hidden `csrf_token` field. The token is derived in `crate::auth::try_session` as HMAC-SHA256(process OS-random secret, session credential) and is stored on the `Session` alongside `seller_id`/`role`. Each session gets a distinct, unpredictable value without a database schema change.
+- A single router-level gate (`src/web/csrf.rs`) validates the submitted field against the session token with constant-time comparison on every POST reaching the console router, before any handler mutates state. A missing, wrong, or cross-session token returns a terse 403 page with no side effects. Hidden fields are injected by one render wrapper in `html_page` / `html_page_bare_panel`, so no form is missed.
+- Pre-session browser doors (login, claim, setup, MFA challenge/enroll) have no session credential; their forms carry an anonymous token derived from the same process secret and validated by the same gate. They remain primarily protected by `SameSite=Strict`.
+- `SameSite=Strict` on the session cookie is retained as defense in depth.
+- Exempt from CSRF tokens: REST API under `/api/v1/**`, the MCP endpoint, and the Crypto Pay webhook. They are bearer- or HMAC-authenticated machine endpoints, are merged outside the web router, and are not cookie-authenticated forms. Bearer requests to the web router are also skipped by the gate.
 
 ## Secrets at rest (implemented)
 - Sensitive config keys (currently `crypto_token`) are sealed with AES-256-GCM before they are written to the SQLite `config` table. `MASTER_KEY` is a 32-byte key supplied as 64 hex characters or standard base64; a set-but-invalid value aborts startup with a clear error.
