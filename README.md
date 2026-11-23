@@ -48,7 +48,7 @@ A self-hosted Telegram bot and web console for selling paid-channel access. The 
 - `/grant user_id | days` — manual access grant.
 - `/revoke user_id` — revoke access (kick).
 - `/subs` — list subscriptions.
-- `/expirecheck` — manual trigger only; expired access is revoked automatically by the in-process 30s loop and 6h sweeper.
+- `/expirecheck` — manual trigger only; expired access is revoked automatically by the in-process 6h sweeper.
 
 ### Activation codes
 - `/gencodes plan | count | [days]` — generate codes.
@@ -180,7 +180,7 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 - Owner/admin gating via `OWNER_ID` + admins table.
 - Never commit `.env`.
 - Validate payments via Crypto Pay API before granting access.
-- Expired access is revoked in-process by a 30s grant loop and a 6h expiry sweeper; `/expirecheck` is a manual trigger.
+- Expired access is revoked in-process by a 6h sweeper; the 30s loop verifies invoice payments. `/expirecheck` is a manual trigger.
 
 ## Deployment
 - Any Linux VPS/home server/Raspberry Pi.

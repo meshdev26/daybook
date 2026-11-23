@@ -45,7 +45,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/grant user_id | days` — manual grant.
 - `/revoke user_id` — revoke access.
 - `/subs` — list subscriptions.
-- `/expirecheck` — manual trigger to revoke expired subscriptions; expiry is handled automatically by the in-process 30s loop and 6h sweeper.
+- `/expirecheck` — manual trigger to revoke expired subscriptions; expiry is handled automatically by the in-process 6h sweeper (the 30s loop verifies invoice payments).
 
 ## Services & bookings
 - `/services` — buyers: the public bookable catalogue, one line per service (name, duration, price, `— by @seller`; the legacy seller-0 global namespace is excluded). Sellers/admins keep the management view.

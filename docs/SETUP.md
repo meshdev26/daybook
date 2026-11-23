@@ -36,4 +36,4 @@ cargo build --release
 3. Create plans and sell.
 
 ## 8. Periodic expiry
-Expiry is automatic: the in-process 30s grant loop and 6h sweeper revoke expired access. `/expirecheck` is available as a manual trigger only; no cron is required.
+Expiry is automatic: the in-process 6h sweeper revokes expired access (the 30s loop verifies invoice payments). `/expirecheck` is available as a manual trigger only; no cron is required.
