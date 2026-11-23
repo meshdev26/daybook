@@ -10,6 +10,15 @@
 - Seller commands: channel/plan/product/code/booking/crypto/AI surfaces and `/mcptoken`; each scoped to the caller's own data (admins see all).
 - Admin commands: require `is_admin`.
 
+## Multi-tenant isolation
+- Every business row carries `seller_id`; all reads and writes go through `Db` methods.
+- Owner/admin are the global privileged tier; sellers see only their own rows. A forged `seller_id` in a request is rejected 403.
+- Bot scoping: `sellers.bot_id` picks the seller's bot (NULL falls back to the primary); web and REST handlers resolve it through `effective_bot`.
+- MCP per-seller tokens map to `Principal { role: Seller, seller_id: Some(seller_id) }`, scoped to that seller's data.
+- Sessions carry `seller_id`; a seller cannot switch bots from the console (the bot is pinned server-side and shown as a label).
+- Role and tenant gates live in handlers and `Db`, not just in navigation.
+- Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
+
 ## Payments
 - Always verify payment via Crypto Pay API before granting access.
 - Never trust client-side payment claims.
