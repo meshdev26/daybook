@@ -63,9 +63,10 @@ pub use handlers::capabilities::web_app as web_app_capability;
 //   * src/main.rs (binary) builds the shop command/dialogue tree from
 //     handlers::commands / messages / callbacks unconditionally and needs
 //     teloxide's sqlite-storage feature for every dispatcher.
-// The capability modules re-exported above are stub `Descriptor` constants
-// with no dependency of their own, and every crate-root module below is
-// shared infrastructure. Gating any of them requires edits to web (web/api/
+// The capability modules re-exported above are `Descriptor` constants plus
+// the scoped command router, with no dependency of their own; every
+// crate-root module below is shared infrastructure. Gating any of them
+// requires edits to web (web/api/
 // auth/embed) and server (handlers core, main.rs) files — out of core territory.
 // Until those areas gate their modules there is no safe `#[cfg(feature=...)]`
 // addition here and no safe `optional = true` / `dep:` mapping in Cargo.toml;

@@ -1,12 +1,14 @@
 //! Public Web app surface — compiled only with the `web_app` feature.
-//! Non-bot surface; an inbound Telegram update bound to this type is refused
-//! explicitly rather than silently routed to the shop tree.
+//!
+//! The non-bot console already exists; a bot of this type issues its one-time
+//! dashboard claim links through the shipped `/dashboard` and `/becomeseller`
+//! commands, narrowed by [`super::ScopedCommands::WebApp`].
 
-use super::{Descriptor, InboundHandler};
+use super::{Descriptor, InboundHandler, ScopedCommands};
 
 pub const DESCRIPTOR: Descriptor = Descriptor {
     bot_type: "web_app",
     feature: "web_app",
     label: "Public Web app",
-    inbound: InboundHandler::VerticalStub,
+    inbound: InboundHandler::Scoped(ScopedCommands::WebApp),
 };

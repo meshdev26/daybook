@@ -1418,19 +1418,28 @@ async fn run() {
     let registry = Arc::new(registry);
     let registry_for_commands = registry.clone();
 
+    // Shared dependencies for live scoped verticals. The receiving bot's
+    // context is injected per dispatcher by dptree, never captured here.
+    let scoped_dispatch = handlers::capabilities::ScopedDispatch {
+        db: db_cmd.clone(),
+        cfg: cfg_cmd.clone(),
+        bot_manager: bot_manager.clone(),
+        crypto: crypto_cmd.clone(),
+        ai: ai_cmd.clone(),
+        registry: registry.clone(),
+    };
+
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
-                // Multibot capability gate (server). The receiving bot's `bot_type`
-                // selects its command set / inbound handler. Only `shop_bot`
-                // (the default) falls through to the unchanged built-in tree
-                // below, so the default build's paths stay byte-identical.
-                // Every other type is intercepted here: an uncompiled or
-                // unknown type gets an explicit, logged refusal; a compiled
-                // vertical stub gets an explicit notice. Never a silent drop.
+                // Multibot capability gate (server). The receiving bot's
+                // `bot_type` selects its inbound handler. Shop and the live
+                // scoped verticals fall through; compiled stubs, uncompiled
+                // and unknown types get an explicit, logged notice. Never a
+                // silent drop.
                 .branch(
                     dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
-                        !cap.is_legacy_shop()
+                        cap.refuses_inbound()
                     })
                     .endpoint(
                         |bot: Bot,
@@ -1535,6 +1544,47 @@ async fn run() {
                     ),
                 )
                 .enter_dialogue::<Message, ErasedStorage<State>, State>()
+                // Live scoped verticals use the same shipped handlers, but
+                // only their own command family. Everything else they receive
+                // ends at the scoped branch and never reaches shop-only code.
+                .branch(
+                    dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>| {
+                        cap.is_scoped()
+                    })
+                    .branch(
+                        dptree::entry()
+                            .filter_command::<handlers::commands::Command>()
+                            .filter(
+                                |cmd: handlers::commands::Command,
+                                 cap: Arc<handlers::capabilities::BotCapability>| {
+                                    cap.allows_command(&cmd)
+                                },
+                            )
+                            .endpoint(
+                                move |bot: Bot,
+                                      msg: Message,
+                                      dialogue: Dialogue<State, ErasedStorage<State>>,
+                                      cmd: handlers::commands::Command,
+                                      cap: Arc<handlers::capabilities::BotCapability>,
+                                      bot_ctx: Arc<bots::BotContext>| {
+                                    let deps = scoped_dispatch.clone();
+                                    async move {
+                                        handlers::capabilities::dispatch_scoped(
+                                            bot, msg, cmd, dialogue, &cap, &deps, bot_ctx,
+                                        )
+                                        .await
+                                    }
+                                },
+                            ),
+                    )
+                    .endpoint(
+                        |bot: Bot,
+                         msg: Message,
+                         cap: Arc<handlers::capabilities::BotCapability>| async move {
+                            handlers::capabilities::send_scoped_hint(&bot, &msg, &cap).await
+                        },
+                    ),
+                )
                 .branch(
                     dptree::case![State::Idle]
                         .branch(
@@ -1578,8 +1628,11 @@ async fn run() {
                         // (falls through otherwise), then role-gated like the
                         // built-ins before the handler runs.
                         .branch(
-                            dptree::filter(|reg: Arc<CommandRegistry>, msg: Message| {
-                                plugin_command_name(&msg, &reg).is_some()
+                            dptree::filter(|cap: Arc<handlers::capabilities::BotCapability>,
+                                           reg: Arc<CommandRegistry>,
+                                           msg: Message| {
+                                cap.allows_plugin_commands()
+                                    && plugin_command_name(&msg, &reg).is_some()
                             })
                             .endpoint(
                                 move |bot: Bot,

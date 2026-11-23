@@ -16,12 +16,12 @@ not create a separate console, login, or port.
 | Type | Plain-language name | What it is |
 |------|---------------------|------------|
 | `shop_bot` | Shop bots | The AI shop bot — subscriptions, products, payments (the existing default). |
-| `movie_bot` | Movie bots | Movie catalog bot (deferred — stub, notice only). |
-| `reply_bot` | Reply bots | Admin Reply Bot (deferred — stub, notice only). |
-| `web_app` | Web apps | Public Web app (a non-bot surface; deferred — stub, notice only). |
-| `service` | Services | AI service (deferred — stub, notice only). |
-| `file_share` | File sharing | File Share (deferred — stub, notice only). |
-| `automation` | Automation | Automation rules (deferred — stub, notice only). |
+| `service` | Services | Services and bookings on a dedicated bot type (live). |
+| `web_app` | Web apps | One-time operator-console claim links on a dedicated bot type (live). |
+| `reply_bot` | Reply bots | Support-ticket reply flow on a dedicated bot type (live). |
+| `movie_bot` | Movie bots | Movie catalog bot (no catalogue exists; stub, notice only). |
+| `file_share` | File sharing | File Share (no upload/share flow exists; stub, notice only). |
+| `automation` | Automation | Automation rules (no rules engine exists; stub, notice only). |
 
 A bot with no type set — including every bot created before this foundation —
 is treated as a `shop_bot`. Leaving the type blank keeps that behavior.
@@ -58,14 +58,21 @@ Capabilities are chosen at compile time. Each one is a Cargo feature that contro
 |---------|---------|
 | `shop_bot` | Shop bot — payments, products, AI drafts. |
 | `moderation` | Owner / seller / per-bot word policy floor. |
-| `movie_bot` | Movie catalog bot (deferred — stub, notice only). |
-| `reply_bot` | Admin Reply Bot (deferred — stub, notice only). |
-| `file_share` | File Share product type (deferred — stub, notice only). |
-| `web_app` | Public Web app surface (deferred — stub, notice only). |
-| `service` | AI service surface (deferred — stub, notice only). |
-| `automation` | Automation rules (deferred — stub, notice only). |
+| `service` | Services/bookings command family on a dedicated bot type. |
+| `web_app` | Dashboard claim links on a dedicated bot type. |
+| `reply_bot` | Support-ticket reply family on a dedicated bot type. |
+| `movie_bot` | No catalogue exists; stub, notice only. |
+| `file_share` | No upload/share flow exists; stub, notice only. |
+| `automation` | No rules engine exists; stub, notice only. |
 
-The default build enables `shop_bot` and `moderation` and keeps every existing path unchanged. To build a movie-only binary that registers only the movie capability (plus the cross-cutting moderation floor) and refuses every other bot type, including the shop bot:
+The default build enables `shop_bot`, `moderation`, `service`, `web_app` and
+`reply_bot`. A bot with no type still uses the unchanged shop tree; enabling
+the scoped features only changes bots explicitly typed as `service`, `web_app`
+or `reply_bot`. Each scoped type runs the shipped handlers for its own command
+family and answers other commands with a short usage hint. To build a
+movie-only binary that registers only the movie capability (plus the
+cross-cutting moderation floor) and refuses every other bot type, including
+the shop bot:
 
 ```bash
 cargo build --no-default-features --features movie_bot

@@ -8,6 +8,25 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - **Admin**: seller commands (global view) + `/sellers`, `/refundapprove`, `/payoutapprove`.
 - **Owner**: admin commands + `/addadmin`, `/removeadmin`, `/admins`, `/webusers`.
 
+## Commands by bot type
+
+A bot's product type narrows which commands its inbound updates accept. A
+`shop_bot` (the default, including every pre-existing bot) runs the full
+command tree below. The live scoped types reuse shipped handlers for one
+command family each:
+
+- `service` — `/services`, `/book`, `/serviceadd`, `/slotadd`, `/bookings`,
+  `/mybookings`, `/cancelbooking`, `/bookingconfirm`, `/bookingdecline`.
+- `web_app` — `/dashboard`, `/becomeseller` (both need `WEB_URL`; the links are
+  one-time operator-console claim links).
+- `reply_bot` — `/support`, `/tickets`, `/reply`, `/closeticket`, `/escalate`.
+
+On a scoped bot, any other command gets a short list of the commands that bot
+supports; plain messages stay silent. The `movie_bot`, `file_share` and
+`automation` types have no live product: inbound updates get an explicit
+"not available" notice. Their Cargo features are optional; the three live
+scoped types plus `shop_bot` and `moderation` are on by default.
+
 ## Web dashboard
 - `/dashboard` — DM a one-time dashboard sign-in link (valid 15 minutes; opening it lets you set a password and signs you in). Creates the account if missing. Requires `WEB_URL`: when it is unset the bot refuses setup, creates no account and discloses no password.
 - `/setwebpassword <new>` — change web dashboard password.

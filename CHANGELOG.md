@@ -27,6 +27,7 @@ and the setup & management UX polish
 (`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
+- Live inbound capability types: `service` bots run the services/bookings command family, `web_app` bots issue one-time dashboard claim links via `/dashboard` and `/becomeseller`, and `reply_bot` bots run the support-ticket reply family. Each scoped type uses the shipped handlers and accepts only its own commands; the default Cargo features now enable all three. `movie_bot`, `file_share` and `automation` stay notice-only stubs because no catalogue, file-share flow or rules engine exists.
 - Per-form CSRF tokens in the operator console: every rendered POST form carries a hidden token derived from the session credential, validated in constant time before any mutation; missing, wrong and cross-session tokens get a 403. `SameSite=Strict` stays enabled. REST API, MCP and webhook (bearer/HMAC-authenticated) are exempt.
 - At-rest secret encryption: `MASTER_KEY` (32 bytes as hex or base64) seals sensitive config values with AES-256-GCM into versioned `enc:v1:` envelopes. A set-but-invalid key aborts startup; without a key, secret writes are refused with a clear console error. Legacy plaintext values stay readable and migrate on re-save. Startup logs only whether encryption is active.
 - Deterministic webhook-to-grant integration test: signed webhook, atomic claim, provider stub verification, exactly-once subscription and replay protection, all against local mocks.

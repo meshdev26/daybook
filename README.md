@@ -108,20 +108,37 @@ Adding or retokenizing a bot needs a restart. Full guide:
 Bots carry a product type (`shop_bot` by default); the console Product / Type
 selector lets the owner pick a product while sellers and admins stay pinned.
 Capabilities are chosen at build time with Cargo features: `shop_bot`,
-`moderation` (both default), `movie_bot`, `reply_bot`, `file_share`, `web_app`,
-`service`, and `automation`. These features control which capabilities are
-registered and which bot types are accepted at runtime — a movie-only build
-registers only the movie capability and refuses other types. They do **not**
-omit dependencies or shrink the binary (all crates stay compiled); dropping
-unused dependencies is a deferred follow-up. A movie-only install
-builds with `cargo build --no-default-features --features movie_bot`; changing
-capabilities means rebuilding and redeploying.
+`moderation`, `service`, `web_app` and `reply_bot` (all default), plus
+`movie_bot`, `file_share` and `automation` (optional). These features control
+which capabilities are registered and which bot types are accepted at runtime —
+a movie-only build registers only the movie capability and refuses other types.
+They do **not** omit dependencies or shrink the binary (all crates stay
+compiled); dropping unused dependencies is a deferred follow-up. A movie-only
+install builds with `cargo build --no-default-features --features movie_bot`;
+changing capabilities means rebuilding and redeploying.
 
-Only `shop_bot` has a live vertical — a real inbound command and dialogue tree.
-The other six types (`movie_bot`, `reply_bot`, `file_share`, `web_app`, `service`,
-`automation`) are build-time registration types only: inbound updates to a bot
-of one of these types return an explicit "not available" notice (`VerticalStub`)
-instead of running a product. They are not shipped products.
+Four types have live inbound behavior:
+
+- `shop_bot` — the full command and dialogue tree, unchanged.
+- `service` — the services and bookings family on a dedicated bot type:
+  `/services`, `/book`, `/serviceadd`, `/slotadd`, `/bookings`, `/mybookings`,
+  `/cancelbooking`, `/bookingconfirm`, `/bookingdecline`. These same commands
+  also stay live inside `shop_bot`.
+- `web_app` — `/dashboard` and `/becomeseller` issue one-time operator-console
+  claim links. Both require `WEB_URL`; without it the bot refuses setup and
+  never sends a password.
+- `reply_bot` — the support-ticket family: `/support`, `/tickets`, `/reply`,
+  `/closeticket`, `/escalate`.
+
+Each live scoped type accepts only its own command family; any other command
+gets a short usage hint and never reaches shop-only handlers.
+
+The other three compiled types — `movie_bot`, `file_share` and `automation` —
+are build-time registration types only: inbound updates return an explicit
+"not available" notice (`VerticalStub`) instead of running a product. There is
+no movie catalogue, no arbitrary-file upload or share flow (only post-payment
+document delivery), and no automation rules engine behind them; activating
+them would mean building new products.
 
 Message moderation uses an owner floor, seller "Blocked words", and per-bot
 overrides — set at least one floor term before enabling it. Full guide:

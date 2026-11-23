@@ -1,11 +1,13 @@
-//! AI service surface — compiled only with the `service` feature.
-//! Vertical handler deferred; see `movie_bot.rs` for the notice contract.
+//! Service bot capability — compiled only with the `service` feature.
+//!
+//! Its inbound path is the shipped services/bookings command family, narrowed
+//! to this vertical by [`super::ScopedCommands::Service`].
 
-use super::{Descriptor, InboundHandler};
+use super::{Descriptor, InboundHandler, ScopedCommands};
 
 pub const DESCRIPTOR: Descriptor = Descriptor {
     bot_type: "service",
     feature: "service",
     label: "AI service",
-    inbound: InboundHandler::VerticalStub,
+    inbound: InboundHandler::Scoped(ScopedCommands::Service),
 };

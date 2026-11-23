@@ -1,5 +1,8 @@
 //! Automation capability — compiled only with the `automation` feature.
-//! Vertical handler deferred; see `movie_bot.rs` for the notice contract.
+//!
+//! There is no rules engine, trigger store or automation runner here; the
+//! product guide lists automation as a non-goal. This type stays a stub and
+//! produces the explicit notice.
 
 use super::{Descriptor, InboundHandler};
 

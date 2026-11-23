@@ -1,8 +1,8 @@
 //! Movie bot capability — compiled only with the `movie_bot` feature.
 //!
-//! The vertical is deferred by the foundation plan; until it lands, a
-//! compiled movie bot produces an explicit "no vertical handler" notice
-//! instead of falling into the shop command tree.
+//! No movie catalogue, search or playback code exists in this repository, so
+//! there is no product to route to. A compiled movie bot produces the
+//! explicit notice instead of falling into the shop command tree.
 
 use super::{Descriptor, InboundHandler};
 
