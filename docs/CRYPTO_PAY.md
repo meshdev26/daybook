@@ -2,7 +2,7 @@
 
 ## Setup
 - Create app in @CryptoBot → Crypto Pay.
-- Set token via `/crypto setup <token>` or `CRYPTO_PAY_TOKEN` env.
+- Set the token in the web console's `/crypto` page or via the `CRYPTO_PAY_TOKEN` env var; never in bot chat.
 
 ## Payment flow
 1. `/buy <plan>` creates invoice via `createInvoice`.

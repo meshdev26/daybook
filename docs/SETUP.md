@@ -32,7 +32,7 @@ cargo build --release
 
 ## 7. Crypto Pay (optional)
 1. Open @CryptoBot → Crypto Pay → Create App → get token.
-2. `/crypto setup <token>` or set `CRYPTO_PAY_TOKEN`.
+2. Set the token in the web console's `/crypto` page or via `CRYPTO_PAY_TOKEN`.
 3. Create plans and sell.
 
 ## 8. Periodic expiry

@@ -4660,18 +4660,13 @@ async fn handle_crypto(
     let arg = arg.trim();
     let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.is_empty() {
-        bot.send_message(chat_id, "Usage: /crypto <me|balance|rates|invoices [status]|invoice <amount> <asset> [desc]|setup <token>|check <amount> <asset>>").await?;
+        bot.send_message(chat_id, "Usage: /crypto <me|balance|rates|invoices [status]|invoice <amount> <asset> [desc]|check <amount> <asset>>").await?;
         return Ok(());
     }
     match parts[0] {
         "setup" => {
-            if parts.len() < 2 {
-                bot.send_message(chat_id, "Usage: /crypto setup <token>")
-                    .await?;
-            } else {
-                db.set_config("crypto_token", parts[1]);
-                bot.send_message(chat_id, "Crypto Pay token saved.").await?;
-            }
+            bot.send_message(chat_id, "Set the Crypto Pay token in the web console's /crypto page or via CRYPTO_PAY_TOKEN; never in chat.")
+                .await?;
         }
         "me" => {
             let cp = crypto_or_load(db, cfg, crypto);
@@ -4680,7 +4675,7 @@ async fn handle_crypto(
                     Ok(v) => bot.send_message(chat_id, format!("App: {}", v)).await?,
                     Err(e) => bot.send_message(chat_id, format!("Error: {}", e)).await?,
                 },
-                None => { bot.send_message(chat_id, "No crypto token configured. Use /crypto setup <token> or set CRYPTO_PAY_TOKEN.").await? }
+                None => { bot.send_message(chat_id, "No crypto token configured. Set it in the web console's /crypto page or via CRYPTO_PAY_TOKEN.").await? }
             };
         }
         "balance" => {

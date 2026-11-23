@@ -52,7 +52,7 @@ An **owner-only** Telegram bot that:
 - `/redeem CODE` — redeem code for access.
 
 ### Crypto Pay
-- `/crypto setup <token>`, `/crypto me|balance|rates|invoices|invoice|check`.
+- `/crypto me|balance|rates|invoices|invoice|check`. Set the token in the web console's `/crypto` page or via `CRYPTO_PAY_TOKEN`.
 
 ### Bot setup
 - `/setupbot` — configure commands, description, short description.
@@ -123,7 +123,7 @@ overrides — set at least one floor term before enabling it. Full guide:
 cargo build --release
 ./target/release/daybook
 ```
-Web dashboard: http://localhost:8080 (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`.
+Web dashboard: loopback by default (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`. For public access, put a reverse proxy with TLS in front — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (`WEB_BIND`, `WEB_URL`, `WEB_BASE_PATH`).
 Web MFA issues 10 one-time recovery codes drawn from the BIP-39 English wordlist, bcrypt-hashed at rest and shown once. `MFA_RECOVERY_CODES_ENABLED` defaults to on; setting it to `0`, `false`, `no` or `off` rejects stored codes and removes the recovery UI and route. TOTP sign-in is unaffected, so disabling the feature without a working authenticator can lock an account out.
 
 ## MCP server (AI agents)
@@ -173,7 +173,7 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 - Owner/admin gating via `OWNER_ID` + admins table.
 - Never commit `.env`.
 - Validate payments via Crypto Pay API before granting access.
-- Run `/expirecheck` periodically (cron) to revoke expired users.
+- Expired access is revoked in-process by a 30s grant loop and a 6h expiry sweeper; `/expirecheck` is a manual trigger.
 
 ## Deployment
 - Any Linux VPS/home server/Raspberry Pi.
@@ -204,7 +204,6 @@ See `docs/` and root MD files:
 - `docs/SETUP.md` — setup guide.
 - `docs/MULTI_BOT.md` — running several bot tokens in one instance.
 - `docs/MULTIBOT_FOUNDATION.md` — product types, capability builds, and moderation.
-- `docs/ARCHITECTURE.md` — code structure.
 - `docs/CRYPTO_PAY.md` — Crypto Pay integration.
 - `docs/SECURITY.md` — security model.
 - `docs/DEPLOYMENT.md` — deployment guide.
@@ -212,7 +211,3 @@ See `docs/` and root MD files:
 - `docs/DESKTOP.md` — desktop app distribution (.exe / .app).
 - `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan.
 - `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (awaiting approval).
-- `docs/COMMANDS.md` — full command reference.
-- `docs/SETUP.md` — step-by-step setup.
-- `docs/ARCHITECTURE.md` — code structure.
-- `docs/CRYPTO_PAY.md` — Crypto Pay integration details.

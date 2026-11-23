@@ -3285,6 +3285,31 @@ fn bot_type_listing_for_seller_is_seller_scoped() {
     );
 }
 
+/// A keyed primary must win over a lower id so NULL-bot_id sellers do not
+/// drift to an unrelated bot when more bots are added.
+#[test]
+fn sellers_without_bot_id_follow_keyed_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keyed_primary_seller.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    let older = db.create_bot("alpha", 1, None, "");
+    let primary = db.create_bot("primary", 2, None, "");
+    assert!(primary > older);
+    db.upsert_seller(10, Some("s10"), None);
+
+    assert_eq!(db.sellers_for_bot(primary), vec![10]);
+    assert!(db.sellers_for_bot(older).is_empty());
+    let listed = db.list_bots_of_type_for_seller(10, "shop_bot");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, primary);
+
+    let fallback_path = dir.path().join("no_keyed_primary_seller.db");
+    let fallback_db = Db::new(fallback_path.to_str().unwrap()).unwrap();
+    let only = fallback_db.create_bot("solo", 1, None, "");
+    fallback_db.upsert_seller(20, Some("s20"), None);
+    assert_eq!(fallback_db.sellers_for_bot(only), vec![20]);
+}
+
 /// Startup backfill carries each configured `BotConfig.bot_type` into the
 /// freshly created row, not just its name.
 #[test]

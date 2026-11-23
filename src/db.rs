@@ -2835,14 +2835,12 @@ impl Db {
             .collect()
     }
 
-    /// Seller-scoped typed listing. A seller with a NULL `bot_id` is
-    /// attributed to the primary bot (lowest id), matching `sellers_for_bot`.
-    /// Both `seller_id` and `bot_type` are bound parameters: scoping narrows
-    /// reads only and never widens permission.
+    /// NULL `bot_id` sellers follow the keyed primary so legacy rows stay
+    /// scoped when extra bots are added.
     pub fn list_bots_of_type_for_seller(&self, seller_id: i64, bot_type: &str) -> Vec<BotRecord> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match conn.prepare(
-            "SELECT b.id, b.key, b.username, b.owner_user_id, b.default_channel_id, b.enabled, b.created_at, b.name, b.bot_type FROM bots b JOIN sellers s ON COALESCE(s.bot_id, (SELECT MIN(id) FROM bots)) = b.id WHERE s.user_id = ?1 AND b.bot_type = ?2 ORDER BY b.id",
+            "SELECT b.id, b.key, b.username, b.owner_user_id, b.default_channel_id, b.enabled, b.created_at, b.name, b.bot_type FROM bots b JOIN sellers s ON COALESCE(s.bot_id, (SELECT id FROM bots WHERE key = 'primary'), (SELECT MIN(id) FROM bots)) = b.id WHERE s.user_id = ?1 AND b.bot_type = ?2 ORDER BY b.id",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -2853,13 +2851,12 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// Seller user_ids whose bot_id == bot_id (or primary bot if their bot_id
-    /// is NULL). NULL bot_id sellers are attributed to the primary bot
-    /// (lowest id).
+    /// NULL `bot_id` sellers belong to the keyed primary so unassigned rows
+    /// remain visible after extra bots are added.
     pub fn sellers_for_bot(&self, bot_id: i64) -> Vec<i64> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = match conn.prepare(
-            "SELECT user_id FROM sellers WHERE COALESCE(bot_id, (SELECT MIN(id) FROM bots)) = ?1",
+            "SELECT user_id FROM sellers WHERE COALESCE(bot_id, (SELECT id FROM bots WHERE key = 'primary'), (SELECT MIN(id) FROM bots)) = ?1",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -2986,10 +2983,6 @@ impl Db {
             "INSERT INTO sellers(user_id, created_at, bot_id) VALUES(?1,?2,?3)
              ON CONFLICT(user_id) DO UPDATE SET bot_id = excluded.bot_id",
             rusqlite::params![seller_id, now, bot_id],
-        );
-        let _ = conn.execute(
-            "UPDATE sellers SET bot_id = ?1 WHERE user_id = ?2",
-            rusqlite::params![bot_id, seller_id],
         );
     }
 

@@ -64,7 +64,7 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/redeem CODE` — redeem code.
 
 ## Crypto Pay
-- `/crypto setup <token>` — save token.
+- Token setup happens in the web console's `/crypto` page or via the `CRYPTO_PAY_TOKEN` env var, never in chat.
 - `/crypto me` — app info.
 - `/crypto balance` — balance.
 - `/crypto rates` — exchange rates.
