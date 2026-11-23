@@ -33,8 +33,11 @@
 - Web dashboard relies on `SameSite=Strict` session cookies for CSRF protection; no per-form CSRF tokens are emitted. If a future security requirement demands token-based CSRF, implement hidden-field tokens in all POST forms.
 - All POST forms are cookie-authenticated; SameSite=Strict prevents cross-site submission in modern browsers.
 
-## Secrets at rest (planned)
-- Future: encrypt sensitive columns (tokens, secrets) at rest with AES-256-GCM keyed by a `MASTER_KEY` env var. Not yet implemented; currently relies on filesystem permissions (SQLite file, `.env` mode 600).
+## Secrets at rest (implemented)
+- Sensitive config keys (currently `crypto_token`) are sealed with AES-256-GCM before they are written to the SQLite `config` table. `MASTER_KEY` is a 32-byte key supplied as 64 hex characters or standard base64; a set-but-invalid value aborts startup with a clear error.
+- Stored shape: `enc:v1:<base64(nonce || ciphertext || tag)>`, with a fresh 12-byte OS-random nonce per write. Authentication failures (tampering, corruption, wrong key) are errors, never plaintext. The key and plaintext are never logged.
+- Behavior change: with no valid `MASTER_KEY`, secret writes are refused and the Crypto console form shows an error. The operator must set the key before saving a token. Reads of legacy unprefixed values still work, so existing deployments keep running; re-save each secret once to migrate it to an encrypted envelope.
+- Non-secret config keys keep verbatim storage and unchanged behavior. Startup logs only whether secret encryption is active, never the key.
 
 ## MCP tokens (v1.4, live)
 - Per-seller bearer tokens live in the `mcp_tokens` table, scoped by `seller_id`, stored SHA-256-hashed with an 8-char display prefix (raw shown once at mint). `authenticate` in `src/mcp/mod.rs` tries the owner env token first, then the hash lookup; revoked/expired rows never authenticate and every failure returns the same 401. Minted/revoked by the seller via `/mcptoken` (10 active max). See the 2026-10-27 additions below for the Sensitive-tier owner-only gate.

@@ -304,6 +304,7 @@ pub(super) async fn broadcast_send(
 #[derive(Deserialize)]
 pub(super) struct CryptoQuery {
     pub(super) saved: Option<String>,
+    pub(super) error: Option<String>,
 }
 
 #[tracing::instrument(skip_all)]
@@ -322,6 +323,10 @@ pub(super) async fn crypto_page(
     let banner = if q.saved.as_deref() == Some("1") {
         r#"<div class="alert alert-success" role="status" aria-live="polite">Token saved.</div>"#
             .to_string()
+    } else if q.error.as_deref() == Some("secret") {
+        // Terse, fixed text: never echo a key, a token or a crypto error.
+        r#"<div class="alert alert-error" role="alert">Token not saved. Set a valid MASTER_KEY first (see setup docs).</div>"#
+            .to_string()
     } else {
         String::new()
     };
@@ -333,7 +338,7 @@ pub(super) async fn crypto_page(
 /// render its check result in place (keys_setup.rs:149-155 direct-Html
 /// precedent — no PRG, no free text in URLs).
 fn crypto_body(state: &WebState, banner: &str) -> String {
-    let token = state.db.get_config("crypto_token");
+    let token = state.db.get_secret_config("crypto_token").ok().flatten();
     let badge = if token
         .as_deref()
         .map(str::trim)
@@ -384,8 +389,12 @@ pub(super) async fn crypto_setup(
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
     if let Some(t) = f.token.as_deref().filter(|s| !s.trim().is_empty()) {
-        state.db.set_config("crypto_token", t.trim());
-        Redirect::to(&state.url("/crypto?saved=1")).into_response()
+        // Refuse to persist plaintext when MASTER_KEY is absent or invalid.
+        // The operator sees a terse error instead of a false "saved" flash.
+        match state.db.try_set_secret_config("crypto_token", t.trim()) {
+            Ok(()) => Redirect::to(&state.url("/crypto?saved=1")).into_response(),
+            Err(_) => Redirect::to(&state.url("/crypto?error=secret")).into_response(),
+        }
     } else {
         // Blank submit changed nothing — no success flash (honest no-op).
         Redirect::to(&state.url("/crypto")).into_response()
@@ -417,7 +426,12 @@ pub(super) async fn crypto_me(
     if !Role::from_role_str(&session.role).has_level(Role::Owner) {
         return forbidden_page(&state, "Crypto", "Crypto").into_response();
     }
-    let token = state.db.get_config("crypto_token").unwrap_or_default();
+    let token = state
+        .db
+        .get_secret_config("crypto_token")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if token.trim().is_empty() {
         return Redirect::to(&state.url("/crypto")).into_response();
     }

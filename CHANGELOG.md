@@ -27,6 +27,8 @@ and the setup & management UX polish
 (`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
+- At-rest secret encryption: `MASTER_KEY` (32 bytes as hex or base64) seals sensitive config values with AES-256-GCM into versioned `enc:v1:` envelopes. A set-but-invalid key aborts startup; without a key, secret writes are refused with a clear console error. Legacy plaintext values stay readable and migrate on re-save. Startup logs only whether encryption is active.
+- Deterministic webhook-to-grant integration test: signed webhook, atomic claim, provider stub verification, exactly-once subscription and replay protection, all against local mocks.
 - `MFA_RECOVERY_CODES_ENABLED` (default on): `0`, `false`, `no` or `off` rejects stored recovery codes, removes the recovery route and console UI, and leaves TOTP sign-in working. Stored codes stay in the database and revive if the flag is re-enabled.
 - Recovery codes now draw from the vetted BIP-39 English wordlist: 10 one-time four-word, hyphen-joined codes, bcrypt-hashed at rest. The UI states they are not wallet seed phrases.
 - Bookings domain closed end-to-end: console `/bookings` page (seller-scope
@@ -90,6 +92,7 @@ and the setup & management UX polish
 - Removed the separate AI-agent workflow layer; AGENT.md is now the only agent instruction file.
 
 ### Changed
+- Cross-asset money totals are no longer returned as a single summed float. Revenue is reported as per-asset lines in the REST/MCP analytics and finance responses and on the console Analytics page; a clearly labeled marker replaces a numeric total when more than one asset is present. This is a breaking response-shape change for clients that read `revenue_total` as a number.
 - Setup and management UX polish (per
   `design-system/daybook/SETUP_UX_POLISH_SPEC.md`): the `/setup`
   wizard groups the form into "Your bot" and "Your console login" with the

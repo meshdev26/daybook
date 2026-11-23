@@ -179,6 +179,7 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 ## Security
 - Owner/admin gating via `OWNER_ID` + admins table.
 - Never commit `.env`.
+- Sensitive config secrets (e.g. the Crypto Pay token saved in the console) are encrypted at rest with AES-256-GCM under `MASTER_KEY`; set it before saving secrets. Without it, secret writes are refused.
 - Validate payments via Crypto Pay API before granting access.
 - Expired access is revoked in-process by a 6h sweeper; the 30s loop verifies invoice payments. `/expirecheck` is a manual trigger.
 
@@ -187,11 +188,11 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 Alpha software; verify these on your own deployment before handling real value:
 
 - No independent multi-tenant penetration test has been run; seller isolation is self-reviewed only (pre-real-money checklist in issue #1).
-- SQLite is unencrypted at rest and secrets such as the Crypto Pay token are stored verbatim in the `config` table; protection is filesystem permissions. At-rest encryption is planned, not implemented.
+- The SQLite database file itself is not encrypted; filesystem permissions still matter. Sensitive config values are encrypted individually under `MASTER_KEY`, and legacy plaintext values keep working until re-saved. Changing or losing the key makes previously encrypted values unreadable.
 - The web dashboard relies on `SameSite=Strict` cookies for CSRF protection and emits no per-form CSRF tokens.
 - With `WEB_URL` unset (the default), `/becomeseller` and `/dashboard` send a plaintext dashboard password over Telegram; set `WEB_URL` to use one-time claim links.
-- The signed Crypto Pay webhook is wired but not validated end-to-end; payment confirmation is still the manual `/paid` step.
-- Analytics revenue totals sum amounts across assets as floats via `CAST(amount AS REAL)` for display only — deterministic, covered by tests, never used to move money.
+- The signed webhook path (signature, queueing, atomic claim, provider verification and exactly-once grant with replay protection) is covered by a deterministic local-mock integration test; the background granter's Telegram invite and DM side effects are not exercised by that test.
+- Revenue is reported per asset; mixed-asset responses carry a marker instead of a summed float. Never interpret a single money number across denominations.
 
 ## Deployment
 - Any Linux VPS/home server/Raspberry Pi.

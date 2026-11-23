@@ -1846,6 +1846,220 @@ async fn api_webhook_cryptopay_missing_signature() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Deterministic end-to-end slice of the payment path: signed webhook ->
+/// invoice queued -> atomic claim -> verified against a local provider stub ->
+/// exactly one subscription -> replay does not re-grant. No real network:
+/// the provider is a wiremock server and the Telegram side effects are not
+/// driven here (the grant row is the durable, auditable outcome).
+#[tokio::test]
+async fn signed_webhook_to_single_grant_path() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (mut state, _dir) = make_state().await;
+    const TOKEN: &str = "webhook-secret";
+    state.cfg.crypto_token = Some(TOKEN.to_string());
+    let db = state.db.clone();
+    db.upsert_seller(7, None, None);
+    db.add_plan(7, "e2e-plan", "5", "USDT", 7, Some("@e2e"));
+    db.save_invoice(
+        "e2e-inv",
+        7,
+        "5",
+        "USDT",
+        Some("e2e-plan"),
+        "pending",
+        None,
+        Some("e2e-plan"),
+        Some(42),
+        None,
+    );
+
+    let app = router(state);
+    let post_webhook = |app: axum::Router| {
+        let app = app.clone();
+        async move {
+            let body = r#"{"payload":{"invoice_id":"e2e-inv","status":"paid"}}"#;
+            let mac = crate::util::hmac_sha256(TOKEN.as_bytes(), body.as_bytes());
+            let sig: String = mac.iter().map(|b| format!("{:02x}", b)).collect();
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/cryptopay")
+                    .header("content-type", "application/json")
+                    .header("x-crypto-pay-api-signature", sig)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // 1. Signed webhook enqueues the invoice (never marks it paid directly).
+    let resp = post_webhook(app.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_invoice("e2e-inv").unwrap().2, "active");
+
+    // 2. Granter claim is atomic: one winner, no second claim.
+    assert!(db.claim_invoice_for_grant("e2e-inv"));
+    assert!(!db.claim_invoice_for_grant("e2e-inv"));
+    assert_eq!(db.get_invoice("e2e-inv").unwrap().2, "granting");
+
+    // 3. Provider stub returns paid; verification is the real client + parser.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/getInvoices"))
+        .and(body_partial_json(
+            serde_json::json!({"invoice_ids": "e2e-inv"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {"items": [{"invoice_id": "e2e-inv", "status": "paid"}]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cp = crate::crypto::CryptoPay::with_base_url(TOKEN.to_string(), &server.uri());
+    let verified = cp.get_invoice("e2e-inv").await.unwrap();
+    assert!(
+        extract_invoice_items(&verified)
+            .iter()
+            .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"))
+    );
+
+    // 4. Exactly-once grant using the same primitives as the granter:
+    // subscription_exists_for_invoice guard + UNIQUE(invoice_id) index.
+    if !db.subscription_exists_for_invoice("e2e-inv") {
+        db.create_subscription(7, 42, None, "@e2e", 7, Some("e2e-inv"), None);
+    }
+    assert_eq!(db.subscriptions_for_invoice("e2e-inv").len(), 1);
+    db.finalize_invoice_paid("e2e-inv");
+    assert_eq!(db.get_invoice("e2e-inv").unwrap().2, "paid");
+
+    // 5. Replay: the webhook must not resurrect a paid invoice into the
+    // grant queue, and no second subscription may appear.
+    let resp = post_webhook(app).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_invoice("e2e-inv").unwrap().2, "paid");
+    assert!(db.pending_invoices().iter().all(|x| x.0 != "e2e-inv"));
+    assert_eq!(db.subscriptions_for_invoice("e2e-inv").len(), 1);
+}
+
+/// The console crypto form writes through the secret setter: a saved token
+/// is never persisted as plaintext in the config table, and a failed save
+/// renders a terse error banner instead of a success flash.
+#[tokio::test]
+async fn crypto_form_uses_secret_setter() {
+    use rusqlite::OptionalExtension;
+
+    let (state, _dir) = make_state().await;
+    let token = owner_token(&state);
+    let db_path = state.cfg.db_path.clone();
+    let app = crate::web::router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/crypto/setup")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", format!("session={token}"))
+                .body(Body::from("token=form-token-123"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let raw: Option<String> = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT value FROM config WHERE key='crypto_token'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    };
+    if std::env::var_os("MASTER_KEY").is_none() {
+        // No key: the form refuses the write and says so.
+        assert!(location.contains("error=secret"), "{location}");
+        assert!(raw.is_none(), "plaintext token was persisted");
+    } else {
+        assert!(location.contains("saved=1"));
+        assert!(raw.as_deref().is_some_and(|v| v.starts_with("enc:v1:")));
+    }
+
+    // The terse error banner is rendered from the fixed query value.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/crypto?error=secret")
+                .header("cookie", format!("session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Token not saved"));
+    assert!(!html.contains("form-token-123"));
+}
+
+/// Mixed-asset revenue must never appear as one summed float in the REST
+/// stat responses: per-asset lines are present and the total is a marker.
+#[tokio::test]
+async fn api_revenue_mixed_assets_never_a_float() {
+    let (state, _dir) = make_state().await;
+    let token = owner_token(&state);
+    state.db.save_invoice(
+        "mix-b", 1, "0.5", "BTC", None, "paid", None, None, None, None,
+    );
+    state.db.save_invoice(
+        "mix-u", 1, "50", "USDT", None, "paid", None, None, None, None,
+    );
+    let app = router(state);
+    for uri in [
+        "/api/v1/dashboard/summary",
+        "/api/v1/revenue",
+        "/api/v1/finance/summary",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let total = v["revenue_total"].as_str().or_else(|| v["total"].as_str());
+        assert_eq!(total, Some("mixed assets"), "{uri}: {v}");
+        let lines = v["revenue_by_asset"]
+            .as_array()
+            .or_else(|| v["by_asset"].as_array())
+            .unwrap();
+        assert_eq!(lines.len(), 2, "{uri}: {v}");
+    }
+}
+
 // ---- Finance payouts ----
 #[tokio::test]
 async fn api_finance_payouts_list_create() {

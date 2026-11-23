@@ -3,6 +3,46 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::secrets::{MasterKey, SecretError, decode_base64, decode_hex};
+
+/// Parse the `MASTER_KEY` text. Two forms are accepted: 64 hexadecimal
+/// characters (32 bytes) or standard base64 of 32 bytes (padded or unpadded).
+/// The value is trimmed; the raw text is never echoed in an error or a log.
+pub fn parse_master_key(raw: &str) -> Result<MasterKey, SecretError> {
+    let text = raw.trim();
+    if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(MasterKey::from_bytes(decode_hex(text)?));
+    }
+    let padded = match text.len() {
+        43 => format!("{text}="),
+        44 => text.to_string(),
+        _ => return Err(SecretError::InvalidMasterKey),
+    };
+    let bytes = decode_base64(&padded)?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SecretError::InvalidMasterKey)?;
+    Ok(MasterKey::from_bytes(key))
+}
+
+/// Resolve the configured master key. `Ok(None)` means no key is set;
+/// `Err` means a key IS set but malformed, which callers must treat as a
+/// fatal configuration error (fail fast at startup).
+pub fn master_key() -> Result<Option<MasterKey>, SecretError> {
+    match env::var("MASTER_KEY") {
+        Ok(v) if !v.trim().is_empty() => parse_master_key(&v).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Startup check: validates a set key and reports whether at-rest secret
+/// encryption is active. The bool is log-only metadata, never a secret.
+pub fn validate_master_key_at_startup() -> Result<bool, String> {
+    master_key()
+        .map(|k| k.is_some())
+        .map_err(|e| format!("MASTER_KEY is set but invalid: {e}"))
+}
+
 /// Default product/capability type for bots that predate the multibot
 /// foundation, and for config entries that omit `bot_type`. One constant
 /// keeps the schema DEFAULT, the migration backfill and the runtime

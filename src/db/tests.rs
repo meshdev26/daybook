@@ -586,9 +586,124 @@ fn test_revenue_by_asset_per_asset_lines() {
         rows,
         vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 70.0)]
     );
-    // revenue_total's cross-asset behavior is deliberately unchanged
-    // (finance ruling 5: the sum is a display defect handled at the callers)
-    assert!((db.revenue_total(None) - 70.5).abs() < 1e-9);
+    // A cross-asset sum (70.5) is never returned: mixed assets produce an
+    // error so callers must render the per-asset lines above instead.
+    assert_eq!(db.revenue_total(None), Err(MixedAssets));
+}
+
+#[test]
+fn mixed_asset_totals_are_not_single_floats() {
+    let (db, _path) = booking_db("mixedtotals");
+    db.save_invoice("b1", 1, "0.5", "BTC", None, "paid", None, None, None, None);
+    db.save_invoice("u1", 1, "50", "USDT", None, "paid", None, None, None, None);
+    // All three entry points refuse to produce a cross-asset number.
+    assert_eq!(db.revenue_total(None), Err(MixedAssets));
+    assert_eq!(db.revenue_total(Some(1)), Err(MixedAssets));
+    assert_eq!(db.analytics_revenue_total(1), Err(MixedAssets));
+    assert_eq!(db.analytics_aov(1), Err(MixedAssets));
+    // The per-asset sources still carry the correct denominated amounts.
+    assert_eq!(
+        db.revenue_by_asset(),
+        vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 50.0)]
+    );
+    assert_eq!(
+        db.analytics_revenue_by_asset(1),
+        vec![("BTC".to_string(), 0.5), ("USDT".to_string(), 50.0)]
+    );
+    // Single-asset scopes keep their exact total.
+    db.save_invoice("u2", 2, "7", "USDT", None, "paid", None, None, None, None);
+    assert_eq!(db.revenue_total(Some(2)), Ok(7.0));
+}
+
+#[test]
+fn secret_config_encrypts_at_rest_and_reads_back() {
+    let (db, path) = booking_db("secretcfg");
+    let mk = crate::config::parse_master_key(&"ab".repeat(32)).unwrap();
+    db.set_secret_config_with(Some(&mk), "crypto_token", "token-123")
+        .unwrap();
+    // Raw SQLite value is an encrypted envelope, never the token.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key='crypto_token'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(raw.starts_with(crate::secrets::SECRET_PREFIX));
+    assert!(!raw.contains("token-123"));
+    assert_eq!(
+        db.get_secret_config_with(&mk, "crypto_token").unwrap(),
+        Some("token-123".to_string())
+    );
+    // Legacy readers of the same key transparently see plaintext.
+    assert_eq!(
+        db.get_config_with_key("crypto_token", Some(&mk)).as_deref(),
+        Some("token-123")
+    );
+    // Non-secret keys keep their verbatim behavior.
+    db.set_config("channel", "@plain");
+    assert_eq!(db.get_config("channel").as_deref(), Some("@plain"));
+}
+
+#[test]
+fn secret_config_without_master_key_refuses_write() {
+    let (db, _) = booking_db("nokey");
+    // No key resolved: the setter refuses before touching the database.
+    assert_eq!(
+        db.set_secret_config_with(None, "crypto_token", "token-789"),
+        Err(crate::secrets::SecretError::MissingMasterKey)
+    );
+    assert_eq!(db.get_secret_config("crypto_token").unwrap(), None);
+    // The public entry point uses the same rule when MASTER_KEY is unset.
+    if std::env::var_os("MASTER_KEY").is_none() {
+        assert_eq!(
+            db.try_set_secret_config("crypto_token", "token-789"),
+            Err(crate::secrets::SecretError::MissingMasterKey)
+        );
+        assert_eq!(db.get_secret_config("crypto_token").unwrap(), None);
+    }
+    // Sensitive-key allowlist is enforced as well.
+    assert_eq!(
+        db.set_secret_config_with(None, "channel", "@x"),
+        Err(crate::secrets::SecretError::NotSensitiveKey)
+    );
+}
+
+#[test]
+fn secret_config_tamper_and_legacy_values() {
+    let (db, path) = booking_db("secrettamper");
+    let mk = crate::config::parse_master_key(&"cd".repeat(32)).unwrap();
+    db.set_secret_config_with(Some(&mk), "crypto_token", "token-456")
+        .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key='crypto_token'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut chars: Vec<char> = raw.chars().collect();
+    let i = chars.len() - 1;
+    chars[i] = if chars[i] == 'A' { 'B' } else { 'A' };
+    let tampered: String = chars.into_iter().collect();
+    conn.execute(
+        "UPDATE config SET value=?1 WHERE key='crypto_token'",
+        rusqlite::params![tampered],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        db.get_secret_config_with(&mk, "crypto_token"),
+        Err(crate::secrets::SecretError::Decrypt)
+    );
+    // A legacy plaintext value is still readable without any key.
+    db.set_config("crypto_token", "legacy-token");
+    assert_eq!(
+        db.get_secret_config("crypto_token").unwrap().as_deref(),
+        Some("legacy-token")
+    );
 }
 
 #[tokio::test]
@@ -3063,9 +3178,9 @@ fn analytics_empty_seller() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("an.db");
     let db = Db::new(path.to_str().unwrap()).unwrap();
-    assert!((db.analytics_revenue_total(1) - 0.0).abs() < 1e-9);
+    assert_eq!(db.analytics_revenue_total(1), Ok(0.0));
     assert_eq!(db.analytics_invoice_counts(1), (0, 0));
-    assert!((db.analytics_aov(1) - 0.0).abs() < 1e-9);
+    assert_eq!(db.analytics_aov(1), Ok(0.0));
     assert_eq!(db.analytics_repeat_buyers(1), (0, 0));
     assert_eq!(db.analytics_abandoned_cart_rate(1), (0, 0));
     assert_eq!(db.analytics_customer_count(1), 0);

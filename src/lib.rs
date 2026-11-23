@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod qr;
 pub mod roles;
+pub mod secrets;
 pub mod services;
 pub mod util;
 pub mod web;

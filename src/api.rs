@@ -2300,6 +2300,23 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
 }
 
 // ---------- Stats ----------
+/// Money payload shared by the stat/finance endpoints. Per-asset lines are
+/// always present. A numeric `revenue_total` is emitted only when every paid
+/// invoice uses one denomination; mixed assets get a labeled marker instead
+/// of a meaningless summed float.
+fn revenue_json(db: &crate::db::Db, scope: Option<i64>) -> serde_json::Value {
+    let by_asset: Vec<serde_json::Value> = db
+        .revenue_by_asset_scoped(scope)
+        .into_iter()
+        .map(|(asset, amount)| serde_json::json!({"asset": asset, "amount": amount}))
+        .collect();
+    let total = match db.revenue_total(scope) {
+        Ok(v) => serde_json::json!(v),
+        Err(_) => serde_json::json!("mixed assets"),
+    };
+    serde_json::json!({"revenue_total": total, "revenue_by_asset": by_asset})
+}
+
 async fn dashboard_summary(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
     let session = match session_or_401(&state, &headers) {
         Ok(s) => s,
@@ -2313,7 +2330,7 @@ async fn dashboard_summary(State(state): State<WebState>, headers: HeaderMap) ->
     let pending_inv = invoices.iter().filter(|i| i.3 == "active").count();
     let codes = state.db.list_codes(scope, 1000);
     let codes_redeemed: i64 = codes.iter().map(|c| c.3).sum();
-    let revenue = state.db.revenue_total(scope);
+    let revenue = revenue_json(&state.db, scope);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2324,7 +2341,8 @@ async fn dashboard_summary(State(state): State<WebState>, headers: HeaderMap) ->
             "invoices_pending": pending_inv,
             "codes_total": codes.len(),
             "codes_redeemed": codes_redeemed,
-            "revenue_total": revenue,
+            "revenue_total": revenue["revenue_total"],
+            "revenue_by_asset": revenue["revenue_by_asset"],
         })),
     )
         .into_response()
@@ -2336,8 +2354,15 @@ async fn revenue(State(state): State<WebState>, headers: HeaderMap) -> impl Into
         Err(e) => return e.into_response(),
     };
     let scope = seller_scope(&session);
-    let total = state.db.revenue_total(scope);
-    (StatusCode::OK, Json(serde_json::json!({"total": total}))).into_response()
+    let revenue = revenue_json(&state.db, scope);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total": revenue["revenue_total"],
+            "by_asset": revenue["revenue_by_asset"],
+        })),
+    )
+        .into_response()
 }
 
 // ---------- Channels ----------
@@ -2470,13 +2495,14 @@ async fn finance_summary(State(state): State<WebState>, headers: HeaderMap) -> i
         Err(e) => return e.into_response(),
     };
     let scope = seller_scope(&session);
-    let revenue = state.db.revenue_total(scope);
+    let revenue = revenue_json(&state.db, scope);
     let invoices = state.db.list_invoices(scope, 1000);
     let paid: f64 = invoices.iter().filter(|i| i.3 == "paid").count() as f64;
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "revenue_total": revenue,
+            "revenue_total": revenue["revenue_total"],
+            "revenue_by_asset": revenue["revenue_by_asset"],
             "invoices_total": invoices.len(),
             "invoices_paid": paid,
         })),
@@ -2536,9 +2562,12 @@ async fn finance_revenue_by_seller(
         .db
         .revenue_by_seller()
         .into_iter()
-        .map(|(sid, total)| {
+        .map(|(sid, by_asset)| {
             serde_json::json!({
-                "seller_id": sid, "revenue_total": total,
+                "seller_id": sid,
+                "revenue_by_asset": by_asset.into_iter()
+                    .map(|(asset, amount)| serde_json::json!({"asset": asset, "amount": amount}))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -2810,7 +2839,7 @@ async fn finance_payouts_execute(
         .cfg
         .crypto_token
         .clone()
-        .or_else(|| state.db.get_config("crypto_token"));
+        .or_else(|| state.db.get_secret_config("crypto_token").ok().flatten());
     let tok = match token {
         Some(t) => t,
         None => {
@@ -3567,7 +3596,7 @@ async fn finance_refunds_execute(
         .cfg
         .crypto_token
         .clone()
-        .or_else(|| state.db.get_config("crypto_token"));
+        .or_else(|| state.db.get_secret_config("crypto_token").ok().flatten());
     let tok = match token {
         Some(t) => t,
         None => {
@@ -4188,13 +4217,15 @@ async fn admin_stats(State(state): State<WebState>, headers: HeaderMap) -> impl 
     let subs = state.db.count_subscriptions(None, None);
     let active_subs = state.db.count_subscriptions(None, Some("active"));
     let invoices = state.db.count_invoices(None, None);
-    let revenue = state.db.revenue_total(None);
+    let revenue = revenue_json(&state.db, None);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "sellers_total": sellers, "users_total": users, "plans_total": plans,
             "subscriptions_total": subs, "subscriptions_active": active_subs,
-            "invoices_total": invoices, "revenue_total": revenue,
+            "invoices_total": invoices,
+            "revenue_total": revenue["revenue_total"],
+            "revenue_by_asset": revenue["revenue_by_asset"],
         })),
     )
         .into_response()
@@ -4684,7 +4715,7 @@ async fn invoices_claim(
         .cfg
         .crypto_token
         .clone()
-        .or_else(|| state.db.get_config("crypto_token"));
+        .or_else(|| state.db.get_secret_config("crypto_token").ok().flatten());
     let tok = match token {
         Some(t) => t,
         None => {
@@ -4898,7 +4929,7 @@ async fn webhook_cryptopay(
         .cfg
         .crypto_token
         .clone()
-        .or_else(|| state.db.get_config("crypto_token"));
+        .or_else(|| state.db.get_secret_config("crypto_token").ok().flatten());
     // Fail closed when crypto pay is not configured: there is no secret to
     // authenticate the webhook against.
     let Some(tok) = token else {

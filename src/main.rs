@@ -291,6 +291,23 @@ async fn run() {
 
     let app_cfg = AppConfig::from_env();
     let cfg: Config = app_cfg.shared.clone();
+    // Fail fast on a malformed MASTER_KEY, and state plainly whether
+    // secret-at-rest encryption is active. No key material is logged.
+    match config::validate_master_key_at_startup() {
+        Ok(active) => {
+            if active {
+                tracing::info!("secret encryption at rest: active (MASTER_KEY configured)");
+            } else {
+                tracing::info!(
+                    "secret encryption at rest: inactive (MASTER_KEY unset; secret writes are refused)"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("startup aborted: {e}");
+            std::process::exit(2);
+        }
+    }
     // CLI recovery subcommand: `daybook reset-owner ...`. Handled
     // before any server/bot startup so it works in setup mode (missing
     // bot token / .env). Exits the process when invoked.

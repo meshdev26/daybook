@@ -1593,7 +1593,8 @@ async fn analytics_summary(
         ids
     };
 
-    let mut revenue_total = 0.0_f64;
+    let mut revenue_by_asset: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     let mut invoice_total: i64 = 0;
     let mut invoice_paid: i64 = 0;
     let mut repeat_total: i64 = 0;
@@ -1604,7 +1605,9 @@ async fn analytics_summary(
     let mut top_products: Vec<(i64, i64)> = Vec::new();
 
     for sid in &seller_ids {
-        revenue_total += state.db.analytics_revenue_total(*sid);
+        for (asset, amount) in state.db.analytics_revenue_by_asset(*sid) {
+            *revenue_by_asset.entry(asset).or_insert(0.0) += amount;
+        }
         let (t, p) = state.db.analytics_invoice_counts(*sid);
         invoice_total += t;
         invoice_paid += p;
@@ -1618,10 +1621,25 @@ async fn analytics_summary(
         customer_count += state.db.analytics_customer_count(*sid);
     }
 
-    let aov = if invoice_paid > 0 {
-        revenue_total / invoice_paid as f64
+    // Money is only ever reported as per-asset lines. A numeric total/AOV
+    // is emitted when one denomination is in play; mixed assets get a marker.
+    let mixed = revenue_by_asset.len() > 1;
+    let revenue_total: f64 = revenue_by_asset.values().sum();
+    let aov = if mixed {
+        serde_json::json!("mixed assets")
+    } else if invoice_paid > 0 {
+        serde_json::json!(revenue_total / invoice_paid as f64)
     } else {
-        0.0
+        serde_json::json!(0.0)
+    };
+    let revenue_lines: Vec<Value> = revenue_by_asset
+        .into_iter()
+        .map(|(asset, amount)| json!({"asset": asset, "amount": amount}))
+        .collect();
+    let revenue_total_json = if mixed {
+        json!("mixed assets")
+    } else {
+        json!(revenue_total)
     };
     let abandoned_rate = if abandoned + recovered > 0 {
         (abandoned as f64 / (abandoned + recovered) as f64) * 100.0
@@ -1642,7 +1660,8 @@ async fn analytics_summary(
         .collect();
 
     Ok(json!({
-        "revenue_total": revenue_total,
+        "revenue_total": revenue_total_json,
+        "revenue_by_asset": revenue_lines,
         "invoice_counts": {"total": invoice_total, "paid": invoice_paid},
         "aov": aov,
         "top_products": top_items,
@@ -1715,9 +1734,17 @@ async fn finance_summary(
     let scope = principal.seller_id;
     let invoices = state.db.list_invoices(scope, 1000);
     let paid = invoices.iter().filter(|i| i.3 == "paid").count();
+    let by_asset = state.db.revenue_by_asset_scoped(scope);
+    let total = match state.db.revenue_total(scope) {
+        Ok(v) => json!(v),
+        Err(_) => json!("mixed assets"),
+    };
     Ok(json!({
         "seller_id": scope,
-        "revenue_total": state.db.revenue_total(scope),
+        "revenue_total": total,
+        "revenue_by_asset": by_asset.into_iter()
+            .map(|(asset, amount)| json!({"asset": asset, "amount": amount}))
+            .collect::<Vec<_>>(),
         "invoices_total": invoices.len(),
         "invoices_paid": paid,
     }))
@@ -1728,14 +1755,27 @@ async fn finance_revenue_by_seller(
     principal: Principal,
     _args: Value,
 ) -> Result<Value, String> {
-    let totals: Vec<(i64, f64)> = if let Some(sid) = principal.seller_id {
-        vec![(sid, state.db.revenue_total(Some(sid)))]
+    let totals: Vec<(i64, Vec<(String, f64)>)> = if let Some(sid) = principal.seller_id {
+        vec![(sid, state.db.revenue_by_asset_scoped(Some(sid)))]
     } else {
         state.db.revenue_by_seller()
     };
     let items: Vec<Value> = totals
         .into_iter()
-        .map(|(sid, total)| json!({"seller_id": sid, "revenue_total": total}))
+        .map(|(sid, by_asset)| {
+            let total = if by_asset.len() > 1 {
+                json!("mixed assets")
+            } else {
+                json!(by_asset.first().map(|x| x.1).unwrap_or(0.0))
+            };
+            json!({
+                "seller_id": sid,
+                "revenue_total": total,
+                "revenue_by_asset": by_asset.into_iter()
+                    .map(|(asset, amount)| json!({"asset": asset, "amount": amount}))
+                    .collect::<Vec<_>>(),
+            })
+        })
         .collect();
     Ok(json!({"items": items, "total": items.len()}))
 }

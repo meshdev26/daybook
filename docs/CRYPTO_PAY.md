@@ -19,6 +19,7 @@
 ## Notes
 - Always verify payment server-side via API before granting access.
 - Invoice status may lag; retry `/paid` if needed.
+- A token saved in the web console is sealed at rest under `MASTER_KEY`; the signed webhook, atomic claim, provider verification and exactly-once grant are covered by a deterministic local-mock integration test.
 
 ## Bookings money ruling (finance, 2026-10-27) — governs v1.5
 
@@ -57,9 +58,12 @@ free-confirmation unchanged; everything below gates the v1.5 priced-bookings spe
 
 5. **Bookings inherit and snapshot the service's price+asset at creation — confirmed.
    Mixed-asset revenue *summing* is NOT acceptable, even "until the split ships":**
-   `revenue_total` (`db.rs:4380`) already sums `CAST(amount AS REAL)` across assets —
-   0.5 BTC + 50 USDT is a meaningless number. Bookings must not extend it; display
-   per-asset lines or no total. A cross-asset sum is a defect, not a shortcut.
+   0.5 BTC + 50 USDT is a meaningless number. Implemented: `revenue_total` no
+   longer sums across assets — it returns an error when more than one asset is
+   present. REST, MCP and the console report `revenue_by_asset` lines; a single
+   numeric total is emitted only within one denomination, and a clearly
+   labeled marker stands in for it otherwise. New money paths must use the
+   per-asset source. A cross-asset sum is a defect, not a shortcut.
 
 ### Paid-booking state machine (v1.5)
 

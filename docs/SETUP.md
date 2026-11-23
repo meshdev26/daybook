@@ -15,6 +15,8 @@ cp .env.example .env
 ```
 Set `TELEGRAM_BOT_TOKEN` and `OWNER_ID`. Optionally `DEFAULT_CHANNEL` and `CRYPTO_PAY_TOKEN`. `MFA_RECOVERY_CODES_ENABLED` defaults to on; `0`, `false`, `no` or `off` disables MFA recovery codes while TOTP sign-in continues to work.
 
+To store secrets in the web console (currently the Crypto Pay token), also set `MASTER_KEY` to 32 bytes of key material, encoded as either 64 hexadecimal characters or standard base64 (e.g. generate with `openssl rand -hex 32`). A set-but-invalid key aborts startup. Without `MASTER_KEY`, secret writes are refused with an explicit console error; existing plaintext tokens remain readable but should be re-saved once to encrypt them at rest. Keep a backup of the key offline: changing it makes previously encrypted secrets unreadable.
+
 ## 4. Build
 ```bash
 cargo build --release

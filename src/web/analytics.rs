@@ -6,7 +6,8 @@ pub(super) struct AnalyticsQuery {
 }
 
 pub(super) struct AnalyticsMetrics {
-    revenue_total: f64,
+    /// One HTML line per denomination; no cross-asset sum is ever rendered.
+    revenue_lines: String,
     invoice_total: i64,
     invoice_paid: i64,
     repeat_total: i64,
@@ -14,7 +15,7 @@ pub(super) struct AnalyticsMetrics {
     abandoned: i64,
     recovered: i64,
     customer_count: i64,
-    aov: f64,
+    aov_text: String,
     abandoned_rate: f64,
     top_rows: String,
     top_labels_json: String,
@@ -41,7 +42,7 @@ fn analytics_seller_ids(state: &WebState, session: &Session) -> Vec<i64> {
 }
 
 pub(super) struct AnalyticsAgg {
-    revenue_total: f64,
+    revenue_by_asset: std::collections::BTreeMap<String, f64>,
     invoice_total: i64,
     invoice_paid: i64,
     repeat_total: i64,
@@ -54,7 +55,8 @@ pub(super) struct AnalyticsAgg {
 }
 
 fn analytics_aggregate(state: &WebState, seller_ids: &[i64]) -> AnalyticsAgg {
-    let mut revenue_total = 0.0_f64;
+    let mut revenue_by_asset: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     let mut invoice_total: i64 = 0;
     let mut invoice_paid: i64 = 0;
     let mut repeat_total: i64 = 0;
@@ -67,11 +69,13 @@ fn analytics_aggregate(state: &WebState, seller_ids: &[i64]) -> AnalyticsAgg {
 
     if seller_ids.len() == 1 {
         let sid = seller_ids[0];
-        revenue_total = state.db.analytics_revenue_total(sid);
+        for (asset, amount) in state.db.analytics_revenue_by_asset(sid) {
+            revenue_by_asset.insert(asset, amount);
+        }
         let (t, p) = state.db.analytics_invoice_counts(sid);
         invoice_total = t;
         invoice_paid = p;
-        aov_single = Some(state.db.analytics_aov(sid));
+        aov_single = state.db.analytics_aov(sid).ok();
         top_products.extend(state.db.analytics_top_products(sid, 10));
         let (tot, rep) = state.db.analytics_repeat_buyers(sid);
         repeat_total = tot;
@@ -82,7 +86,9 @@ fn analytics_aggregate(state: &WebState, seller_ids: &[i64]) -> AnalyticsAgg {
         customer_count = state.db.analytics_customer_count(sid);
     } else {
         for sid in seller_ids {
-            revenue_total += state.db.analytics_revenue_total(*sid);
+            for (asset, amount) in state.db.analytics_revenue_by_asset(*sid) {
+                *revenue_by_asset.entry(asset).or_insert(0.0) += amount;
+            }
             let (t, p) = state.db.analytics_invoice_counts(*sid);
             invoice_total += t;
             invoice_paid += p;
@@ -98,7 +104,7 @@ fn analytics_aggregate(state: &WebState, seller_ids: &[i64]) -> AnalyticsAgg {
     }
 
     AnalyticsAgg {
-        revenue_total,
+        revenue_by_asset,
         invoice_total,
         invoice_paid,
         repeat_total,
@@ -115,13 +121,32 @@ pub(super) fn analytics_metrics(state: &WebState, session: &Session) -> Analytic
     let seller_ids = analytics_seller_ids(state, session);
     let agg = analytics_aggregate(state, &seller_ids);
 
-    let aov = agg.aov_single.unwrap_or_else(|| {
-        if agg.invoice_paid > 0 {
-            agg.revenue_total / agg.invoice_paid as f64
-        } else {
-            0.0
-        }
-    });
+    // Money is rendered per asset. A single float is shown only when the
+    // whole scope uses one denomination; otherwise both total and AOV carry
+    // a clearly labeled marker, never a meaningless cross-asset number.
+    let mixed = agg.revenue_by_asset.len() > 1;
+    let revenue_sum: f64 = agg.revenue_by_asset.values().sum();
+    let mut revenue_lines = String::new();
+    for (asset, amount) in &agg.revenue_by_asset {
+        revenue_lines.push_str(&format!(
+            r#"<div class="stat"><span class="stat-label">Revenue ({asset})</span><span class="stat-value">{amount:.2}</span></div>"#
+        ));
+    }
+    if revenue_lines.is_empty() {
+        revenue_lines = r#"<div class="stat"><span class="stat-label">Revenue</span><span class="stat-value">0.00</span></div>"#.to_string();
+    }
+    let aov_text = if mixed {
+        "mixed assets".to_string()
+    } else {
+        let value = agg.aov_single.unwrap_or_else(|| {
+            if agg.invoice_paid > 0 {
+                revenue_sum / agg.invoice_paid as f64
+            } else {
+                0.0
+            }
+        });
+        format!("{value:.2}")
+    };
 
     let mut top_map: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for (pid, cnt) in &agg.top_products {
@@ -158,7 +183,7 @@ pub(super) fn analytics_metrics(state: &WebState, session: &Session) -> Analytic
     }
 
     AnalyticsMetrics {
-        revenue_total: agg.revenue_total,
+        revenue_lines,
         invoice_total: agg.invoice_total,
         invoice_paid: agg.invoice_paid,
         repeat_total: agg.repeat_total,
@@ -166,7 +191,7 @@ pub(super) fn analytics_metrics(state: &WebState, session: &Session) -> Analytic
         abandoned: agg.abandoned,
         recovered: agg.recovered,
         customer_count: agg.customer_count,
-        aov,
+        aov_text,
         abandoned_rate,
         top_rows,
         top_labels_json,
@@ -190,17 +215,17 @@ fn analytics_overview(m: &AnalyticsMetrics) -> String {
     format!(
         r#"<section aria-labelledby="overview-heading"><h2 id="overview-heading">Overview</h2>
 <div class="grid-stats">
-<div class="panel"><div class="stat"><span class="stat-label">Revenue total</span><span class="stat-value">{revenue_total:.2}</span></div></div>
+{revenue_lines}
 <div class="panel"><div class="stat"><span class="stat-label">Invoice counts</span><span class="stat-value">{invoice_paid}/{invoice_total}</span></div></div>
-<div class="panel"><div class="stat"><span class="stat-label">AOV</span><span class="stat-value">{aov:.2}</span></div></div>
+<div class="panel"><div class="stat"><span class="stat-label">AOV</span><span class="stat-value">{aov_text}</span></div></div>
 <div class="panel"><div class="stat"><span class="stat-label">Customer count</span><span class="stat-value">{customer_count}</span></div></div>
 <div class="panel"><div class="stat"><span class="stat-label">Repeat buyers</span><span class="stat-value">{repeat_buyers}/{repeat_total}</span></div></div>
 <div class="panel"><div class="stat"><span class="stat-label">Abandoned cart rate</span><span class="stat-value">{abandoned_rate:.1}% ({abandoned}/{recovered})</span></div></div>
 </div></section>"#,
-        revenue_total = m.revenue_total,
+        revenue_lines = m.revenue_lines,
         invoice_paid = m.invoice_paid,
         invoice_total = m.invoice_total,
-        aov = m.aov,
+        aov_text = m.aov_text,
         customer_count = m.customer_count,
         repeat_buyers = m.repeat_buyers,
         repeat_total = m.repeat_total,
@@ -308,7 +333,8 @@ pub(super) async fn analytics_export(
         ids
     };
 
-    let mut revenue_total = 0.0_f64;
+    let mut revenue_by_asset: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     let mut invoice_total: i64 = 0;
     let mut invoice_paid: i64 = 0;
     let mut repeat_total: i64 = 0;
@@ -317,7 +343,9 @@ pub(super) async fn analytics_export(
     let mut recovered: i64 = 0;
     let mut customer_count: i64 = 0;
     for sid in &seller_ids {
-        revenue_total += state.db.analytics_revenue_total(*sid);
+        for (asset, amount) in state.db.analytics_revenue_by_asset(*sid) {
+            *revenue_by_asset.entry(asset).or_insert(0.0) += amount;
+        }
         let (t, p) = state.db.analytics_invoice_counts(*sid);
         invoice_total += t;
         invoice_paid += p;
@@ -329,10 +357,14 @@ pub(super) async fn analytics_export(
         recovered += rec;
         customer_count += state.db.analytics_customer_count(*sid);
     }
-    let aov = if invoice_paid > 0 {
-        revenue_total / invoice_paid as f64
+    let mixed = revenue_by_asset.len() > 1;
+    let revenue_sum: f64 = revenue_by_asset.values().sum();
+    let aov_text = if mixed {
+        "mixed assets".to_string()
+    } else if invoice_paid > 0 {
+        format!("{:.2}", revenue_sum / invoice_paid as f64)
     } else {
-        0.0
+        "0.00".to_string()
     };
     let abandoned_rate = if abandoned + recovered > 0 {
         (abandoned as f64 / (abandoned + recovered) as f64) * 100.0
@@ -341,10 +373,20 @@ pub(super) async fn analytics_export(
     };
 
     let mut csv = String::from("metric,value\n");
-    csv.push_str(&format!("revenue_total,{:.2}\n", revenue_total));
+    for (asset, amount) in &revenue_by_asset {
+        csv.push_str(&format!("revenue_{asset},{amount:.2}\n"));
+    }
+    csv.push_str(&format!(
+        "revenue_total,{}\n",
+        if mixed {
+            "mixed assets".to_string()
+        } else {
+            format!("{revenue_sum:.2}")
+        }
+    ));
     csv.push_str(&format!("invoice_total,{}\n", invoice_total));
     csv.push_str(&format!("invoice_paid,{}\n", invoice_paid));
-    csv.push_str(&format!("aov,{:.2}\n", aov));
+    csv.push_str(&format!("aov,{aov_text}\n"));
     csv.push_str(&format!("customer_count,{}\n", customer_count));
     csv.push_str(&format!("repeat_buyers,{}\n", repeat_buyers));
     csv.push_str(&format!("repeat_buyer_total,{}\n", repeat_total));

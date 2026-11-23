@@ -1,4 +1,5 @@
 #![allow(clippy::type_complexity)]
+use crate::secrets::{MasterKey, SecretError, decrypt_secret, encrypt_secret};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -43,6 +44,21 @@ type InvoiceRow = (
 // them (the /buy resolver in handlers::commands returns these verbatim).
 pub type PlanRow = (String, String, String, i64, Option<String>, bool, i64);
 pub type PlanGlobalRow = (i64, i64, String, String, String, i64, Option<String>);
+
+/// A single numeric money total cannot be formed when invoices use more
+/// than one asset. Money amounts stay denominated per asset; callers must
+/// render [`Db::revenue_by_asset`](Db::revenue_by_asset) lines instead of a
+/// summed float.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixedAssets;
+
+impl std::fmt::Display for MixedAssets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mixed assets: no cross-asset money total is available")
+    }
+}
+
+impl std::error::Error for MixedAssets {}
 
 /// Booking row for the console table and `/mybookings` (web/server), adjusted to
 /// the real columns of schema.sql: (bookings.id, bookings.booking_id public
@@ -1563,7 +1579,61 @@ impl Db {
         }
     }
 
+    /// Read a config value. For non-secret keys behavior is unchanged.
+    /// Encrypted values are transparently decoded so legacy readers of a
+    /// secret key keep working; a missing key or a corrupt envelope reads as
+    /// absent (fail closed) and is logged without any secret material.
     pub fn get_config(&self, key: &str) -> Option<String> {
+        let mk = crate::config::master_key().ok().flatten();
+        self.get_config_with_key(key, mk.as_ref())
+    }
+
+    /// Core of `get_config` with an explicitly resolved key, so the
+    /// transparent-read behavior is testable without process environment.
+    fn get_config_with_key(&self, key: &str, mk: Option<&MasterKey>) -> Option<String> {
+        let raw = self.config_raw(key)?;
+        if !crate::secrets::is_encrypted(&raw) {
+            return Some(raw);
+        }
+        let Some(mk) = mk else {
+            tracing::warn!(
+                "config value for '{}' is encrypted but MASTER_KEY is unavailable",
+                key
+            );
+            return None;
+        };
+        match decrypt_secret(mk, &raw) {
+            Ok(plain) => String::from_utf8(plain).ok(),
+            Err(_) => {
+                tracing::warn!("config value for '{}' could not be decoded", key);
+                None
+            }
+        }
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO config(key,value,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![key, value, now],
+        );
+    }
+
+    // ---- Secrets at rest ----
+
+    /// Config keys that must never be written verbatim. Kept as a list so a
+    /// future sensitive key is added in one place; callers still opt in by
+    /// using the secret setter rather than `set_config`.
+    pub fn is_sensitive_config_key(key: &str) -> bool {
+        matches!(key, "crypto_token")
+    }
+
+    fn config_raw(&self, key: &str) -> Option<String> {
         let conn = self
             .conn
             .lock()
@@ -1578,17 +1648,73 @@ impl Db {
         .flatten()
     }
 
-    pub fn set_config(&self, key: &str, value: &str) {
-        let conn = self
-            .conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Utc::now().to_rfc3339();
-        let _ = conn.execute(
-            "INSERT INTO config(key,value,updated_at) VALUES(?1,?2,?3)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            params![key, value, now],
-        );
+    /// Write a sensitive config value as an encrypted envelope. Refuses to
+    /// write plaintext when MASTER_KEY is absent or malformed — an operator
+    /// must configure the key before secrets can be saved.
+    pub fn try_set_secret_config(&self, key: &str, value: &str) -> Result<(), SecretError> {
+        if !Self::is_sensitive_config_key(key) {
+            return Err(SecretError::NotSensitiveKey);
+        }
+        let mk = crate::config::master_key()?;
+        self.set_secret_config_with(mk.as_ref(), key, value)
+    }
+
+    /// Same as `try_set_secret_config` with an explicitly resolved key.
+    /// `None` models an absent MASTER_KEY and refuses the write.
+    pub(crate) fn set_secret_config_with(
+        &self,
+        mk: Option<&MasterKey>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), SecretError> {
+        if !Self::is_sensitive_config_key(key) {
+            return Err(SecretError::NotSensitiveKey);
+        }
+        let mk = mk.ok_or(SecretError::MissingMasterKey)?;
+        let sealed = encrypt_secret(mk, value.as_bytes())?;
+        self.set_config(key, &sealed);
+        Ok(())
+    }
+
+    /// Read a sensitive config value. Legacy unprefixed values are returned
+    /// verbatim so existing deployments keep working; encrypted values need a
+    /// valid MASTER_KEY and fail closed on tampering or a wrong key.
+    pub fn get_secret_config(&self, key: &str) -> Result<Option<String>, SecretError> {
+        if !Self::is_sensitive_config_key(key) {
+            return Err(SecretError::NotSensitiveKey);
+        }
+        let Some(raw) = self.config_raw(key) else {
+            return Ok(None);
+        };
+        self.decode_secret_value(&raw)
+    }
+
+    pub(crate) fn get_secret_config_with(
+        &self,
+        mk: &MasterKey,
+        key: &str,
+    ) -> Result<Option<String>, SecretError> {
+        let Some(raw) = self.config_raw(key) else {
+            return Ok(None);
+        };
+        if !crate::secrets::is_encrypted(&raw) {
+            return Ok(Some(raw));
+        }
+        let plain = decrypt_secret(mk, &raw)?;
+        Ok(Some(
+            String::from_utf8(plain).map_err(|_| SecretError::InvalidUtf8)?,
+        ))
+    }
+
+    fn decode_secret_value(&self, raw: &str) -> Result<Option<String>, SecretError> {
+        if !crate::secrets::is_encrypted(raw) {
+            return Ok(Some(raw.to_string()));
+        }
+        let mk = crate::config::master_key()?.ok_or(SecretError::MissingMasterKey)?;
+        let plain = decrypt_secret(&mk, raw)?;
+        Ok(Some(
+            String::from_utf8(plain).map_err(|_| SecretError::InvalidUtf8)?,
+        ))
     }
 
     // ---- Sellers ----
@@ -6871,59 +6997,63 @@ impl Db {
                 .unwrap_or(0)
         }
     }
-    pub fn revenue_total(&self, seller_scope: Option<i64>) -> f64 {
+    /// Paid revenue per asset, optionally scoped to one seller. This is the
+    /// correct source for every money display; each amount stays in its own
+    /// denomination, so a BTC amount is never added to a USDT amount.
+    pub fn revenue_by_asset_scoped(&self, seller_scope: Option<i64>) -> Vec<(String, f64)> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sql = if seller_scope.is_some() {
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status='paid'"
+            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status='paid' GROUP BY asset ORDER BY asset"
         } else {
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE status='paid'"
+            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE status='paid' GROUP BY asset ORDER BY asset"
         };
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(_) => return 0.0,
-        };
-        let res = if let Some(sid) = seller_scope {
-            stmt.query_row(params![sid], |r| r.get::<_, f64>(0))
-        } else {
-            stmt.query_row([], |r| r.get::<_, f64>(0))
-        };
-        res.unwrap_or(0.0)
-    }
-
-    pub fn revenue_by_seller(&self) -> Vec<(i64, f64)> {
-        let mut out = Vec::new();
-        for sid in self.list_sellers() {
-            out.push((sid, self.revenue_total(Some(sid))));
-        }
-        out
-    }
-
-    /// Per-asset paid revenue — the finance ruling (CRYPTO_PAY.md, ruling 5):
-    /// summing CAST(amount AS REAL) across assets (0.5 BTC + 50 USDT) is a
-    /// meaningless number and a display defect, so revenue is reported per
-    /// asset and must never be totalled cross-asset downstream. Same
-    /// paid-invoice basis as revenue_total: `WHERE status='paid'`.
-    pub fn revenue_by_asset(&self) -> Vec<(String, f64)> {
-        let conn = self
-            .conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut stmt = match conn.prepare(
-            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE status='paid' GROUP BY asset ORDER BY asset",
-        ) {
-            Ok(s) => s,
             Err(_) => return vec![],
         };
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
-            .ok();
-        match rows {
-            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-            None => vec![],
+        if let Some(sid) = seller_scope {
+            match stmt.query_map(params![sid], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            }) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            }
+        } else {
+            match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            }
         }
+    }
+
+    /// Paid revenue per asset across every seller. See the finance ruling in
+    /// `docs/CRYPTO_PAY.md`: cross-asset summing is a display defect.
+    pub fn revenue_by_asset(&self) -> Vec<(String, f64)> {
+        self.revenue_by_asset_scoped(None)
+    }
+
+    /// Single-denomination total, for the common case where every paid
+    /// invoice uses the same asset. Returns `Err(MixedAssets)` as soon as a
+    /// second asset appears — the caller must show per-asset lines instead.
+    pub fn revenue_total(&self, seller_scope: Option<i64>) -> Result<f64, MixedAssets> {
+        let rows = self.revenue_by_asset_scoped(seller_scope);
+        match rows.len() {
+            0 => Ok(0.0),
+            1 => Ok(rows[0].1),
+            _ => Err(MixedAssets),
+        }
+    }
+
+    /// Per-seller revenue as per-asset lines. A seller selling two assets has
+    /// two entries; no cross-asset number is produced anywhere.
+    pub fn revenue_by_seller(&self) -> Vec<(i64, Vec<(String, f64)>)> {
+        self.list_sellers()
+            .into_iter()
+            .map(|sid| (sid, self.revenue_by_asset_scoped(Some(sid))))
+            .collect()
     }
 
     // ---- MCP approvals & audit ----
@@ -8960,9 +9090,33 @@ impl Db {
     }
 
     // ---- Phase 5: business analytics ----
-    pub fn analytics_revenue_total(&self, seller_id: i64) -> f64 {
+    /// Analytics revenue per asset (paid/executed basis), the only valid
+    /// money breakdown for this seller.
+    pub fn analytics_revenue_by_asset(&self, seller_id: i64) -> Vec<(String, f64)> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0.0)
+        let mut stmt = match conn.prepare(
+            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed') GROUP BY asset ORDER BY asset",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        match stmt.query_map(params![seller_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// Single-asset revenue only. Multiple assets produce `MixedAssets` —
+    /// a summed float across BTC and USDT is not a money amount.
+    pub fn analytics_revenue_total(&self, seller_id: i64) -> Result<f64, MixedAssets> {
+        let rows = self.analytics_revenue_by_asset(seller_id);
+        match rows.len() {
+            0 => Ok(0.0),
+            1 => Ok(rows[0].1),
+            _ => Err(MixedAssets),
+        }
     }
 
     pub fn analytics_invoice_counts(&self, seller_id: i64) -> (i64, i64) {
@@ -8979,9 +9133,18 @@ impl Db {
         (total, paid)
     }
 
-    pub fn analytics_aov(&self, seller_id: i64) -> f64 {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row("SELECT COALESCE(AVG(CAST(amount AS REAL)),0) FROM invoices WHERE seller_id=?1 AND status IN ('paid','executed')", params![seller_id], |r| r.get(0)).unwrap_or(0.0)
+    /// Average order value is meaningful only within one denomination.
+    /// Multiple assets produce `MixedAssets`; callers show per-asset lines.
+    pub fn analytics_aov(&self, seller_id: i64) -> Result<f64, MixedAssets> {
+        let rows = self.analytics_revenue_by_asset(seller_id);
+        if rows.len() > 1 {
+            return Err(MixedAssets);
+        }
+        let (_, paid) = self.analytics_invoice_counts(seller_id);
+        if paid == 0 {
+            return Ok(0.0);
+        }
+        Ok(rows.first().map(|r| r.1).unwrap_or(0.0) / paid as f64)
     }
 
     pub fn analytics_top_products(&self, seller_id: i64, limit: i64) -> Vec<(i64, i64)> {
