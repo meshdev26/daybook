@@ -13,7 +13,7 @@ Chat with @userinfobot to get your numeric user ID.
 cp .env.example .env
 # edit .env
 ```
-Set `TELEGRAM_BOT_TOKEN` and `OWNER_ID`. Optionally `DEFAULT_CHANNEL` and `CRYPTO_PAY_TOKEN`.
+Set `TELEGRAM_BOT_TOKEN` and `OWNER_ID`. Optionally `DEFAULT_CHANNEL` and `CRYPTO_PAY_TOKEN`. `MFA_RECOVERY_CODES_ENABLED` defaults to on; `0`, `false`, `no` or `off` disables MFA recovery codes while TOTP sign-in continues to work.
 
 ## 4. Build
 ```bash

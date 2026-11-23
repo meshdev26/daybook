@@ -22,11 +22,25 @@ pub(crate) fn normalize_bot_type(bot_type: &str) -> &str {
     }
 }
 
+/// Default-on parse: only false-like values disable; unknown values fail open.
+fn flag_default_true_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+pub(crate) fn env_flag_default_true(name: &str) -> bool {
+    flag_default_true_value(env::var(name).ok().as_deref())
+}
+
 #[derive(Clone)]
 pub struct SharedConfig {
     pub db_path: String,
     pub crypto_token: Option<String>,
     pub ai_enabled: bool,
+    /// Default on; false-like values reject stored codes and hide the recovery UI.
+    pub mfa_recovery_codes_enabled: bool,
     pub ai_provider: String,
     pub ai_api_style: String,
     pub ai_base_url: String,
@@ -484,6 +498,7 @@ impl AppConfig {
         let ai_enabled = env::var("AI_ENABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let mfa_recovery_codes_enabled = env_flag_default_true("MFA_RECOVERY_CODES_ENABLED");
         let ai_provider = env::var("AI_PROVIDER").unwrap_or_else(|_| "openai".to_string());
         let ai_api_style = env::var("AI_API_STYLE").unwrap_or_else(|_| {
             if ai_provider == "anthropic" {
@@ -520,6 +535,7 @@ impl AppConfig {
             db_path,
             crypto_token,
             ai_enabled,
+            mfa_recovery_codes_enabled,
             ai_provider,
             ai_api_style,
             ai_base_url,
@@ -730,6 +746,30 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn default_true_flag_parser() {
+        for value in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("garbage"),
+        ] {
+            assert!(
+                flag_default_true_value(value),
+                "expected enabled for {value:?}"
+            );
+        }
+        for value in ["0", "false", "FALSE", "no", "off", " NO ", " Off "] {
+            assert!(
+                !flag_default_true_value(Some(value)),
+                "expected disabled for {value:?}"
+            );
+        }
     }
 
     #[test]

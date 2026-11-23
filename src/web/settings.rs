@@ -101,10 +101,16 @@ pub(super) async fn settings_page(
             r#"<div class="alert alert-success" role="status" aria-live="polite">MFA disabled. Sign-in is password-only until MFA is enrolled again.</div>"#
                 .to_string(),
         ),
-        Some(_) => Some(
-            r#"<div class="alert alert-error" role="alert">That code was not accepted — MFA settings are unchanged. Enter a current authenticator code or an unused recovery code.</div>"#
-                .to_string(),
-        ),
+        Some(_) => {
+            let hint = if state.cfg.mfa_recovery_codes_enabled {
+                "Enter a current authenticator code or an unused recovery code."
+            } else {
+                "Enter a current authenticator code."
+            };
+            Some(format!(
+                r#"<div class="alert alert-error" role="alert">That code was not accepted — MFA settings are unchanged. {hint}</div>"#
+            ))
+        }
         None => None,
     };
     let banner = [setupbot_banner, mfa_banner]
@@ -321,33 +327,49 @@ fn password_panel(state: &WebState) -> String {
 
 fn mfa_panel(state: &WebState, session: &Session) -> String {
     let (_secret, enabled, _last) = state.db.get_totp_state(session.account_id);
-    let unused = state.db.list_unused_recovery_codes(session.account_id);
     let mfa_status = if enabled {
         r#"<span class="badge badge-success">enabled</span>"#
     } else {
         r#"<span class="badge badge-warning">disabled</span>"#
     };
+    let recovery = state.cfg.mfa_recovery_codes_enabled;
+    let unused_row = if recovery {
+        format!(
+            r#"<dt>Unused recovery codes</dt><dd class="mono">{}</dd>"#,
+            state.db.list_unused_recovery_codes(session.account_id)
+        )
+    } else {
+        String::new()
+    };
+    let rotate_form = if recovery {
+        format!(
+            r#"<form method="post" action="{}">
+<label for="mfa-recovery-code">Code — to rotate recovery codes</label>
+<input type="text" id="mfa-recovery-code" name="code" required autocomplete="one-time-code"><span class="help">Required to rotate. A recovery code is accepted (and consumed) when your authenticator is unavailable. These codes are NOT a wallet seed phrase — never enter them in a crypto wallet.</span>
+<button type="submit" class="btn btn-sm">Regenerate recovery codes</button>
+</form>"#,
+            state.url("/settings/mfa/recovery")
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<details open id="mfa"><summary>Multi-factor authentication (MFA)</summary>
 <article class="panel">
-<dl class="kv"><dt>Status</dt><dd>{status}</dd><dt>Unused recovery codes</dt><dd class="mono">{unused}</dd></dl>
+<dl class="kv"><dt>Status</dt><dd>{status}</dd>{unused_row}</dl>
 <form method="post" action="{}"><button type="submit" class="btn btn-sm">Enroll / Re-enroll MFA</button></form>
 <form method="post" action="{}">
 <label for="mfa-disable-code">Code — to disable MFA</label>
 <input type="text" id="mfa-disable-code" name="code" required autocomplete="one-time-code"><span class="help">Required: a hijacked session cannot disable MFA without the current factor.</span>
 <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Disable MFA? You will sign in with password only until you enroll again.')">Disable MFA</button>
 </form>
-<form method="post" action="{}">
-<label for="mfa-recovery-code">Code — to rotate recovery codes</label>
-<input type="text" id="mfa-recovery-code" name="code" required autocomplete="one-time-code"><span class="help">Required to rotate. A recovery code is accepted (and consumed) when your authenticator is unavailable.</span>
-<button type="submit" class="btn btn-sm">Regenerate recovery codes</button>
-</form>
+{rotate_form}
 </article></details>"#,
         state.url("/settings/mfa/enroll"),
         state.url("/settings/mfa/disable"),
-        state.url("/settings/mfa/recovery"),
         status = mfa_status,
-        unused = unused,
+        unused_row = unused_row,
+        rotate_form = rotate_form,
     )
 }
 

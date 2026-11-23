@@ -11,7 +11,7 @@ Roles: `owner > admin > seller > user`. Sellers are auto-scoped to their own `se
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
 | POST | /auth/login | public | `{username, password}` → `{token, expires_at, account_id, role, seller_id}`. TOTP-enabled accounts instead return 200 `{mfa_required: true, pending_token}` — a 5-minute single-use token, not a session; TOTP-disabled owner/admin get 401 `mfa_required` ("enroll via the web console first") |
-| POST | /auth/mfa/verify | public (pending token) | `{pending_token, code}` → `{token, expires_at, account_id, role, seller_id}`. `code` is a TOTP authenticator code or a recovery code; the pending token is single-use; 401 `invalid_code` on a bad code; failed attempts throttled 5 per 15 min per pending token (429 `too_many_attempts`) |
+| POST | /auth/mfa/verify | public (pending token) | `{pending_token, code}` → `{token, expires_at, account_id, role, seller_id}`. `code` is a TOTP authenticator code or, while `MFA_RECOVERY_CODES_ENABLED` is on (the default), a recovery code; the pending token is single-use; 401 `invalid_code` on a bad code; failed attempts throttled 5 per 15 min per pending token (429 `too_many_attempts`) |
 | POST | /auth/logout | any | Revoke session |
 | GET | /auth/me | any | Current account |
 | POST | /auth/password | any | `{new_password}` |
@@ -19,7 +19,7 @@ Roles: `owner > admin > seller > user`. Sellers are auto-scoped to their own `se
 | POST | /auth/api-keys | seller+ | `{name, scopes}` → returns full key once |
 | DELETE | /auth/api-keys/{id} | seller+/owner | Revoke key |
 
-Login on a TOTP-enabled account is two-step: `POST /auth/login` never mints a session directly — exchange the returned `pending_token` plus a valid code at `POST /auth/mfa/verify` (REST parity with the web flow). Enrollment itself is web-console only.
+Login on a TOTP-enabled account is two-step: `POST /auth/login` never mints a session directly — exchange the returned `pending_token` plus a valid code at `POST /auth/mfa/verify` (REST parity with the web flow). Enrollment itself is web-console only. With `MFA_RECOVERY_CODES_ENABLED` disabled, stored recovery codes are rejected with `invalid_code` ("invalid authenticator code") and TOTP is the only second factor; an account without a working authenticator cannot complete login.
 
 ### Sellers
 | Method | Path | Role | Description |

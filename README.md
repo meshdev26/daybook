@@ -124,6 +124,7 @@ cargo build --release
 ./target/release/daybook
 ```
 Web dashboard: http://localhost:8080 (set `WEB_PORT`, `WEB_USERNAME`, `WEB_PASSWORD` in `.env`). Login with owner credentials; sellers get accounts via `/becomeseller` or `/dashboard`.
+Web MFA issues 10 one-time recovery codes drawn from the BIP-39 English wordlist, bcrypt-hashed at rest and shown once. `MFA_RECOVERY_CODES_ENABLED` defaults to on; setting it to `0`, `false`, `no` or `off` rejects stored codes and removes the recovery UI and route. TOTP sign-in is unaffected, so disabling the feature without a working authenticator can lock an account out.
 
 ## MCP server (AI agents)
 

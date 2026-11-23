@@ -14,6 +14,8 @@ and the setup & management UX polish
 (`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Added
+- `MFA_RECOVERY_CODES_ENABLED` (default on): `0`, `false`, `no` or `off` rejects stored recovery codes, removes the recovery route and console UI, and leaves TOTP sign-in working. Stored codes stay in the database and revive if the flag is re-enabled.
+- Recovery codes now draw from the vetted BIP-39 English wordlist: 10 one-time four-word, hyphen-joined codes, bcrypt-hashed at rest. The UI states they are not wallet seed phrases.
 - Bookings domain closed end-to-end: console `/bookings` page (seller-scope
   table, status filter, confirm/decline/cancel actions with audit, read-only
   services panel), buyer `/mybookings` and `/cancelbooking`, seller

@@ -1,5 +1,6 @@
 use super::tests::{
-    authed_req, body_string, make_state, owner_session, post_authed_req, seller_session,
+    authed_req, body_string, get_req, make_state, make_state_with_recovery_codes, owner_session,
+    pending_get_req, pending_post_req, post_authed_req, seller_session,
 };
 use super::*;
 use axum::http::StatusCode;
@@ -113,6 +114,207 @@ async fn settings_mfa_recovery_requires_current_factor() {
         0,
         "no codes may be minted without the current factor"
     );
+}
+
+fn pending_row(
+    db: &crate::db::Db,
+    account_id: i64,
+    purpose: &str,
+    secret: Option<&str>,
+    raw: &str,
+) {
+    let expires = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    db.create_pending_mfa(
+        crate::web::auth_pages::sha256_hex(raw),
+        account_id,
+        purpose,
+        secret,
+        expires,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn mfa_enroll_omits_recovery_codes_when_disabled() {
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    const RAW: &str = "enroll-pending-off";
+    let (state, _dir) = make_state_with_recovery_codes(false).await;
+    let db = state.db.clone();
+    let (acc_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    pending_row(&db, acc_id, "enroll", Some(SECRET), RAW);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let code = crate::util::totp_generate(SECRET, now, 6usize, 30u64);
+    let app = router(state);
+    let resp = app
+        .oneshot(pending_post_req(
+            "/mfa/enroll",
+            &format!("code={code}"),
+            RAW,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("MFA enabled"), "{body}");
+    assert!(body.contains("Continue to dashboard"), "{body}");
+    assert!(!body.contains("recovery-codes"), "{body}");
+    assert!(!body.contains("wallet seed"), "{body}");
+    assert!(db.get_totp_state(acc_id).1, "TOTP must still be enabled");
+    assert_eq!(db.list_unused_recovery_codes(acc_id), 0);
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn mfa_enroll_shows_recovery_codes_when_enabled() {
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    const RAW: &str = "enroll-pending-on";
+    let (state, _dir) = make_state_with_recovery_codes(true).await;
+    let db = state.db.clone();
+    let (acc_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    pending_row(&db, acc_id, "enroll", Some(SECRET), RAW);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let code = crate::util::totp_generate(SECRET, now, 6usize, 30u64);
+    let app = router(state);
+    let resp = app
+        .oneshot(pending_post_req(
+            "/mfa/enroll",
+            &format!("code={code}"),
+            RAW,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("recovery-codes"), "{body}");
+    assert!(body.contains("wallet seed"), "{body}");
+    assert_eq!(db.list_unused_recovery_codes(acc_id), 10);
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn mfa_verify_rejects_stored_recovery_code_when_disabled() {
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    const RAW: &str = "verify-pending-flag";
+    const PLAIN: &str = "alpha-bravo-charlie-delta";
+    let (mut state, _dir) = make_state_with_recovery_codes(false).await;
+    let db = state.db.clone();
+    let (acc_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    db.enable_totp(acc_id, SECRET).unwrap();
+    let hashed = bcrypt::hash(PLAIN, bcrypt::DEFAULT_COST).unwrap_or_default();
+    db.create_recovery_codes(acc_id, [hashed]).unwrap();
+    pending_row(&db, acc_id, "verify", None, RAW);
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(pending_post_req(
+            "/mfa/verify",
+            &format!("code={PLAIN}"),
+            RAW,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("Invalid code"), "{body}");
+    assert_eq!(
+        db.list_unused_recovery_codes(acc_id),
+        1,
+        "code stays dormant"
+    );
+
+    state.cfg.mfa_recovery_codes_enabled = true;
+    let app = router(state);
+    let resp = app
+        .oneshot(pending_post_req(
+            "/mfa/verify",
+            &format!("code={PLAIN}"),
+            RAW,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("location").unwrap(), "/dashboard");
+    assert_eq!(
+        db.list_unused_recovery_codes(acc_id),
+        0,
+        "code revives when re-enabled"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn mfa_verify_page_label_tracks_flag() {
+    let (state_off, _dir_off) = make_state_with_recovery_codes(false).await;
+    let db_off = state_off.db.clone();
+    let (acc_off, _, _, _, _) = db_off.get_web_account_by_username("owner").unwrap();
+    pending_row(&db_off, acc_off, "verify", None, "page-off");
+    let app = router(state_off);
+    let resp = app
+        .oneshot(pending_get_req("/mfa/verify", "page-off"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains(">Authenticator code<"), "{body}");
+    assert!(!body.contains("or recovery code"), "{body}");
+
+    let (state_on, _dir_on) = make_state_with_recovery_codes(true).await;
+    let db_on = state_on.db.clone();
+    let (acc_on, _, _, _, _) = db_on.get_web_account_by_username("owner").unwrap();
+    pending_row(&db_on, acc_on, "verify", None, "page-on");
+    let app = router(state_on);
+    let resp = app
+        .oneshot(pending_get_req("/mfa/verify", "page-on"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("Authenticator code or recovery code"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_mfa_recovery_route_refused_when_disabled() {
+    let (state, _dir) = make_state_with_recovery_codes(false).await;
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app
+        .clone()
+        .oneshot(post_authed_req(
+            "/settings/mfa/recovery",
+            "code=123456",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    for path in ["/mfa/verify", "/mfa/enroll"] {
+        let resp = app.clone().oneshot(get_req(path)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must stay live"
+        );
+    }
+}
+
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn settings_mfa_panel_hides_recovery_ui_when_disabled() {
+    let (state, _dir) = make_state_with_recovery_codes(false).await;
+    let token = owner_session(&state).await;
+    let app = router(state);
+    let resp = app.oneshot(authed_req("/settings", &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("Multi-factor authentication"), "{body}");
+    assert!(body.contains("Enroll / Re-enroll MFA"), "{body}");
+    assert!(body.contains("Disable MFA"), "{body}");
+    assert!(!body.contains("Unused recovery codes"), "{body}");
+    assert!(!body.contains("Regenerate recovery codes"), "{body}");
+    assert!(!body.contains("wallet seed"), "{body}");
 }
 
 // ---- Refund create seller clamp (MED-7 mirror) ----

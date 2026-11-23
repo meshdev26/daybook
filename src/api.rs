@@ -286,14 +286,12 @@ struct MfaVerifyReq {
     /// Raw pending token returned by `auth_login` when it responded
     /// `{"mfa_required": true, "pending_token": ...}`.
     pending_token: String,
-    /// TOTP authenticator code or a recovery code.
+    /// TOTP code, or a recovery code when enabled.
     code: String,
 }
 
-/// REST parity for the web MFA verify (web::mfa_verify_submit): exchange a
-/// pending token minted by `auth_login` plus a valid TOTP or recovery code
-/// for a full web session. Throttled 5/900 per pending token via the shared
-/// login-attempt map; the pending token is single-use (deleted on success).
+/// Exchange a pending token plus TOTP (or a recovery code when enabled) for a session.
+/// Single-use token, five attempts per 15 min.
 async fn auth_mfa_verify(
     State(state): State<WebState>,
     Json(f): Json<MfaVerifyReq>,
@@ -359,16 +357,19 @@ async fn auth_mfa_verify(
             }
         }
     }
-    if !ok && state.db.verify_recovery_code(account_id, code) {
+    if !ok
+        && state.cfg.mfa_recovery_codes_enabled
+        && state.db.verify_recovery_code(account_id, code)
+    {
         ok = true;
     }
     if !ok {
-        return err(
-            StatusCode::UNAUTHORIZED,
-            "invalid_code",
-            "invalid authenticator or recovery code",
-        )
-        .into_response();
+        let detail = if state.cfg.mfa_recovery_codes_enabled {
+            "invalid authenticator or recovery code"
+        } else {
+            "invalid authenticator code"
+        };
+        return err(StatusCode::UNAUTHORIZED, "invalid_code", detail).into_response();
     }
     crate::auth::login_ok(&state.login_attempts, &throttle_key);
     let _ = state.db.delete_pending_mfa(&hash);

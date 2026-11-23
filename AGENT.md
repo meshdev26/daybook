@@ -158,6 +158,11 @@ cargo deny check
 - Daybook is a free MIT library, not a hosted or sold service. The maintainer
   owes no ToS/refund/EAA; self-hosters own their legal docs (see `docs/LEGAL.md`,
   templates in `docs/*_DRAFT.md`).
+- MFA recovery codes draw four hyphen-joined words from the `bip39` English
+  word list (2 bytes per word, 2^11 mask = uniform over 2048). They are one-time
+  sign-in codes, never wallet seeds. `MFA_RECOVERY_CODES_ENABLED` defaults on;
+  false-like values reject stored codes, remove the recovery UI and route, and
+  leave TOTP enrollment and verification live.
 
 ## 12. Contacts
 - Maintainer: repository owner.

@@ -28,6 +28,15 @@ is intentionally not served when a base path is set. Also set
 `WEB_BASE_PATH` **after** first-run setup or re-add it afterwards — the setup
 form rewrites `.env` with a fixed key list (known issue, tracked).
 
+## MFA recovery codes
+
+Recovery codes are 10 one-time codes drawn from the BIP-39 English wordlist and
+stored bcrypt-hashed. `MFA_RECOVERY_CODES_ENABLED` defaults to on; `0`, `false`,
+`no` or `off` reject stored codes and remove the recovery UI and route from the
+dashboard. TOTP enrollment and verification stay available. Stored codes remain
+in the database and work again if the flag is turned back on. Confirm that every
+privileged account has a working authenticator before disabling the feature.
+
 ## Embed into a Rust host
 
 The crate is a library: an existing axum service can mount the whole app:

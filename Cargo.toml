@@ -109,6 +109,8 @@ sha2 = "0.10"
 async-trait = "0.1"
 bcrypt = "0.15"
 getrandom = "0.4"
+# Word list only; four-word codes need no mnemonic API.
+bip39 = "2.2.2"
 
 # ---- Personal-account MTProto identity (Phase 0a, user-identity design) ----
 # Exact pins (`=`) per the ratified design: grammers' raw-TL surfaces are not

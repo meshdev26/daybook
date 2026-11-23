@@ -84,6 +84,7 @@ async fn make_state() -> (WebState, tempfile::TempDir) {
         db_path: db_path.clone(),
         crypto_token: None,
         ai_enabled: false,
+        mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),
         ai_api_style: "openai".to_string(),
         ai_base_url: "https://api.openai.com/v1".to_string(),
@@ -190,6 +191,83 @@ async fn api_login_and_me() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+fn api_pending(db: &Db, account_id: i64, raw: &str) {
+    let expires = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    db.create_pending_mfa(sha256_hex(raw), account_id, "verify", None::<&str>, expires)
+        .unwrap();
+}
+
+fn mfa_json_req(pending: &str, code: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/mfa/verify")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"pending_token": pending, "code": code}).to_string(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn api_mfa_verify_rejects_stored_recovery_code_when_disabled() {
+    const RAW: &str = "api-pending-recovery-off";
+    const PLAIN: &str = "echo-foxtrot-golf-hotel";
+    let (mut state, _dir) = make_state().await;
+    state.cfg.mfa_recovery_codes_enabled = false;
+    let db = state.db.clone();
+    let (acc_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    db.enable_totp(acc_id, "JBSWY3DPEHPK3PXP").unwrap();
+    let hashed = bcrypt::hash(PLAIN, bcrypt::DEFAULT_COST).unwrap_or_default();
+    db.create_recovery_codes(acc_id, [hashed]).unwrap();
+    api_pending(&db, acc_id, RAW);
+
+    let app = router(state.clone());
+    let resp = app.clone().oneshot(mfa_json_req(RAW, PLAIN)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"].as_str(), Some("invalid_code"));
+    assert_eq!(
+        v["error"]["message"].as_str(),
+        Some("invalid authenticator code")
+    );
+    assert_eq!(
+        db.list_unused_recovery_codes(acc_id),
+        1,
+        "code stays dormant"
+    );
+
+    state.cfg.mfa_recovery_codes_enabled = true;
+    let app = router(state);
+    let resp = app.oneshot(mfa_json_req(RAW, PLAIN)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.list_unused_recovery_codes(acc_id), 0, "code revives");
+}
+
+#[tokio::test]
+async fn api_mfa_verify_accepts_totp_when_recovery_disabled() {
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    const RAW: &str = "api-pending-totp-off";
+    let (mut state, _dir) = make_state().await;
+    state.cfg.mfa_recovery_codes_enabled = false;
+    let db = state.db.clone();
+    let (acc_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    db.enable_totp(acc_id, SECRET).unwrap();
+    api_pending(&db, acc_id, RAW);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let code = crate::util::totp_generate(SECRET, now, 6usize, 30u64);
+    let app = router(state);
+    let resp = app.oneshot(mfa_json_req(RAW, &code)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v["token"].as_str().is_some());
 }
 
 /// F2: the REST login must record failures under the same namespaced key as

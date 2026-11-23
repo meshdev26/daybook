@@ -43,17 +43,23 @@ pub(super) async fn mfa_verify_page(
     if purpose != "verify" {
         return Redirect::to(&state.url("/mfa/enroll")).into_response();
     }
+    let code_label = if state.cfg.mfa_recovery_codes_enabled {
+        "Authenticator code or recovery code"
+    } else {
+        "Authenticator code"
+    };
     let body = format!(
         r#"<h1>Verify MFA <span class="sub">enter your authenticator code</span></h1>
 <article class="panel">
 <form method="post" action="{}">
-<label>Authenticator code or recovery code<input type="text" name="code" required autocomplete="one-time-code"></label>
+<label>{code_label}<input type="text" name="code" required autocomplete="one-time-code"></label>
 <button type="submit">Verify</button>
 </form>
 <p class="help">Account {}.</p>
 </article>"#,
         state.url("/mfa/verify"),
-        account_id
+        account_id,
+        code_label = code_label,
     );
     Html(html_page_bare(&state.base_path, "MFA verify", &body)).into_response()
 }
@@ -107,7 +113,10 @@ pub(super) async fn mfa_verify_submit(
             }
         }
     }
-    if !ok && state.db.verify_recovery_code(account_id, code) {
+    if !ok
+        && state.cfg.mfa_recovery_codes_enabled
+        && state.db.verify_recovery_code(account_id, code)
+    {
         ok = true;
     }
     if ok {
@@ -230,21 +239,29 @@ pub(super) async fn mfa_enroll_submit(
     }
     login_ok(&state.login_attempts, &format!("mfa:{}", raw));
     let _ = state.db.enable_totp(account_id, secret.clone());
-    // generate recovery codes
-    let mut plain: Vec<String> = Vec::new();
-    for _ in 0..10 {
-        plain.push(crate::util::gen_recovery_code());
-    }
-    let plain_clone = plain.clone();
-    let hashed = tokio::task::spawn_blocking(move || {
-        plain_clone
-            .iter()
-            .map(|c| bcrypt::hash(c, bcrypt::DEFAULT_COST).unwrap_or_default())
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-    let _ = state.db.create_recovery_codes(account_id, hashed);
+    let codes_section = if state.cfg.mfa_recovery_codes_enabled {
+        let mut plain: Vec<String> = Vec::new();
+        for _ in 0..10 {
+            plain.push(crate::util::gen_recovery_code());
+        }
+        let plain_clone = plain.clone();
+        let hashed = tokio::task::spawn_blocking(move || {
+            plain_clone
+                .iter()
+                .map(|c| bcrypt::hash(c, bcrypt::DEFAULT_COST).unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let _ = state.db.create_recovery_codes(account_id, hashed);
+        format!(
+            r#"<div class="alert alert-warn" role="status" aria-live="polite">Save these recovery codes; they are NOT a wallet seed phrase — never enter them in a crypto wallet. They will not be shown again.</div>
+<ul class="recovery-codes" aria-label="Recovery codes">{}</ul>"#,
+            recovery_codes_html(&plain)
+        )
+    } else {
+        String::new()
+    };
     let _ = state.db.delete_pending_mfa(&hash);
     let (id, _u, _h, role, seller_id) = state.db.get_web_account_by_id(account_id).unwrap_or((
         account_id,
@@ -254,12 +271,9 @@ pub(super) async fn mfa_enroll_submit(
         None,
     ));
     let token = state.db.create_web_session(id, &role, seller_id, 7);
-    let codes_html = recovery_codes_html(&plain);
     let body = format!(
-        r#"<h1>MFA enabled</h1><div class="alert alert-warn" role="status" aria-live="polite">Save these recovery codes; they will not be shown again.</div>
-<ul class="recovery-codes" aria-label="Recovery codes">{}</ul>
+        r#"<h1>MFA enabled</h1>{codes_section}
 <p><a href="{}">Continue to dashboard</a></p>"#,
-        codes_html,
         state.url("/dashboard")
     );
     // Two Set-Cookie headers on one response: an ARRAY of (name, value)
@@ -477,13 +491,7 @@ pub(super) async fn setup_claim_submit(
 
 // Settings MFA handlers
 
-/// Validates the CURRENT second factor for an MFA-setting change (disable or
-/// recovery-code rotation): a valid TOTP code against the account's enrolled
-/// secret — same 6-digit window and replay rules as `/mfa/verify` — or, only
-/// when the TOTP does not match, a valid unused recovery code (which
-/// `verify_recovery_code` consumes on success). TOTP is tried first, so a
-/// working authenticator never burns a recovery code; a recovery code is
-/// consumed only when it is the factor that actually authorized the change.
+/// TOTP first, so a working authenticator never burns a recovery code.
 pub(super) fn verify_current_second_factor(state: &WebState, account_id: i64, code: &str) -> bool {
     let code = code.trim();
     let (secret, enabled, last_used) = state.db.get_totp_state(account_id);
@@ -498,6 +506,9 @@ pub(super) fn verify_current_second_factor(state: &WebState, account_id: i64, co
             let _ = state.db.update_totp_last_used(account_id, current_counter);
             return true;
         }
+    }
+    if !state.cfg.mfa_recovery_codes_enabled {
+        return false;
     }
     state.db.verify_recovery_code(account_id, code)
 }
@@ -532,11 +543,7 @@ pub(super) async fn settings_mfa_enroll(
         .into_response()
 }
 
-/// Disable MFA for the signed-in account. A hijacked session must not be
-/// able to strip the second factor: the form requires the CURRENT factor
-/// (valid TOTP or unused recovery code, `verify_current_second_factor`).
-/// On a rejected code nothing changes and the settings page answers with an
-/// error banner (`?mfa=reauth`).
+/// Re-auth guard: a rejected factor keeps MFA on and shows `?mfa=reauth`.
 #[tracing::instrument(skip_all)]
 pub(super) async fn settings_mfa_disable(
     State(state): State<WebState>,
@@ -555,16 +562,16 @@ pub(super) async fn settings_mfa_disable(
     Redirect::to(&state.url("/settings?mfa=disabled")).into_response()
 }
 
-/// Regenerate the account's recovery codes. Same re-auth rule as disable:
-/// the CURRENT factor is required (TOTP preferred; a recovery code is
-/// consumed when it is what authorized the rotation), and a rejected code
-/// leaves the old codes untouched.
+/// Rotate recovery codes after re-auth; a rejected factor changes nothing.
 #[tracing::instrument(skip_all)]
 pub(super) async fn settings_mfa_recovery(
     State(state): State<WebState>,
     headers: axum::http::HeaderMap,
     Form(f): Form<MfaCodeForm>,
 ) -> impl IntoResponse {
+    if !state.cfg.mfa_recovery_codes_enabled {
+        return Redirect::to(&state.url("/settings")).into_response();
+    }
     let session = match session_from_headers(&state, &headers) {
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
@@ -590,7 +597,7 @@ pub(super) async fn settings_mfa_recovery(
     let _ = state.db.create_recovery_codes(session.account_id, hashed);
     let codes_html = recovery_codes_html(&plain);
     let body = format!(
-        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once):<ul class="recovery-codes" aria-label="New recovery codes">{}</ul></div>"#,
+        r#"<h1>Recovery codes</h1><div class="alert alert-warn" role="status" aria-live="polite">New recovery codes (shown once). They are NOT a wallet seed phrase — never enter them in a crypto wallet.<ul class="recovery-codes" aria-label="New recovery codes">{}</ul></div>"#,
         codes_html
     );
     Html(html_page(&state, Some(&session), "Settings", &body)).into_response()

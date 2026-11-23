@@ -34,6 +34,8 @@ in the web UI), double-click / run. The dashboard opens at
   Set `WEB_BIND=0.0.0.0` only behind a TLS reverse proxy on a server.
 - Browser auto-open: on by default for Windows/macOS, off for Linux;
   `OPEN_BROWSER=0` / `OPEN_BROWSER=1` overrides.
+- MFA recovery codes are on by default. `MFA_RECOVERY_CODES_ENABLED=0` rejects
+  stored codes and removes the recovery UI and route; TOTP sign-in still works.
 
 ## Building packages yourself
 

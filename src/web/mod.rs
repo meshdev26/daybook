@@ -214,7 +214,7 @@ pub fn router(state: WebState) -> Router {
     let r = routes_support(r);
     let r = routes_finance(r);
     let r = routes_admin(r);
-    let r = routes_mfa_posts(r);
+    let r = routes_mfa_posts(r, state.cfg.mfa_recovery_codes_enabled);
     let r = routes_identity_bots(r);
     // Moderation capability pages register only when compiled in. No existing
     // route is renamed or moved; the default build keeps every prior path.
@@ -369,13 +369,19 @@ fn routes_admin(r: Router<WebState>) -> Router<WebState> {
         .route("/privacy/delete", post(privacy_delete))
 }
 
-fn routes_mfa_posts(r: Router<WebState>) -> Router<WebState> {
-    r.route("/mfa/verify", get(mfa_verify_page).post(mfa_verify_submit))
+fn routes_mfa_posts(r: Router<WebState>, recovery_codes_enabled: bool) -> Router<WebState> {
+    // Unregistering keeps the disabled feature off the route table, not merely guarded.
+    let r = r
+        .route("/mfa/verify", get(mfa_verify_page).post(mfa_verify_submit))
         .route("/mfa/enroll", get(mfa_enroll_page).post(mfa_enroll_submit))
         .route("/settings/mfa/enroll", post(settings_mfa_enroll))
-        .route("/settings/mfa/disable", post(settings_mfa_disable))
-        .route("/settings/mfa/recovery", post(settings_mfa_recovery))
-        .route("/settings/setupbot", post(settings_setupbot))
+        .route("/settings/mfa/disable", post(settings_mfa_disable));
+    let r = if recovery_codes_enabled {
+        r.route("/settings/mfa/recovery", post(settings_mfa_recovery))
+    } else {
+        r
+    };
+    r.route("/settings/setupbot", post(settings_setupbot))
         .route("/post/schedule", post(post_schedule))
         .route("/post/edit", post(post_edit))
         .route("/post/delete", post(post_delete))

@@ -18,6 +18,7 @@ pub async fn make_state() -> (WebState, TempDir) {
         db_path: db_path.to_str().unwrap().to_string(),
         crypto_token: None,
         ai_enabled: false,
+        mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),
         ai_api_style: "openai".to_string(),
         ai_base_url: "https://api.openai.com/v1".to_string(),
@@ -48,6 +49,31 @@ pub async fn make_state() -> (WebState, TempDir) {
         base_path: String::new(),
     };
     (state, dir)
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn make_state_with_recovery_codes(enabled: bool) -> (WebState, TempDir) {
+    let (mut state, dir) = make_state().await;
+    state.cfg.mfa_recovery_codes_enabled = enabled;
+    (state, dir)
+}
+
+pub fn pending_post_req(uri: &str, body: &str, raw: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", format!("mfa_pending={raw}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+pub fn pending_get_req(uri: &str, raw: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("cookie", format!("mfa_pending={raw}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tracing::instrument(skip_all)]
