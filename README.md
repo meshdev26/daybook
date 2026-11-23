@@ -2,16 +2,15 @@
 
 Daybook — the calm back-office ledger for your Telegram commerce.
 
-> **Alpha:** self-hosted and reviewed, but not independently audited. Do not use with real customer money or live customer data without first reading the code and testing seller isolation on your own deployment.
+> **Alpha:** self-hosted, self-reviewed (with AI assistance), not independently audited. Do not use with real customer money or live customer data without first reading the code and testing seller isolation on your own deployment.
 >
 > Track the pre-real-money checklist in [issue #1](https://github.com/meshdev26/daybook/issues/1).
 
 Updates channel: https://t.me/daybook26
 
-An **owner-only** Telegram bot that:
-- Posts and manages a target Telegram channel **only on your command**.
+A self-hosted Telegram bot and web console for selling paid-channel access. The owner runs it; sellers manage their own channels; customers only see the shop commands.
+- Posts and manages a target Telegram channel **only on command**.
 - Sells subscriptions and grants channel access via **Crypto Pay** or **activation codes**.
-- Stays **silent to everyone else**.
 
 ## Features
 
@@ -44,11 +43,12 @@ An **owner-only** Telegram bot that:
 - `/plans` — list plans.
 - `/planadd name | price | asset | days` — create plan.
 - `/plandel name` — remove plan.
-- `/buy <plan>` — create Crypto Pay invoice; user pays; run `/paid <invoice_id>` to verify and grant access.
+- `/buy <plan>` — create Crypto Pay invoice. Payment verification via `/paid <invoice_id>` is a manual step today.
+- `/paid <invoice_id>` — manually verify payment and grant access; a signed Crypto Pay webhook can enqueue paid invoices for the background granter, which re-verifies with Crypto Pay before granting (see Roadmap).
 - `/grant user_id | days` — manual access grant.
 - `/revoke user_id` — revoke access (kick).
 - `/subs` — list subscriptions.
-- `/expirecheck` — revoke expired subscriptions.
+- `/expirecheck` — manual trigger only; expired access is revoked automatically by the in-process 30s loop and 6h sweeper.
 
 ### Activation codes
 - `/gencodes plan | count | [days]` — generate codes.
@@ -156,10 +156,13 @@ Every tool call and every approve/deny is written to the `mcp_audit` table.
 1. Create a plan: `/planadd Premium | 10 | USDT | 30`.
 2. User buys: `/buy Premium` → bot returns pay link + invoice id.
 3. User pays via Crypto Pay.
-4. User (or you) runs `/paid <invoice_id>` → bot verifies payment, creates subscription, sends single-use invite link to the private channel.
-5. On expiry, run `/expirecheck` (or schedule) to revoke access.
+4. User (or you) runs `/paid <invoice_id>` to manually verify payment, create the subscription, and send a single-use invite link to the private channel. This is a manual step today.
+5. Access is revoked automatically on expiry; `/expirecheck` is only a manual trigger.
 
 Activation codes provide an alternative: `/gencodes Premium | 5` then share codes; users run `/redeem CODE`.
+
+## Roadmap
+- Validate Crypto Pay webhook confirmation end-to-end so the manual `/paid` verification step can be retired: the signed webhook at `POST /api/v1/webhooks/cryptopay` already enqueues paid invoices for the background granter, which re-verifies with Crypto Pay before granting (tracked in [issue #1](https://github.com/meshdev26/daybook/issues/1)).
 
 ## Architecture
 - `src/main.rs` — dispatcher, dialogue storage; merges the routers with the request-timeout and metrics layers.

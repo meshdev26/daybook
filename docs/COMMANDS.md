@@ -40,12 +40,12 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 - `/plans` — list plans. Buyers see the active plans of every seller, one line each with `— by @seller` (the legacy seller-0 global namespace is excluded); sellers see their own catalogue, admins the global view.
 - `/planadd name | price | asset | days` — add plan.
 - `/plandel name` — remove plan.
-- `/buy <plan>` — create payment invoice.
-- `/paid <invoice_id>` — verify payment and grant access. Distinct replies when verification failed permanently (contact the seller, do not pay again) and when the seller's channel isn't configured yet (delivery happens automatically once they finish setup).
+- `/buy <plan>` — create payment invoice. Payment verification via `/paid <invoice_id>` is a manual step today.
+- `/paid <invoice_id>` — manual step today: verify payment and grant access. Distinct replies when verification failed permanently (contact the seller, do not pay again) and when the seller's channel isn't configured yet (delivery happens automatically once they finish setup). The signed webhook at `POST /api/v1/webhooks/cryptopay` only enqueues paid invoices for the background granter, which re-verifies with Crypto Pay before granting; [issue #1](https://github.com/meshdev26/daybook/issues/1) tracks confirming end-to-end webhook verification so this manual step can be retired.
 - `/grant user_id | days` — manual grant.
 - `/revoke user_id` — revoke access.
 - `/subs` — list subscriptions.
-- `/expirecheck` — revoke expired subscriptions.
+- `/expirecheck` — manual trigger to revoke expired subscriptions; expiry is handled automatically by the in-process 30s loop and 6h sweeper.
 
 ## Services & bookings
 - `/services` — buyers: the public bookable catalogue, one line per service (name, duration, price, `— by @seller`; the legacy seller-0 global namespace is excluded). Sellers/admins keep the management view.

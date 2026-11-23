@@ -19,7 +19,7 @@
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
-> **Status:** alpha, not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
+> **Status:** alpha, self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
 
 ## Payments
 - Always verify payment via Crypto Pay API before granting access.
