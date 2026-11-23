@@ -66,7 +66,7 @@ builder.command(CommandSpec {
 ## Systemd
 ```ini
 [Unit]
-Description=Telegram Business Platform
+Description=Daybook
 After=network.target
 
 [Service]

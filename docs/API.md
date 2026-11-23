@@ -236,6 +236,9 @@ Protocol errors: unparseable body → HTTP 400 `-32700` (`id: null`); unknown/mi
 ```
 
 ### Tools
+
+The registry exposes 38 tools across three tiers: 24 Read, 4 Write, and 10 Sensitive. Every registered tool is listed below.
+
 | Tool | Tier | Purpose |
 |---|---|---|
 | `list_channels` | Read | Default target channel + each seller's channel |
@@ -243,6 +246,11 @@ Protocol errors: unparseable body → HTTP 400 `-32700` (`id: null`); unknown/mi
 | `list_posts` | Read | Recent stored posts, newest first (`limit` default 20, max 50) |
 | `subs_report` | Read | Subscription counts by status; user ids masked unless `include_user_ids: true` (response then flagged `contains_pii: true`) |
 | `list_codes` | Read | Recent activation codes, always masked to the first 4 chars + `…` |
+| `list_promos` | Read | Promo codes for the seller (not secret) |
+| `list_referrals` | Read | Referral records (masked) |
+| `referral_stats` | Read | Referral program counts and earnings |
+| `analytics_summary` | Read | Aggregated business analytics (revenue, invoice counts, AOV, top products, repeat buyers, abandoned carts, customer count); no PII |
+| `list_customers` | Read | CRM customers; user ids masked unless `include_user_ids: true` (response then flagged `contains_pii: true`) |
 | `list_bookings` | Read | Seller-scoped booking rows (buyer ids omitted) |
 | `list_subscriptions` | Read | Seller-scoped subscriptions (subscriber ids omitted) |
 | `list_bots` | Read | Owner-only bot inventory (key/username/type/enabled); no tokens |
@@ -253,16 +261,25 @@ Protocol errors: unparseable body → HTTP 400 `-32700` (`id: null`); unknown/mi
 | `finance_reconciliation_list` | Read | Money rows awaiting reconciliation (spend ids omitted) |
 | `moderation_blocked_words` | Read | Seller-scoped blocked terms (term/mode/enabled); no message content |
 | `moderation_global_floor` | Read | Owner-enforced global floor terms; no message content |
+| `read_channel` | Read | Recent messages from a channel via the owner's personal Telegram account (owner credential only) |
+| `read_thread` | Read | Replies of one thread via the owner's personal Telegram account (owner credential only) |
+| `search_messages` | Read | Search messages via the owner's personal Telegram account within a console-configured channel (owner credential only) |
+| `unread_digest` | Read | Chats with unread activity via the owner's personal Telegram account, newest first (owner credential only) |
 | `publish_post` | Write | Send + log a text post (default channel unless `channel` given) |
 | `edit_post` | Write | Edit a stored post record (the already-sent Telegram message is not rewritten) |
+| `customer_note` | Write | Add or update a note on a CRM customer (audited) |
 | `booking_set_status` | Write | Confirm/decline/cancel one booking, scoped to the caller's seller |
 | `gen_codes` | Sensitive | Generate activation codes (`count` 1–50); full codes go to the owner's Telegram chat only, never the MCP response |
+| `create_promo` | Sensitive | Create a promo code (`percent` or `fixed`); requires owner approval |
 | `delete_post` | Sensitive | Delete a stored post record (the sent Telegram message is not unsent) |
 | `broadcast` | Sensitive | Text message to all known users |
 | `ai_publish_post` | Sensitive | Publish an AI-generated post draft by `draft_id` |
+| `export_buyer_data` | Sensitive | Export one buyer's stored data as JSON, delivered in the approval reply |
+| `delete_buyer_data` | Sensitive | Delete all stored data for one buyer; irreversible |
+| `publish_as_user` | Sensitive | Publish a text post as the owner's personal Telegram account to a console-configured channel bound to that identity |
 | `finance_refund_create` | Sensitive | Park a PENDING refund request from one paid invoice; no transfer |
 | `finance_payout_create` | Sensitive | Park a PENDING payout request; no transfer |
 
-The finance create tools only park a **request** after owner approval: refund/payout approve, process, execute, reconciliation resolution and any transfer remain WEB-ONLY (two-person rule) and are not exposed over MCP. Only the owner credential can call Sensitive tools.
+The finance create tools only park a **request** after owner approval: refund/payout approve, process, execute, reconciliation resolution and any transfer are available only through the web console and the REST API (`/api/v1/finance/...`), are owner-gated (two-person rule), and are **not** exposed over MCP. Only the owner credential can call Sensitive tools.
 
 Read and Write tools execute on the call (`readOnlyHint` true/false respectively); `list_codes` and `subs_report` mask secrets/PII by default. **Sensitive tools are owner-only and never execute on the call path**: a per-seller principal calling any Sensitive tool is refused with JSON-RPC error `-32001 "sensitive tools require the owner credential"` (HTTP 200) before anything parks — no approval row, no execution, not even arg validation (the gate sits before the validator). The owner flow is unchanged: decide via `/approve <id>` / `/deny <id>` in the bot within 15 minutes of `expires_at` (expired rows are decided to `expired`, never executed; the atomic pending→decided flip makes a double `/approve` execute once; approved work re-runs the tool's own validator and executor). `/approvals` lists pending rows.

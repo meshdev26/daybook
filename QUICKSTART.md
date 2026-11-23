@@ -5,7 +5,7 @@
 ## Native
 
 ```bash
-git clone <repo> && cd daybook
+git clone https://github.com/meshdev26/daybook.git && cd daybook
 cp .env.example .env
 # fill TELEGRAM_BOT_TOKEN, OWNER_ID; optional CRYPTO_PAY_TOKEN
 cargo build --release

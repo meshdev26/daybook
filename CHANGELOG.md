@@ -1,4 +1,4 @@
-# Changelog — Telegram Business Platform
+# Changelog — Daybook
 
 All notable changes to this project are documented in this file.
 

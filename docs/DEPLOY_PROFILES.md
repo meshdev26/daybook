@@ -22,7 +22,7 @@ double-click; the dashboard opens at `http://127.0.0.1:8080`. Details:
 ## New server (nothing installed yet)
 
 ```bash
-git clone <repo> && cd daybook
+git clone https://github.com/meshdev26/daybook.git && cd daybook
 ./setup.sh                 # validates your bot token, writes .env (0600)
 make run-release           # or: make install  (systemd, hardened)
 ```

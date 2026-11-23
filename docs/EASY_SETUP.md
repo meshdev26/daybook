@@ -1,7 +1,7 @@
 # Easy Setup Experience — Phased Plan
 
 ## Goal
-Non-technical business owners can deploy and configure the Telegram Business Platform
+Non-technical business owners can deploy and configure Daybook
 without editing `.env` or touching code. Single binary preserved. Secrets stay in
 environment/`.env` (not DB) whenever possible; DB only holds non-secret config and
 encrypted-at-rest placeholders if env is unavailable.

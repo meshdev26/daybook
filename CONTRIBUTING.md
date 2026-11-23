@@ -1,12 +1,12 @@
 # Contributing
 
-Thanks for improving the Telegram Business Platform. The repo is set up so
+Thanks for improving Daybook. The repo is set up so
 the tooling enforces most rules — you just run it.
 
 ## Setup
 
 ```bash
-git clone <repo> && cd daybook
+git clone https://github.com/meshdev26/daybook.git && cd daybook
 cargo build          # Rust 1.99+/edition 2024 (rust-toolchain.toml pins it)
 make test            # the full gate suite
 ```
@@ -41,7 +41,7 @@ is deliberately outside `make test`, which stays Rust-only. The CI
 `client-check` job runs the same commands; it is a required status and must be
 green before merge.
 
-**Compliance posture:** Terms of Service, Privacy, Refund, and Retention policies and an EAA statement are pending before any paid public launch; contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
+**Compliance posture:** Daybook is a free MIT library, not a hosted or sold service. The maintainer owes no Terms of Service, refund policy, or EAA statement; each self-hoster owns their instance's legal documents, with templates in `docs/TERMS_DRAFT.md`, `docs/PRIVACY_DRAFT.md`, `docs/REFUND_POLICY_DRAFT.md`, `docs/RETENTION_DRAFT.md`, and `docs/ACCESSIBILITY_DRAFT.md` (see `docs/LEGAL.md`). Contributors should not add fee, AI-charging, or promo value while guards G1–G8 (see `docs/MONEY_SAFETY_SPEC.md`) are deferred.
 
 ## Finding your way around
 
@@ -65,6 +65,7 @@ green before merge.
 
 ## Reporting a security issue
 
-Please do not open a public issue for vulnerabilities. A private reporting
-channel will be enabled before the public launch; until then, see
-`docs/SECURITY.md` for the current guarantees.
+Please do not open a public issue for vulnerabilities. Report them privately
+through GitHub Security Advisories — open the repository's **Security** tab and
+choose **Report a vulnerability**. See `docs/SECURITY.md` for the current
+guarantees.

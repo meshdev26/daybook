@@ -142,7 +142,7 @@ then register the server in your agent's MCP settings:
                       "headers": { "Authorization": "Bearer <MCP_OWNER_TOKEN>" } } }
 ```
 
-The token maps to the **Owner** principal. Tools are tiered so AI use stays safe:
+The token maps to the **Owner** principal. The registry exposes 38 tools across three tiers (24 Read, 4 Write, 10 Sensitive); the table highlights representative ones. Tiering keeps AI use safe:
 
 | Tier | Tools | Behavior |
 |------|-------|----------|
@@ -215,4 +215,4 @@ See `docs/` and root MD files:
 - `docs/DEPLOY_PROFILES.md` — same app anywhere: desktop / new / existing server, Docker, ARM.
 - `docs/DESKTOP.md` — desktop app distribution (.exe / .app).
 - `docs/reviews/2026-10-25-architecture.md` — architecture review & v1.1 plan.
-- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap (awaiting approval).
+- `docs/ARCHITECTURE-SCALE-PLAN.md` — fullness verdict + products/orders/bookings roadmap.
