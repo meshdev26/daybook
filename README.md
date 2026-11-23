@@ -182,6 +182,17 @@ Activation codes provide an alternative: `/gencodes Premium | 5` then share code
 - Validate payments via Crypto Pay API before granting access.
 - Expired access is revoked in-process by a 6h sweeper; the 30s loop verifies invoice payments. `/expirecheck` is a manual trigger.
 
+## Known limitations
+
+Alpha software; verify these on your own deployment before handling real value:
+
+- No independent multi-tenant penetration test has been run; seller isolation is self-reviewed only (pre-real-money checklist in issue #1).
+- SQLite is unencrypted at rest and secrets such as the Crypto Pay token are stored verbatim in the `config` table; protection is filesystem permissions. At-rest encryption is planned, not implemented.
+- The web dashboard relies on `SameSite=Strict` cookies for CSRF protection and emits no per-form CSRF tokens.
+- With `WEB_URL` unset (the default), `/becomeseller` and `/dashboard` send a plaintext dashboard password over Telegram; set `WEB_URL` to use one-time claim links.
+- The signed Crypto Pay webhook is wired but not validated end-to-end; payment confirmation is still the manual `/paid` step.
+- Analytics revenue totals sum amounts across assets as floats via `CAST(amount AS REAL)` for display only — deterministic, covered by tests, never used to move money.
+
 ## Deployment
 - Any Linux VPS/home server/Raspberry Pi.
 - Docker: build release binary in multi-stage image.
