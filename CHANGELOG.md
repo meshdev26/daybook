@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 (see [`docs/RELEASING.md`](docs/RELEASING.md)).
 
+## [0.4.2-alpha]
+
+Alpha pre-release of the v1.4 milestone. Still alpha, not independently audited;
+the pre-real-money checklist in issue #1 remains open.
+
+### Fixed
+- Secrets at rest: `crypto_token` is sealed with AES-256-GCM under `MASTER_KEY`
+  (32 bytes as hex or base64); secret writes are refused when the key is unset,
+  and legacy plaintext values stay readable until re-saved.
+- Cross-asset revenue totals replaced with per-asset lines and a mixed-asset
+  marker; no summed float is displayed.
+- Per-form CSRF tokens on console POSTs, validated in constant time; the REST
+  API, MCP endpoint and webhook are exempt.
+- `/books` alias added; with `WEB_URL` unset, `/becomeseller` and `/dashboard`
+  fail closed instead of sending a plaintext password by DM.
+- `service`, `web_app` and `reply_bot` verticals are live via shipped handlers;
+  `movie_bot`, `file_share` and `automation` remain explicit stubs.
+- Deterministic test covers webhook signature, invoice claim, exactly-once grant
+  and replay protection; the granter's Telegram side effects are not covered.
+
 ## [0.4.1-alpha]
 
 Alpha pre-release of the v1.4 milestone. Not independently audited; see the

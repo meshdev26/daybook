@@ -4,7 +4,7 @@ Channel: https://t.me/daybook26 — announcement-only; no support or feature
 requests. Managed by the owner.
 
 Release news comes from `CHANGELOG.md`. The current pre-release is
-`v0.4.1-alpha`; the older v0.4.0 announcement was posted on 2026-11-22.
+`v0.4.2-alpha`; the older v0.4.0 announcement was posted on 2026-11-22.
 
 ## Scope
 Release notes distilled from `CHANGELOG.md`. No support threads, no commitments

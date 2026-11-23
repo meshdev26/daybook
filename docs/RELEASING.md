@@ -43,7 +43,7 @@ cargo deny check                # licenses
 ## Version bump
 
 Cargo tracks the milestone (`docs/ARCHITECTURE-V1.4.md` §5, Trust pack):
-milestone vN ships as `0.N.0` — v1.4 → `0.4.1-alpha`. `0.x` means pre-1.0; minors
+milestone vN ships as `0.N.0` — v1.4 → `0.4.2-alpha`. `0.x` means pre-1.0; minors
 may break.
 
 1. Edit `version` in `Cargo.toml`.
@@ -63,8 +63,8 @@ may break.
    creates the GitHub release with generated notes:
 
    ```bash
-   git tag v0.4.1-alpha
-   git push origin v0.4.1-alpha  # HUMAN — external publish
+   git tag v0.4.2-alpha
+   git push origin v0.4.2-alpha  # HUMAN — external publish
    ```
 
 4. Artifact smoke: download the artifacts from the release, run one, `make
