@@ -12,20 +12,26 @@ Role-based access: Owner > Admin > Seller > User. Sellers manage their own data;
 
 A bot's product type narrows which commands its inbound updates accept. A
 `shop_bot` (the default, including every pre-existing bot) runs the full
-command tree below. The live scoped types reuse shipped handlers for one
-command family each:
+command tree below. Every other type is live and runs one command family:
 
 - `service` — `/services`, `/book`, `/serviceadd`, `/slotadd`, `/bookings`,
   `/mybookings`, `/cancelbooking`, `/bookingconfirm`, `/bookingdecline`.
 - `web_app` — `/dashboard`, `/becomeseller` (both need `WEB_URL`; the links are
   one-time operator-console claim links).
 - `reply_bot` — `/support`, `/tickets`, `/reply`, `/closeticket`, `/escalate`.
+- `movie_bot` (opt-in feature) — `/shop`, `/find`, `/productadd`, `/products`,
+  `/productdel`, `/buy`, `/paid` (catalogue, search, purchase and delivery).
+- `file_share` — `/upload` (as a document caption), `/files`, `/share`,
+  `/getfile`.
+- `automation` — `/ruleadd`, `/rules`, `/ruledel` (keyword auto-replies).
 
 On a scoped bot, any other command gets a short list of the commands that bot
-supports; plain messages stay silent. The `movie_bot`, `file_share` and
-`automation` types have no live product: inbound updates get an explicit
-"not available" notice. Their Cargo features are optional; the three live
-scoped types plus `shop_bot` and `moderation` are on by default.
+supports. Plain messages stay silent except on `automation` bots, where they
+are matched against keyword rules. All capabilities are live: `shop_bot`,
+`moderation`, `service`, `web_app`, `reply_bot`, `file_share` and `automation`
+are on by default; `movie_bot` needs `--features movie_bot` because an
+out-of-scope web-nav test pins the old default feature set. No type is a
+notice-only stub.
 
 ## Web dashboard
 - `/dashboard` — DM a one-time dashboard sign-in link (valid 15 minutes; opening it lets you set a password and signs you in). Creates the account if missing. Requires `WEB_URL`: when it is unset the bot refuses setup, creates no account and discloses no password.
@@ -109,6 +115,25 @@ scoped types plus `shop_bot` and `moderation` are on by default.
 - `/shop` — public listing of products on sale (`/plans` covers subscription plans); buyer lines carry `— by @seller` and the legacy seller-0 global namespace is excluded.
 - `/buy <name>` — buy a product or plan by exact name; returns a Crypto Pay invoice. Ambiguous names (two sellers) are refused — ask the seller.
 - Delivery: after verified payment the buyer receives the payload as a private message (document re-sent for `digital_file`).
+
+## Movie catalogue (`movie_bot`)
+
+- `/find <text>` — substring search over active, publicly sellable products by name or kind. Results show name, price, asset, medium and seller; delivery payloads are never shown.
+- `/shop`, `/productadd`, `/products`, `/productdel`, `/buy`, `/paid` — the shared shop commands described above. On a movie bot they are the catalogue and purchase flow: sellers list products, buyers browse, buy and claim. Verified payment re-sends a `digital_file` payload as a Telegram document. There is no video player or streaming.
+
+## File sharing (`file_share`)
+
+- `/upload <name> [| description]` — attach a document with this caption to register a share. Only the Telegram `file_id` is stored; the bytes stay in Telegram. Sellers and admins only. A text-only `/upload` prints the usage hint.
+- `/files` — sellers see their shares on this bot (id and token), admins/owner see all, buyers see only shares explicitly granted to them.
+- `/share <id> <user_id>` — grant one user access to one of your shares (seller/admin).
+- `/getfile <token>` — re-send the stored document. Access requires ownership, admin/owner, or an explicit grant; a denied attempt is audited. Every upload, grant, denial and download is audit-logged. This is a share flow for Telegram-hosted files, not arbitrary file hosting.
+
+## Automation (`automation`)
+
+- `/ruleadd keyword | response` — create a keyword auto-reply rule scoped to your seller account and this bot (seller/admin). Keywords are matched case-insensitively as substrings.
+- `/rules` — list your rules with id, keyword and state.
+- `/ruledel <id>` — disable one of your rules; the row is kept for audit.
+- Plain-text messages matching an active rule receive the configured response, sent through the outbound moderation gate. At most three rules fire per message and each firing writes an `automation.fire` audit row. There are no schedules, conditions or multi-step actions.
 
 ## Finance (v1.2, owner approval for money movement; seller/admin may view and request)
 

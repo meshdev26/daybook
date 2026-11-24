@@ -108,16 +108,18 @@ Adding or retokenizing a bot needs a restart. Full guide:
 Bots carry a product type (`shop_bot` by default); the console Product / Type
 selector lets the owner pick a product while sellers and admins stay pinned.
 Capabilities are chosen at build time with Cargo features: `shop_bot`,
-`moderation`, `service`, `web_app` and `reply_bot` (all default), plus
-`movie_bot`, `file_share` and `automation` (optional). These features control
-which capabilities are registered and which bot types are accepted at runtime —
-a movie-only build registers only the movie capability and refuses other types.
+`moderation`, `service`, `web_app`, `reply_bot`, `file_share` and `automation`
+are on by default; `movie_bot` is opt-in (`--features movie_bot`) because a
+web-nav test owned by another phase still pins the old default feature set.
+The feature itself is fully live, not a stub. These features control which
+capabilities are registered and which bot types are accepted at runtime — a
+movie-only build registers only the movie capability and refuses other types.
 They do **not** omit dependencies or shrink the binary (all crates stay
 compiled); dropping unused dependencies is a deferred follow-up. A movie-only
 install builds with `cargo build --no-default-features --features movie_bot`;
 changing capabilities means rebuilding and redeploying.
 
-Four types have live inbound behavior:
+All seven bot types have live inbound behavior:
 
 - `shop_bot` — the full command and dialogue tree, unchanged.
 - `service` — the services and bookings family on a dedicated bot type:
@@ -129,16 +131,32 @@ Four types have live inbound behavior:
   never sends a password.
 - `reply_bot` — the support-ticket family: `/support`, `/tickets`, `/reply`,
   `/closeticket`, `/escalate`.
+- `movie_bot` (opt-in feature) — a movie catalogue built on the existing
+  products, invoices and delivery machinery. Buyers browse `/shop`, search
+  `/find <text>`, buy `/buy` and check `/paid`; sellers manage listings with
+  `/productadd`, `/products` and `/productdel`. `digital_file` and
+  `digital_link` payloads are re-sent to the buyer after verified payment.
+  There is no video player or streaming: this
+  is a catalogue, purchase and delivery flow, and listings are ordinary shop
+  products that can also be sold from `shop_bot`.
+- `file_share` — a deliberately narrow Telegram-hosted share flow, not
+  arbitrary file hosting. A seller attaches a document whose caption is
+  `/upload <name> [| description]`; only the Telegram `file_id` reference is
+  stored. `/files` lists shares, `/share <id> <user_id>` grants one user access,
+  and `/getfile <token>` re-sends the document. Owner, admin and explicit
+  grants can download; no grant means no access. Uploads, grants, denials and
+  downloads are written to the audit log.
+- `automation` — a keyword auto-reply slice, not a general rules engine.
+  Sellers create rules with `/ruleadd keyword | response`, list them with
+  `/rules` and disable them with `/ruledel <id>`. On plain-text messages the
+  bot matches active rules for the message's tenant, sends the configured reply
+  through the outbound moderation gate and writes an audit row. At most three
+  rules fire per message. There are no schedules, conditions or multi-step
+  actions.
 
 Each live scoped type accepts only its own command family; any other command
-gets a short usage hint and never reaches shop-only handlers.
-
-The other three compiled types — `movie_bot`, `file_share` and `automation` —
-are build-time registration types only: inbound updates return an explicit
-"not available" notice (`VerticalStub`) instead of running a product. There is
-no movie catalogue, no arbitrary-file upload or share flow (only post-payment
-document delivery), and no automation rules engine behind them; activating
-them would mean building new products.
+gets a short usage hint and never reaches shop-only handlers. There are no
+notice-only stubs left: every compiled product type does real work.
 
 Message moderation uses an owner floor, seller "Blocked words", and per-bot
 overrides — set at least one floor term before enabling it. Full guide:

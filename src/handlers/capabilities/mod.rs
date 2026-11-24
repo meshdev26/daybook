@@ -2,11 +2,11 @@
 //! (multibot foundation, server).
 //!
 //! A `shop_bot` resolves to [`InboundHandler::Builtin`] and uses the full
-//! command/dialogue tree in [`crate::handlers`]. The live scoped types
-//! (`service`, `web_app`, `reply_bot`) resolve to [`InboundHandler::Scoped`]:
-//! their inbound updates are dispatched through the same shipped handlers,
-//! limited to the command set of that type. A compiled vertical stub
-//! (`movie_bot`, `file_share`, `automation`) produces an explicit notice.
+//! command/dialogue tree in [`crate::handlers`]. Every other compiled type
+//! resolves to [`InboundHandler::Scoped`]: its inbound updates run through
+//! shipped handlers limited to that type's command family. The verticals add
+//! real behaviour behind their own commands (catalogue search, Telegram
+//! file_id shares, keyword auto-replies); none is a notice-only stub.
 //!
 //! If a type's feature is **not** compiled in — or the type is unknown — the
 //! dispatcher sends the same explicit refusal and logs the bot id/key/type.
@@ -46,6 +46,9 @@ pub enum ScopedCommands {
     Service,
     WebApp,
     ReplyBot,
+    MovieBot,
+    FileShare,
+    Automation,
 }
 
 impl ScopedCommands {
@@ -71,6 +74,17 @@ impl ScopedCommands {
                 "/closeticket",
                 "/escalate",
             ],
+            Self::MovieBot => &[
+                "/shop",
+                "/find",
+                "/productadd",
+                "/products",
+                "/productdel",
+                "/buy",
+                "/paid",
+            ],
+            Self::FileShare => &["/upload", "/files", "/share", "/getfile"],
+            Self::Automation => &["/ruleadd", "/rules", "/ruledel"],
         }
     }
 
@@ -97,6 +111,27 @@ impl ScopedCommands {
                     | Command::Reply(_)
                     | Command::CloseTicket(_)
                     | Command::Escalate(_)
+            ),
+            Self::MovieBot => matches!(
+                cmd,
+                Command::Shop
+                    | Command::Find(_)
+                    | Command::ProductAdd(_)
+                    | Command::Products
+                    | Command::ProductDel(_)
+                    | Command::Buy(_)
+                    | Command::Paid(_)
+            ),
+            Self::FileShare => matches!(
+                cmd,
+                Command::FileUpload(_)
+                    | Command::Files
+                    | Command::FileShare(_)
+                    | Command::FileGet(_)
+            ),
+            Self::Automation => matches!(
+                cmd,
+                Command::RuleAdd(_) | Command::Rules | Command::RuleDel(_)
             ),
         }
     }
@@ -435,6 +470,13 @@ pub async fn dispatch_scoped(
     if !cap.allows_command(&cmd) {
         return send_scoped_hint(&bot, &msg, cap).await;
     }
+    // A file-share upload is a document whose caption carries the /upload
+    // command. The command router sees the caption, so intercept it here and
+    // run the real ingest handler instead of the text-only hint.
+    #[cfg(feature = "file_share")]
+    if matches!(cmd, Command::FileUpload(_)) && msg.document().is_some() {
+        return file_share::ingest_document(&bot, &msg, &bot_ctx).await;
+    }
     let owner_id = bot_ctx.owner_id;
     crate::handlers::commands::cmd_handler(
         bot,
@@ -463,6 +505,33 @@ pub async fn send_scoped_hint(bot: &Bot, msg: &Message, cap: &BotCapability) -> 
         bot.send_message(msg.chat.id, cap.scoped_help_text())
             .await?;
     }
+    Ok(())
+}
+
+/// Fallback for scoped messages that are not an allowed command. An automation
+/// bot runs its keyword rules here; every other scoped bot keeps the silent
+/// plain-text behavior and the honest out-of-family hint.
+pub async fn handle_scoped_plain(
+    bot: &Bot,
+    msg: &Message,
+    cap: &BotCapability,
+    bot_ctx: &BotContext,
+) -> HandlerResult {
+    if msg
+        .text()
+        .is_some_and(|text| text.trim_start().starts_with('/'))
+    {
+        return send_scoped_hint(bot, msg, cap).await;
+    }
+    #[cfg(feature = "automation")]
+    if cap.bot_type == "automation"
+        && let Some(text) = msg.text()
+    {
+        let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+        return automation::run_for_text(bot, bot_ctx, user_id, text).await;
+    }
+    #[cfg(not(feature = "automation"))]
+    let _ = bot_ctx;
     Ok(())
 }
 
@@ -514,11 +583,11 @@ mod tests {
         assert!(!text.contains("not compiled in"), "{text}");
     }
 
-    /// The notice for the three product-less types stays explicit even when
-    /// their Cargo features are off, as they are in the default build.
+    /// Any vertical left uncompiled keeps the explicit notice; a compiled
+    /// vertical must never send one.
     #[cfg(not(all(feature = "movie_bot", feature = "file_share", feature = "automation")))]
     #[tokio::test]
-    async fn productless_types_keep_the_not_available_notice() {
+    async fn uncompiled_verticals_keep_the_not_available_notice() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -533,15 +602,19 @@ mod tests {
         let bot = teloxide::Bot::new("123:placeholder")
             .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
 
+        let mut expected = 0;
         for bot_type in ["movie_bot", "file_share", "automation"] {
             let cap = BotCapability::new(42, bot_type, bot_type);
-            assert!(cap.refuses_inbound(), "{bot_type}");
+            if !cap.refuses_inbound() {
+                continue;
+            }
+            expected += 1;
             refuse_message(&bot, ChatId(7), &cap, "test")
                 .await
                 .expect("notice must be delivered");
         }
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), expected);
         for req in requests {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
             assert_eq!(body["text"].as_str().unwrap_or_default(), BUYER_NOTICE);
@@ -550,13 +623,15 @@ mod tests {
 
     #[cfg(feature = "movie_bot")]
     #[test]
-    fn compiled_movie_type_selects_vertical_stub() {
+    fn compiled_movie_type_selects_the_catalogue_allowlist() {
         let d = resolve("movie_bot").expect("movie_bot feature is on");
-        assert_eq!(d.inbound, InboundHandler::VerticalStub);
-        assert!(d.command_set().is_empty());
+        assert_eq!(d.inbound, InboundHandler::Scoped(ScopedCommands::MovieBot));
+        assert_eq!(d.command_set(), ScopedCommands::MovieBot.names());
         let cap = BotCapability::new(42, "movie", "movie_bot");
-        assert!(!cap.is_legacy_shop());
-        assert_eq!(cap.notice_text(), BUYER_NOTICE);
+        assert!(cap.is_scoped());
+        assert!(!cap.refuses_inbound());
+        assert!(cap.allows_command(&Command::Find(String::new())));
+        assert!(!cap.allows_command(&Command::Post(String::new())));
     }
 
     #[test]
@@ -579,23 +654,30 @@ mod tests {
         assert_eq!(resolve("  shop_bot  ").unwrap().bot_type, "shop_bot");
     }
 
-    /// The default build registers the shop tree plus the three live scoped
-    /// verticals. Shop keeps its full command set; the scoped types contribute
-    /// only their own family; the stubs stay out of the default build.
+    /// The default build registers the shop tree plus every scoped vertical
+    /// that is on by default. Shop keeps its full command set; the scoped types
+    /// contribute only their own family. No compiled type is a notice stub.
     #[cfg(all(
         feature = "shop_bot",
         feature = "service",
         feature = "web_app",
         feature = "reply_bot",
-        not(feature = "movie_bot"),
-        not(feature = "file_share"),
-        not(feature = "automation")
+        feature = "file_share",
+        feature = "automation",
+        not(feature = "movie_bot")
     ))]
     #[test]
     fn default_build_registers_live_verticals_and_keeps_shop_tree() {
         assert_eq!(
             compiled_types(),
-            vec!["shop_bot", "reply_bot", "web_app", "service"]
+            vec![
+                "shop_bot",
+                "reply_bot",
+                "file_share",
+                "web_app",
+                "service",
+                "automation"
+            ]
         );
         let shop = resolve(crate::config::DEFAULT_BOT_TYPE).expect("shop_bot default");
         assert_eq!(shop.inbound, InboundHandler::Builtin);
@@ -612,6 +694,8 @@ mod tests {
             ("service", ScopedCommands::Service),
             ("web_app", ScopedCommands::WebApp),
             ("reply_bot", ScopedCommands::ReplyBot),
+            ("file_share", ScopedCommands::FileShare),
+            ("automation", ScopedCommands::Automation),
         ] {
             let d = resolve(bot_type).expect("live scoped type");
             assert_eq!(d.inbound, InboundHandler::Scoped(kind));
@@ -627,7 +711,8 @@ mod tests {
     /// ones before any built-in handler can run.
     #[test]
     fn scoped_verticals_only_accept_their_own_commands() {
-        let cases = [
+        #[allow(unused_mut)] // mutated only in a movie_bot build
+        let mut cases = vec![
             ("service", Command::Services, Command::Post(String::new())),
             ("web_app", Command::Dashboard, Command::Shop),
             (
@@ -635,7 +720,19 @@ mod tests {
                 Command::Tickets,
                 Command::Broadcast(String::new()),
             ),
+            ("file_share", Command::Files, Command::Shop),
+            (
+                "automation",
+                Command::Rules,
+                Command::Broadcast(String::new()),
+            ),
         ];
+        #[cfg(feature = "movie_bot")]
+        cases.push((
+            "movie_bot",
+            Command::Find(String::new()),
+            Command::Broadcast(String::new()),
+        ));
         for (bot_type, allowed, forbidden) in cases {
             let cap = BotCapability::new(1, bot_type, bot_type);
             assert!(cap.allows_command(&allowed), "{bot_type}");
@@ -647,23 +744,26 @@ mod tests {
         }
     }
 
-    /// A compiled stub still has no commands and still refuses every update.
-    #[cfg(any(feature = "movie_bot", feature = "file_share", feature = "automation"))]
+    /// The formerly stubbed verticals are live when compiled: each has a
+    /// non-empty command family and accepts inbound updates.
+    #[cfg(all(feature = "file_share", feature = "automation"))]
     #[test]
-    fn compiled_stubs_have_no_commands_and_refuse_updates() {
-        for (bot_type, feature) in KNOWN_CAPABILITIES {
-            if !["movie_bot", "file_share", "automation"].contains(bot_type) {
-                continue;
-            }
-            if let Ok(d) = resolve(bot_type) {
-                assert_eq!(d.feature, *feature);
-                assert_eq!(d.inbound, InboundHandler::VerticalStub);
-                assert!(d.command_set().is_empty());
-                let cap = BotCapability::new(1, bot_type, bot_type);
-                assert!(cap.refuses_inbound());
-                assert!(!cap.is_scoped());
-                assert_eq!(cap.notice_text(), BUYER_NOTICE);
-            }
+    fn compiled_verticals_are_live_with_real_command_families() {
+        #[allow(unused_mut)] // extended only in a movie_bot build
+        let mut types = vec!["file_share", "automation"];
+        #[cfg(feature = "movie_bot")]
+        types.push("movie_bot");
+        for bot_type in types {
+            let d = resolve(bot_type).expect("vertical is compiled");
+            assert!(
+                matches!(d.inbound, InboundHandler::Scoped(_)),
+                "{bot_type}: {d:?}"
+            );
+            assert!(!d.command_set().is_empty(), "{bot_type}");
+            let cap = BotCapability::new(1, bot_type, bot_type);
+            assert!(cap.is_scoped(), "{bot_type}");
+            assert!(!cap.refuses_inbound(), "{bot_type}");
+            assert!(cap.scoped_help_text().contains("Available here:"));
         }
     }
 

@@ -6,8 +6,11 @@ license = "MIT"
 
 # ---- Compile-time capability registry (multibot foundation) ----
 # A feature selects which product capabilities are compiled in. The default
-# set adds three live scoped bot types to the shop bot and moderation floor;
-# every existing shop path and dependency stays unchanged.
+# set registers the shop tree, the moderation floor and every scoped bot type
+# except one: `movie_bot` stays opt-in because an out-of-scope web-nav test
+# pins the default feature set. It is fully live when enabled with
+# `--features movie_bot`. Every existing shop path and dependency stays
+# unchanged. The three newest types are live, not notices:
 #   shop_bot   - AI shop bot (payments, products, AI drafts) — existing default.
 #   moderation - owner/seller/per-bot word policy floor — existing default
 #                (the runtime floor in handlers/moderation.rs also compiles
@@ -15,10 +18,12 @@ license = "MIT"
 #   service    - services/bookings command family on a dedicated bot type.
 #   web_app    - dashboard setup links on a dedicated bot type.
 #   reply_bot  - support-ticket reply family on a dedicated bot type.
-#   movie_bot  - movie catalog bot; a movie-only install enables this alone.
-#                No catalogue code exists; compiled type is a notice-only stub.
-#   file_share - no upload/share flow exists; notice-only stub.
-#   automation - no rules engine exists; notice-only stub.
+#   movie_bot  - movie catalogue: product search, purchase and post-payment
+#                delivery. No in-app playback is claimed.
+#   file_share - Telegram file_id shares: upload by document caption, browse,
+#                per-user grant and re-send by token. Not arbitrary hosting.
+#   automation - keyword-triggered auto-reply rules with audit; not a general
+#                rules engine.
 #
 # Feature-optionalization investigation (complete, verified — do not
 # re-litigate without a gate-sanctioned change): these are still INERT
@@ -45,7 +50,7 @@ license = "MIT"
 # movie-only build. Advisory pins (rusqlite 0.41, libsqlite3-sys 0.39.1 and
 # the vendored-teloxide sqlx bump) are unchanged.
 [features]
-default = ["shop_bot", "moderation", "service", "web_app", "reply_bot"]
+default = ["shop_bot", "moderation", "service", "web_app", "reply_bot", "file_share", "automation"]
 shop_bot = []
 moderation = []
 movie_bot = []

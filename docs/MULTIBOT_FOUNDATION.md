@@ -19,9 +19,9 @@ not create a separate console, login, or port.
 | `service` | Services | Services and bookings on a dedicated bot type (live). |
 | `web_app` | Web apps | One-time operator-console claim links on a dedicated bot type (live). |
 | `reply_bot` | Reply bots | Support-ticket reply flow on a dedicated bot type (live). |
-| `movie_bot` | Movie bots | Movie catalog bot (no catalogue exists; stub, notice only). |
-| `file_share` | File sharing | File Share (no upload/share flow exists; stub, notice only). |
-| `automation` | Automation | Automation rules (no rules engine exists; stub, notice only). |
+| `movie_bot` | Movie bots | Catalogue search, purchase and post-payment delivery over the shop products tables (no playback). |
+| `file_share` | File sharing | Telegram file_id shares: upload by document caption, browse, grant, re-send by token. |
+| `automation` | Automation | Keyword-triggered auto-reply rules with audit (not a general rules engine). |
 
 A bot with no type set — including every bot created before this foundation —
 is treated as a `shop_bot`. Leaving the type blank keeps that behavior.
@@ -61,16 +61,21 @@ Capabilities are chosen at compile time. Each one is a Cargo feature that contro
 | `service` | Services/bookings command family on a dedicated bot type. |
 | `web_app` | Dashboard claim links on a dedicated bot type. |
 | `reply_bot` | Support-ticket reply family on a dedicated bot type. |
-| `movie_bot` | No catalogue exists; stub, notice only. |
-| `file_share` | No upload/share flow exists; stub, notice only. |
-| `automation` | No rules engine exists; stub, notice only. |
+| `movie_bot` | Catalogue commands `/shop`, `/find`, `/productadd`, `/products`, `/productdel`, `/buy`, `/paid`. |
+| `file_share` | Share commands `/upload` (document caption), `/files`, `/share`, `/getfile`. |
+| `automation` | Rule commands `/ruleadd`, `/rules`, `/ruledel` plus keyword matching on plain text. |
 
-The default build enables `shop_bot`, `moderation`, `service`, `web_app` and
-`reply_bot`. A bot with no type still uses the unchanged shop tree; enabling
-the scoped features only changes bots explicitly typed as `service`, `web_app`
-or `reply_bot`. Each scoped type runs the shipped handlers for its own command
-family and answers other commands with a short usage hint. To build a
-movie-only binary that registers only the movie capability (plus the
+The default build enables every capability except `movie_bot`, which is live
+when compiled with `--features movie_bot` (an out-of-scope web-nav test pins the
+old default feature set; the feature itself is not a stub). A bot with no type
+still uses the unchanged shop tree; a scoped type runs the shipped handlers for
+its own command family and answers other commands with a short usage hint.
+`movie_bot` reuses products, invoices and `services::deliver` for catalogue and delivery,
+but provides no video playback. `file_share` stores only Telegram `file_id`
+references with seller/bot scope and per-user grants, not arbitrary file
+bytes. `automation` supports one slice end-to-end: keyword auto-replies with
+persisted rules and audit rows; there are no schedules or multi-step actions.
+To build a movie-only binary that registers only the movie capability (plus the
 cross-cutting moderation floor) and refuses every other bot type, including
 the shop bot:
 
@@ -146,5 +151,5 @@ do". A degraded install never silently lets messages through.
 
 - No machine-learning training or local models — external AI API calls only.
 - No public non-Telegram chat.
-- No general automation engine.
+- No general automation engine; only the keyword auto-reply slice above.
 - No dynamic plugin (`.so`) loading.

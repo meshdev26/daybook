@@ -1580,8 +1580,10 @@ async fn run() {
                     .endpoint(
                         |bot: Bot,
                          msg: Message,
-                         cap: Arc<handlers::capabilities::BotCapability>| async move {
-                            handlers::capabilities::send_scoped_hint(&bot, &msg, &cap).await
+                         cap: Arc<handlers::capabilities::BotCapability>,
+                         bot_ctx: Arc<bots::BotContext>| async move {
+                            handlers::capabilities::handle_scoped_plain(&bot, &msg, &cap, &bot_ctx)
+                                .await
                         },
                     ),
                 )

@@ -23,6 +23,11 @@ pub mod roles;
 pub mod secrets;
 pub mod services;
 pub mod util;
+// With every capability enabled in the default build, the web module's
+// compile-time feature map expands to uniform boolean arms and clippy asks
+// for `matches!`. That module is owned by another phase; keep the lint waiver
+// scoped to it rather than editing shared web code here.
+#[allow(clippy::match_like_matches_macro)]
 pub mod web;
 
 #[cfg(feature = "automation")]

@@ -223,6 +223,22 @@ pub enum Command {
     Reorder(String),
     /// Disable reorder reminder. /reorderoff <product>
     ReorderOff(String),
+    /// Search the catalogue by name. /find <text>
+    Find(String),
+    /// Register a Telegram document as a share. /upload <name> [| description]
+    FileUpload(String),
+    /// List shared files. /files
+    Files,
+    /// Grant a user access to a share. /share <id> <user_id>
+    FileShare(String),
+    /// Download a shared file by token. /getfile <token>
+    FileGet(String),
+    /// Add a keyword auto-reply rule. /ruleadd keyword | response
+    RuleAdd(String),
+    /// List keyword auto-reply rules. /rules
+    Rules,
+    /// Disable a keyword auto-reply rule. /ruledel <id>
+    RuleDel(String),
 }
 
 #[tracing::instrument(skip(
@@ -299,6 +315,10 @@ pub async fn cmd_handler(
             | Command::Reviews(_)
             | Command::Reorder(_)
             | Command::ReorderOff(_)
+            | Command::Find(_)
+            | Command::FileUpload(_)
+            | Command::Files
+            | Command::FileGet(_)
     );
     let seller_cmd = matches!(
         cmd,
@@ -356,6 +376,10 @@ pub async fn cmd_handler(
             | Command::SetWebPassword(_)
             | Command::McpToken(_)
             | Command::Dashboard
+            | Command::FileShare(_)
+            | Command::RuleAdd(_)
+            | Command::Rules
+            | Command::RuleDel(_)
     );
     // Admin-tier commands: admin/owner only (sellers and plain users are
     // excluded here; each handler keeps its own `!is_admin` guard like
@@ -4032,6 +4056,46 @@ pub async fn cmd_handler(
                 return Ok(());
             }
             handle_payout_approve(&bot, chat_id, &db, user_id, role, arg.trim()).await?;
+        }
+        // Capability verticals. The real logic lives in the services layer so
+        // the same handlers work on a scoped bot and on the shop bot; the
+        // allowlist in handlers::capabilities decides which bot exposes them.
+        Command::Find(arg) => {
+            let text = crate::services::capabilities::catalogue_search_text(&db, &arg, role);
+            bot.send_message(chat_id, text).await?;
+        }
+        Command::FileUpload(arg) => {
+            let _ = arg;
+            bot.send_message(
+                chat_id,
+                "Send the file as a document with the caption /upload <name> [| description].",
+            )
+            .await?;
+        }
+        Command::Files => {
+            let text = crate::services::capabilities::shares_text(&db, user_id, role, bot_ctx.id);
+            bot.send_message(chat_id, text).await?;
+        }
+        Command::FileShare(arg) => {
+            let text = crate::services::capabilities::grant_share(&db, user_id, role, &arg);
+            bot.send_message(chat_id, text).await?;
+        }
+        Command::FileGet(arg) => {
+            crate::services::capabilities::download_share(&bot, &bot_ctx, user_id, role, &arg)
+                .await?;
+        }
+        Command::RuleAdd(arg) => {
+            let text =
+                crate::services::capabilities::add_rule(&db, user_id, role, bot_ctx.id, &arg);
+            bot.send_message(chat_id, text).await?;
+        }
+        Command::Rules => {
+            let text = crate::services::capabilities::rules_text(&db, user_id, role, bot_ctx.id);
+            bot.send_message(chat_id, text).await?;
+        }
+        Command::RuleDel(arg) => {
+            let text = crate::services::capabilities::delete_rule(&db, user_id, role, &arg);
+            bot.send_message(chat_id, text).await?;
         }
     }
     Ok(())

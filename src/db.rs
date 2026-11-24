@@ -712,6 +712,18 @@ impl Db {
         let _ = conn.execute("ALTER TABLE payouts ADD COLUMN processed_by INTEGER", []);
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT, metadata TEXT, created_at TEXT NOT NULL)", []);
         let _ = conn.execute("CREATE TABLE IF NOT EXISTS api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, name TEXT, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT, scopes TEXT, revoked INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT, last_used_at TEXT)", []);
+        // Capability verticals. File shares store only a Telegram file_id
+        // reference (the bytes stay in Telegram); automation rules are
+        // keyword-triggered auto-replies. Both are seller/bot scoped and use
+        // the shared audit_log for every state change and firing.
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS file_shares (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL DEFAULT 0, file_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', token TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS file_share_grants (share_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (share_id, user_id))", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_shares_scope ON file_shares(seller_id, bot_id)",
+            [],
+        );
+        let _ = conn.execute("CREATE TABLE IF NOT EXISTS automation_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, bot_id INTEGER NOT NULL DEFAULT 0, keyword TEXT NOT NULL, response TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_automation_rules_scope ON automation_rules(seller_id, bot_id)", []);
         // Production indexes for multi-tenant scoping and lookups.
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_plans_seller ON plans(seller_id)",
@@ -10045,6 +10057,333 @@ impl Db {
             bot_override_active,
             enforcement_degraded: !storage_ready || floor_read_failed,
         }
+    }
+}
+
+// ---- Capability verticals: catalogue search, file shares, automation ----
+
+/// A stored file share. Field order: id, seller_id, bot_id, file_id, name,
+/// description, token, active. The file_id is a Telegram reference, not bytes.
+pub type FileShareRow = (i64, i64, i64, String, String, String, String, i64);
+/// A keyword auto-reply rule. Field order: id, seller_id, bot_id, keyword,
+/// response, active.
+pub type AutomationRuleRow = (i64, i64, i64, String, String, i64);
+
+impl Db {
+    /// Substring search over active, publicly sellable products. The legacy
+    /// seller 0 namespace is excluded; the caller decides what to render.
+    pub fn search_products(&self, query: &str, limit: i64) -> Vec<ProductRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pattern = format!("%{}%", query.trim());
+        let mut stmt = match conn.prepare(
+            "SELECT id,seller_id,name,price,asset,kind,delivery,stock,active FROM products \
+             WHERE active=1 AND seller_id<>0 AND (name LIKE ?1 OR kind LIKE ?1) \
+             ORDER BY id LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![pattern, limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn create_file_share(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        file_id: &str,
+        name: &str,
+        description: &str,
+        token: &str,
+    ) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO file_shares(seller_id,bot_id,file_id,name,description,token,active,created_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,1,?7)",
+            params![seller_id, bot_id, file_id, name, description, token, now],
+        );
+        conn.last_insert_rowid()
+    }
+
+    fn file_share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileShareRow> {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+        ))
+    }
+
+    const FILE_SHARE_COLUMNS: &str = "id,seller_id,bot_id,file_id,name,description,token,active";
+
+    pub fn get_file_share(&self, id: i64) -> Option<FileShareRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sql = format!(
+            "SELECT {} FROM file_shares WHERE id=?1",
+            Self::FILE_SHARE_COLUMNS
+        );
+        conn.query_row(&sql, params![id], Self::file_share_from_row)
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn get_file_share_by_token(&self, token: &str) -> Option<FileShareRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sql = format!(
+            "SELECT {} FROM file_shares WHERE token=?1",
+            Self::FILE_SHARE_COLUMNS
+        );
+        conn.query_row(&sql, params![token], Self::file_share_from_row)
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Owner/admin view: shares created by one seller on one bot, or all.
+    pub fn list_file_shares(
+        &self,
+        seller_scope: Option<i64>,
+        bot_id: Option<i64>,
+    ) -> Vec<FileShareRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = format!(
+            "SELECT {} FROM file_shares WHERE active=1",
+            Self::FILE_SHARE_COLUMNS
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(sid) = seller_scope {
+            values.push(Box::new(sid));
+            sql.push_str(&format!(" AND seller_id=?{}", values.len()));
+        }
+        if let Some(bid) = bot_id {
+            values.push(Box::new(bid));
+            sql.push_str(&format!(" AND bot_id=?{}", values.len()));
+        }
+        sql.push_str(" ORDER BY id DESC");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(values.iter().map(|b| b.as_ref())),
+                Self::file_share_from_row,
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    /// Buyer view: only shares explicitly granted to this user.
+    pub fn list_file_shares_for_user(&self, user_id: i64) -> Vec<FileShareRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sql = format!(
+            "SELECT {0} FROM file_shares f JOIN file_share_grants g ON g.share_id=f.id \
+             WHERE g.user_id=?1 AND f.active=1 ORDER BY f.id DESC",
+            Self::FILE_SHARE_COLUMNS
+                .split(',')
+                .map(|c| format!("f.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(params![user_id], Self::file_share_from_row)
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn grant_file_share(&self, share_id: i64, user_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO file_share_grants(share_id,user_id,created_at) VALUES(?1,?2,?3)",
+            params![share_id, user_id, now],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn revoke_file_share(&self, share_id: i64, user_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM file_share_grants WHERE share_id=?1 AND user_id=?2",
+            params![share_id, user_id],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn file_share_grant_exists(&self, share_id: i64, user_id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT 1 FROM file_share_grants WHERE share_id=?1 AND user_id=?2",
+            params![share_id, user_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    pub fn set_file_share_active(&self, id: i64, seller_id: i64, active: bool) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE file_shares SET active=?1 WHERE id=?2 AND seller_id=?3",
+            params![i64::from(active), id, seller_id],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn create_automation_rule(
+        &self,
+        seller_id: i64,
+        bot_id: i64,
+        keyword: &str,
+        response: &str,
+    ) -> i64 {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO automation_rules(seller_id,bot_id,keyword,response,active,created_at) \
+             VALUES(?1,?2,?3,?4,1,?5)",
+            params![seller_id, bot_id, keyword, response, now],
+        );
+        conn.last_insert_rowid()
+    }
+
+    fn automation_rule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRuleRow> {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    }
+
+    /// Rules visible to one seller on one bot. `None` scopes mean all rows
+    /// (admin view); `active_only` is used by the trigger runner.
+    pub fn list_automation_rules(
+        &self,
+        seller_scope: Option<i64>,
+        bot_id: Option<i64>,
+        active_only: bool,
+    ) -> Vec<AutomationRuleRow> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sql = String::from(
+            "SELECT id,seller_id,bot_id,keyword,response,active FROM automation_rules WHERE 1=1",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(sid) = seller_scope {
+            values.push(Box::new(sid));
+            sql.push_str(&format!(" AND seller_id=?{}", values.len()));
+        }
+        if let Some(bid) = bot_id {
+            values.push(Box::new(bid));
+            sql.push_str(&format!(" AND bot_id=?{}", values.len()));
+        }
+        if active_only {
+            sql.push_str(" AND active=1");
+        }
+        sql.push_str(" ORDER BY id");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(values.iter().map(|b| b.as_ref())),
+                Self::automation_rule_from_row,
+            )
+            .ok();
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn set_automation_rule_active(&self, id: i64, seller_id: i64, active: bool) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE automation_rules SET active=?1 WHERE id=?2 AND seller_id=?3",
+            params![i64::from(active), id, seller_id],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
     }
 }
 

@@ -5013,3 +5013,108 @@ fn money_safety_schema_shape() {
     );
     assert!(index_names.iter().any(|n| n == "uq_refunds_invoice_idem"));
 }
+
+#[test]
+fn capability_catalogue_search_is_active_and_buyer_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::new(dir.path().join("search.db").to_str().unwrap()).unwrap();
+    db.add_product(
+        1,
+        "Night Shift",
+        "5",
+        "USDT",
+        "digital_file",
+        Some("payload"),
+        None,
+    )
+    .unwrap();
+    db.add_product(
+        1,
+        "Hidden Reel",
+        "7",
+        "USDT",
+        "digital_link",
+        Some("link"),
+        None,
+    )
+    .unwrap();
+    db.add_product(
+        0,
+        "Admin Only",
+        "9",
+        "USDT",
+        "digital_link",
+        Some("link"),
+        None,
+    )
+    .unwrap();
+    db.set_product_active(1, "Hidden Reel", false);
+
+    let hits = db.search_products("night", 10);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Night Shift");
+    assert!(
+        db.search_products("reel", 10).is_empty(),
+        "inactive is hidden"
+    );
+    assert!(
+        db.search_products("admin", 10).is_empty(),
+        "the legacy seller 0 namespace is excluded by the search query"
+    );
+    assert!(!db.search_products("", 10).is_empty());
+}
+
+#[test]
+fn capability_file_share_grants_are_scoped_and_revocable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::new(dir.path().join("shares.db").to_str().unwrap()).unwrap();
+    let id = db.create_file_share(7, 3, "file-id", "clip", "desc", "TOKEN1");
+    assert!(id > 0);
+    let row = db.get_file_share(id).expect("row exists");
+    assert_eq!(row.1, 7);
+    assert_eq!(row.2, 3);
+    assert_eq!(row.3, "file-id");
+    assert_eq!(row.6, "TOKEN1");
+    assert_eq!(db.get_file_share_by_token("TOKEN1").unwrap().0, id);
+
+    assert_eq!(db.list_file_shares(Some(7), Some(3)).len(), 1);
+    assert!(db.list_file_shares(Some(8), Some(3)).is_empty());
+    assert!(db.list_file_shares_for_user(42).is_empty());
+
+    assert!(db.grant_file_share(id, 42));
+    assert!(!db.grant_file_share(id, 42), "grant is idempotent");
+    assert!(db.file_share_grant_exists(id, 42));
+    let granted = db.list_file_shares_for_user(42);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].0, id);
+    assert!(db.revoke_file_share(id, 42));
+    assert!(db.list_file_shares_for_user(42).is_empty());
+
+    assert!(db.set_file_share_active(id, 7, false));
+    assert!(
+        !db.set_file_share_active(id, 8, false),
+        "other seller cannot change it"
+    );
+    assert!(db.list_file_shares(Some(7), Some(3)).is_empty());
+}
+
+#[test]
+fn capability_automation_rules_scope_and_active_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::new(dir.path().join("rules.db").to_str().unwrap()).unwrap();
+    let id = db.create_automation_rule(7, 3, "hello", "hi there");
+    db.create_automation_rule(8, 3, "hello", "other seller");
+    db.create_automation_rule(7, 9, "hello", "other bot");
+
+    let mine = db.list_automation_rules(Some(7), Some(3), true);
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].0, id);
+    assert_eq!(mine[0].3, "hello");
+    assert_eq!(db.list_automation_rules(None, Some(3), true).len(), 2);
+    assert_eq!(db.list_automation_rules(Some(7), None, true).len(), 2);
+
+    assert!(db.set_automation_rule_active(id, 7, false));
+    assert!(!db.set_automation_rule_active(id, 8, false));
+    assert!(db.list_automation_rules(Some(7), Some(3), true).is_empty());
+    assert_eq!(db.list_automation_rules(Some(7), Some(3), false).len(), 1);
+}

@@ -5,4 +5,5 @@
 //! absorptions are §3 seam work and are built only on their scale trigger.
 
 pub mod broadcast;
+pub mod capabilities;
 pub mod deliver;
