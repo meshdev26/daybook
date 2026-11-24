@@ -31,7 +31,7 @@
 //! | 14 | console | seller GET pages | own marker only |
 //! | 15 | console | seller cross-tenant POSTs | no change to victim rows or bot traffic |
 //! | 16 | bot | for_seller/for_channel/unmapped fallback and effective_bot | seller and channel ownership decide the bot |
-//! | 17 | REST known gap | expire-check processes every expired subscription | ignored reproduction of a real cross-tenant write |
+//! | 17 | REST write | expire-check with a seller token | only that seller's expired rows; owner control still sweeps globally |
 //!
 //! To add a case: extend the table above, then add a row to the matching
 //! surface table inside the test function below.
@@ -1138,18 +1138,16 @@ async fn bot_resolution_follows_seller_and_channel_ownership() {
     assert_eq!(web::effective_bot(&f.state, &b_session).id, f.b.bot_id);
 }
 
-/// Known real cross-tenant write, kept as an ignored reproduction only.
-/// Reproduction: sell A and B with expired active subscriptions (negative
-/// `days` in `create_subscription`), POST `/api/v1/subscriptions/expire-check`
-/// with A's session bearer token, then list B's subscriptions: both rows are
-/// `expired` and the response reports both. No production code was changed.
-/// Run deliberately with `cargo test --test tenant_isolation -- --ignored`.
+/// Regression for the cross-tenant expire-check write: a seller token may
+/// expire only that seller's own active-but-expired rows. The owner control
+/// proves the global sweep is still available to the privileged tier.
 #[tokio::test]
-#[ignore = "real cross-tenant write in REST expire-check; reported, not patched"]
 async fn expire_check_must_not_touch_another_tenants_subscriptions() {
     let f = make_fixture().await;
     let victim =
         f.db.create_subscription(B, 5_003, None, B_CHANNEL, -1, None, None);
+    let own =
+        f.db.create_subscription(A, 5_004, None, A_CHANNEL, -1, None, None);
     let status = |id: i64| {
         f.db.list_subscriptions(None, 1000)
             .into_iter()
@@ -1159,6 +1157,7 @@ async fn expire_check_must_not_touch_another_tenants_subscriptions() {
             .clone()
     };
     assert_eq!(status(victim), "active");
+    assert_eq!(status(own), "active");
     let (status_code, body) = rest(
         &f.app,
         &f.a.session,
@@ -1170,7 +1169,25 @@ async fn expire_check_must_not_touch_another_tenants_subscriptions() {
     assert_eq!(status_code, StatusCode::OK);
     assert_eq!(
         body, "{\"expired\":1}",
-        "A expired B's subscription: {body}"
+        "seller must expire only its own row: {body}"
+    );
+    assert_eq!(
+        status(own),
+        "expired",
+        "A's own expired row was not expired"
     );
     assert_eq!(status(victim), "active", "B's row was mutated by A");
+
+    // Owner control: the same endpoint still sweeps every tenant globally.
+    let (status_code, body) = rest(
+        &f.app,
+        &f.owner_session,
+        "POST",
+        "/api/v1/subscriptions/expire-check",
+        None,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(body, "{\"expired\":1}", "owner control: {body}");
+    assert_eq!(status(victim), "expired", "owner did not expire B's row");
 }

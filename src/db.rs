@@ -4192,6 +4192,24 @@ impl Db {
         }
     }
 
+    /// Seller-scoped counterpart to `expired_subscriptions`: atomically mark
+    /// only this seller's active-but-expired rows and return how many changed.
+    /// The unconditional `seller_id` predicate is the isolation boundary; the
+    /// global sweep (`expired_subscriptions` + `mark_subscription_expired`)
+    /// stays available for the owner path and the periodic sweeper.
+    pub fn expire_subscriptions_for_seller(&self, seller_id: i64) -> usize {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE subscriptions SET status='expired' WHERE seller_id=?1 AND status='active' AND expires_at < ?2",
+            params![seller_id, now],
+        )
+        .unwrap_or(0)
+    }
+
     pub fn mark_subscription_expired(&self, id: i64) {
         let conn = self
             .conn

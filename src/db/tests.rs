@@ -1795,6 +1795,42 @@ fn test_expired_subscriptions() {
     assert_eq!(subs[0].4, "expired");
 }
 
+/// The scoped expire must touch only the requested seller's active-but-expired
+/// rows; a foreign seller's rows and the caller's still-valid rows stay active.
+#[test]
+fn test_expire_subscriptions_for_seller_is_scoped() {
+    let path = "/tmp/opencode/test_expire_subscriptions_for_seller.db";
+    let _ = fs::remove_file(path);
+    let db = Db::new(path).unwrap();
+    db.upsert_seller(1, Some("alice"), Some("@chan"));
+    db.upsert_seller(2, Some("bob"), Some("@chan"));
+    let own_expired = db.create_subscription(1, 42, None, "@chan", -1, None, None);
+    let own_valid = db.create_subscription(1, 43, None, "@chan", 7, None, None);
+    let foreign_expired = db.create_subscription(2, 44, None, "@chan", -1, None, None);
+    let foreign_valid = db.create_subscription(2, 45, None, "@chan", 7, None, None);
+
+    assert_eq!(db.expire_subscriptions_for_seller(1), 1);
+    let status = |id: i64| {
+        db.list_subscriptions(None, 1000)
+            .into_iter()
+            .find(|s| s.0 == id)
+            .unwrap()
+            .4
+    };
+    assert_eq!(status(own_expired), "expired");
+    assert_eq!(status(own_valid), "active");
+    assert_eq!(status(foreign_expired), "active");
+    assert_eq!(status(foreign_valid), "active");
+
+    // Idempotent: a second pass finds nothing left for this seller.
+    assert_eq!(db.expire_subscriptions_for_seller(1), 0);
+    // The global view still sees only the other seller's expired row.
+    let global = db.expired_subscriptions();
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].0, foreign_expired);
+    let _ = fs::remove_file(path);
+}
+
 #[test]
 fn test_ai_template_upsert_get_list_delete() {
     let path = "/tmp/opencode/test_ai_template_upsert_get_list_delete.db";

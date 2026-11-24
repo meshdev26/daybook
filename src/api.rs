@@ -1226,14 +1226,40 @@ async fn subs_expire_check(State(state): State<WebState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let expired = state.db.expired_subscriptions();
-    let n = expired.len();
-    for (id, _sid, _uid, _ch) in expired {
-        // only process seller's own unless admin
-        state.db.mark_subscription_expired(id);
-    }
-    let _ = session;
-    (StatusCode::OK, Json(serde_json::json!({"expired": n}))).into_response()
+    let role = Role::from_role_str(&session.role);
+    let expired = if role.has_level(Role::Owner) {
+        // Owner/admin keep the global sweep, matching the web
+        // `/subs/expirecheck` owner gate and the scheduled sweeper.
+        let rows = state.db.expired_subscriptions();
+        let n = rows.len();
+        for (id, _sid, _uid, _ch) in rows {
+            state.db.mark_subscription_expired(id);
+        }
+        n
+    } else if role == Role::Seller {
+        // Sellers may expire only their own rows. The unconditional
+        // seller_id predicate lives in Db, and a seller without a server-set
+        // seller_id fails closed rather than widening to a global sweep.
+        match seller_scope(&session) {
+            Some(sid) => state.db.expire_subscriptions_for_seller(sid),
+            None => {
+                return err(StatusCode::FORBIDDEN, "forbidden", "seller scope required")
+                    .into_response();
+            }
+        }
+    } else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "seller or owner required",
+        )
+        .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"expired": expired})),
+    )
+        .into_response()
 }
 
 async fn user_subs(
