@@ -50,6 +50,7 @@ and the setup & management UX polish
 
 ### Fixed
 - Security: `POST /api/v1/subscriptions/expire-check` is now seller-scoped — a seller token expires only that seller's active-but-expired subscriptions; owner/admin keep the global sweep used by the console and the periodic sweeper. Covered by a permanent case in the isolation suite.
+- Security: bot `/expirecheck` is seller-scoped the same way — a seller revokes and receives notices only for its own expired rows, using the caller's server-derived user id; owner/admin keep the global sweep. Covered by a regression test in `commands/tests.rs`.
 
 ### Added
 - Automated multi-tenant isolation validation suite (`tests/tenant_isolation.rs`): seller isolation on a fresh local database across REST, MCP, the web console and bot scoping, with per-tenant markers, per-seller tokens and loopback Bot mocks. This is self-validation, not an independent penetration test or a third-party audit; the scratch-deployment verification in issue #1 remains open.

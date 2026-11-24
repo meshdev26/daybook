@@ -517,11 +517,18 @@ fn cmd_test_db() -> (tempfile::TempDir, Arc<Db>) {
 /// Drive the real `cmd_handler` against a wiremock Bot API and return the
 /// `text` of every outgoing sendMessage. No Telegram transport is touched.
 async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
+    run_cmd_with_mock_bot_as(cmd, db, 42, 999).await
+}
+
+/// Same driver with an explicit caller and owner id, for role/tenant tests.
+async fn run_cmd_with_mock_bot_as(
+    cmd: Command,
+    db: Arc<Db>,
+    caller: i64,
+    owner: i64,
+) -> Vec<String> {
     use teloxide::dispatching::dialogue::{Dialogue, InMemStorage, Storage};
     use teloxide::types::ChatId;
-
-    const USER: i64 = 42;
-    const OWNER: i64 = 999;
 
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -531,7 +538,7 @@ async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
                 "result": {
                     "message_id": 1,
                     "date": 1_700_000_000,
-                    "chat": {"id": USER, "type": "private", "first_name": "T"},
+                    "chat": {"id": caller, "type": "private", "first_name": "T"},
                     "text": "sent"
                 }
             })),
@@ -546,7 +553,7 @@ async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
         id: 0,
         key: "primary".to_string(),
         bot: bot.clone(),
-        owner_id: OWNER,
+        owner_id: owner,
         shared: Arc::new(cfg.clone()),
         db: db.clone(),
     });
@@ -559,12 +566,12 @@ async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
     let msg: teloxide::types::Message = serde_json::from_value(serde_json::json!({
         "message_id": 7,
         "date": 1_700_000_000,
-        "chat": {"id": USER, "type": "private", "first_name": "T"},
-        "from": {"id": USER, "is_bot": false, "first_name": "T", "username": "seller42"},
+        "chat": {"id": caller, "type": "private", "first_name": "T"},
+        "from": {"id": caller, "is_bot": false, "first_name": "T", "username": "seller42"},
         "text": "/command"
     }))
     .expect("test Message must deserialize");
-    let dialogue = Dialogue::new(InMemStorage::<State>::new().erase(), ChatId(USER));
+    let dialogue = Dialogue::new(InMemStorage::<State>::new().erase(), ChatId(caller));
 
     cmd_handler(
         bot,
@@ -574,7 +581,7 @@ async fn run_cmd_with_mock_bot(cmd: Command, db: Arc<Db>) -> Vec<String> {
         cfg,
         bot_ctx,
         bot_manager,
-        OWNER,
+        owner,
         None,
         None,
         Arc::new(CommandRegistry::new()),
@@ -703,5 +710,63 @@ fn claim_link_still_issued_when_web_url_set() {
             "{}",
             dashboard_texts[0]
         );
+    });
+}
+
+/// Regression: `/expirecheck` invoked by seller A may revoke only A's rows,
+/// and the notices name only A's channel. The owner call is the control that
+/// proves the global sweep is retained for the privileged tier.
+#[test]
+fn expirecheck_scopes_seller_and_keeps_owner_global() {
+    on_large_stack(async {
+        const SELLER_A: i64 = 42;
+        const SELLER_B: i64 = 77;
+        const OWNER: i64 = 999;
+        const PLAIN_USER: i64 = 55;
+        const A_CHANNEL: &str = "@iso_cmd_alpha";
+        const B_CHANNEL: &str = "@iso_cmd_beta";
+
+        let (_dir, db) = cmd_test_db();
+        db.upsert_seller(SELLER_A, Some("seller42"), None);
+        db.upsert_seller(SELLER_B, Some("seller77"), None);
+        let a_sub = db.create_subscription(SELLER_A, 5_001, None, A_CHANNEL, -1, None, None);
+        let b_sub = db.create_subscription(SELLER_B, 5_002, None, B_CHANNEL, -1, None, None);
+        let status = |id: i64| {
+            db.list_subscriptions(None, 1000)
+                .into_iter()
+                .find(|s| s.0 == id)
+                .map(|s| s.4)
+                .unwrap_or_default()
+        };
+
+        // The seller-tier gate rejects a plain user before any sweep happens.
+        let denied =
+            run_cmd_with_mock_bot_as(Command::ExpireCheck, db.clone(), PLAIN_USER, OWNER).await;
+        assert_eq!(status(a_sub), "active");
+        assert_eq!(status(b_sub), "active");
+        assert!(
+            denied.iter().any(|t| t.contains("isn't authorized")),
+            "{denied:?}"
+        );
+
+        // Seller A: only A's row expires; B's channel never appears in a notice.
+        let texts =
+            run_cmd_with_mock_bot_as(Command::ExpireCheck, db.clone(), SELLER_A, OWNER).await;
+        assert_eq!(status(a_sub), "expired");
+        assert_eq!(status(b_sub), "active", "A expired B's subscription");
+        assert!(
+            texts.iter().any(|t| t.contains("Expired and revoked: 1")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains(A_CHANNEL)), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains(B_CHANNEL)),
+            "B's channel leaked into A's notices: {texts:?}"
+        );
+
+        // Owner control: the same command still sweeps every tenant globally.
+        let texts = run_cmd_with_mock_bot_as(Command::ExpireCheck, db.clone(), OWNER, OWNER).await;
+        assert_eq!(status(b_sub), "expired", "owner did not expire B's row");
+        assert!(texts.iter().any(|t| t.contains(B_CHANNEL)), "{texts:?}");
     });
 }

@@ -16,13 +16,14 @@
 - Bot scoping: `sellers.bot_id` picks the seller's bot (NULL falls back to the primary); web and REST handlers resolve it through `effective_bot`.
 - MCP per-seller tokens map to `Principal { role: Seller, seller_id: Some(seller_id) }`, scoped to that seller's data.
 - Sessions carry `seller_id`; a seller cannot switch bots from the console (the bot is pinned server-side and shown as a label).
+- Bot `/expirecheck` follows the same split as REST `expire-check`: a seller revokes and is notified only about its own expired rows; owner/admin keep the global sweep used by the console and the periodic sweeper. The seller id is the caller's server-derived user id, never a command argument.
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)
 
 - Automated self-validation of seller isolation on a fresh local database across REST, MCP, the web console and bot scoping; this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open.
-- The suite runs on loopback with mock Bot APIs, two forged-token seller principals and per-tenant markers. Seller-scoped REST `expire-check` (owner/admin retain the global sweep) is covered as a permanent isolation case.
+- The suite runs on loopback with mock Bot APIs, two forged-token seller principals and per-tenant markers. Seller-scoped REST `expire-check` (owner/admin retain the global sweep) is a permanent isolation case; bot `/expirecheck` has a matching regression test in `commands/tests.rs`.
 
 > **Status:** alpha, self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
 

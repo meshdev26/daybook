@@ -4175,14 +4175,31 @@ impl Db {
     }
 
     pub fn expired_subscriptions(&self) -> Vec<(i64, i64, i64, String)> {
+        self.expired_subscriptions_filtered(None)
+    }
+
+    /// Seller-scoped SELECT for the bot expiry paths. The tenant predicate
+    /// lives in SQL rather than a post-filter over every tenant's rows, so a
+    /// caller can never see a foreign seller's subscription. The kick+mark
+    /// loop stays shared with the global sweep in `crate::expire_subscriptions`.
+    pub fn expired_subscriptions_for_seller(&self, seller_id: i64) -> Vec<(i64, i64, i64, String)> {
+        self.expired_subscriptions_filtered(Some(seller_id))
+    }
+
+    fn expired_subscriptions_filtered(
+        &self,
+        seller_id: Option<i64>,
+    ) -> Vec<(i64, i64, i64, String)> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
-        let mut stmt = match conn.prepare("SELECT id,seller_id,user_id,channel_id FROM subscriptions WHERE status='active' AND expires_at < ?1") { Ok(s)=>s, Err(_)=>return vec![] };
+        // A NULL seller means the owner/admin global sweep; a bound seller
+        // restricts the result set at the DB boundary.
+        let mut stmt = match conn.prepare("SELECT id,seller_id,user_id,channel_id FROM subscriptions WHERE (?1 IS NULL OR seller_id=?1) AND status='active' AND expires_at < ?2") { Ok(s)=>s, Err(_)=>return vec![] };
         let rows = stmt
-            .query_map(params![now], |r| {
+            .query_map(params![seller_id, now], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .ok();

@@ -3425,7 +3425,16 @@ pub async fn cmd_handler(
             // resolves the moderating bot per row (`BotManager::for_seller`),
             // so a seller bound to another bot is kicked/DM'd by that bot, not
             // by whichever bot received the command.
-            let expired = crate::expire_subscriptions(&bot_manager, &db).await;
+            // Owner/admin keep the global sweep; a seller is scoped to its
+            // own rows. `user_id` comes from `msg.from` (server-derived), and
+            // sellers are keyed by that same id (`upsert_seller(user_id, ..)`
+            // in /becomeseller), so no caller-supplied id can widen the scope.
+            // The seller-tier gate above already excludes plain users.
+            let expired = if is_admin {
+                crate::expire_subscriptions(&bot_manager, &db).await
+            } else {
+                crate::expire_subscriptions_for_seller(&bot_manager, &db, user_id).await
+            };
             let mut notified = 0usize;
             for (_sub_id, seller_id, uid, channel) in &expired {
                 let row_bot = bot_manager.for_seller(*seller_id).bot.clone();

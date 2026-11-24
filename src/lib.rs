@@ -80,9 +80,9 @@ pub use handlers::capabilities::web_app as web_app_capability;
 use teloxide::prelude::*;
 
 /// Revoke every expired subscription: kick the member out of the channel
-/// (ban + unban) and mark the row expired. Shared by the `/expirecheck`
-/// command and the periodic expiry sweeper so the behavior stays
-/// single-sourced.
+/// (ban + unban) and mark the row expired. Shared by the owner/admin
+/// `/expirecheck` path and the periodic expiry sweeper so the behavior stays
+/// single-sourced. Seller callers use `expire_subscriptions_for_seller`.
 ///
 /// The kick goes through the bot that owns the row's seller
 /// (`BotManager::for_seller`), so one bot never moderates another bot's
@@ -95,8 +95,35 @@ pub async fn expire_subscriptions(
     bots: &crate::bots::BotManager,
     db: &db::Db,
 ) -> Vec<(i64, i64, i64, String)> {
+    expire_subscriptions_scoped(bots, db, None).await
+}
+
+/// Seller-scoped counterpart used by the bot `/expirecheck` for seller
+/// callers: only that seller's active-but-expired rows are revoked. Owner and
+/// admin callers keep the global `expire_subscriptions` sweep. The `seller_id`
+/// passed here is always server-derived (the caller's Telegram user id), never
+/// a command argument.
+pub async fn expire_subscriptions_for_seller(
+    bots: &crate::bots::BotManager,
+    db: &db::Db,
+    seller_id: i64,
+) -> Vec<(i64, i64, i64, String)> {
+    expire_subscriptions_scoped(bots, db, Some(seller_id)).await
+}
+
+/// Shared kick+mark loop. Both entry points return the same row shape so the
+/// caller's buyer-notice loop is identical for the global and scoped paths.
+async fn expire_subscriptions_scoped(
+    bots: &crate::bots::BotManager,
+    db: &db::Db,
+    only_seller: Option<i64>,
+) -> Vec<(i64, i64, i64, String)> {
+    let rows = match only_seller {
+        Some(sid) => db.expired_subscriptions_for_seller(sid),
+        None => db.expired_subscriptions(),
+    };
     let mut expired = Vec::new();
-    for (id, seller_id, uid, ch) in db.expired_subscriptions() {
+    for (id, seller_id, uid, ch) in rows {
         let bot = bots.for_seller(seller_id).bot.clone();
         let cid = util::to_chat_id(&ch);
         // The kick/unban used to be fully swallowed (`let _ =`); a failing
