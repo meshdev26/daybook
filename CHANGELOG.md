@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 (see [`docs/RELEASING.md`](docs/RELEASING.md)).
 
+## [0.4.3-alpha]
+
+Alpha pre-release of the v1.4 milestone. All seven product types are live by
+default. Still alpha, not independently audited; issue #1 and scratch-deployment
+verification remain open.
+
+### Added
+- All seven capability verticals are live in the default build: `movie_bot`
+  (catalogue, search and post-payment delivery), `file_share` (Telegram-hosted
+  file_id shares with per-user grants), `automation` (keyword auto-reply rules),
+  plus the existing `service`, `web_app`, `reply_bot` and `shop_bot` types.
+- Deterministic end-to-end tests for the signed webhook, the background granter
+  and REST `/claim` against a mocked provider and mocked Telegram, covering the
+  invite and delivery side effects, exactly-once grants and replay protection.
+- Automated tenant-isolation validation suite across REST, MCP, the web console
+  and bot scoping, with two sellers and two bots on a fresh local database. This
+  is automated self-validation, not an independent audit or penetration test.
+- Property tests for seller scope, `channel_key` canonicalization and TOTP, plus
+  three new fuzz branches for `channel_key`, role parsing and `to_chat_id`.
+
+### Fixed
+- REST `expire-check` and bot `/expirecheck` are seller-scoped: a seller expires
+  or revokes only its own rows; owner/admin keep the global sweep.
+- `/channels` no longer lists another seller's channels: sellers see channels
+  attached to their own plans, owner/admin keep the global catalogue.
+- `to_chat_id` canonicalizes usernames to exactly one leading `@` and strips
+  whitespace and control characters before any target reaches the Bot API.
+
 ## [0.4.2-alpha]
 
 Alpha pre-release of the v1.4 milestone. Still alpha, not independently audited;

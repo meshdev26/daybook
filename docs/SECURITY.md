@@ -17,6 +17,8 @@
 - MCP per-seller tokens map to `Principal { role: Seller, seller_id: Some(seller_id) }`, scoped to that seller's data.
 - Sessions carry `seller_id`; a seller cannot switch bots from the console (the bot is pinned server-side and shown as a label).
 - Bot `/expirecheck` follows the same split as REST `expire-check`: a seller revokes and is notified only about its own expired rows; owner/admin keep the global sweep used by the console and the periodic sweeper. The seller id is the caller's server-derived user id, never a command argument.
+- `/channels` lists only channels attached to the caller's plans for a seller; owner/admin keep the global catalogue. A seller cannot advertise another seller's channel through it.
+- Chat targets taken from user input are canonicalized before reaching the Bot API: `to_chat_id` gives usernames exactly one leading `@` and removes whitespace and control characters, while `channel_key` canonicalization is total and idempotent. Property tests and fuzz targets guard both, along with seller-scope escalation and TOTP code shape.
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
