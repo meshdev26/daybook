@@ -202,6 +202,7 @@ fn chan_cfg() -> SharedConfig {
         owner_id: 1,
         db_path: String::new(),
         crypto_token: None,
+        crypto_api_base: None,
         ai_enabled: false,
         mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),

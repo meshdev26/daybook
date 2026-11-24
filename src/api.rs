@@ -4728,9 +4728,14 @@ async fn invoices_claim(
             .into_response();
         }
     };
-    let cp = crate::crypto::CryptoPay::new(tok);
-    let v = match cp.get_invoice(&invoice_id).await {
-        Ok(v) => v,
+    // The optional base URL is test-only; production keeps the canonical
+    // endpoint via `CryptoPay::new`.
+    let cp = match state.cfg.crypto_api_base.as_deref() {
+        Some(base) => crate::crypto::CryptoPay::with_base_url(tok, base),
+        None => crate::crypto::CryptoPay::new(tok),
+    };
+    let paid = match crate::services::grant::verify_paid(&cp, &invoice_id).await {
+        Ok(paid) => paid,
         Err(e) => {
             // Verification error: release the claim; the background granter
             // retries. Never grant on doubt.
@@ -4743,9 +4748,6 @@ async fn invoices_claim(
             .into_response();
         }
     };
-    let paid = extract_invoice_items(&v)
-        .iter()
-        .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
     if !paid {
         state.db.release_invoice_claim(&invoice_id);
         return err(StatusCode::BAD_REQUEST, "not_paid", "invoice not paid").into_response();

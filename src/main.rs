@@ -3,7 +3,6 @@ use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::{ErasedStorage, SqliteStorage, Storage, serializer::Json},
     error_handlers::LoggingErrorHandler,
-    payloads::CreateChatInviteLinkSetters,
     prelude::*,
     update_listeners::Polling,
 };
@@ -23,96 +22,7 @@ use daybook::{
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// Bounded retries for background jobs (2026-10-25 review: "leaving for
-/// retry" forever). After this many FAILED VERIFICATION/SEND attempts the
-/// item is marked terminal-failed instead of being re-queued. A "not settled
-/// yet" invoice release does NOT count — a buyer may legitimately pay days
-/// later; only verification errors and misconfigurations age out.
-const VERIFY_ATTEMPT_CAP: i64 = 10;
 const POST_ATTEMPT_CAP: i64 = 10;
-
-/// Record one failed verification attempt for an invoice and, at the cap,
-/// move it to the terminal 'failed' state (pending_invoices() no longer
-/// returns it), log loudly, and audit. Returns the new attempt count so the
-/// caller can log bounded-retry context. A degraded counter (0) reads as
-/// "never capped" — identical to the previous retry-forever behavior.
-fn bump_invoice_failure(db: &Db, inv_id: &str, reason: &str) -> i64 {
-    let attempts = db.bump_invoice_attempts(inv_id);
-    if attempts >= VERIFY_ATTEMPT_CAP {
-        // §3.1: once the provider has verified `paid` the money is settled —
-        // terminal `failed` is illegal (it would strand a paid buyer and hide
-        // the liability). Refuse the transition and raise an audited alarm.
-        let status = db.get_invoice(inv_id).map(|i| i.2).unwrap_or_default();
-        if status == "paid" || status == "paid_ungranted" {
-            db.log_action(
-                0,
-                "system",
-                "invoice_failed_after_paid_blocked",
-                "invoice",
-                inv_id,
-                Some(&format!(
-                    "attempts={} reason={} status={}",
-                    attempts, reason, status
-                )),
-            );
-            tracing::error!(
-                "blocked terminal-failed transition on paid invoice {} (status {}, {} attempts, reason: {})",
-                inv_id,
-                status,
-                attempts,
-                reason
-            );
-            return attempts;
-        }
-        db.update_invoice_status(inv_id, "failed");
-        tracing::error!(
-            "invoice {} failed terminally after {} verification attempts ({}); restore manually via the admin invoice-status API if needed",
-            inv_id,
-            attempts,
-            reason
-        );
-        db.log_action(
-            0,
-            "system",
-            "invoice_verify_failed",
-            "invoice",
-            inv_id,
-            Some(&format!("attempts={} reason={}", attempts, reason)),
-        );
-    }
-    attempts
-}
-
-/// §3.2: verification said `paid` but the exactly-once grant claim produced
-/// no subscription/product grant. Move the row to the non-terminal recovery
-/// state, stamp the clock once, and audit. Never call `finalize_invoice_paid`
-/// on this path — that would hide the ungranted liability.
-fn mark_paid_ungranted(db: &Db, inv_id: &str, seller_id: i64, reason: &str) {
-    if !db.mark_invoice_paid_ungranted(inv_id) {
-        return;
-    }
-    let inv = db.get_invoice(inv_id);
-    let meta = serde_json::json!({
-        "seller_id": seller_id,
-        "amount": inv.as_ref().map(|i| i.0.as_str()).unwrap_or("-"),
-        "asset": inv.as_ref().map(|i| i.1.as_str()).unwrap_or("-"),
-        "reason": reason,
-    })
-    .to_string();
-    db.log_action(
-        0,
-        "system",
-        "invoice_paid_ungranted",
-        "invoice",
-        inv_id,
-        Some(&meta),
-    );
-    tracing::warn!(
-        "invoice {} verified paid but not granted ({}); queued for 30s recovery",
-        inv_id,
-        reason
-    );
-}
 
 /// Best-effort owner DM from the primary bot. Send failures are logged (error
 /// text only — never message content or secrets) and never propagate into a
@@ -658,283 +568,26 @@ async fn run() {
                         if bm.for_seller(inv_seller).id != this_id {
                             continue;
                         }
-                        // (a) Claim: only the winner verifies and grants.
-                        if !db_bg.claim_invoice_for_grant(&inv_id) {
-                            continue;
-                        }
-                        // (b) Resolve a crypto token; without one there is no way to
-                        // verify payment — leave the claim for a later cycle, no grant.
-                        let cp = if let Some(c) = &crypto_bg {
-                            Some(c.clone())
-                        } else {
+                        // Resolve the crypto provider once per cycle; the loop's
+                        // seller binding above is the only routing decision here.
+                        let cp_local = crypto_bg.clone().or_else(|| {
                             db_bg
                                 .get_config("crypto_token")
                                 .or_else(|| cfg_bg.crypto_token.clone())
                                 .map(crypto::CryptoPay::new)
                                 .map(std::sync::Arc::new)
-                        };
-                        let cp = match cp {
-                            Some(c) => c,
-                            None => {
-                                // Bounded retry (VERIFY_ATTEMPT_CAP): a missing
-                                // token is a permanent misconfiguration, not a
-                                // transient condition — age the invoice out.
-                                let attempts = bump_invoice_failure(
-                                    &db_bg,
-                                    &inv_id,
-                                    "no crypto token configured",
-                                );
-                                if attempts < VERIFY_ATTEMPT_CAP {
-                                    tracing::warn!(
-                                        "invoice {} claimed but no crypto token configured; leaving for retry (attempt {}/{})",
-                                        inv_id,
-                                        attempts,
-                                        VERIFY_ATTEMPT_CAP
-                                    );
-                                }
-                                continue;
-                            }
-                        };
-                        // (c) Verify with the provider; any error stays fail-closed.
-                        let v = match cp.get_invoice(&inv_id).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                // Bounded retry: N consecutive provider errors
-                                // age the invoice out instead of looping forever.
-                                let attempts = bump_invoice_failure(
-                                    &db_bg,
-                                    &inv_id,
-                                    &format!("provider verification error: {}", e),
-                                );
-                                if attempts < VERIFY_ATTEMPT_CAP {
-                                    tracing::warn!(
-                                        "invoice {} verification failed: {}; leaving for retry (attempt {}/{})",
-                                        inv_id,
-                                        e,
-                                        attempts,
-                                        VERIFY_ATTEMPT_CAP
-                                    );
-                                }
-                                continue;
-                            }
-                        };
-                        let paid = crate::api::extract_invoice_items(&v)
-                            .iter()
-                            .any(|x| x.get("status").and_then(|s| s.as_str()) == Some("paid"));
-                        if !paid {
-                            // Not settled yet: release the claim ('granting' ->
-                            // 'active') so future cycles (and /paid) re-verify
-                            // cleanly. release_invoice_claim is the sanctioned
-                            // unwinder — never write the release by hand.
-                            db_bg.release_invoice_claim(&inv_id);
-                            continue;
-                        }
-                        // (d-bis) Product invoices: grant the purchase and DM the
-                        // delivery payload. Plan invoices take the subscription
-                        // path below; the branch is selected by invoices.product_id.
-                        if let Some((pid, kind, pname, delivery)) =
-                            db_bg.invoice_product_delivery(&inv_id)
-                        {
-                            let target_user = uid.unwrap_or(0);
-                            if target_user == 0 {
-                                // Verified paid but nobody bound to deliver to:
-                                // this is exactly the §3.2 paid-but-ungranted
-                                // case; keep it recoverable, never finalize.
-                                mark_paid_ungranted(
-                                    &db_bg,
-                                    &inv_id,
-                                    inv_seller,
-                                    "paid product invoice has no bound user",
-                                );
-                                continue;
-                            }
-                            if !db_bg.product_grant_exists(&inv_id) {
-                                match db_bg.grant_product(inv_seller, target_user, pid, &inv_id) {
-                                    Ok(true) => {
-                                        if let Err(e) = services::deliver::deliver(
-                                            &bot_bg,
-                                            target_user,
-                                            &kind,
-                                            &pname,
-                                            delivery.as_deref(),
-                                            &db_bg,
-                                            inv_seller,
-                                            Some(this_id),
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                "invoice {}: product '{}' granted but delivery DM failed: {}",
-                                                inv_id,
-                                                pname,
-                                                e
-                                            );
-                                        }
-                                    }
-                                    // A concurrent granter (/paid, claim API) won
-                                    // the UNIQUE(invoice_id) race; nothing to do.
-                                    Ok(false) => {}
-                                    // e.g. out of stock: money settled, grant not —
-                                    // §3.2 paid-but-ungranted, kept recoverable.
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "invoice {}: product grant failed ({}); queuing for recovery",
-                                            inv_id,
-                                            e
-                                        );
-                                        mark_paid_ungranted(
-                                            &db_bg,
-                                            &inv_id,
-                                            inv_seller,
-                                            "product grant failed",
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Terminal: verified paid + grant succeeded (or a
-                            // concurrent granter won the idempotency race).
-                            db_bg.finalize_invoice_paid(&inv_id);
-                            continue;
-                        }
-                        // (d) Idempotency: if a subscription already exists for this
-                        // invoice, only finalize.
-                        if db_bg.subscription_exists_for_invoice(&inv_id) {
-                            db_bg.finalize_invoice_paid(&inv_id);
-                            continue;
-                        }
-                        // (e) Grant: subscription + single-use invite link + notice.
-                        let target_user = uid.unwrap_or(0);
-                        if target_user == 0 {
-                            // Verified paid but nobody bound to grant to:
-                            // §3.2 paid-but-ungranted, never terminal 'paid'.
-                            mark_paid_ungranted(
-                                &db_bg,
-                                &inv_id,
-                                inv_seller,
-                                "paid plan invoice has no bound user",
-                            );
-                            continue;
-                        }
-                        // Seller-scoped plan lookup: the invoice's plan is
-                        // resolved under the invoice's own seller, never a global
-                        // same-name plan owned by someone else.
-                        // Tuple: (id, price, asset, name, days, channel).
-                        let plan_info = plan_name
-                            .as_ref()
-                            .and_then(|pn| db_bg.get_plan(inv_seller, pn));
-                        let days = plan_info
-                            .as_ref()
-                            .map(|p| p.4)
-                            .unwrap_or(30)
-                            .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
-                        let seller_id = inv_seller;
-                        let ch = plan_info
-                            .as_ref()
-                            .and_then(|p| p.5.clone())
-                            .or_else(|| db_bg.seller_channel(seller_id))
-                            .or_else(|| db_bg.get_config("channel"))
-                            .unwrap_or_default();
-                        if ch.is_empty() {
-                            // Verified paid but no channel to grant into: §3.2
-                            // paid-but-ungranted with a recoverable clock. Do
-                            // NOT age this to terminal 'failed' — the money
-                            // is settled; the recovery sweeper retries the
-                            // exactly-once grant once a channel exists.
-                            mark_paid_ungranted(
-                                &db_bg,
-                                &inv_id,
-                                seller_id,
-                                "no channel resolvable",
-                            );
-                            continue;
-                        }
-                        let sub_id = db_bg.create_subscription(
-                            seller_id,
-                            target_user,
-                            None,
-                            &ch,
-                            days,
-                            Some(&inv_id),
-                            None,
-                        );
-                        // grant invite link (checked expiry math; defensive even
-                        // behind the clamp above)
-                        let expire = chrono::Duration::try_days(days)
-                            .and_then(|d| chrono::Utc::now().checked_add_signed(d))
-                            .unwrap_or_else(chrono::Utc::now);
-                        let link = bot_bg
-                            .create_chat_invite_link(util::to_chat_id(&ch))
-                            .member_limit(1)
-                            .expire_date(expire)
-                            .await
-                            .ok()
-                            .map(|l| l.invite_link);
-                        match link {
-                            Some(l) => {
-                                let grant_text = format!(
-                                    "Payment confirmed. Access granted.\nInvite: {}\nSubscription #{}",
-                                    l, sub_id
-                                );
-                                // security outbound gate before this raw-Bot DM (the
-                                // grant itself is already durable and finalizes
-                                // below; only the notice is skipped while held).
-                                if crate::handlers::moderation::gate_outbound(
-                                    &db_bg,
-                                    seller_id,
-                                    Some(this_id),
-                                    &grant_text,
-                                )
-                                .is_ok()
-                                {
-                                    match bot_bg
-                                        .send_message(
-                                            teloxide::types::ChatId(target_user),
-                                            grant_text,
-                                        )
-                                        .await
-                                    {
-                                        Err(e) => {
-                                            tracing::warn!("failed to send grant message: {}", e)
-                                        }
-                                        Ok(_) => metrics::bot_sent(),
-                                    }
-                                }
-                            }
-                            None => {
-                                // Money settled and the subscription row exists,
-                                // but no invite link could be created: still
-                                // finalize (the grant is durable), then tell the
-                                // buyer honestly — never leave them waiting on a
-                                // link that will not come. DM failures are logged,
-                                // never propagated: the sweeper/granter must not
-                                // die on a send error.
-                                let notice = "Payment confirmed — your invite link couldn't be created. Contact the seller to get access.";
-                                // security outbound gate before this raw-Bot DM.
-                                if crate::handlers::moderation::gate_outbound(
-                                    &db_bg,
-                                    seller_id,
-                                    Some(this_id),
-                                    notice,
-                                )
-                                .is_ok()
-                                {
-                                    match bot_bg
-                                        .send_message(teloxide::types::ChatId(target_user), notice)
-                                        .await
-                                    {
-                                        Err(e) => tracing::warn!(
-                                            "invoice {}: granted without invite link and buyer notice failed: {}",
-                                            inv_id,
-                                            e
-                                        ),
-                                        Ok(_) => metrics::bot_sent(),
-                                    }
-                                }
-                            }
-                        }
-                        // (f) Terminal: verified paid + granted.
-                        db_bg.finalize_invoice_paid(&inv_id);
+                        });
+                        services::grant::grant_one(
+                            &db_bg,
+                            &bot_bg,
+                            cp_local.as_deref(),
+                            &inv_id,
+                            plan_name.as_deref(),
+                            uid,
+                            inv_seller,
+                            this_id,
+                        )
+                        .await;
                     }
                 }
             });

@@ -78,6 +78,10 @@ pub(crate) fn env_flag_default_true(name: &str) -> bool {
 pub struct SharedConfig {
     pub db_path: String,
     pub crypto_token: Option<String>,
+    /// Optional Crypto Pay API base URL. None keeps `CryptoPay::new`'s
+    /// production endpoint; a test-only override lets the REST claim path
+    /// verify against a local mock. Never populated from the environment.
+    pub crypto_api_base: Option<String>,
     pub ai_enabled: bool,
     /// Default on; false-like values reject stored codes and hide the recovery UI.
     pub mfa_recovery_codes_enabled: bool,
@@ -574,6 +578,7 @@ impl AppConfig {
         let shared = SharedConfig {
             db_path,
             crypto_token,
+            crypto_api_base: None,
             ai_enabled,
             mfa_recovery_codes_enabled,
             ai_provider,

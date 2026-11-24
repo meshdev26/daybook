@@ -269,6 +269,7 @@ mod tests {
         SharedConfig {
             db_path: String::new(),
             crypto_token: None,
+            crypto_api_base: None,
             ai_enabled: false,
             mfa_recovery_codes_enabled: true,
             ai_provider: "openai".to_string(),

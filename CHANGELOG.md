@@ -21,10 +21,12 @@ the pre-real-money checklist in issue #1 remains open.
   API, MCP endpoint and webhook are exempt.
 - `/books` alias added; with `WEB_URL` unset, `/becomeseller` and `/dashboard`
   fail closed instead of sending a plaintext password by DM.
-- `service`, `web_app` and `reply_bot` verticals are live via shipped handlers;
-  `movie_bot`, `file_share` and `automation` remain explicit stubs.
-- Deterministic test covers webhook signature, invoice claim, exactly-once grant
-  and replay protection; the granter's Telegram side effects are not covered.
+- All seven verticals (`shop_bot`, `service`, `web_app`, `reply_bot`,
+  `movie_bot`, `file_share` and `automation`) are live via shipped handlers and
+  on by default.
+- Deterministic tests cover webhook signature, invoice claim, exactly-once
+  grant, replay protection, the granter's Telegram invite and delivery side
+  effects, and every REST claim outcome against local provider and Bot mocks.
 
 ## [0.4.1-alpha]
 
@@ -48,10 +50,11 @@ and the setup & management UX polish
 
 ### Added
 - Live inbound capability types: `service` bots run the services/bookings command family, `web_app` bots issue one-time dashboard claim links via `/dashboard` and `/becomeseller`, and `reply_bot` bots run the support-ticket reply family. Each scoped type uses the shipped handlers and accepts only its own commands; the default Cargo features now enable all three.
-- All three remaining verticals are now live with real behavior, not notices. `movie_bot` is a catalogue over the existing products/invoices/delivery machinery: `/shop`, `/find`, `/productadd`, `/products`, `/productdel`, `/buy`, `/paid`, with post-payment re-send of `digital_file` payloads; no playback is claimed. `file_share` stores Telegram `file_id` references with seller/bot scope and per-user grants: upload by document caption, `/files`, `/share`, `/getfile`, with every upload, grant, denial and download audited; it is not arbitrary file hosting. `automation` is a keyword auto-reply slice: `/ruleadd`, `/rules`, `/ruledel`, with persisted rules, outbound-moderation-gated replies, a three-rule-per-message cap and an audit row per firing; it is not a general rules engine. `file_share` and `automation` join the default features; `movie_bot` stays opt-in with `--features movie_bot` because an out-of-scope web-nav test pins the old default feature set, but its feature is fully live rather than a stub. Integration tests drive the real handlers against a mock Bot API for catalogue listing/search and delivery, upload plus access-controlled download, rule creation plus trigger and audit, and scoped rejection of shop-only commands.
+- All three remaining verticals are now live with real behavior, not notices. `movie_bot` is a catalogue over the existing products/invoices/delivery machinery: `/shop`, `/find`, `/productadd`, `/products`, `/productdel`, `/buy`, `/paid`, with post-payment re-send of `digital_file` payloads; no playback is claimed. `file_share` stores Telegram `file_id` references with seller/bot scope and per-user grants: upload by document caption, `/files`, `/share`, `/getfile`, with every upload, grant, denial and download audited; it is not arbitrary file hosting. `automation` is a keyword auto-reply slice: `/ruleadd`, `/rules`, `/ruledel`, with persisted rules, outbound-moderation-gated replies, a three-rule-per-message cap and an audit row per firing; it is not a general rules engine. All three join the default features so every vertical is live in a default build. Integration tests drive the real handlers against a mock Bot API for catalogue listing/search and delivery, upload plus access-controlled download, rule creation plus trigger and audit, and scoped rejection of shop-only commands.
 - Per-form CSRF tokens in the operator console: every rendered POST form carries a hidden token derived from the session credential, validated in constant time before any mutation; missing, wrong and cross-session tokens get a 403. `SameSite=Strict` stays enabled. REST API, MCP and webhook (bearer/HMAC-authenticated) are exempt.
 - At-rest secret encryption: `MASTER_KEY` (32 bytes as hex or base64) seals sensitive config values with AES-256-GCM into versioned `enc:v1:` envelopes. A set-but-invalid key aborts startup; without a key, secret writes are refused with a clear console error. Legacy plaintext values stay readable and migrate on re-save. Startup logs only whether encryption is active.
 - Deterministic webhook-to-grant integration test: signed webhook, atomic claim, provider stub verification, exactly-once subscription and replay protection, all against local mocks.
+- The 30s granter body is extracted into a testable `services::grant` unit with a provider verifier seam, so the seller-bot invite link, plan/product delivery DMs, failure/retry states and REST `/claim` outcomes are exercised end-to-end without real network calls or timer sleeps.
 - `MFA_RECOVERY_CODES_ENABLED` (default on): `0`, `false`, `no` or `off` rejects stored recovery codes, removes the recovery route and console UI, and leaves TOTP sign-in working. Stored codes stay in the database and revive if the flag is re-enabled.
 - Recovery codes now draw from the vetted BIP-39 English wordlist: 10 one-time four-word, hyphen-joined codes, bcrypt-hashed at rest. The UI states they are not wallet seed phrases.
 - Bookings domain closed end-to-end: console `/bookings` page (seller-scope

@@ -108,12 +108,11 @@ Adding or retokenizing a bot needs a restart. Full guide:
 Bots carry a product type (`shop_bot` by default); the console Product / Type
 selector lets the owner pick a product while sellers and admins stay pinned.
 Capabilities are chosen at build time with Cargo features: `shop_bot`,
-`moderation`, `service`, `web_app`, `reply_bot`, `file_share` and `automation`
-are on by default; `movie_bot` is opt-in (`--features movie_bot`) because a
-web-nav test owned by another phase still pins the old default feature set.
-The feature itself is fully live, not a stub. These features control which
-capabilities are registered and which bot types are accepted at runtime — a
-movie-only build registers only the movie capability and refuses other types.
+`moderation`, `service`, `web_app`, `reply_bot`, `file_share`, `automation`
+and `movie_bot` are all on by default. Every feature is fully live, not a stub.
+These features control which capabilities are registered and which bot types
+are accepted at runtime — a movie-only build registers only the movie
+capability and refuses other types.
 They do **not** omit dependencies or shrink the binary (all crates stay
 compiled); dropping unused dependencies is a deferred follow-up. A movie-only
 install builds with `cargo build --no-default-features --features movie_bot`;
@@ -131,7 +130,7 @@ All seven bot types have live inbound behavior:
   never sends a password.
 - `reply_bot` — the support-ticket family: `/support`, `/tickets`, `/reply`,
   `/closeticket`, `/escalate`.
-- `movie_bot` (opt-in feature) — a movie catalogue built on the existing
+- `movie_bot` (default feature) — a movie catalogue built on the existing
   products, invoices and delivery machinery. Buyers browse `/shop`, search
   `/find <text>`, buy `/buy` and check `/paid`; sellers manage listings with
   `/productadd`, `/products` and `/productdel`. `digital_file` and

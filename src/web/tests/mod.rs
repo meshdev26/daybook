@@ -30,6 +30,7 @@ pub(super) async fn make_unclaimed_state() -> (WebState, TempDir) {
         owner_id: 0,
         db_path: db_path.to_str().unwrap().to_string(),
         crypto_token: None,
+        crypto_api_base: None,
         ai_enabled: false,
         mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),

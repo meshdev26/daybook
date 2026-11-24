@@ -6,11 +6,9 @@ license = "MIT"
 
 # ---- Compile-time capability registry (multibot foundation) ----
 # A feature selects which product capabilities are compiled in. The default
-# set registers the shop tree, the moderation floor and every scoped bot type
-# except one: `movie_bot` stays opt-in because an out-of-scope web-nav test
-# pins the default feature set. It is fully live when enabled with
-# `--features movie_bot`. Every existing shop path and dependency stays
-# unchanged. The three newest types are live, not notices:
+# set registers the shop tree, the moderation floor and all seven scoped bot
+# types, including `movie_bot`. Every existing shop path and dependency stays
+# unchanged. All seven types are live, not notices:
 #   shop_bot   - AI shop bot (payments, products, AI drafts) — existing default.
 #   moderation - owner/seller/per-bot word policy floor — existing default
 #                (the runtime floor in handlers/moderation.rs also compiles
@@ -50,7 +48,7 @@ license = "MIT"
 # movie-only build. Advisory pins (rusqlite 0.41, libsqlite3-sys 0.39.1 and
 # the vendored-teloxide sqlx bump) are unchanged.
 [features]
-default = ["shop_bot", "moderation", "service", "web_app", "reply_bot", "file_share", "automation"]
+default = ["shop_bot", "moderation", "service", "web_app", "reply_bot", "file_share", "automation", "movie_bot"]
 shop_bot = []
 moderation = []
 movie_bot = []

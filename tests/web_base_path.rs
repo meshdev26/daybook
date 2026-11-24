@@ -57,6 +57,7 @@ async fn make_state(base: &str) -> (WebState, tempfile::TempDir) {
         owner_id: 1,
         db_path: db_path.to_str().unwrap().to_string(),
         crypto_token: None,
+        crypto_api_base: None,
         ai_enabled: false,
         mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),

@@ -398,18 +398,20 @@ fn default_build_nav_rows_are_untagged_and_paths_unchanged() {
     }
     // Capability flags resolve from Cargo features; unknown never enables.
     assert!(capability_enabled("shop_bot")); // default feature
-    assert!(!capability_enabled("movie_bot")); // not compiled by default
+    assert!(capability_enabled("movie_bot")); // default feature
     assert!(!capability_enabled("not_a_capability"));
     assert_eq!(product_type_label("movie_bot"), "Movie bots");
     assert_eq!(product_type_label("raw_slug"), "Other products");
 }
 
-/// A nav item whose capability was not compiled is absent. This exercises
-/// the exact filter `rail_nav` applies; a `--no-default-features --features
-/// movie_bot` build makes the mirror case (a shop-gated item absent) true.
+/// A nav item whose capability was not compiled is absent. All seven
+/// verticals are compiled in the default build, so this uses a deliberately
+/// unknown capability name to exercise the exact filter `rail_nav` applies.
+/// A `--no-default-features` build makes the mirror case (a compiled-out
+/// capability row absent) true for real feature tags.
 #[test]
 fn feature_gated_item_absent_when_not_compiled() {
-    let movie_only = NavItem {
+    let missing_cap = NavItem {
         id: "movie-catalog",
         label: "Movie catalog",
         path: "movie-catalog",
@@ -417,16 +419,16 @@ fn feature_gated_item_absent_when_not_compiled() {
         roles: NavRole::Owner,
         titles: &["Movie catalog"],
         pref: None,
-        feature: Some("movie_bot"),
+        feature: Some("not_a_capability"),
         product_types: Some(&["movie_bot"]),
     };
-    // Default build: movie_bot is not compiled -> the item is filtered out.
-    assert!(!movie_only.feature.is_none_or(capability_enabled));
+    // No build compiles the unknown capability -> the item is filtered out.
+    assert!(!missing_cap.feature.is_none_or(capability_enabled));
     // Runtime type filter is a view filter only: the selected movie product
     // keeps the item; an unscoped owner ("All products") also keeps it.
-    assert!(nav_item_type_ok(&movie_only, Some("movie_bot")));
-    assert!(nav_item_type_ok(&movie_only, None));
-    assert!(!nav_item_type_ok(&movie_only, Some("shop_bot")));
+    assert!(nav_item_type_ok(&missing_cap, Some("movie_bot")));
+    assert!(nav_item_type_ok(&missing_cap, None));
+    assert!(!nav_item_type_ok(&missing_cap, Some("shop_bot")));
     // An untagged item is never removed by either filter.
     let core = &NAV_ITEMS[0];
     assert!(core.feature.is_none_or(capability_enabled));

@@ -83,6 +83,7 @@ async fn make_state() -> (WebState, tempfile::TempDir) {
         owner_id: 1,
         db_path: db_path.clone(),
         crypto_token: None,
+        crypto_api_base: None,
         ai_enabled: false,
         mfa_recovery_codes_enabled: true,
         ai_provider: "openai".to_string(),
@@ -3910,4 +3911,426 @@ async fn invoice_manual_failed_owner_reason_audit_and_refuses_paid() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(db.get_invoice(&paid_inv).unwrap().2, "paid");
+}
+
+// ---- REST /claim: provider verification and seller-bot side effects -------
+
+/// Point the API's session at a mock Telegram bot that answers invite-link
+/// and DM calls locally, so the claim happy path exercises the real Bot
+/// transport code without reaching the network.
+async fn attach_claim_bot(state: &mut WebState) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path_regex};
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .and(path_regex(r".*/CreateChatInviteLink"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "invite_link": "https://t.me/+claim-invite",
+                    "creator": {"id": 42, "is_bot": true, "first_name": "Seller"},
+                    "creates_join_request": false,
+                    "is_primary": false,
+                    "is_revoked": false
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("POST"))
+        .and(path_regex(r".*/SendMessage"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 1,
+                    "date": 1_700_000_000,
+                    "chat": {"id": 42, "type": "private", "first_name": "T"},
+                    "text": "x"
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+    let bot = teloxide::Bot::new("42:placeholder")
+        .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+    let ctx = Arc::new(crate::bots::BotContext {
+        id: 9,
+        key: "mock".to_string(),
+        bot,
+        owner_id: 0,
+        shared: Arc::new(state.cfg.clone()),
+        db: state.db.clone(),
+    });
+    state.bots = Arc::new(crate::bots::BotManager {
+        bots: vec![ctx.clone()],
+        primary: ctx,
+        db: state.db.clone(),
+        identity: crate::identity::IdentityHandle::unconnected(),
+    });
+    server
+}
+
+async fn claim_request(
+    app: axum::Router,
+    token: &str,
+    invoice_id: &str,
+) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/invoices/{invoice_id}/claim"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn claim_provider(server: &wiremock::MockServer, invoice_id: &str, status: &str) {
+    use wiremock::matchers::{body_partial_json, method, path};
+    wiremock::Mock::given(method("POST"))
+        .and(path("/getInvoices"))
+        .and(body_partial_json(
+            serde_json::json!({"invoice_ids": invoice_id}),
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"items": [{"invoice_id": invoice_id, "status": status}]}
+            })),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// A seller can claim their own paid invoice: the real claim handler calls
+/// the mocked provider once, grants exactly one subscription, and drives the
+/// seller's mock bot for the invite link and DM.
+#[tokio::test]
+async fn claim_api_valid_seller_grants_once_with_provider_and_bot_side_effects() {
+    use wiremock::MockServer;
+    let provider = MockServer::start().await;
+    claim_provider(&provider, "inv-claim", "paid").await;
+
+    let (mut state, _dir) = make_seller_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.add_plan(42, "plan", "5", "USDT", 7, Some("@chan42"));
+    db.save_invoice(
+        "inv-claim",
+        42,
+        "5",
+        "USDT",
+        Some("plan"),
+        "active",
+        None,
+        Some("plan"),
+        Some(42),
+        None,
+    );
+    let telegram = attach_claim_bot(&mut state).await;
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-claim").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["granted"], true);
+    assert_eq!(v["invoice_id"], "inv-claim");
+
+    assert_eq!(db.get_invoice("inv-claim").unwrap().2, "paid");
+    assert_eq!(db.subscriptions_for_invoice("inv-claim").len(), 1);
+    let paths: Vec<String> = provider
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(paths.len(), 1, "exactly one provider call: {paths:?}");
+    let telegram_paths: Vec<String> = telegram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        telegram_paths
+            .iter()
+            .any(|p| p.ends_with("/CreateChatInviteLink")),
+        "{telegram_paths:?}"
+    );
+    assert!(
+        telegram_paths.iter().any(|p| p.ends_with("/SendMessage")),
+        "{telegram_paths:?}"
+    );
+}
+
+/// A session scoped to seller A cannot claim seller B's invoice, and the
+/// provider is never contacted.
+#[tokio::test]
+async fn claim_api_foreign_seller_is_forbidden_without_provider_call() {
+    use wiremock::MockServer;
+    let provider = MockServer::start().await;
+    let (mut state, _dir) = make_seller_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.save_invoice(
+        "inv-foreign",
+        99,
+        "5",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-foreign").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(db.get_invoice("inv-foreign").unwrap().2, "active");
+    assert!(provider.received_requests().await.unwrap().is_empty());
+}
+
+/// Without a crypto token the claim is released back to active and answered
+/// 503; nothing is granted.
+#[tokio::test]
+async fn claim_api_no_token_returns_503_and_releases_claim() {
+    let (state, _dir) = make_seller_state().await;
+    let db = state.db.clone();
+    db.save_invoice(
+        "inv-notoken",
+        42,
+        "5",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-notoken").await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(db.get_invoice("inv-notoken").unwrap().2, "active");
+    assert!(db.subscriptions_for_invoice("inv-notoken").is_empty());
+}
+
+/// A provider API error releases the claim and answers 502 (never grant on
+/// doubt).
+#[tokio::test]
+async fn claim_api_provider_error_returns_502_and_releases_claim() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/getInvoices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": false,
+            "error": "provider down"
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let (mut state, _dir) = make_seller_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.save_invoice(
+        "inv-provider-err",
+        42,
+        "5",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-provider-err").await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(db.get_invoice("inv-provider-err").unwrap().2, "active");
+    assert!(db.subscriptions_for_invoice("inv-provider-err").is_empty());
+    assert_eq!(provider.received_requests().await.unwrap().len(), 1);
+}
+
+/// A provider answer that is not `paid` releases the claim and answers 400.
+#[tokio::test]
+async fn claim_api_not_paid_returns_400_and_releases_claim() {
+    use wiremock::MockServer;
+    let provider = MockServer::start().await;
+    claim_provider(&provider, "inv-unpaid", "pending").await;
+    let (mut state, _dir) = make_seller_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.save_invoice(
+        "inv-unpaid",
+        42,
+        "5",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-unpaid").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(db.get_invoice("inv-unpaid").unwrap().2, "active");
+    assert!(db.subscriptions_for_invoice("inv-unpaid").is_empty());
+}
+
+/// A concurrent claim loses the atomic active-to-granting race and gets 409
+/// before any provider work.
+#[tokio::test]
+async fn claim_api_concurrent_claim_returns_409() {
+    use wiremock::MockServer;
+    let provider = MockServer::start().await;
+    let (mut state, _dir) = make_seller_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.save_invoice(
+        "inv-raced",
+        42,
+        "5",
+        "USDT",
+        None,
+        "active",
+        None,
+        None,
+        Some(42),
+        None,
+    );
+    assert!(db.claim_invoice_for_grant("inv-raced"));
+    let token = seller_token(&state);
+    let resp = claim_request(router(state), &token, "inv-raced").await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(db.get_invoice("inv-raced").unwrap().2, "granting");
+    assert!(provider.received_requests().await.unwrap().is_empty());
+}
+
+/// The claim handler resolves the Telegram sender with BotManager::for_seller:
+/// seller B's invoice reaches B's bot only; the primary/A mock servers stay
+/// untouched.
+#[tokio::test]
+async fn claim_api_seller_b_uses_only_bots_b() {
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/getInvoices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {"items": [{"invoice_id": "inv-b", "status": "paid"}]}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    let (mut state, _dir) = make_state().await;
+    state.cfg.crypto_token = Some("claim-token".to_string());
+    state.cfg.crypto_api_base = Some(provider.uri());
+    let db = state.db.clone();
+    db.create_web_account("sellerb", "secret", "seller", Some(99))
+        .await
+        .unwrap();
+    db.upsert_seller(99, None, None);
+    db.add_plan(99, "plan-b", "5", "USDT", 7, Some("@chan99"));
+    db.save_invoice(
+        "inv-b",
+        99,
+        "5",
+        "USDT",
+        Some("plan-b"),
+        "active",
+        None,
+        Some("plan-b"),
+        Some(99),
+        None,
+    );
+
+    let telegram_a = MockServer::start().await;
+    let telegram_b = MockServer::start().await;
+    for server in [&telegram_a, &telegram_b] {
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/CreateChatInviteLink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "invite_link": "https://t.me/+claim-b",
+                    "creator": {"id": 99, "is_bot": true, "first_name": "B"},
+                    "creates_join_request": false,
+                    "is_primary": false,
+                    "is_revoked": false
+                }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/SendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 1,
+                    "date": 1_700_000_000,
+                    "chat": {"id": 99, "type": "private", "first_name": "T"},
+                    "text": "x"
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+    let shared = Arc::new(state.cfg.clone());
+    let ctx_a = Arc::new(crate::bots::BotContext {
+        id: 1,
+        key: "a".to_string(),
+        bot: teloxide::Bot::new("1:placeholder")
+            .set_api_url(telegram_a.uri().parse::<reqwest::Url>().unwrap()),
+        owner_id: 0,
+        shared: shared.clone(),
+        db: db.clone(),
+    });
+    let ctx_b = Arc::new(crate::bots::BotContext {
+        id: 9,
+        key: "b".to_string(),
+        bot: teloxide::Bot::new("9:placeholder")
+            .set_api_url(telegram_b.uri().parse::<reqwest::Url>().unwrap()),
+        owner_id: 0,
+        shared,
+        db: db.clone(),
+    });
+    state.bots = Arc::new(crate::bots::BotManager {
+        bots: vec![ctx_a.clone(), ctx_b.clone()],
+        primary: ctx_a.clone(),
+        db: db.clone(),
+        identity: crate::identity::IdentityHandle::unconnected(),
+    });
+    db.upsert_seller_bot_id(99, Some(9));
+    assert_eq!(state.bots.for_seller(99).id, 9);
+    let (account_id, _, _, _, _) = db.get_web_account_by_username("sellerb").unwrap();
+    let token = db.create_web_session(account_id, "seller", Some(99), 7);
+
+    let resp = claim_request(router(state), &token, "inv-b").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.get_invoice("inv-b").unwrap().2, "paid");
+    assert_eq!(db.subscriptions_for_invoice("inv-b").len(), 1);
+    assert!(telegram_a.received_requests().await.unwrap().is_empty());
+    assert_eq!(telegram_b.received_requests().await.unwrap().len(), 2);
 }
