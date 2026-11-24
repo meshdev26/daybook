@@ -466,15 +466,7 @@ pub async fn cmd_handler(
                 .await?;
         }
         Command::Channels => {
-            let mut set = std::collections::BTreeSet::new();
-            if let Some(c) = db.get_config("channel") {
-                set.insert(c);
-            }
-            for p in db.list_plans(None) {
-                if let Some(c) = p.4 {
-                    set.insert(c);
-                }
-            }
+            let set = channels_visible_to(&db, is_admin, user_id);
             if set.is_empty() {
                 bot.send_message(chat_id, "No channels configured.").await?;
             } else {
@@ -4257,6 +4249,28 @@ async fn check_seller_channel_target(bot: &Bot, channel: &str, sender_id: i64) -
                 .to_string(),
         )
     }
+}
+
+/// Channels advertised by `/channels`. Admin/Owner keep the global catalogue;
+/// every other caller (including sellers) sees only channels attached to plans
+/// in their own server-derived scope. The caller id is never an ownership
+/// input: it reaches the DB only as the seller scope of a non-admin session.
+fn channels_visible_to(
+    db: &Db,
+    is_admin: bool,
+    user_id: i64,
+) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Some(c) = db.get_config("channel") {
+        set.insert(c);
+    }
+    let scope = if is_admin { None } else { Some(user_id) };
+    for p in db.list_plans(scope) {
+        if let Some(c) = p.4 {
+            set.insert(c);
+        }
+    }
+    set
 }
 
 /// Resolve the target channel for a caller. Sellers may only operate on their

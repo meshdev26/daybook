@@ -69,6 +69,38 @@ proptest! {
         let bad: String = chars.into_iter().collect();
         prop_assert!(!crate::util::ct_eq(&hex, &bad));
     }
+
+    /// seller_scope is the server-derived ownership input. A session may only
+    /// carry its own seller id, and only when its role string parses to exactly
+    /// Seller; every other spelling or role must widen to None (global view),
+    /// never to a caller-chosen id.
+    #[test]
+    fn prop_seller_scope_cannot_escalate(
+        role in prop_oneof![
+            Just("seller".to_string()),
+            Just("owner".to_string()),
+            Just("admin".to_string()),
+            Just("user".to_string()),
+            Just("SELLER".to_string()),
+            Just(" seller".to_string()),
+            ".*",
+        ],
+        sid in proptest::option::of(any::<i64>()),
+    ) {
+        let session = crate::web::Session {
+            account_id: 1,
+            seller_id: sid,
+            role: role.clone(),
+            selected_bot_id: None,
+            csrf_token: String::new(),
+        };
+        let expected = if Role::from_role_str(&role) == Role::Seller {
+            sid
+        } else {
+            None
+        };
+        prop_assert_eq!(seller_scope(&session), expected);
+    }
 }
 
 async fn make_state() -> (WebState, tempfile::TempDir) {

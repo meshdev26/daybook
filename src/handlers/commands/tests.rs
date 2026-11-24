@@ -290,6 +290,37 @@ fn target_channel_admin_keeps_explicit_wins() {
     );
 }
 
+// ---- /channels listing is seller-scoped ----
+
+#[test]
+fn channels_listing_does_not_leak_another_sellers_channel() {
+    // Regression: `/channels` used to call list_plans(None) for every caller,
+    // advertising every seller's plan channel to any seller. Seller A must see
+    // only its own channel (plus the global default); owner keeps the global
+    // view, which proves the scoping is not a blanket deny.
+    let (_d, db) = chan_db();
+    db.set_config("channel", "@global");
+    db.add_plan(91_001, "alpha plan", "10", "USDT", 30, Some("@alpha"));
+    db.add_plan(91_002, "beta plan", "20", "USDT", 30, Some("@beta"));
+
+    let seller = channels_visible_to(&db, false, 91_001);
+    assert!(seller.contains("@alpha"), "seller lost its own channel");
+    assert!(
+        seller.contains("@global"),
+        "global default still advertised"
+    );
+    assert!(
+        !seller.contains("@beta"),
+        "seller A saw seller B's channel: {seller:?}"
+    );
+
+    let owner = channels_visible_to(&db, true, 1);
+    assert!(
+        owner.contains("@alpha") && owner.contains("@beta"),
+        "owner must keep the global view: {owner:?}"
+    );
+}
+
 // ---- /buy resolution over the (seller_id, name) plan namespace ----
 
 fn buy_db() -> (tempfile::TempDir, Db) {

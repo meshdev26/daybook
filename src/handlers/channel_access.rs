@@ -91,6 +91,28 @@ pub fn may_post_to_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // Canonicalization is total and fail-closed: a target always loses every
+    // leading '@' and is ASCII-lowercased, and applying it twice changes
+    // nothing. An input made only of whitespace and '@' canonicalizes to the
+    // empty (refused) key. An '@' in the middle of a name is not a prefix
+    // marker and is deliberately preserved, so the property checks the
+    // leading form rather than banning the character outright.
+    proptest! {
+        #[test]
+        fn prop_channel_key_is_total_and_fail_closed(s in ".*") {
+            let k = channel_key(&s);
+            prop_assert!(!k.starts_with('@'), "leading @ survived: {:?}", k);
+            prop_assert!(k == k.to_ascii_lowercase(), "not lowercase: {:?}", k);
+            prop_assert!(channel_key(&k) == k, "not idempotent: {:?}", k);
+            prop_assert_eq!(
+                k.is_empty(),
+                s.trim().trim_start_matches('@').is_empty(),
+                "empty target mismatch: {:?} -> {:?}", s, k
+            );
+        }
+    }
 
     #[test]
     fn channel_gate_matches_console_policy() {

@@ -21,7 +21,7 @@ fn decode_entities(e: &str) -> String {
 fuzz_target!(|data: &[u8]| {
     let Some(&tag) = data.first() else { return };
     let rest = &data[1..];
-    match tag % 5 {
+    match tag % 8 {
         // esc(): any UTF-8 input must produce metachar-free output that
         // exactly round-trips through entity decoding.
         0 => {
@@ -86,6 +86,52 @@ fuzz_target!(|data: &[u8]| {
                     if a != b {
                         assert!(!daybook::util::ct_eq(a, b));
                     }
+                }
+            }
+        }
+        // channel_key: canonicalization is total. Leading '@' is stripped,
+        // output is ASCII-lowercase, and a second pass is a no-op. An '@' in
+        // the middle of a name is not a prefix marker and stays untouched.
+        5 => {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let k = daybook::handlers::channel_access::channel_key(s);
+                assert!(!k.starts_with('@'), "leading @ survived: {k:?}");
+                assert_eq!(k, k.to_ascii_lowercase(), "not lowercase: {k:?}");
+                assert_eq!(
+                    daybook::handlers::channel_access::channel_key(&k),
+                    k,
+                    "not idempotent: {k:?}"
+                );
+            }
+        }
+        // Role parsing degrades to User for every spelling but the exact four
+        // lowercase role strings, and only "owner" reaches the Owner tier.
+        6 => {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                use daybook::roles::Role;
+                let r = Role::from_role_str(s);
+                let expected = match s {
+                    "owner" => Role::Owner,
+                    "admin" => Role::Admin,
+                    "seller" => Role::Seller,
+                    "user" => Role::User,
+                    _ => Role::User,
+                };
+                assert_eq!(r, expected, "role mismatch for {s:?}");
+                assert_eq!(r.has_level(Role::Owner), s == "owner", "owner gate: {s:?}");
+            }
+        }
+        // to_chat_id: the produced target never carries whitespace/control
+        // characters, and a username form has exactly one leading '@'.
+        7 => {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let target = daybook::util::to_chat_id(s).to_string();
+                assert!(
+                    !target.chars().any(|c| c.is_whitespace() || c.is_control()),
+                    "invalid target chars: {target:?}"
+                );
+                if target.starts_with('@') {
+                    assert!(!target.starts_with("@@"), "doubled prefix: {target:?}");
                 }
             }
         }

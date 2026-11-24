@@ -1,17 +1,22 @@
 use sha2::Digest;
 use teloxide::types::{ChatId, Recipient};
 
+/// Resolve a chat target. Usernames are canonicalized to exactly one leading
+/// '@' and no embedded whitespace or control characters: a Telegram username
+/// can contain none of those, so an arbitrary string must never be forwarded
+/// verbatim (a doubled '@@' prefix or a newline would otherwise reach the Bot
+/// API). Numeric ids stay numeric.
 pub fn to_chat_id(s: &str) -> Recipient {
     let s = s.trim();
     if let Ok(id) = s.parse::<i64>() {
         Recipient::Id(ChatId(id))
     } else {
-        let name = s.trim_start_matches('@');
-        Recipient::ChannelUsername(if s.starts_with('@') {
-            s.to_string()
-        } else {
-            format!("@{}", name)
-        })
+        let cleaned: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace() && !c.is_control())
+            .collect();
+        let name = cleaned.trim_start_matches('@');
+        Recipient::ChannelUsername(format!("@{name}"))
     }
 }
 
@@ -224,6 +229,35 @@ mod prop_tests {
                 prop_assert!(!ct_eq(&a, &b));
             }
         }
+
+        /// TOTP generation is total: any secret (including malformed base32),
+        /// timestamp, digit count and step yields a fixed-width decimal code,
+        /// recomputes identically, and a known-good secret produces a
+        /// different code two steps later.
+        #[test]
+        fn prop_totp_generate_is_total_and_shape_correct(
+            secret in ".*",
+            ts in any::<u64>(),
+            digits in 1usize..=9,
+            step in 1u64..=300,
+        ) {
+            let code = totp_generate(&secret, ts, digits, step);
+            prop_assert_eq!(code.len(), digits, "wrong width: {:?}", code);
+            prop_assert!(
+                code.bytes().all(|b| b.is_ascii_digit()),
+                "non-decimal code: {code:?}"
+            );
+            prop_assert_eq!(code, totp_generate(&secret, ts, digits, step));
+
+            // RFC 6238 base32 of "12345678901234567890".
+            const KNOWN: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+            const TS: u64 = 1_700_000_000;
+            prop_assert_ne!(
+                totp_generate(KNOWN, TS, 6usize, 30u64),
+                totp_generate(KNOWN, TS + 2 * 30, 6usize, 30u64),
+                "two steps apart must not collide for a good secret"
+            );
+        }
     }
 
     /// RFC 4231 test case 1 for HMAC-SHA256 (official vector).
@@ -290,6 +324,39 @@ mod tests {
             to_chat_id("@mychannel"),
             Recipient::ChannelUsername("@mychannel".to_string())
         );
+    }
+
+    /// Fuzz-tag-7 reproduction. The old code forwarded any string starting
+    /// with '@' verbatim, so "@@foo" reached the Bot API with a doubled prefix;
+    /// embedded whitespace and control characters survived too. The target
+    /// must always be a structurally valid single '@' username.
+    #[test]
+    fn to_chat_id_canonicalizes_username_form() {
+        for raw in [
+            "@@foo", "@foo", "foo", " @ @foo ", "fo\no", "a\tb", "@", "@@", "",
+        ] {
+            let target = to_chat_id(raw).to_string();
+            assert!(
+                !target.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "{raw:?} -> {target:?}"
+            );
+            if target.starts_with('@') {
+                assert!(!target.starts_with("@@"), "{raw:?} -> {target:?}");
+            }
+        }
+        assert_eq!(
+            to_chat_id("@@foo"),
+            Recipient::ChannelUsername("@foo".to_string())
+        );
+        assert_eq!(
+            to_chat_id(" @ @foo "),
+            Recipient::ChannelUsername("@foo".to_string())
+        );
+        assert_eq!(
+            to_chat_id("fo\no"),
+            Recipient::ChannelUsername("@foo".to_string())
+        );
+        assert_eq!(to_chat_id("-100123"), Recipient::Id(ChatId(-100123)));
     }
 
     #[test]

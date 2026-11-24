@@ -32,6 +32,7 @@
 //! | 15 | console | seller cross-tenant POSTs | no change to victim rows or bot traffic |
 //! | 16 | bot | for_seller/for_channel/unmapped fallback and effective_bot | seller and channel ownership decide the bot |
 //! | 17 | REST write | expire-check with a seller token | only that seller's expired rows; owner control still sweeps globally |
+//! | 18 | REST/console | every mutating route swept with no session and with a B-targeted body | session required, owner-tier 403/404, victim snapshot byte-identical, no B bot traffic |
 //!
 //! To add a case: extend the table above, then add a row to the matching
 //! surface table inside the test function below.
@@ -444,6 +445,57 @@ fn rpc_code(v: &Value) -> i64 {
 
 async fn request_count(server: &MockServer) -> usize {
     server.received_requests().await.unwrap_or_default().len()
+}
+
+/// Same REST request as `rest`, but with an invalid session credential. A
+/// bogus bearer keeps the request on the REST auth path (the CSRF middleware
+/// lets bearer requests through), so a 401 proves the handler's own session
+/// gate refuses the caller before any handler body or bot call runs.
+async fn rest_without_session(
+    app: &Router,
+    method_name: &str,
+    path: &str,
+    body: Option<Value>,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(method_name)
+        .uri(path)
+        .header("authorization", "Bearer not-a-valid-session");
+    let payload = match body {
+        Some(v) => {
+            builder = builder.header("content-type", "application/json");
+            v.to_string()
+        }
+        None => String::new(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(payload)).unwrap())
+        .await
+        .unwrap();
+    resp.status()
+}
+
+/// Same console POST as `console`, but without a session cookie or CSRF token.
+/// The router-level CSRF middleware refuses these before any handler runs.
+async fn console_without_session(app: &Router, path: &str, form: &str) -> StatusCode {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    resp.status()
+}
+
+fn is_denied(status: StatusCode) -> bool {
+    status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND
 }
 
 async fn assert_only_a_contacted(f: &Fixture) {
@@ -1190,4 +1242,475 @@ async fn expire_check_must_not_touch_another_tenants_subscriptions() {
     assert_eq!(status_code, StatusCode::OK);
     assert_eq!(body, "{\"expired\":1}", "owner control: {body}");
     assert_eq!(status(victim), "expired", "owner did not expire B's row");
+}
+
+/// Black-box sweep over every mutating REST and console route covered by this
+/// suite. Each route is driven twice: once with no credential (must be refused
+/// before the handler runs), then as seller A with a payload aimed at tenant
+/// B's ids. A session is never an ownership input: owner/admin-only routes
+/// answer 403/404 for a seller, and seller-scoped routes derive the owner from
+/// the session, so B's rows and B's bot are untouched on every path.
+#[tokio::test]
+async fn mutating_routes_require_session_and_never_mutate_another_tenant() {
+    let f = make_fixture().await;
+    let s = seed(&f.db);
+    let a_post = f.db.list_posts(Some(A), 10)[0].0;
+    let before = victim_snapshot(&f.db);
+    let b_invoice_before = f.db.get_invoice(&s.b_invoice);
+    let global_before = f.db.get_config("channel");
+
+    // label | method | path | body (seller_id/bot_id/channel aimed at B) | seller is denied
+    let rest_cases: Vec<(&str, &str, String, Value, bool)> = vec![
+        (
+            "seller create",
+            "POST",
+            "/api/v1/sellers".into(),
+            json!({"user_id": B, "username": "sweep", "default_channel": B_CHANNEL}),
+            true,
+        ),
+        (
+            "seller channel set",
+            "POST",
+            format!("/api/v1/sellers/{B}/channel"),
+            json!({"channel": B_CHANNEL}),
+            true,
+        ),
+        (
+            "seller ai settings",
+            "POST",
+            format!("/api/v1/sellers/{B}/ai-settings"),
+            json!({"daily_token_budget": 1, "seller_id": A}),
+            true,
+        ),
+        (
+            "plan create",
+            "POST",
+            "/api/v1/plans".into(),
+            json!({"name": "sweep-plan", "price": "1", "asset": "USDT", "duration_days": 3, "channel_id": B_CHANNEL, "seller_id": B}),
+            false,
+        ),
+        (
+            "plan patch",
+            "PATCH",
+            format!("/api/v1/plans/{}", s.b_plan),
+            json!({"name": "sweep", "seller_id": A}),
+            true,
+        ),
+        (
+            "plan delete",
+            "DELETE",
+            format!("/api/v1/plans/{}", s.b_plan),
+            Value::Null,
+            true,
+        ),
+        (
+            "plan active",
+            "POST",
+            format!("/api/v1/plans/{}/active", s.b_plan),
+            json!({"active": false}),
+            true,
+        ),
+        (
+            "subscription grant",
+            "POST",
+            "/api/v1/subscriptions".into(),
+            json!({"user_id": 5_002, "days": 3, "seller_id": B}),
+            false,
+        ),
+        (
+            "subscription patch",
+            "PATCH",
+            format!("/api/v1/subscriptions/{}", s.b_sub),
+            json!({"status": "expired", "seller_id": A}),
+            true,
+        ),
+        (
+            "subscription expire-check",
+            "POST",
+            "/api/v1/subscriptions/expire-check".into(),
+            Value::Null,
+            false,
+        ),
+        (
+            "invoice create",
+            "POST",
+            "/api/v1/invoices".into(),
+            json!({"amount": "1", "asset": "USDT", "user_id": 5_002, "seller_id": B, "description": "sweep"}),
+            false,
+        ),
+        (
+            "invoice status",
+            "POST",
+            format!("/api/v1/invoices/{}/status", s.b_invoice),
+            json!({"status": "expired"}),
+            true,
+        ),
+        (
+            "code create",
+            "POST",
+            "/api/v1/codes".into(),
+            json!({"plan_id": s.b_plan, "value_days": 3, "seller_id": B}),
+            false,
+        ),
+        (
+            "code reclaim",
+            "POST",
+            "/api/v1/codes/reclaim".into(),
+            json!({"code": s.b_code, "seller_id": B}),
+            true,
+        ),
+        (
+            "code delete",
+            "DELETE",
+            format!("/api/v1/codes/{}", s.b_code),
+            Value::Null,
+            true,
+        ),
+        (
+            "code redeem (own code, forged seller)",
+            "POST",
+            format!("/api/v1/codes/{}/redeem", s.a_code),
+            json!({"seller_id": B}),
+            false,
+        ),
+        (
+            "post create",
+            "POST",
+            "/api/v1/posts".into(),
+            json!({"channel": B_CHANNEL, "text": "sweep", "seller_id": B}),
+            true,
+        ),
+        (
+            "post schedule",
+            "POST",
+            "/api/v1/posts/schedule".into(),
+            json!({"channel": B_CHANNEL, "text": "sweep", "scheduled_at": "2026-01-02T03:04:05Z", "seller_id": B}),
+            true,
+        ),
+        (
+            "post patch",
+            "PATCH",
+            format!("/api/v1/posts/{}", s.b_post),
+            json!({"text": "sweep", "seller_id": A}),
+            true,
+        ),
+        (
+            "post delete",
+            "DELETE",
+            format!("/api/v1/posts/{}", s.b_post),
+            Value::Null,
+            true,
+        ),
+        (
+            "post pin",
+            "POST",
+            format!("/api/v1/posts/{}/pin", s.b_post),
+            Value::Null,
+            true,
+        ),
+        (
+            "post unpin",
+            "POST",
+            format!("/api/v1/posts/{}/unpin", s.b_post),
+            Value::Null,
+            true,
+        ),
+        (
+            "post pin (own row, forged seller)",
+            "POST",
+            format!("/api/v1/posts/{a_post}/pin"),
+            json!({"seller_id": B}),
+            false,
+        ),
+        (
+            "broadcast",
+            "POST",
+            "/api/v1/broadcasts".into(),
+            json!({"text": "sweep", "seller_id": B}),
+            false,
+        ),
+        (
+            "user upsert",
+            "POST",
+            "/api/v1/users/upsert".into(),
+            json!({"user_id": 5_002, "username": "sweep", "seller_id": B}),
+            false,
+        ),
+        (
+            "channel patch",
+            "PATCH",
+            format!("/api/v1/channels/{B_CHANNEL}"),
+            json!({"title": "sweep", "seller_id": B}),
+            true,
+        ),
+        (
+            "global channel config",
+            "POST",
+            "/api/v1/config/channel".into(),
+            json!({"channel": B_CHANNEL}),
+            true,
+        ),
+        (
+            "ai template create",
+            "POST",
+            "/api/v1/ai/templates".into(),
+            json!({"name": "sweep-tpl", "user_prompt": "x", "seller_id": B}),
+            false,
+        ),
+        (
+            "ai template patch",
+            "PATCH",
+            "/api/v1/ai/templates/sweep-tpl".into(),
+            json!({"description": "x", "seller_id": B}),
+            false,
+        ),
+        (
+            "ai template delete",
+            "DELETE",
+            "/api/v1/ai/templates/sweep-tpl".into(),
+            Value::Null,
+            false,
+        ),
+        (
+            "product create",
+            "POST",
+            "/api/v1/products".into(),
+            json!({"name": "sweep-product", "price": "1", "asset": "USDT", "kind": "digital_link", "delivery": "payload", "seller_id": B}),
+            false,
+        ),
+        (
+            "product delete",
+            "DELETE",
+            format!("/api/v1/products/{}", s.b_product),
+            Value::Null,
+            true,
+        ),
+        (
+            "payout create",
+            "POST",
+            "/api/v1/finance/payouts".into(),
+            json!({"seller_id": B, "amount": "1", "asset": "USDT", "destination": "sweep"}),
+            true,
+        ),
+        (
+            "payout patch",
+            "PATCH",
+            format!("/api/v1/finance/payouts/{}", s.a_payout),
+            json!({"status": "failed", "seller_id": B}),
+            true,
+        ),
+        (
+            "payout process",
+            "POST",
+            format!("/api/v1/finance/payouts/{}/process", s.a_payout),
+            Value::Null,
+            true,
+        ),
+        (
+            "payout approve",
+            "POST",
+            format!("/api/v1/finance/payouts/{}/approve", s.a_payout),
+            Value::Null,
+            true,
+        ),
+        (
+            "payout execute",
+            "POST",
+            format!("/api/v1/finance/payouts/{}/execute", s.a_payout),
+            Value::Null,
+            true,
+        ),
+        (
+            "refund create",
+            "POST",
+            "/api/v1/finance/refunds".into(),
+            json!({"invoice_id": s.b_invoice, "amount": "1", "seller_id": B}),
+            true,
+        ),
+        (
+            "refund process",
+            "POST",
+            "/api/v1/finance/refunds/1/process".into(),
+            Value::Null,
+            true,
+        ),
+        (
+            "refund approve",
+            "POST",
+            "/api/v1/finance/refunds/1/approve".into(),
+            Value::Null,
+            true,
+        ),
+        (
+            "refund execute",
+            "POST",
+            "/api/v1/finance/refunds/1/execute".into(),
+            Value::Null,
+            true,
+        ),
+        (
+            "reconciliation resolve",
+            "POST",
+            "/api/v1/finance/reconciliation/subscription/1/resolve".into(),
+            json!({"outcome": "void", "reason": "sweep", "seller_id": B}),
+            true,
+        ),
+        (
+            "admin seller patch",
+            "PATCH",
+            format!("/api/v1/admin/sellers/{B}"),
+            json!({"default_channel": B_CHANNEL}),
+            true,
+        ),
+        (
+            "admin create",
+            "POST",
+            "/api/v1/admin/admins".into(),
+            json!({"user_id": B, "username": "sweep", "seller_id": B}),
+            true,
+        ),
+        (
+            "admin delete",
+            "DELETE",
+            format!("/api/v1/admin/admins/{B}"),
+            Value::Null,
+            true,
+        ),
+        (
+            "web account create",
+            "POST",
+            "/api/v1/admin/web-accounts".into(),
+            json!({"username": "sweep", "password": "sweep-pw", "role": "seller", "seller_id": B}),
+            true,
+        ),
+        (
+            "web account delete",
+            "DELETE",
+            "/api/v1/admin/web-accounts/9999".into(),
+            Value::Null,
+            true,
+        ),
+        (
+            "web account password",
+            "PATCH",
+            "/api/v1/admin/web-accounts/9999/password".into(),
+            json!({"password": "sweep-pw", "seller_id": B}),
+            true,
+        ),
+        (
+            "api key create",
+            "POST",
+            "/api/v1/auth/api-keys".into(),
+            json!({"name": "sweep", "scopes": "*", "seller_id": B}),
+            false,
+        ),
+        (
+            "api key delete",
+            "DELETE",
+            "/api/v1/auth/api-keys/9999".into(),
+            Value::Null,
+            true,
+        ),
+    ];
+
+    for (label, method, path, body, deny) in rest_cases {
+        let anon = rest_without_session(&f.app, method, &path, Some(body.clone())).await;
+        assert_eq!(
+            anon,
+            StatusCode::UNAUTHORIZED,
+            "{label}: sessionless caller was not refused"
+        );
+        let (status, text) = rest(&f.app, &f.a.session, method, &path, Some(body)).await;
+        if deny {
+            assert!(
+                is_denied(status),
+                "{label}: seller A expected 403/404, got {status}: {text}"
+            );
+        } else {
+            assert!(
+                status.is_success(),
+                "{label}: seller-scoped create expected success, got {status}: {text}"
+            );
+        }
+        assert_eq!(
+            victim_snapshot(&f.db),
+            before,
+            "{label}: tenant B rows changed"
+        );
+        assert_eq!(
+            f.db.get_invoice(&s.b_invoice),
+            b_invoice_before,
+            "{label}: tenant B invoice changed"
+        );
+        assert_eq!(
+            f.db.get_config("channel"),
+            global_before,
+            "{label}: global channel changed"
+        );
+    }
+
+    // Console mutations answer with redirects rather than JSON status codes;
+    // the invariant is the same: no cookie means no handler, and an A-targeted
+    // form never changes B's rows or reaches B's bot.
+    let console_cases: Vec<(&str, String, String)> = vec![
+        (
+            "console plan delete",
+            format!("/plans/{}/delete", s.b_plan),
+            String::new(),
+        ),
+        (
+            "console code delete",
+            "/codes/delete".into(),
+            format!("code={}", s.b_code),
+        ),
+        (
+            "console code reclaim",
+            "/codes/reclaim".into(),
+            format!("code={}", s.b_code),
+        ),
+        (
+            "console product delete",
+            "/productdel".into(),
+            format!("name={}", s.b_product),
+        ),
+    ];
+    for (label, path, form) in console_cases {
+        let anon = console_without_session(&f.app, &path, &form).await;
+        assert_eq!(
+            anon,
+            StatusCode::FORBIDDEN,
+            "{label}: sessionless console POST was not refused"
+        );
+        let (status, text) = console(&f.app, &f.a.session, "POST", &path, &form).await;
+        assert!(
+            status.is_success() || status.is_redirection(),
+            "{label}: {status}: {text}"
+        );
+        assert_eq!(
+            victim_snapshot(&f.db),
+            before,
+            "{label}: tenant B rows changed"
+        );
+        assert_eq!(
+            f.db.get_invoice(&s.b_invoice),
+            b_invoice_before,
+            "{label}: tenant B invoice changed"
+        );
+        assert_eq!(
+            f.db.get_config("channel"),
+            global_before,
+            "{label}: global channel changed"
+        );
+    }
+
+    assert_eq!(
+        request_count(&f.b.server).await,
+        0,
+        "tenant B bot received traffic"
+    );
+    assert_eq!(
+        request_count(&f.primary).await,
+        0,
+        "primary bot received traffic"
+    );
 }
