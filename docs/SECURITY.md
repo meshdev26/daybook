@@ -19,6 +19,11 @@
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
+### Automated validation (self-check, not an audit)
+
+- Automated self-validation of seller isolation on a fresh local database across REST, MCP, the web console and bot scoping; this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open.
+- The suite runs on loopback with mock Bot APIs, two forged-token seller principals and per-tenant markers. One known cross-tenant write in the REST `expire-check` path is kept as an ignored reproduction pending a production fix.
+
 > **Status:** alpha, self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
 
 ## Payments
