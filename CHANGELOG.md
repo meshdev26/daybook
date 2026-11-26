@@ -33,6 +33,13 @@ verification remain open.
   attached to their own plans, owner/admin keep the global catalogue.
 - `to_chat_id` canonicalizes usernames to exactly one leading `@` and strips
   whitespace and control characters before any target reaches the Bot API.
+- A `seller` web account with no `seller_id` binding can no longer be minted or
+  used. That pair previously resolved to the platform/global view, so REST
+  handlers scoped by `seller_scope` widened to every tenant. `Role::tenant_scope`
+  now resolves it to `Denied`, `create_web_account` refuses it at creation, and
+  the session loader refuses a pre-existing row. Owner, admin and buyer `user`
+  accounts keep their existing scope. The console's create form now reports the
+  refusal with a specific message instead of a generic failure.
 
 ## [0.4.2-alpha]
 

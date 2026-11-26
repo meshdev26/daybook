@@ -477,23 +477,18 @@ async fn webusers_create_duplicate_shows_taken_banner() {
     let (state, _dir) = make_state().await;
     let token = owner_session(&state).await;
     let app = router(state.clone());
+    // A bound seller, so the first create is a legitimate account rather than
+    // the scopeless-seller refusal this test is not about.
+    const FORM: &str = "username=dup&password=secret1&role=seller&seller_id=42";
     let resp = app
         .clone()
-        .oneshot(post_authed_req(
-            "/webusers/create",
-            "username=dup&password=secret1&role=seller",
-            &token,
-        ))
+        .oneshot(post_authed_req("/webusers/create", FORM, &token))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
     let resp = app
         .clone()
-        .oneshot(post_authed_req(
-            "/webusers/create",
-            "username=dup&password=secret1&role=seller",
-            &token,
-        ))
+        .oneshot(post_authed_req("/webusers/create", FORM, &token))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
@@ -504,11 +499,14 @@ async fn webusers_create_duplicate_shows_taken_banner() {
     assert!(body.contains("That username is taken."), "{body}");
 }
 
-/// E13: the seller select's empty option creates a platform-level account
-/// (seller_id stays None) — no more typed raw ids.
+/// A `seller` account with no seller binding is the fail-open state: every
+/// tenant-scoped helper read `seller_id = None` as "unscoped / every tenant".
+/// The create form offers an empty seller option and defaults the role to
+/// `seller`, so the pair is one click away. Creation must refuse it, and the
+/// refusal must be a specific message rather than the generic create failure.
 #[tokio::test]
 #[tracing::instrument(skip_all)]
-async fn webusers_create_empty_seller_id_is_platform_level() {
+async fn webusers_create_seller_without_binding_is_refused() {
     let (state, _dir) = make_state().await;
     let token = owner_session(&state).await;
     let app = router(state.clone());
@@ -522,12 +520,37 @@ async fn webusers_create_empty_seller_id_is_platform_level() {
         .unwrap();
     assert!(resp.status().is_redirection());
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("error=seller"), "{loc}");
+    assert!(
+        state.db.get_web_account_by_username("plat").is_none(),
+        "a scopeless seller must not be persisted"
+    );
+}
+
+/// The same empty binding IS legitimate for the owner tier (the platform view
+/// has no tenant), so the guard must be role-specific, not "any empty id".
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn webusers_create_owner_without_binding_is_allowed() {
+    let (state, _dir) = make_state().await;
+    let token = owner_session(&state).await;
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req(
+            "/webusers/create",
+            "username=second-owner&password=secretasingle1&role=owner&seller_id=",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_redirection());
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
     assert!(loc.contains("created=1"), "{loc}");
     let (_id, _u, _h, _r, seller_id) = state
         .db
-        .get_web_account_by_username("plat")
-        .expect("account exists");
-    assert_eq!(seller_id, None, "empty seller stays platform-level");
+        .get_web_account_by_username("second-owner")
+        .expect("owner account exists");
+    assert_eq!(seller_id, None, "an owner stays platform-level");
 }
 
 /// E17: the preview form renders exactly ONE visible custom-segment text

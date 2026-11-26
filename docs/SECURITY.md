@@ -20,6 +20,17 @@
 - `/channels` lists only channels attached to the caller's plans for a seller; owner/admin keep the global catalogue. A seller cannot advertise another seller's channel through it.
 - Chat targets taken from user input are canonicalized before reaching the Bot API: `to_chat_id` gives usernames exactly one leading `@` and removes whitespace and control characters, while `channel_key` canonicalization is total and idempotent. Property tests and fuzz targets guard both, along with seller-scope escalation and TOTP code shape.
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
+- A `seller` account must carry a binding. The session resolver (`Role::tenant_scope`)
+  maps `seller` + NULL to `Denied`, not to the global view, and its `Db` scope is a
+  negative sentinel that matches no tenant row; account creation and the session
+  loader refuse that pair outright.
+- Diagnosed, not yet fixed, in this branch: REST handlers that gate with a *negative
+  equality* (`role == Seller && seller_id != Some(target)`) let every other tier --
+  including a buyer `user` session -- fall through to the unscoped `Db` call. That
+  includes `invoices_status`, which has no status allowlist, so a money-integrity
+  write reaches any tenant's invoice. Do not rely on the isolation claims above until
+  those gates are positive (`!has_level(...) && binding != Some(target)`). Tracked
+  in this branch's follow-up commits, not in this one.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)

@@ -744,6 +744,45 @@ async fn test_web_account_update_password() {
     assert!(db.verify_web_password("bob", "newpw").await.is_some());
 }
 
+/// The creation boundary: a seller-tier account with no seller binding is the
+/// fail-open state (None was read as "unscoped / every tenant"), so minting one
+/// must be impossible. Every other (role, binding) pair stays valid.
+#[tokio::test]
+async fn create_web_account_refuses_scopeless_seller() {
+    let path = "/tmp/opencode/test_create_scopeless_seller.db";
+    let _ = fs::remove_file(path);
+    let db = Db::new(path).unwrap();
+
+    let err = db
+        .create_web_account("ghost-seller", "pw", "seller", None)
+        .await
+        .expect_err("a seller with no binding must be refused");
+    assert!(err.contains("seller binding"), "{err}");
+    assert!(
+        db.get_web_account_by_username("ghost-seller").is_none(),
+        "the refused account must not be persisted"
+    );
+
+    // A bound seller, an owner, an admin and a buyer are all still creatable.
+    db.create_web_account("bound-seller", "pw", "seller", Some(42))
+        .await
+        .expect("a bound seller is legitimate");
+    db.create_web_account("boss", "pw", "owner", None)
+        .await
+        .expect("the owner is platform-level");
+    db.create_web_account("ops", "pw", "admin", None)
+        .await
+        .expect("an admin may be platform-level");
+    db.create_web_account("shopper", "pw", "user", None)
+        .await
+        .expect("a buyer holds no tenant grant");
+
+    // The legacy escape hatch is exactly what it says: it can still write the
+    // refused state, which is how the old rows are modelled in tests.
+    db.insert_legacy_web_account("legacy-ghost", "seller", None);
+    assert!(db.get_web_account_by_username("legacy-ghost").is_some());
+}
+
 #[tokio::test]
 async fn test_web_session_lifecycle() {
     let path = "/tmp/opencode/test_web_session_lifecycle.db";

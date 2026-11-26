@@ -620,6 +620,9 @@ fn webusers_banner(q: &WebUsersQuery) -> String {
     let who = esc(q.u.as_deref().unwrap_or(""));
     let err = match q.error.as_deref() {
         Some("taken") => Some("That username is taken."),
+        Some("seller") => Some(
+            "A seller account needs a seller binding. Pick a seller, or create an owner account.",
+        ),
         Some("create") => Some("Account could not be created — check the values and try again."),
         Some("password") => Some("Password reset failed — try again."),
         _ => None,
@@ -679,9 +682,12 @@ pub(super) async fn webusers_resetmfa(
 
 /// E13 (EDIT_FLOW_SPEC): the create form's seller picker — the real seller
 /// list with channels (the sellers_page idiom), never a typed raw id the
-/// owner cannot know. The empty option is platform-level (None).
+/// owner cannot know. The empty option is platform-level (None tri-state) and is
+/// legitimate only for the owner role: a `seller` with no binding has no tenant
+/// and is refused at creation, so the label says so rather than inviting the pick.
 fn webusers_seller_options(state: &WebState) -> String {
-    let mut options = String::from(r#"<option value="">No seller (platform-level)</option>"#);
+    let mut options =
+        String::from(r#"<option value="">No seller (platform-level; owner only)</option>"#);
     for sid in state.db.list_sellers() {
         let ch = state.db.seller_channel(sid).unwrap_or_default();
         let label = if ch.is_empty() {
@@ -817,15 +823,25 @@ pub(super) async fn webusers_create(
         .seller_id
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok());
-    let res = state
-        .db
-        .create_web_account(&f.username, &f.password, role, seller_id)
-        .await;
+    // The create form's seller picker includes an empty option, and role
+    // defaults to `seller`, so this pair is reachable straight from the UI. A
+    // seller account with no binding is refused by `create_web_account` too;
+    // short-circuiting here gives the operator a specific message instead of
+    // the generic "could not be created".
+    let res = if !crate::roles::session_is_usable(role, seller_id) {
+        Err("seller role requires a seller binding".to_string())
+    } else {
+        state
+            .db
+            .create_web_account(&f.username, &f.password, role, seller_id)
+            .await
+    };
     // E11: a duplicate username used to vanish (`let _ =`) — the honest
     // failure renders now. Other Db failures get their own key.
     let dest = match res {
         Ok(()) => format!("/webusers?created=1&u={}", qenc(f.username.trim())),
         Err(e) if e.contains("UNIQUE") => "/webusers?error=taken".to_string(),
+        Err(e) if e.contains("seller binding") => "/webusers?error=seller".to_string(),
         Err(_) => "/webusers?error=create".to_string(),
     };
     Redirect::to(&state.url(&dest)).into_response()

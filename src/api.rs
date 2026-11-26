@@ -54,12 +54,30 @@ fn session_or_401(
     })
 }
 
+/// Tenant scope for the REST surface, resolved from the server-side session.
+///
+/// Returns `None` only for the platform-operator tiers (owner, and every admin
+/// -- this surface has never narrowed an admin to its own binding, and this
+/// change deliberately does not start). A `seller` account with no binding
+/// resolves to
+/// [`TenantScope::Denied`], whose `as_opt()` is the sentinel `-1` rather than
+/// `None`. Before this type existed, the stored `Option` was passed through
+/// verbatim, so a missing binding arrived at the `Db` layer as `None` — the
+/// "all rows" argument of every seller-scoped helper — and silently widened to
+/// the platform view.
+///
+/// The sentinel is defence in depth, not a universal denial. For the common
+/// equality shape (`WHERE seller_id = ?1`) it selects no row, because seller ids
+/// are Telegram user ids (positive) plus platform `0`. It cannot neutralise a
+/// predicate that *filters in* other ids, so a helper that unions the platform
+/// namespace or treats `None`/`Some(0)` as "global" still needs the caller to
+/// refuse `Denied` at the boundary. `list_channels` is the known example:
+/// `WHERE seller_id = 0 OR seller_id = ?1` returns the platform rows for any
+/// argument, `-1` included. See `TenantScope::DENIED_ID` for the inventory.
 fn seller_scope(session: &crate::web::Session) -> Option<i64> {
-    if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
-    }
+    Role::from_role_str(&session.role)
+        .tenant_scope(session.seller_id)
+        .as_opt()
 }
 
 /// §2: every money approval, execution, void and resolution requires the
@@ -202,6 +220,20 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
                 &state.login_attempts,
                 &crate::auth::login_throttle_key(&f.username),
             );
+            // A seller-tier account with no seller binding has no tenant to
+            // act as (see `Role::tenant_scope`). Refuse it at the mint boundary
+            // rather than issuing a session that resolves to a denial on every
+            // request: the honest answer is 403, not a credential that silently
+            // does nothing. These rows should no longer be creatable
+            // (`create_web_account` refuses them); this covers legacy ones.
+            if !crate::roles::session_is_usable(&role, seller_id) {
+                return err(
+                    StatusCode::FORBIDDEN,
+                    "account_denied",
+                    "this account has no seller binding; ask the owner to fix it",
+                )
+                .into_response();
+            }
             // MFA parity with the web login (web::login_submit): a correct
             // password alone never mints a session for a TOTP-enabled or
             // privileged account.

@@ -4940,6 +4940,28 @@ impl Db {
         role: &str,
         seller_id: Option<i64>,
     ) -> Result<(), String> {
+        // Creation boundary for the scopeless-seller state that `TenantScope`
+        // refuses on the read side. A `seller` account with no seller binding
+        // has no tenant to act as, so minting one can only produce credentials
+        // that every scope check denies; the console form's empty "No seller
+        // (platform-level)" option made that a one-click mistake. Refused here,
+        // rather than stored as a row that can never legitimately be used.
+        //
+        // Checked before the bcrypt hash below: a refusal must not cost the
+        // caller ~100ms of CPU, and no hash is needed for a row never written.
+        // Owner/admin legitimately have no binding (they are the platform view),
+        // and `user` is a buyer account, not a tenant principal.
+        //
+        // The predicate is the same one the session loader uses, and it judges
+        // through `Role::from_role_str`, so an arbitrary or misspelled role
+        // string is classified exactly as it will be when the account logs in.
+        // Creation and load cannot disagree about what is usable.
+        if !crate::roles::session_is_usable(role, seller_id) {
+            return Err(
+                "seller role requires a seller binding (platform-level seller account refused)"
+                    .to_string(),
+            );
+        }
         let password = password.to_string();
         let hash =
             tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
@@ -4956,6 +4978,33 @@ impl Db {
             params![username, hash, role, seller_id, now],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Test-only: insert a `web_accounts` row without the creation guards.
+    ///
+    /// `create_web_account` now refuses `role='seller'` with no binding, but a
+    /// database provisioned before that fix can already hold such rows. Tests
+    /// that pin how the load and authorization paths treat that legacy state
+    /// need to fabricate it, so they use this escape hatch instead of the
+    /// production method being weakened to accommodate them. The `#[cfg(test)]`
+    /// gate is crate-unit-tests only; it is not part of any built binary.
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_web_account(
+        &self,
+        username: &str,
+        role: &str,
+        seller_id: Option<i64>,
+    ) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO web_accounts(username,password_hash,salt,role,seller_id,created_at) VALUES(?1,'x','',?2,?3,?4)",
+            params![username, role, seller_id, now],
+        )
+        .expect("legacy web_accounts fixture insert");
     }
 
     pub fn get_web_account_by_username(
