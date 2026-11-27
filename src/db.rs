@@ -1925,6 +1925,25 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a post only when it is inside the caller's tenant scope.
+    /// `None` is the operator's global view (every post must stay reachable);
+    /// `Some(0)` is the platform namespace; `Some(-1)` is the denied-tenant
+    /// sentinel and must match no row; any other `Some(id)` matches only that
+    /// seller's posts. `false` means missing OR out of scope, deliberately
+    /// indistinguishable so callers cannot probe for foreign post ids.
+    pub fn delete_post_scoped(&self, seller_scope: Option<i64>, id: i64) -> bool {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM posts WHERE id=?1 AND (?2 IS NULL OR seller_id=?2)",
+            params![id, seller_scope],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
     pub fn update_post_content(&self, id: i64, content: &str) -> Result<(), rusqlite::Error> {
         let conn = self
             .conn
