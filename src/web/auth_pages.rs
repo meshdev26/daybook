@@ -190,6 +190,25 @@ async fn login_complete(
     seller_id: Option<i64>,
     mfa_disabled: bool,
 ) -> Response {
+    // A seller-tier account with no seller binding has no tenant to act as.
+    // Refuse the console login outright: minting a session here would land the
+    // operator on /dashboard, whose every page resolves the tenant from this
+    // binding and denies, i.e. believable credentials that can do nothing.
+    // The owner mints accounts, so the actionable fix is on the Web users page.
+    if !crate::roles::session_is_usable(&role, seller_id) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Html(html_page_bare(
+                &state.base_path,
+                "Sign in",
+                &sign_in_form_html(
+                    state,
+                    Some("This account has no seller binding yet. Ask the owner to assign one on the Web users page."),
+                ),
+            )),
+        )
+            .into_response();
+    }
     let (_totp_secret, totp_enabled, _last) = state.db.get_totp_state(account_id);
     if !mfa_disabled && totp_enabled {
         let pending_raw = crate::util::gen_token(48);

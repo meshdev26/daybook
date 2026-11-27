@@ -9,6 +9,9 @@ pub(super) async fn referrals_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Referrals", "Referrals").into_response();
+    }
     // Collect referrals across the visible seller scope.
     let mut all: Vec<(i64, i64, i64, i64, String, String, f64)> = Vec::new(); // (seller, id, referrer, referee, code, status, reward)
     if Role::from_role_str(&session.role) == Role::Seller {
@@ -166,6 +169,9 @@ pub(super) async fn orders_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Orders", "Orders").into_response();
+    }
     let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -264,6 +270,9 @@ pub(super) async fn reviews_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Reviews", "Reviews").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -344,6 +353,12 @@ pub(super) async fn reviews_approve(
                 .map(|r| r.0)
         })
         .collect();
+    // `approve_review` takes a bare row id, so the allow-list above is the
+    // only ownership check. Operators see every row; a tenantless session has
+    // no products, hence no reviews to approve.
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Reviews", "Reviews").into_response();
+    }
     if Role::from_role_str(&session.role) == Role::Seller && !allowed.contains(&f.id) {
         return Redirect::to(&state.url("/reviews")).into_response();
     }

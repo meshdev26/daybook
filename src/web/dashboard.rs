@@ -42,6 +42,9 @@ pub(super) async fn dashboard(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Dashboard", "Dashboard").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {

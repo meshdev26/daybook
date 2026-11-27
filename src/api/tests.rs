@@ -70,10 +70,19 @@ proptest! {
         prop_assert!(!crate::util::ct_eq(&hex, &bad));
     }
 
-    /// seller_scope is the server-derived ownership input. A session may only
-    /// carry its own seller id, and only when its role string parses to exactly
-    /// Seller; every other spelling or role must widen to None (global view),
-    /// never to a caller-chosen id.
+    /// `seller_scope` is the server-derived ownership input: the boundary
+    /// between "who the caller is" and "which rows Db returns". Its only
+    /// dangerous failure mode is widening.
+    ///
+    /// A `seller` session that carries an id must resolve to that id and
+    /// nothing else (no caller-chosen id is ever substituted, however the role
+    /// string is spelled). A `seller` session with NO binding must not widen to
+    /// the unscoped/global view: it resolves to `Denied`, whose scope matches no
+    /// row.
+    ///
+    /// Operator and admin tiers keep their historical unscoped view, asserted
+    /// explicitly so a future edit cannot silently demote them while "fixing"
+    /// the seller arm.
     #[test]
     fn prop_seller_scope_cannot_escalate(
         role in prop_oneof![
@@ -94,13 +103,100 @@ proptest! {
             selected_bot_id: None,
             csrf_token: String::new(),
         };
-        let expected = if Role::from_role_str(&role) == Role::Seller {
-            sid
-        } else {
-            None
-        };
-        prop_assert_eq!(seller_scope(&session), expected);
+
+        let parsed = Role::from_role_str(&role);
+        let scope = seller_scope(&session);
+
+        // The escalation invariant, stated positively: the resolved scope is
+        // either the operator view (`None`), the id this session actually
+        // carries, or the Denied sentinel. It is never another tenant's id.
+        //
+        // Deliberately no `prop_assume!` here. Assuming the sentinel away would
+        // discard exactly the scopeless-seller case this test exists to guard, and
+        // leave a green test that asserts nothing about it.
+        prop_assert!(
+            scope.is_none() || scope == sid || scope == Some(crate::roles::TenantScope::DENIED_ID),
+            "role {:?} sid {:?} resolved to a foreign scope {:?}",
+            role,
+            sid,
+            scope
+        );
+
+        match (parsed, sid) {
+            // Operator tiers keep the global view.
+            (Role::Owner | Role::Admin, _) => prop_assert_eq!(scope, None),
+            // A bound seller sees exactly its own rows...
+            (Role::Seller, Some(id)) => prop_assert_eq!(scope, Some(id)),
+            // ...and an unbound seller is REFUSED, never widened to global.
+            (Role::Seller, None) => prop_assert_eq!(
+                scope,
+                Some(crate::roles::TenantScope::DENIED_ID),
+                "scopeless seller widened to the global view (fail-open)"
+            ),
+            // The buyer tier is not a tenant principal: never global.
+            (Role::User, _) => prop_assert_eq!(scope, Some(crate::roles::TenantScope::DENIED_ID)),
+        }
     }
+}
+
+/// The scopeless-seller state is the defect `TenantScope` exists to close, so it
+/// gets a named assertion rather than riding on a proptest arm: `seller` + NULL
+/// must resolve to `Denied`, and `Denied` must never be spellable as the global
+/// scope (`None`), which the `Db` layer reads as "every tenant's rows".
+#[test]
+fn no_scope_is_not_global() {
+    use crate::roles::{Role as R, TenantScope};
+
+    assert_eq!(
+        R::from_role_str("seller").tenant_scope(None),
+        TenantScope::Denied,
+        "a seller with no binding must be denied, not global"
+    );
+    assert_eq!(
+        R::from_role_str("seller").tenant_scope(Some(7)),
+        TenantScope::Seller(7)
+    );
+
+    // Operator tiers keep their unscoped view. A bound admin stays global on
+    // this surface too: that is the REST layer's historical meaning, unchanged
+    // by this commit, so the fix cannot widen or narrow an admin.
+    assert_eq!(
+        R::from_role_str("owner").tenant_scope(None),
+        TenantScope::Global
+    );
+    assert_eq!(
+        R::from_role_str("admin").tenant_scope(None),
+        TenantScope::Global
+    );
+    assert_eq!(
+        R::from_role_str("admin").tenant_scope(Some(7)),
+        TenantScope::Global
+    );
+
+    // The buyer tier holds no seller grant, and an unknown role string parses
+    // to `User`, so both must fail closed rather than inherit the operator view.
+    assert_eq!(
+        R::from_role_str("user").tenant_scope(None),
+        TenantScope::Denied
+    );
+    assert_eq!(
+        R::from_role_str("user").tenant_scope(Some(7)),
+        TenantScope::Denied
+    );
+    assert_eq!(
+        R::from_role_str("bogus").tenant_scope(Some(7)),
+        TenantScope::Denied
+    );
+
+    // The one that actually matters: `Denied` is not representable as the global
+    // (`None`) scope, and its sentinel cannot collide with a real positive id.
+    assert_eq!(
+        TenantScope::Denied.as_opt(),
+        Some(TenantScope::DENIED_ID),
+        "Denied must not be spellable as the global (None) scope"
+    );
+    assert_ne!(TenantScope::Denied.as_opt(), None);
+    const { assert!(TenantScope::DENIED_ID < 0) };
 }
 
 async fn make_state() -> (WebState, tempfile::TempDir) {

@@ -9,6 +9,9 @@ pub(super) async fn channels_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Channels", "Channels").into_response();
+    }
     let banners = channels_banners(&q, &state, &session);
     let success_banner: Option<String> = if banners.is_empty() {
         None

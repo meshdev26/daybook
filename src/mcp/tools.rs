@@ -2212,17 +2212,16 @@ async fn exec_gen_codes(
 
 async fn exec_delete_post(
     state: WebState,
-    _principal: Principal,
+    principal: Principal,
     args: Value,
 ) -> Result<Value, String> {
     let post_id = args
         .get("post_id")
         .and_then(|v| v.as_i64())
         .unwrap_or_default();
-    state
-        .db
-        .delete_post(post_id)
-        .map_err(|e| format!("delete failed: {e}"))?;
+    if !state.db.delete_post_scoped(principal.seller_id, post_id) {
+        return Err("post not found or not yours".into());
+    }
     Ok(json!({"ok": true, "post_id": post_id,
               "note": "stored record deleted; the sent Telegram message was not unsent"}))
 }
@@ -2688,6 +2687,48 @@ mod tests {
         assert!(validate_delete_post(&json!({"post_id": 3})).is_ok());
         assert!(validate_limit(&json!({"limit": 51})).is_err());
         assert!(validate_limit(&json!({})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_post_is_tenant_scoped_for_sellers_and_owner() {
+        let (state, _dir) = send_test_state("http://127.0.0.1:1");
+        // A seller B post, plus a platform-namespace post the owner may delete.
+        state
+            .db
+            .log_post(22, "chat-victim", 1, "text", Some("victim"), "bot")
+            .unwrap();
+        state
+            .db
+            .log_post(0, "chat-owner", 2, "text", Some("owner"), "bot")
+            .unwrap();
+        let posts = state.db.list_posts(None, 10);
+        let victim = posts.iter().find(|p| p.1 == 22).map(|p| p.0).unwrap();
+        let owner_post = posts.iter().find(|p| p.1 == 0).map(|p| p.0).unwrap();
+
+        let err = exec_delete_post(state.clone(), seller(11), json!({"post_id": victim}))
+            .await
+            .expect_err("seller A must not delete seller B's post");
+        assert_eq!(err, "post not found or not yours");
+        assert_eq!(
+            state.db.get_post_seller(victim),
+            Some(22),
+            "foreign post is intact"
+        );
+
+        let ok = exec_delete_post(
+            state.clone(),
+            Principal::OWNER,
+            json!({"post_id": owner_post}),
+        )
+        .await
+        .expect("owner keeps the global delete view");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["post_id"], owner_post);
+        assert_eq!(
+            state.db.get_post_seller(owner_post),
+            None,
+            "owner post was deleted"
+        );
     }
 
     // ---- Identity reads: registration, validation, error mapping ----

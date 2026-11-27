@@ -56,7 +56,7 @@ Login on a TOTP-enabled account is two-step: `POST /auth/login` never mints a se
 | GET | /subscriptions/{id} | scoped | Subscription detail |
 | PATCH | /subscriptions/{id} | seller+ | Expire/revoke/extend |
 | POST | /subscriptions/expire-check | seller+ | Revoke expired |
-| GET | /users/{user_id}/subscriptions | self/admin+ | User's subscriptions |
+| GET | /users/{user_id}/subscriptions | admin+ | User's subscriptions |
 
 ### Invoices
 | Method | Path | Role | Description |

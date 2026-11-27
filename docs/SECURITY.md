@@ -20,6 +20,26 @@
 - `/channels` lists only channels attached to the caller's plans for a seller; owner/admin keep the global catalogue. A seller cannot advertise another seller's channel through it.
 - Chat targets taken from user input are canonicalized before reaching the Bot API: `to_chat_id` gives usernames exactly one leading `@` and removes whitespace and control characters, while `channel_key` canonicalization is total and idempotent. Property tests and fuzz targets guard both, along with seller-scope escalation and TOTP code shape.
 - Role and tenant gates live in handlers and `Db`, not just in navigation.
+- A `seller` account must carry a binding. The session resolver (`Role::tenant_scope`)
+  maps `seller` + NULL to `Denied`, not to the global view, and its `Db` scope is a
+  negative sentinel that matches no tenant row; account creation and the session
+  loader refuse that pair outright.
+- REST tenant gates now reject the buyer tier. Nineteen of the twenty negative
+  equality gates were converted to a positive tier-floor check; `invoices_claim`
+  keeps its buyer self-claim carve-out (`src/api.rs:4730-4744`). An earlier draft
+  claimed 41 gates and said `invoices_status` had no status allowlist. Both were
+  wrong: the paid and paid_ungranted states were already refused, failed was
+  owner-only, and the reachable forged value was `executed`, which analytics
+  counts (`src/db.rs:9194`). Invoice status changes now allow only active,
+  expired and cancelled. Tenantless sessions also refuse the console write
+  routes, the REST namespace writes, and the global user lists. The MCP delete
+  tool is scoped to its seller as an invariant; the Sensitive owner gate had
+  already blocked non-owners.
+- Console read pages now refuse a tenantless session instead of handing it the
+  global list. Buyer nav entries are still visible; removing them is an owner
+  surface decision. `codes_redeem` keeps the buyer redemption flow but ignores a
+  caller-supplied beneficiary for the user tier. The buyer invoice self-claim
+  and code redemption flows remain supported as documented in `docs/API.md`.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)

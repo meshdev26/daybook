@@ -296,6 +296,9 @@ pub(super) async fn analytics_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Analytics", "Analytics").into_response();
+    }
 
     let period = q.period.clone().unwrap_or_else(|| "30d".to_string());
     let period = match period.as_str() {
@@ -323,6 +326,9 @@ pub(super) async fn analytics_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Analytics", "Analytics").into_response();
+    }
     let seller_ids: Vec<i64> = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id.into_iter().collect()
     } else {
@@ -418,6 +424,9 @@ pub(super) async fn usage_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Usage", "Usage").into_response();
+    }
     let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id

@@ -54,12 +54,30 @@ fn session_or_401(
     })
 }
 
+/// Tenant scope for the REST surface, resolved from the server-side session.
+///
+/// Returns `None` only for the platform-operator tiers (owner, and every admin
+/// -- this surface has never narrowed an admin to its own binding, and this
+/// change deliberately does not start). A `seller` account with no binding
+/// resolves to
+/// [`TenantScope::Denied`], whose `as_opt()` is the sentinel `-1` rather than
+/// `None`. Before this type existed, the stored `Option` was passed through
+/// verbatim, so a missing binding arrived at the `Db` layer as `None` — the
+/// "all rows" argument of every seller-scoped helper — and silently widened to
+/// the platform view.
+///
+/// The sentinel is defence in depth, not a universal denial. For the common
+/// equality shape (`WHERE seller_id = ?1`) it selects no row, because seller ids
+/// are Telegram user ids (positive) plus platform `0`. It cannot neutralise a
+/// predicate that *filters in* other ids, so a helper that unions the platform
+/// namespace or treats `None`/`Some(0)` as "global" still needs the caller to
+/// refuse `Denied` at the boundary. `list_channels` is the known example:
+/// `WHERE seller_id = 0 OR seller_id = ?1` returns the platform rows for any
+/// argument, `-1` included. See `TenantScope::DENIED_ID` for the inventory.
 fn seller_scope(session: &crate::web::Session) -> Option<i64> {
-    if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
-    }
+    Role::from_role_str(&session.role)
+        .tenant_scope(session.seller_id)
+        .as_opt()
 }
 
 /// §2: every money approval, execution, void and resolution requires the
@@ -202,6 +220,20 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
                 &state.login_attempts,
                 &crate::auth::login_throttle_key(&f.username),
             );
+            // A seller-tier account with no seller binding has no tenant to
+            // act as (see `Role::tenant_scope`). Refuse it at the mint boundary
+            // rather than issuing a session that resolves to a denial on every
+            // request: the honest answer is 403, not a credential that silently
+            // does nothing. These rows should no longer be creatable
+            // (`create_web_account` refuses them); this covers legacy ones.
+            if !crate::roles::session_is_usable(&role, seller_id) {
+                return err(
+                    StatusCode::FORBIDDEN,
+                    "account_denied",
+                    "this account has no seller binding; ask the owner to fix it",
+                )
+                .into_response();
+            }
             // MFA parity with the web login (web::login_submit): a correct
             // password alone never mints a session for a TOTP-enabled or
             // privileged account.
@@ -576,7 +608,7 @@ async fn seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
+    if seller_scope(&session).is_some_and(|s| s != user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -691,7 +723,7 @@ async fn seller_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
+    if seller_scope(&session).is_some_and(|s| s != user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -778,7 +810,7 @@ async fn seller_get_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
+    if seller_scope(&session).is_some_and(|s| s != user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -812,7 +844,7 @@ async fn seller_set_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(user_id) {
+    if seller_scope(&session).is_some_and(|s| s != user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -957,19 +989,12 @@ async fn plans_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let scope = if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
-    };
     // find by id via list (no get_plan_by_id scoping helper exists for seller; use get_plan_by_id then check)
     match state.db.get_plan_by_id(id) {
         Some((sid, price, asset, name, days, channel)) => {
-            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid)
-            {
+            if seller_scope(&session).is_some_and(|s| s != sid) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
             }
-            let _ = scope;
             (StatusCode::OK, Json(serde_json::json!({
                 "id": id, "seller_id": sid, "name": name, "price": price, "asset": asset, "duration_days": days, "channel_id": channel,
             }))).into_response()
@@ -1003,7 +1028,7 @@ async fn plans_update(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
+    if seller_scope(&session).is_some_and(|s| s != sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     // Re-add plan with merged fields (add_plan is upsert by seller+name)
@@ -1056,7 +1081,7 @@ async fn plans_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
+    if seller_scope(&session).is_some_and(|s| s != sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     state.db.remove_plan(sid, &name);
@@ -1083,7 +1108,7 @@ async fn plans_active(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
+    if seller_scope(&session).is_some_and(|s| s != sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     if f.active {
@@ -1323,7 +1348,14 @@ async fn invoices_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let inv_id = format!("inv_{}", crate::util::gen_token(16));
     state.db.save_invoice(
         &inv_id,
@@ -1355,9 +1387,7 @@ async fn invoices_get(
     };
     match state.db.get_invoice(&invoice_id) {
         Some((amount, asset, status, desc, plan_id, user_id, seller_id)) => {
-            if Role::from_role_str(&session.role) == Role::Seller
-                && session.seller_id != Some(seller_id)
-            {
+            if seller_scope(&session).is_some_and(|s| s != seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1387,7 +1417,7 @@ async fn invoices_status(
     };
     // ownership check
     if let Some((_a, _as, _st, _d, _p, _u, sid)) = state.db.get_invoice(&invoice_id) {
-        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
+        if seller_scope(&session).is_some_and(|s| s != sid) {
             return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
         }
     } else {
@@ -1455,6 +1485,14 @@ async fn invoices_status(
     }
     // All other transitions keep their prior behaviour (seller may e.g. mark
     // an unpaid invoice 'expired'/'cancelled' without a reason).
+    if !matches!(f.status.as_str(), "active" | "expired" | "cancelled") {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_status",
+            "status transition not allowed",
+        )
+        .into_response();
+    }
     state.db.update_invoice_status(&invoice_id, &f.status);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -1569,9 +1607,7 @@ async fn codes_get(
     };
     match state.db.get_code(&code) {
         Some((id, seller_id, plan_id, value_days, max_uses, uses, expires_at)) => {
-            if Role::from_role_str(&session.role) == Role::Seller
-                && session.seller_id != Some(seller_id)
-            {
+            if seller_scope(&session).is_some_and(|s| s != seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1598,7 +1634,7 @@ async fn codes_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "code not found").into_response();
         }
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(seller_id) {
+    if seller_scope(&session).is_some_and(|s| s != seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
     // Real delete via the scoped helper (server db.rs addition): sellers delete
@@ -1644,7 +1680,12 @@ async fn codes_redeem(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let user_id = f.user_id.unwrap_or(session.account_id);
+    // Tier floor: a user-tier caller must not name a beneficiary in the body.
+    let user_id = if Role::from_role_str(&session.role) == Role::User {
+        session.account_id
+    } else {
+        f.user_id.unwrap_or(session.account_id)
+    };
     // Pre-flight seller-channel check (mirrors /redeem): redeem_code burns a
     // use unconditionally, so a code whose seller has nowhere to grant INTO
     // must be refused untouched, not consumed (P1#7).
@@ -1690,9 +1731,7 @@ async fn codes_redemptions(
     };
     match state.db.get_code(&code) {
         Some((_id, seller_id, _p, _v, _m, _u, _e)) => {
-            if Role::from_role_str(&session.role) == Role::Seller
-                && session.seller_id != Some(seller_id)
-            {
+            if seller_scope(&session).is_some_and(|s| s != seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
         }
@@ -1783,7 +1822,9 @@ async fn posts_create(
     // principal (session), never a global 0, so seller rules apply too.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
-        session.seller_id.unwrap_or(0),
+        session
+            .seller_namespace()
+            .unwrap_or(crate::roles::TenantScope::DENIED_ID),
         Some(bot.id),
         &f.text,
     ) {
@@ -1797,7 +1838,9 @@ async fn posts_create(
         Ok(m) => m.id.0,
         Err(_) => 0,
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let seller_id = session
+        .seller_namespace()
+        .unwrap_or(crate::roles::TenantScope::DENIED_ID);
     let _ = state
         .db
         .log_post(seller_id, &ch, msg_id, "text", Some(&f.text), "bot");
@@ -1851,7 +1894,9 @@ async fn posts_schedule(
     if !api_may_mutate_channel(&state, &session, &ch) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
     }
-    let seller_id = session.seller_id.unwrap_or(0);
+    let seller_id = session
+        .seller_namespace()
+        .unwrap_or(crate::roles::TenantScope::DENIED_ID);
     let id = state
         .db
         .create_scheduled_post(seller_id, &ch, &f.text, "text", &f.scheduled_at);
@@ -1884,8 +1929,7 @@ async fn posts_get(
     let posts = state.db.list_posts(scope, 100000);
     match posts.into_iter().find(|p| p.0 == id) {
         Some(p) => {
-            if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1)
-            {
+            if seller_scope(&session).is_some_and(|s| s != p.1) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1917,7 +1961,7 @@ async fn posts_update(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
+    if seller_scope(&session).is_some_and(|s| s != p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     let new_content = f.content.or(f.text);
@@ -1929,7 +1973,9 @@ async fn posts_update(
         let bot = crate::web::effective_bot(&state, &session);
         if let Err(hold) = crate::handlers::moderation::gate_outbound(
             &state.db,
-            session.seller_id.unwrap_or(0),
+            session
+                .seller_namespace()
+                .unwrap_or(crate::roles::TenantScope::DENIED_ID),
             Some(bot.id),
             c,
         ) {
@@ -1962,7 +2008,7 @@ async fn posts_delete(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
+    if seller_scope(&session).is_some_and(|s| s != p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -1999,7 +2045,7 @@ async fn posts_pin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
+    if seller_scope(&session).is_some_and(|s| s != p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -2027,7 +2073,7 @@ async fn posts_unpin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(p.1) {
+    if seller_scope(&session).is_some_and(|s| s != p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -2064,9 +2110,11 @@ async fn broadcasts(
         .into_response();
     }
     let recipients = if Role::from_role_str(&session.role) == Role::Seller {
-        state
-            .db
-            .list_users_for_seller(session.seller_id.unwrap_or(0))
+        state.db.list_users_for_seller(
+            session
+                .seller_namespace()
+                .unwrap_or(crate::roles::TenantScope::DENIED_ID),
+        )
     } else {
         state.db.list_users()
     };
@@ -2077,7 +2125,9 @@ async fn broadcasts(
     // covers every recipient; seller scope comes from the session principal.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
-        session.seller_id.unwrap_or(0),
+        session
+            .seller_namespace()
+            .unwrap_or(crate::roles::TenantScope::DENIED_ID),
         Some(bot.id),
         &f.text,
     ) {
@@ -2114,7 +2164,14 @@ async fn channels_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let _ = session;
+    if session.seller_namespace().is_none() {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    }
     (StatusCode::OK, Json(serde_json::json!({"channel": id}))).into_response()
 }
 
@@ -2176,17 +2233,9 @@ async fn users_get(
     };
     let (uid, username) = state.db.get_user(user_id).unwrap_or((user_id, None));
     let mut resp = serde_json::json!({"user_id": uid, "username": username});
-    if Role::from_role_str(&session.role) == Role::Seller {
-        let scope = session.seller_id;
-        let subs = state.db.list_subscriptions(scope, 1000);
-        let cnt = subs.iter().filter(|s| s.2 == user_id).count();
-        resp["subscription_count"] = serde_json::json!(cnt);
-    } else {
-        // admin: count across all
-        let subs = state.db.list_subscriptions(None, 1000);
-        let cnt = subs.iter().filter(|s| s.2 == user_id).count();
-        resp["subscription_count"] = serde_json::json!(cnt);
-    }
+    let subs = state.db.list_subscriptions(seller_scope(&session), 1000);
+    let cnt = subs.iter().filter(|s| s.2 == user_id).count();
+    resp["subscription_count"] = serde_json::json!(cnt);
     (StatusCode::OK, Json(resp)).into_response()
 }
 
@@ -2204,7 +2253,14 @@ async fn users_upsert(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let _ = session;
+    if session.seller_namespace().is_none() {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    }
     state.db.upsert_user(f.user_id, f.username.as_deref());
     (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -2219,7 +2275,14 @@ async fn ai_templates_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     match state.db.get_ai_template(seller_id, &name) {
         Some(t) => (StatusCode::OK, Json(serde_json::json!({
             "name": t.0, "description": t.1, "system_prompt": t.2, "user_prompt": t.3, "variables": t.4,
@@ -2245,7 +2308,14 @@ async fn ai_templates_update(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let existing = state.db.get_ai_template(seller_id, &name);
     let description = f
         .description
@@ -2288,7 +2358,14 @@ async fn ai_templates_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     state.db.delete_ai_template(seller_id, &name);
     state.db.log_action(
         session.account_id,
@@ -2307,6 +2384,14 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    if session.seller_namespace().is_none() {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    }
     let ids = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
@@ -2420,7 +2505,14 @@ async fn config_get_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let _ = session;
+    if session.seller_namespace().is_none() {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    }
     let ch = state.db.get_config("channel").unwrap_or_default();
     (StatusCode::OK, Json(serde_json::json!({"channel": ch}))).into_response()
 }
@@ -2454,7 +2546,14 @@ async fn ai_templates_list(State(state): State<WebState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let tpls = state.db.list_ai_templates(seller_id);
     let items: Vec<serde_json::Value> = tpls
         .into_iter()
@@ -2480,7 +2579,14 @@ async fn ai_templates_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     state.db.upsert_ai_template(
         seller_id,
         &f.name,
@@ -2505,7 +2611,14 @@ async fn ai_usage(State(state): State<WebState>, headers: HeaderMap) -> impl Int
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let summary = state.db.ai_usage_summary(seller_id, 30);
     let items: Vec<serde_json::Value> = summary
         .into_iter()
@@ -3278,7 +3391,7 @@ async fn finance_refunds_create(
         }
     };
     let (inv_amount, inv_asset, inv_status, _desc, _plan, inv_user, inv_seller) = inv;
-    if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(inv_seller) {
+    if seller_scope(&session).is_some_and(|s| s != inv_seller) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
     // Only settled money can be returned. `paid_ungranted` is still paid

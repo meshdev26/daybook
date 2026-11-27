@@ -744,6 +744,45 @@ async fn test_web_account_update_password() {
     assert!(db.verify_web_password("bob", "newpw").await.is_some());
 }
 
+/// The creation boundary: a seller-tier account with no seller binding is the
+/// fail-open state (None was read as "unscoped / every tenant"), so minting one
+/// must be impossible. Every other (role, binding) pair stays valid.
+#[tokio::test]
+async fn create_web_account_refuses_scopeless_seller() {
+    let path = "/tmp/opencode/test_create_scopeless_seller.db";
+    let _ = fs::remove_file(path);
+    let db = Db::new(path).unwrap();
+
+    let err = db
+        .create_web_account("ghost-seller", "pw", "seller", None)
+        .await
+        .expect_err("a seller with no binding must be refused");
+    assert!(err.contains("seller binding"), "{err}");
+    assert!(
+        db.get_web_account_by_username("ghost-seller").is_none(),
+        "the refused account must not be persisted"
+    );
+
+    // A bound seller, an owner, an admin and a buyer are all still creatable.
+    db.create_web_account("bound-seller", "pw", "seller", Some(42))
+        .await
+        .expect("a bound seller is legitimate");
+    db.create_web_account("boss", "pw", "owner", None)
+        .await
+        .expect("the owner is platform-level");
+    db.create_web_account("ops", "pw", "admin", None)
+        .await
+        .expect("an admin may be platform-level");
+    db.create_web_account("shopper", "pw", "user", None)
+        .await
+        .expect("a buyer holds no tenant grant");
+
+    // The legacy escape hatch is exactly what it says: it can still write the
+    // refused state, which is how the old rows are modelled in tests.
+    db.insert_legacy_web_account("legacy-ghost", "seller", None);
+    assert!(db.get_web_account_by_username("legacy-ghost").is_some());
+}
+
 #[tokio::test]
 async fn test_web_session_lifecycle() {
     let path = "/tmp/opencode/test_web_session_lifecycle.db";
@@ -2846,6 +2885,23 @@ fn test_channels_add_list_set_default_default_channel() {
     assert_eq!(db.default_channel().as_deref(), Some("@c2"));
     let scoped = db.list_channels(Some(5));
     assert_eq!(scoped.len(), 2);
+}
+
+#[test]
+fn list_channels_denied_scope_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chan-denied.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    db.add_channel("@global", 0).unwrap();
+    db.add_channel("@own", 5).unwrap();
+
+    assert_eq!(db.list_channels(None).len(), 2);
+    assert_eq!(db.list_channels(Some(5)).len(), 2);
+    assert!(
+        db.list_channels(Some(crate::roles::TenantScope::DENIED_ID))
+            .is_empty(),
+        "the denied sentinel must not widen to the global namespace"
+    );
 }
 
 #[test]

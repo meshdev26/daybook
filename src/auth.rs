@@ -164,6 +164,14 @@ pub fn session_from_headers(state: &WebState, headers: &HeaderMap) -> Option<Ses
 
 fn try_session(state: &WebState, token: &str) -> Option<Session> {
     let (account_id, role, seller_id, selected_bot_id) = state.db.get_web_session(token)?;
+    // Load-side half of the creation boundary (see `create_web_account`): a
+    // session whose role is seller-tier but which carries no seller binding has
+    // no tenant, and used to resolve to the platform view wherever a handler read
+    // `seller_id` as `None`/"unscoped". Such rows can pre-date the fix, so they
+    // are refused here as well -- the credential simply does not resolve.
+    if !crate::roles::session_is_usable(&role, seller_id) {
+        return None;
+    }
     Some(Session {
         account_id,
         role,

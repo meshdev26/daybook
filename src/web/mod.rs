@@ -194,6 +194,42 @@ pub struct Session {
     pub csrf_token: String,
 }
 
+impl Session {
+    /// The console tenant scope for this session.
+    ///
+    /// `Some(None)`   platform operator view (owner, or any admin);
+    /// `Some(Some(id))` exactly that seller's rows;
+    /// `None`         no tenant authority at all.
+    ///
+    /// A `seller` with no binding, and the buyer `user` tier, both have no
+    /// tenant to act as, so both are `None`. Handlers must refuse `None`
+    /// (403 / redirect to /login-adjacent) rather than read the old
+    /// `session.seller_id.unwrap_or(0)`, which turned a missing binding into
+    /// the platform namespace and let either tier write global rows.
+    ///
+    /// This delegates to `Role::tenant_scope`, so an unknown or misspelled
+    /// role string is classified exactly like `user` and never inherits the
+    /// operator view.
+    pub fn tenant_scope(&self) -> Option<Option<i64>> {
+        Role::from_role_str(&self.role)
+            .tenant_scope(self.seller_id)
+            .console_scope()
+    }
+
+    /// The seller id to *write* as, for the `Db` methods whose namespace is a
+    /// plain `i64` (`add_plan`, `add_product`, `set_product_active`, ...).
+    ///
+    /// `0` is the documented platform namespace, so an operator session writes
+    /// there. `None` means the session has no tenant (seller without a binding,
+    /// or the buyer `user` tier): callers must refuse, never fall back to `0`.
+    /// This is exactly `tenant_scope` flattened, so the read and write rules
+    /// cannot drift apart.
+    pub fn seller_namespace(&self) -> Option<i64> {
+        self.tenant_scope()
+            .map(|scope| scope.unwrap_or(crate::roles::TenantScope::PLATFORM_ID))
+    }
+}
+
 /// HTML-escapes a dynamic value before it is interpolated into an HTML body
 /// or an attribute value. Must be applied to every non-numeric dynamic value.
 /// Public so the fuzz targets can exercise it.

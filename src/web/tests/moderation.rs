@@ -239,21 +239,49 @@ async fn blocked_words_admin_without_seller_uses_global_scope() {
     assert!(state.db.get_blocked_word(42, "x").is_none());
 
     // A seller without a seller binding still fails closed: no widening.
+    //
+    // Such an account can no longer be *created* (create_web_account refuses it,
+    // asserted in db::tests), but a database provisioned before that guard can
+    // already hold one, so the authorization path must still refuse it. The row
+    // is fabricated directly to model exactly that legacy state.
     state
         .db
-        .create_web_account("scopeless-seller", "secret", "seller", None)
-        .await
-        .unwrap();
+        .insert_legacy_web_account("legacy-scopeless-seller", "seller", None);
     let (sid, _u, _h, _r, _s) = state
         .db
-        .get_web_account_by_username("scopeless-seller")
+        .get_web_account_by_username("legacy-scopeless-seller")
         .unwrap();
     let scopeless = state.db.create_web_session(sid, "seller", None, 7);
+    // Load gate: the legacy session does not even resolve.
+    assert!(
+        crate::auth::session_from_headers(
+            &state,
+            &axum::http::HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {scopeless}")).unwrap()
+            )])
+        )
+        .is_none(),
+        "a scopeless seller session must not resolve"
+    );
+    // Over HTTP the same refusal surfaces as "not signed in": the unresolved
+    // session is redirected to /login before any page gate runs. Assert the
+    // redirect rather than a 403, because the loader rejects it first and there
+    // is no session for the page gate to forbid.
     let resp = app
         .oneshot(authed_req("/blocked-words", &scopeless))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        resp.status().is_redirection(),
+        "expected fail-closed redirect, got {}",
+        resp.status()
+    );
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("/login"), "{loc}");
+    // Fail closed means no widening: the global floor is untouched by the
+    // attempt. (The scoped `seller_id=42` form is refused earlier in this test.)
+    assert!(state.db.get_blocked_word(0, "x").is_none());
 }
 
 /// Content policy stays owner-only after the ordered-role change: an admin,

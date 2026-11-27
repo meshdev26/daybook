@@ -1714,3 +1714,232 @@ async fn mutating_routes_require_session_and_never_mutate_another_tenant() {
         "primary bot received traffic"
     );
 }
+
+/// A web account whose role carries no tenant authority must not fall into the
+/// operator arm of a console write. The buyer tier is provisionable through the
+/// owner-only REST endpoint with an arbitrary role string; its cookie therefore
+/// has to fail closed at every route that derives a namespace from the session.
+#[tokio::test]
+async fn tenantless_console_session_cannot_write_in_the_global_namespace() {
+    let f = make_fixture().await;
+    let s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+
+    f.db.create_web_account("tenantless-buyer", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-buyer")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    // A real B-owned ticket: without it the ticket gates could pass vacuously.
+    let ticket_id = f.db.create_ticket(B, 5_002, "iso ticket B");
+    let ticket_before = f.db.get_ticket(ticket_id);
+
+    let posts = [
+        (
+            "create plan",
+            "/plan",
+            "name=foreign&price=1&asset=USDT&duration_days=1",
+        ),
+        ("delete plan by name", "/plandel", "name=iso_beta_plan"),
+        (
+            "delete plan by id",
+            &format!("/plans/{}/delete", s.b_plan),
+            "",
+        ),
+        (
+            "create product",
+            "/product",
+            "name=foreign&price=1&asset=USDT&kind=digital",
+        ),
+        ("delete product", "/productdel", "name=iso_beta_product"),
+        (
+            "activate product",
+            "/product/activate",
+            "name=iso_beta_product",
+        ),
+        (
+            "delete code",
+            "/codes/delete",
+            &format!("code={}", s.b_code),
+        ),
+        (
+            "reclaim code",
+            "/codes/reclaim",
+            &format!("code={}", s.b_code),
+        ),
+        ("revoke promo", "/promos/revoke", "code=iso_beta_promo"),
+        ("approve review", "/reviews/approve", "id=1"),
+        (
+            "reply to ticket",
+            "/tickets/reply",
+            &format!("ticket_id={ticket_id}&text=foreign"),
+        ),
+        (
+            "set ticket status",
+            "/tickets/status",
+            &format!("ticket_id={ticket_id}&status=closed"),
+        ),
+    ];
+    for (label, path, form) in posts {
+        let (status, body) = console(&f.app, &buyer, "POST", path, form).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+    }
+
+    assert_eq!(
+        victim_snapshot(&f.db),
+        before,
+        "a tenantless console POST changed B rows"
+    );
+    assert_eq!(
+        f.db.get_ticket(ticket_id),
+        ticket_before,
+        "a tenantless console POST changed B's ticket"
+    );
+    assert_eq!(
+        request_count(&f.b.server).await,
+        0,
+        "tenant B bot received traffic"
+    );
+    assert_eq!(
+        request_count(&f.primary).await,
+        0,
+        "primary bot received traffic"
+    );
+}
+
+/// The buyer tier can hold a REST bearer but no tenant authority. The old
+/// seller-only equality gates fell through for that tier and exposed another
+/// seller's rows; the scope gates must refuse it while the owner still reads.
+#[tokio::test]
+async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
+    let f = make_fixture().await;
+    let s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+    let invoice_before = f.db.get_invoice(&s.b_invoice);
+
+    f.db.create_web_account("tenantless-rest-buyer", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-rest-buyer")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    let get_paths = [
+        format!("/api/v1/sellers/{B}"),
+        format!("/api/v1/plans/{}", s.b_plan),
+        format!("/api/v1/invoices/{}", s.b_invoice),
+        format!("/api/v1/codes/{}", s.b_code),
+        "/api/v1/users".to_string(),
+        "/api/v1/ai/templates".to_string(),
+        "/api/v1/ai/usage".to_string(),
+    ];
+    for path in &get_paths {
+        let (status, body) = rest(&f.app, &buyer, "GET", path, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "buyer GET {path}: {body}");
+        assert!(
+            !body.contains(B_MARK),
+            "buyer GET {path} leaked B marker: {body}"
+        );
+
+        let (status, body) = rest(&f.app, &f.owner_session, "GET", path, None).await;
+        assert_eq!(status, StatusCode::OK, "owner control GET {path}: {body}");
+    }
+
+    // Users detail keeps the documented username read for the buyer tier; the
+    // subscription count alone is scope-gated (denied sentinel => 0).
+    let (status, body) = rest(&f.app, &buyer, "GET", "/api/v1/users/5002", None).await;
+    assert_eq!(status, StatusCode::OK, "buyer GET user detail: {body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["subscription_count"], 0, "buyer user detail count");
+    assert!(
+        !body.contains(B_MARK),
+        "buyer GET user detail leaked B marker: {body}"
+    );
+    let (status, body) = rest(&f.app, &f.owner_session, "GET", "/api/v1/users/5002", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "owner control GET user detail: {body}"
+    );
+
+    let (status, body) = rest(
+        &f.app,
+        &buyer,
+        "POST",
+        &format!("/api/v1/invoices/{}/status", s.b_invoice),
+        Some(json!({"status": "expired"})),
+    )
+    .await;
+    assert!(
+        is_denied(status),
+        "buyer invoice status POST: {status} {body}"
+    );
+
+    let (status, body) = rest(
+        &f.app,
+        &buyer,
+        "POST",
+        "/api/v1/invoices",
+        Some(json!({"amount": "1", "asset": "USDT", "user_id": 5002, "description": "iso B_MARK"})),
+    )
+    .await;
+    assert!(
+        is_denied(status),
+        "buyer invoice create POST: {status} {body}"
+    );
+
+    assert_eq!(
+        victim_snapshot(&f.db),
+        before,
+        "a tenantless REST request changed B rows"
+    );
+    assert_eq!(
+        f.db.get_invoice(&s.b_invoice),
+        invoice_before,
+        "a tenantless REST request changed B's invoice"
+    );
+}
+
+/// Console reads must not hand a tenantless session the operator's global list.
+/// Owner and bound seller controls keep their previous views.
+#[tokio::test]
+async fn tenantless_console_session_cannot_read_other_tenants() {
+    let f = make_fixture().await;
+    seed(&f.db);
+
+    f.db.create_web_account("tenantless-reader", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-reader")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    let paths = [
+        "/dashboard",
+        "/plans",
+        "/products",
+        "/posts",
+        "/codes",
+        "/subs",
+        "/referrals",
+        "/orders",
+        "/customers",
+        "/analytics",
+        "/tickets",
+        "/channels",
+        "/promos",
+    ];
+    for path in paths {
+        let (status, body) = console(&f.app, &buyer, "GET", path, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "buyer GET {path}: {body}");
+        assert!(!body.contains(B_MARK), "buyer GET {path} leaked B: {body}");
+
+        let (status, body) = console(&f.app, &f.owner_session, "GET", path, "").await;
+        assert_eq!(status, StatusCode::OK, "owner control GET {path}: {body}");
+    }
+}

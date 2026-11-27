@@ -58,6 +58,9 @@ pub(super) async fn promos_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Promos", "Promos").into_response();
+    }
     let promos = if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             state.db.list_promo_codes(sid)
@@ -243,12 +246,16 @@ pub(super) async fn promos_revoke(
     if code.is_empty() {
         return Redirect::to(&state.url("/promos")).into_response();
     }
-    if Role::from_role_str(&session.role) == Role::Seller {
-        if let Some(sid) = session.seller_id {
+    // The `_all` variant has no tenant predicate. Only operators may reach it;
+    // a seller is bound to its own namespace and a tenantless session is refused.
+    match session.tenant_scope() {
+        Some(None) => {
+            state.db.revoke_promo_code_all(&code);
+        }
+        Some(Some(sid)) => {
             state.db.revoke_promo_code(sid, &code);
         }
-    } else {
-        state.db.revoke_promo_code_all(&code);
+        None => return forbidden_page(&state, "Promos", "Promos").into_response(),
     }
     // E7: the confirm names the code, but the outcome used to be silent.
     Redirect::to(&state.url("/promos?revoked=1")).into_response()
