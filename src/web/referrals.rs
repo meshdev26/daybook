@@ -9,6 +9,9 @@ pub(super) async fn referrals_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Referrals", "Referrals").into_response();
+    }
     // Collect referrals across the visible seller scope.
     let mut all: Vec<(i64, i64, i64, i64, String, String, f64)> = Vec::new(); // (seller, id, referrer, referee, code, status, reward)
     if Role::from_role_str(&session.role) == Role::Seller {
@@ -166,6 +169,9 @@ pub(super) async fn orders_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Orders", "Orders").into_response();
+    }
     let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -264,6 +270,9 @@ pub(super) async fn reviews_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Reviews", "Reviews").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {

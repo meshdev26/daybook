@@ -143,6 +143,9 @@ pub(super) async fn subs_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Subscriptions", "Subscriptions").into_response();
+    }
     let status_filter = normalize_sub_status(q.status.clone());
     let page: i64 = q
         .page
@@ -522,6 +525,9 @@ pub(super) async fn subs_export(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Subscriptions", "Subscriptions").into_response();
+    }
     let is_owner = Role::from_role_str(&session.role).has_level(Role::Owner);
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id

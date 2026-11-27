@@ -58,6 +58,9 @@ pub(super) async fn promos_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Promos", "Promos").into_response();
+    }
     let promos = if Role::from_role_str(&session.role) == Role::Seller {
         if let Some(sid) = session.seller_id {
             state.db.list_promo_codes(sid)

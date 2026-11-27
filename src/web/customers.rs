@@ -89,6 +89,9 @@ pub(super) async fn customers_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Customers", "Customers").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -293,6 +296,9 @@ pub(super) async fn tickets_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Tickets", "Tickets").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {

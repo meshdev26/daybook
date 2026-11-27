@@ -186,6 +186,9 @@ pub(super) async fn channels_manage_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Channels", "Channels").into_response();
+    }
     let Some(ch) = q
         .channel
         .as_deref()

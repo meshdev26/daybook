@@ -1903,3 +1903,43 @@ async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
         "a tenantless REST request changed B's invoice"
     );
 }
+
+/// Console reads must not hand a tenantless session the operator's global list.
+/// Owner and bound seller controls keep their previous views.
+#[tokio::test]
+async fn tenantless_console_session_cannot_read_other_tenants() {
+    let f = make_fixture().await;
+    seed(&f.db);
+
+    f.db.create_web_account("tenantless-reader", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-reader")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    let paths = [
+        "/dashboard",
+        "/plans",
+        "/products",
+        "/posts",
+        "/codes",
+        "/subs",
+        "/referrals",
+        "/orders",
+        "/customers",
+        "/analytics",
+        "/tickets",
+        "/channels",
+        "/promos",
+    ];
+    for path in paths {
+        let (status, body) = console(&f.app, &buyer, "GET", path, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "buyer GET {path}: {body}");
+        assert!(!body.contains(B_MARK), "buyer GET {path} leaked B: {body}");
+
+        let (status, body) = console(&f.app, &f.owner_session, "GET", path, "").await;
+        assert_eq!(status, StatusCode::OK, "owner control GET {path}: {body}");
+    }
+}

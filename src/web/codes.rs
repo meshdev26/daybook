@@ -20,6 +20,9 @@ pub(super) async fn codes_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Codes", "Codes").into_response();
+    }
     let banner = codes_banner(&q);
     let body = codes_body(&state, &session, &banner);
     Html(html_page(&state, Some(&session), "Codes", &body)).into_response()

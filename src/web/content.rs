@@ -45,6 +45,9 @@ pub(super) async fn plans_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Plans", "Plans").into_response();
+    }
     let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -107,6 +110,9 @@ pub(super) async fn posts_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Posts", "Posts").into_response();
+    }
     let scope = if Role::from_role_str(&session.role) == Role::Seller {
         session.seller_id
     } else {
@@ -570,6 +576,9 @@ pub(super) async fn products_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Products", "Products").into_response();
+    }
     let banner = products_banner(&q);
     let body = products_body(&state, &session, &banner);
     Html(html_page(&state, Some(&session), "Products", &body)).into_response()
