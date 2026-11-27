@@ -41,5 +41,5 @@ Expected: token accepted or rejected is reported; operator diagnostics only, nev
 ## 7. Sign-off
 
 Date each observation; keep issue #1 open. Publish, tag and push are human-only actions.
-Verbatim sentence that must remain (docs/SECURITY.md:46):
+Verbatim sentence that must remain (docs/SECURITY.md:47):
 "this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open."

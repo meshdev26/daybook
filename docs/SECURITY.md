@@ -24,13 +24,13 @@
   maps `seller` + NULL to `Denied`, not to the global view, and its `Db` scope is a
   negative sentinel that matches no tenant row; account creation and the session
   loader refuse that pair outright.
-- REST tenant gates now reject the buyer tier. Nineteen of the twenty negative
+- REST tenant gates now reject the buyer tier. Nineteen of the twenty-one negative
   equality gates were converted to a positive tier-floor check; `invoices_claim`
-  keeps its buyer self-claim carve-out (`src/api.rs:4730-4744`). An earlier draft
+  keeps its buyer self-claim carve-out (`src/api.rs:4797-4801`). An earlier draft
   claimed 41 gates and said `invoices_status` had no status allowlist. Both were
   wrong: the paid and paid_ungranted states were already refused, failed was
   owner-only, and the reachable forged value was `executed`, which analytics
-  counts (`src/db.rs:9194`). Invoice status changes now allow only active,
+  counts (`src/db.rs:9218`). Invoice status changes now allow only active,
   expired and cancelled. Tenantless sessions also refuse the console write
   routes, the REST namespace writes, and the global user lists. The MCP delete
   tool is scoped to its seller as an invariant; the Sensitive owner gate had

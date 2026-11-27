@@ -37,8 +37,9 @@ verification remain open.
   used. That pair previously resolved to the platform/global view, so REST
   handlers scoped by `seller_scope` widened to every tenant. `Role::tenant_scope`
   now resolves it to `Denied`, `create_web_account` refuses it at creation, and
-  the session loader refuses a pre-existing row. Owner, admin and buyer `user`
-  accounts keep their existing scope. The console's create form now reports the
+  the session loader refuses a pre-existing row. Owner and admin keep their
+  global view; a buyer `user` session is now refused by tenant-scoped handlers.
+  The console's create form now reports the
   refusal with a specific message instead of a generic failure.
 - Security: console writes by a session with no tenant binding are refused
   instead of landing in the platform namespace. Plans, products, posts, codes,
