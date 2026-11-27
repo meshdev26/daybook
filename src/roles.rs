@@ -97,6 +97,12 @@ impl TenantScope {
     /// privileged, so `-1` can only under-select, never over-select.
     pub const DENIED_ID: i64 = -1;
 
+    /// The platform / global namespace in `Db`: rows whose `seller_id` is `0`
+    /// are the operator's own, and the migrations backfilled every legacy row
+    /// here as well. It is not "no row" -- it is a real owner, so only the operator
+    /// tiers may write it.
+    pub const PLATFORM_ID: i64 = 0;
+
     /// The `Option<i64>` the `Db` layer takes, where `None` means "all rows".
     ///
     /// `Denied` maps to [`Self::DENIED_ID`], never `None` — the whole point of
@@ -112,6 +118,18 @@ impl TenantScope {
     /// True when the request must be refused before any data access.
     pub fn is_denied(self) -> bool {
         matches!(self, TenantScope::Denied)
+    }
+
+    /// The console's read/write scope: `Some(None)` is the platform view,
+    /// `Some(Some(id))` one tenant, and `None` a refusal. Keeping this
+    /// conversion beside the resolver stops the two surfaces from disagreeing
+    /// about which tiers hold authority.
+    pub fn console_scope(self) -> Option<Option<i64>> {
+        match self {
+            Self::Global => Some(None),
+            Self::Seller(id) => Some(Some(id)),
+            Self::Denied => None,
+        }
     }
 }
 

@@ -372,9 +372,15 @@ pub(super) async fn create_post(
             if sender.is_bot() {
                 crate::metrics::bot_sent();
             }
-            // Record the row with the sender it actually used — the posts
+            // Record the row with the sender it actually used -- the posts
             // page badge is a fact about the row, not the current binding.
-            let seller_id = session.seller_id.unwrap_or(0);
+            //
+            // A sender with no tenant has no namespace to file this row in:
+            // the old `unwrap_or(0)` attributed it to the operator. The
+            // message has already been delivered, so report the scope failure.
+            let Some(seller_id) = session.seller_namespace() else {
+                return Redirect::to(&state.url("/dashboard?post_error=scope")).into_response();
+            };
             let message_id = i32::try_from(sent.message_id).unwrap_or(0);
             if let Err(e) = state.db.log_post(
                 seller_id,
@@ -422,7 +428,12 @@ pub(super) async fn create_plan(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    // A seller acts inside its own namespace; owner/admin act globally. A
+    // session with no tenant (seller without a binding, or the buyer `user`
+    // tier) is refused rather than defaulting to the platform namespace 0.
+    let Some(seller_id) = session.seller_namespace() else {
+        return forbidden_page(&state, "Plans", "Plans");
+    };
     let name = f.name.trim().to_string();
     let price = f.price.trim().to_string();
     let asset = f.asset.trim().to_string();
@@ -466,20 +477,26 @@ pub(super) async fn delete_plan_by_name(
     let Some(name) = name else {
         return Redirect::to(&state.url("/plans")).into_response();
     };
-    if let Some(sid) = session.seller_id {
-        state.db.remove_plan(sid, &name);
-    } else {
-        // Owner/admin: resolve the plan's owning seller from the
-        // (seller_id, name) namespace instead of the retired
-        // get_plan_global. Falls back to the global namespace (0).
-        let sid = state
-            .db
-            .list_plans(None)
-            .into_iter()
-            .find(|p| p.0 == name)
-            .map(|p| p.6)
-            .unwrap_or(0);
-        state.db.remove_plan(sid, &name);
+    // Plan names are unique per seller, not globally, so a delete BY NAME must
+    // know whose namespace it is in. A seller deletes its own; an operator may
+    // delete from any namespace (the console lists every plan, so the name was
+    // resolved across all of them, and that authority is kept here). A session
+    // with no tenant -- a seller with no binding, or the buyer `user` tier -- has
+    // no namespace at all, and the old `else` arm silently treated it as the
+    // operator and deleted the *platform* plan of that name.
+    match session.tenant_scope() {
+        Some(Some(sid)) => state.db.remove_plan(sid, &name),
+        Some(None) => {
+            let sid = state
+                .db
+                .list_plans(None)
+                .into_iter()
+                .find(|p| p.0 == name)
+                .map(|p| p.6)
+                .unwrap_or(0);
+            state.db.remove_plan(sid, &name)
+        }
+        None => return forbidden_page(&state, "Plans", "Plans"),
     }
     Redirect::to(&state.url("/plans?deleted=1")).into_response()
 }
@@ -495,8 +512,14 @@ pub(super) async fn delete_plan_by_id(
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
     if let Some((sid, price, asset, name, days, channel)) = state.db.get_plan_by_id(id) {
-        if Role::from_role_str(&session.role) == Role::Seller && session.seller_id != Some(sid) {
-            return Redirect::to(&state.url("/plans")).into_response();
+        // The owner comes from the row, never the request. Operators may delete
+        // any namespace, sellers only their own, and a session with no tenant
+        // has no namespace to delete in.
+        match session.tenant_scope() {
+            Some(None) => {}
+            Some(Some(own)) if own == sid => {}
+            Some(Some(_)) => return Redirect::to(&state.url("/plans")).into_response(),
+            None => return forbidden_page(&state, "Plans", "Plans").into_response(),
         }
         let _ = (price, asset, days, channel);
         state.db.remove_plan(sid, &name);
@@ -661,7 +684,11 @@ pub(super) async fn create_product(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    // Same tenant rule as create_plan: a seller writes its own namespace, an
+    // operator the platform one, and a session with no tenant is refused.
+    let Some(seller_id) = session.seller_namespace() else {
+        return forbidden_page(&state, "Products", "Products");
+    };
     let name = f.name.trim().to_string();
     let price = f.price.trim().to_string();
     let asset = f.asset.trim().to_string();
@@ -721,7 +748,9 @@ pub(super) async fn delete_product(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller = session.seller_id.unwrap_or(0);
+    let Some(seller) = session.seller_namespace() else {
+        return forbidden_page(&state, "Products", "Products");
+    };
     let name = f.name.trim().to_string();
     if !name.is_empty() {
         state.db.set_product_active(seller, &name, false);
@@ -746,7 +775,9 @@ pub(super) async fn product_activate(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller = session.seller_id.unwrap_or(0);
+    let Some(seller) = session.seller_namespace() else {
+        return forbidden_page(&state, "Products", "Products");
+    };
     let name = f.name.trim().to_string();
     if !name.is_empty() {
         state.db.set_product_active(seller, &name, true);

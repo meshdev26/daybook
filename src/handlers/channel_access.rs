@@ -85,6 +85,13 @@ pub fn may_post_to_channel(
         return true;
     }
     let key = channel_key(channel);
+    // The extra global-row allowance is a seller privilege. Without a tenant
+    // binding, a buyer or unknown-role principal would otherwise deliver a
+    // message through the operator's bot and only fail afterwards when the row
+    // is attributed. Operator tiers already passed `may_mutate_channel`.
+    if !Role::from_role_str(session_role).has_level(Role::Seller) || session_seller_id.is_none() {
+        return false;
+    }
     !key.is_empty() && owns_channel_row(db, 0, channel)
 }
 
@@ -170,6 +177,15 @@ mod tests {
             3,
             None,
             "@victim"
+        ));
+        // A tenantless principal must not reach the global row either: the
+        // send happens before the caller can attribute the post to a tenant.
+        assert!(!may_post_to_channel(&db, "user", None, 4, None, "@global"));
+        assert!(!may_post_to_channel(
+            &db, "seller", None, 4, None, "@global"
+        ));
+        assert!(!may_post_to_channel(
+            &db, "unknown", None, 4, None, "@global"
         ));
     }
 }

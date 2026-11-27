@@ -198,7 +198,11 @@ pub(super) async fn channels_manage_page(
     if Role::from_role_str(&session.role) == Role::Seller {
         // The seller's own channel (the legacy entry may have no `channels`
         // row — the sellers column is the source of truth), NOCASE-matched.
-        let sid = session.seller_id.unwrap_or(0);
+        // A seller without a binding has no channel; 0 would be the operator's.
+        let Some(sid) = session.seller_id else {
+            let body = channels_manage_refusal(&state, "That channel isn't yours to manage.");
+            return Html(html_page(&state, Some(&session), "Channels", &body)).into_response();
+        };
         let own = state
             .db
             .seller_channel(sid)
@@ -491,7 +495,9 @@ fn channels_manage_body_seller(
     q: &ChannelsQuery,
 ) -> String {
     let banners = channels_banners(q, state, session).join("\n");
-    let sid = session.seller_id.unwrap_or(0);
+    let Some(sid) = session.seller_id else {
+        return channels_manage_refusal(state, "That channel isn't yours to manage.");
+    };
     // Same label contract as the seller rows (CHANNELS_TITLE_UX_SPEC §2):
     // the title is read from the channels table, case-insensitively.
     let title = state

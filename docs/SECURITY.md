@@ -24,13 +24,17 @@
   maps `seller` + NULL to `Denied`, not to the global view, and its `Db` scope is a
   negative sentinel that matches no tenant row; account creation and the session
   loader refuse that pair outright.
-- Diagnosed, not yet fixed, in this branch: REST handlers that gate with a *negative
-  equality* (`role == Seller && seller_id != Some(target)`) let every other tier --
-  including a buyer `user` session -- fall through to the unscoped `Db` call. That
-  includes `invoices_status`, which has no status allowlist, so a money-integrity
-  write reaches any tenant's invoice. Do not rely on the isolation claims above until
-  those gates are positive (`!has_level(...) && binding != Some(target)`). Tracked
-  in this branch's follow-up commits, not in this one.
+- Diagnosed, not yet fixed, in this branch: 21 REST gates use a *negative equality*
+  (`role == Seller && seller_id != Some(target)`). Any other tier, including a buyer
+  `user` bearer, skips the check. The verified consequences are cross-tenant reads
+  and writes of plans, AI settings and invoice state, plus global `users` rows and
+  arbitrary invoice `status` strings. An earlier draft of this note said
+  `invoices_status` had no status allowlist and could forge a paid invoice. That is
+  wrong: `paid`, `paid_ungranted` and `failed` are all refused or owner-gated
+  (`src/api.rs:1431-1470`). The reachable value is `executed`, which console and MCP
+  revenue analytics count (`src/db.rs:9194`), so the exposure is analytics-revenue
+  forgery and money-state corruption, not a payout or a settled-payment forgery.
+  Do not rely on the isolation claims above until those gates check the tier floor.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)

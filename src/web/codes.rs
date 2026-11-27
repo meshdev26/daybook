@@ -216,10 +216,13 @@ pub(super) async fn codes_delete(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
+    // `None` in `delete_code_seller_scoped` means every tenant, so only the
+    // operator tier may use it. A seller is bound to its own namespace; a
+    // session with no tenancy is refused, not promoted to the global arm.
+    let scope = match session.tenant_scope() {
+        Some(None) => None,
+        Some(Some(sid)) => Some(sid),
+        None => return forbidden_page(&state, "Codes", "Codes").into_response(),
     };
     state.db.delete_code_seller_scoped(&f.code, scope);
     Redirect::to(&state.url("/codes?deleted=1")).into_response()
@@ -241,10 +244,12 @@ pub(super) async fn codes_reclaim(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let scope = if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
+    // `reclaim_code` skips its ownership check for `None`, so that scope is
+    // operator-only. A tenantless session must not reclaim another seller's code.
+    let scope = match session.tenant_scope() {
+        Some(None) => None,
+        Some(Some(sid)) => Some(sid),
+        None => return forbidden_page(&state, "Codes", "Codes").into_response(),
     };
     // The inline length field is gone (E4); the 12 default stays here.
     let length: usize = f

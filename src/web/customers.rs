@@ -453,14 +453,17 @@ pub(super) async fn tickets_reply(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
+    // A ticket is addressed by a bare id, so the scope check is the only
+    // ownership gate. `None` used to mean "operator" here, which also admitted
+    // the buyer tier and let it write into another tenant's ticket as "seller".
+    let scope = match session.tenant_scope() {
+        Some(None) => None,
+        Some(Some(sid)) => Some(sid),
+        None => return forbidden_page(&state, "Tickets", "Tickets").into_response(),
     };
     if let Some(t) = state.db.get_ticket(f.ticket_id) {
         let (_id, seller_id, _buyer, _subj, _status, _c, _u) = t;
-        if seller_scope.is_none() || seller_scope == Some(seller_id) {
+        if scope.is_none() || scope == Some(seller_id) {
             let role_str = if Role::from_role_str(&session.role).has_level(Role::Admin) {
                 "admin"
             } else {
@@ -484,14 +487,16 @@ pub(super) async fn tickets_status(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    let seller_scope = if Role::from_role_str(&session.role) == Role::Seller {
-        session.seller_id
-    } else {
-        None
+    // `set_ticket_status` takes a bare id with no tenant predicate; only the
+    // operator tier may use the unscoped form.
+    let scope = match session.tenant_scope() {
+        Some(None) => None,
+        Some(Some(sid)) => Some(sid),
+        None => return forbidden_page(&state, "Tickets", "Tickets").into_response(),
     };
     if let Some(t) = state.db.get_ticket(f.ticket_id) {
         let (_id, seller_id, _buyer, _subj, _status, _c, _u) = t;
-        if seller_scope.is_none() || seller_scope == Some(seller_id) {
+        if scope.is_none() || scope == Some(seller_id) {
             let _ = state.db.set_ticket_status(f.ticket_id, &f.status);
         }
     }

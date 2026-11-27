@@ -344,6 +344,12 @@ pub(super) async fn reviews_approve(
                 .map(|r| r.0)
         })
         .collect();
+    // `approve_review` takes a bare row id, so the allow-list above is the
+    // only ownership check. Operators see every row; a tenantless session has
+    // no products, hence no reviews to approve.
+    if session.tenant_scope().is_none() {
+        return forbidden_page(&state, "Reviews", "Reviews").into_response();
+    }
     if Role::from_role_str(&session.role) == Role::Seller && !allowed.contains(&f.id) {
         return Redirect::to(&state.url("/reviews")).into_response();
     }

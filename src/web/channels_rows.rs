@@ -209,7 +209,11 @@ pub(super) fn render_seller_channels(
     success: &String,
     q: Option<&ChannelsQuery>,
 ) -> String {
-    let sid = session.seller_id.unwrap_or(0);
+    // Seller pages have no channel when the binding is absent; falling back to
+    // the platform namespace would render the operator's row as theirs.
+    let Some(sid) = session.seller_id else {
+        return r#"<li class="empty"><b>No channel yet.</b> Add one, or use /setchannel in the bot.</li>"#.to_string();
+    };
     let focus = added_focus(q);
     let list = match state.db.seller_channel(sid) {
         Some(ch) => {

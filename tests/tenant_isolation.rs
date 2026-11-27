@@ -1714,3 +1714,98 @@ async fn mutating_routes_require_session_and_never_mutate_another_tenant() {
         "primary bot received traffic"
     );
 }
+
+/// A web account whose role carries no tenant authority must not fall into the
+/// operator arm of a console write. The buyer tier is provisionable through the
+/// owner-only REST endpoint with an arbitrary role string; its cookie therefore
+/// has to fail closed at every route that derives a namespace from the session.
+#[tokio::test]
+async fn tenantless_console_session_cannot_write_in_the_global_namespace() {
+    let f = make_fixture().await;
+    let s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+
+    f.db.create_web_account("tenantless-buyer", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-buyer")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    // A real B-owned ticket: without it the ticket gates could pass vacuously.
+    let ticket_id = f.db.create_ticket(B, 5_002, "iso ticket B");
+    let ticket_before = f.db.get_ticket(ticket_id);
+
+    let posts = [
+        (
+            "create plan",
+            "/plan",
+            "name=foreign&price=1&asset=USDT&duration_days=1",
+        ),
+        ("delete plan by name", "/plandel", "name=iso_beta_plan"),
+        (
+            "delete plan by id",
+            &format!("/plans/{}/delete", s.b_plan),
+            "",
+        ),
+        (
+            "create product",
+            "/product",
+            "name=foreign&price=1&asset=USDT&kind=digital",
+        ),
+        ("delete product", "/productdel", "name=iso_beta_product"),
+        (
+            "activate product",
+            "/product/activate",
+            "name=iso_beta_product",
+        ),
+        (
+            "delete code",
+            "/codes/delete",
+            &format!("code={}", s.b_code),
+        ),
+        (
+            "reclaim code",
+            "/codes/reclaim",
+            &format!("code={}", s.b_code),
+        ),
+        ("revoke promo", "/promos/revoke", "code=iso_beta_promo"),
+        ("approve review", "/reviews/approve", "id=1"),
+        (
+            "reply to ticket",
+            "/tickets/reply",
+            &format!("ticket_id={ticket_id}&text=foreign"),
+        ),
+        (
+            "set ticket status",
+            "/tickets/status",
+            &format!("ticket_id={ticket_id}&status=closed"),
+        ),
+    ];
+    for (label, path, form) in posts {
+        let (status, body) = console(&f.app, &buyer, "POST", path, form).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+    }
+
+    assert_eq!(
+        victim_snapshot(&f.db),
+        before,
+        "a tenantless console POST changed B rows"
+    );
+    assert_eq!(
+        f.db.get_ticket(ticket_id),
+        ticket_before,
+        "a tenantless console POST changed B's ticket"
+    );
+    assert_eq!(
+        request_count(&f.b.server).await,
+        0,
+        "tenant B bot received traffic"
+    );
+    assert_eq!(
+        request_count(&f.primary).await,
+        0,
+        "primary bot received traffic"
+    );
+}
