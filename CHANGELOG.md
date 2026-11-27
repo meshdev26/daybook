@@ -53,6 +53,11 @@ verification remain open.
   `delete_post_is_tenant_scoped_for_sellers_and_owner`.
 - Security: the denied tenant sentinel no longer widens `list_channels` to the
   platform namespace. Covered by `list_channels_denied_scope_returns_empty`.
+- Security: console read pages refuse a tenantless session instead of showing
+  every tenant's rows. Buyer nav entries are unchanged. Covered by
+  `tenantless_console_session_cannot_read_other_tenants`.
+- Security: a buyer redeeming a code can no longer name a third-party
+  beneficiary. The documented buyer redemption flow is unchanged.
 
 ## [0.4.2-alpha]
 

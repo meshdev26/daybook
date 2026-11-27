@@ -35,10 +35,11 @@
   routes, the REST namespace writes, and the global user lists. The MCP delete
   tool is scoped to its seller as an invariant; the Sensitive owner gate had
   already blocked non-owners.
-- Known gaps: 19 console read pages still give a tenantless session the global
-  list. Whether a buyer should have console views at all is an owner decision.
-  `codes_redeem` has no tier floor pending a decision on the supported buyer
-  redemption flow, and the buyer self-claim carve-out above is intentional.
+- Console read pages now refuse a tenantless session instead of handing it the
+  global list. Buyer nav entries are still visible; removing them is an owner
+  surface decision. `codes_redeem` keeps the buyer redemption flow but ignores a
+  caller-supplied beneficiary for the user tier. The buyer invoice self-claim
+  and code redemption flows remain supported as documented in `docs/API.md`.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)
