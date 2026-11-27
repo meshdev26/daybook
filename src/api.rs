@@ -1348,7 +1348,14 @@ async fn invoices_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let inv_id = format!("inv_{}", crate::util::gen_token(16));
     state.db.save_invoice(
         &inv_id,
@@ -2209,17 +2216,9 @@ async fn users_get(
     };
     let (uid, username) = state.db.get_user(user_id).unwrap_or((user_id, None));
     let mut resp = serde_json::json!({"user_id": uid, "username": username});
-    if Role::from_role_str(&session.role) == Role::Seller {
-        let scope = session.seller_id;
-        let subs = state.db.list_subscriptions(scope, 1000);
-        let cnt = subs.iter().filter(|s| s.2 == user_id).count();
-        resp["subscription_count"] = serde_json::json!(cnt);
-    } else {
-        // admin: count across all
-        let subs = state.db.list_subscriptions(None, 1000);
-        let cnt = subs.iter().filter(|s| s.2 == user_id).count();
-        resp["subscription_count"] = serde_json::json!(cnt);
-    }
+    let subs = state.db.list_subscriptions(seller_scope(&session), 1000);
+    let cnt = subs.iter().filter(|s| s.2 == user_id).count();
+    resp["subscription_count"] = serde_json::json!(cnt);
     (StatusCode::OK, Json(resp)).into_response()
 }
 
@@ -2259,7 +2258,14 @@ async fn ai_templates_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     match state.db.get_ai_template(seller_id, &name) {
         Some(t) => (StatusCode::OK, Json(serde_json::json!({
             "name": t.0, "description": t.1, "system_prompt": t.2, "user_prompt": t.3, "variables": t.4,
@@ -2285,7 +2291,14 @@ async fn ai_templates_update(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let existing = state.db.get_ai_template(seller_id, &name);
     let description = f
         .description
@@ -2328,7 +2341,14 @@ async fn ai_templates_delete(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     state.db.delete_ai_template(seller_id, &name);
     state.db.log_action(
         session.account_id,
@@ -2347,6 +2367,14 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    if session.seller_namespace().is_none() {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    }
     let ids = if Role::from_role_str(&session.role) == Role::Seller {
         state
             .db
@@ -2501,7 +2529,14 @@ async fn ai_templates_list(State(state): State<WebState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let tpls = state.db.list_ai_templates(seller_id);
     let items: Vec<serde_json::Value> = tpls
         .into_iter()
@@ -2527,7 +2562,14 @@ async fn ai_templates_create(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     state.db.upsert_ai_template(
         seller_id,
         &f.name,
@@ -2552,7 +2594,14 @@ async fn ai_usage(State(state): State<WebState>, headers: HeaderMap) -> impl Int
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let Some(seller_id) = session.seller_namespace() else {
+        return err(
+            StatusCode::FORBIDDEN,
+            "not_a_seller",
+            "seller profile required",
+        )
+        .into_response();
+    };
     let summary = state.db.ai_usage_summary(seller_id, 30);
     let items: Vec<serde_json::Value> = summary
         .into_iter()

@@ -1833,6 +1833,9 @@ async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
         format!("/api/v1/plans/{}", s.b_plan),
         format!("/api/v1/invoices/{}", s.b_invoice),
         format!("/api/v1/codes/{}", s.b_code),
+        "/api/v1/users".to_string(),
+        "/api/v1/ai/templates".to_string(),
+        "/api/v1/ai/usage".to_string(),
     ];
     for path in &get_paths {
         let (status, body) = rest(&f.app, &buyer, "GET", path, None).await;
@@ -1846,6 +1849,23 @@ async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
         assert_eq!(status, StatusCode::OK, "owner control GET {path}: {body}");
     }
 
+    // Users detail keeps the documented username read for the buyer tier; the
+    // subscription count alone is scope-gated (denied sentinel => 0).
+    let (status, body) = rest(&f.app, &buyer, "GET", "/api/v1/users/5002", None).await;
+    assert_eq!(status, StatusCode::OK, "buyer GET user detail: {body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["subscription_count"], 0, "buyer user detail count");
+    assert!(
+        !body.contains(B_MARK),
+        "buyer GET user detail leaked B marker: {body}"
+    );
+    let (status, body) = rest(&f.app, &f.owner_session, "GET", "/api/v1/users/5002", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "owner control GET user detail: {body}"
+    );
+
     let (status, body) = rest(
         &f.app,
         &buyer,
@@ -1857,6 +1877,19 @@ async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
     assert!(
         is_denied(status),
         "buyer invoice status POST: {status} {body}"
+    );
+
+    let (status, body) = rest(
+        &f.app,
+        &buyer,
+        "POST",
+        "/api/v1/invoices",
+        Some(json!({"amount": "1", "asset": "USDT", "user_id": 5002, "description": "iso B_MARK"})),
+    )
+    .await;
+    assert!(
+        is_denied(status),
+        "buyer invoice create POST: {status} {body}"
     );
 
     assert_eq!(
