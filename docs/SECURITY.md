@@ -40,6 +40,16 @@
   surface decision. `codes_redeem` keeps the buyer redemption flow but ignores a
   caller-supplied beneficiary for the user tier. The buyer invoice self-claim
   and code redemption flows remain supported as documented in `docs/API.md`.
+- Local adversarial self-validation is in `tests/adversarial_local.rs`: eight
+  loopback cases cover invoice status forgery, foreign review and ticket writes,
+  seller MCP deletion, forged seller ids, tenantless console reads, legacy
+  seller sessions and the denied-sentinel id collision. The sentinel case was
+  shown red (buyer got 200 and created `sellers(-1)`) before the shared
+  ownership helper was fixed. This is not an independent penetration test.
+- Residual S3 findings from the adversarial review, not fixed here: the login
+  throttle map evicts old buckets after 1024 keys, so a flood of unknown
+  usernames can reset a victim's lockout; and the MCP rate bucket keys owner by
+  role ordinal 3, which collides with a real seller whose id is 3.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)

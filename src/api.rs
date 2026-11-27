@@ -80,6 +80,16 @@ fn seller_scope(session: &crate::web::Session) -> Option<i64> {
         .as_opt()
 }
 
+/// Ownership check for a row id supplied by the caller. The denied sentinel
+/// still has to be refused explicitly: `Some(-1) != -1` would otherwise let a
+/// buyer name the sentinel itself and pass an equality-based gate.
+fn may_act_on_seller(session: &crate::web::Session, target: i64) -> bool {
+    let Some(scope) = seller_scope(session) else {
+        return true;
+    };
+    scope != crate::roles::TenantScope::DENIED_ID && scope == target
+}
+
 /// §2: every money approval, execution, void and resolution requires the
 /// Owner role (not merely Admin+). Returns the spec's `owner_required` 403.
 fn owner_gate(session: &crate::web::Session) -> Result<(), (StatusCode, Json<ApiError>)> {
@@ -608,7 +618,7 @@ async fn seller_get(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != user_id) {
+    if !may_act_on_seller(&session, user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -723,7 +733,7 @@ async fn seller_set_channel(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != user_id) {
+    if !may_act_on_seller(&session, user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -810,7 +820,7 @@ async fn seller_get_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != user_id) {
+    if !may_act_on_seller(&session, user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -844,7 +854,7 @@ async fn seller_set_ai_settings(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != user_id) {
+    if !may_act_on_seller(&session, user_id) {
         return err(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -992,7 +1002,7 @@ async fn plans_get(
     // find by id via list (no get_plan_by_id scoping helper exists for seller; use get_plan_by_id then check)
     match state.db.get_plan_by_id(id) {
         Some((sid, price, asset, name, days, channel)) => {
-            if seller_scope(&session).is_some_and(|s| s != sid) {
+            if !may_act_on_seller(&session, sid) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1028,7 +1038,7 @@ async fn plans_update(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if seller_scope(&session).is_some_and(|s| s != sid) {
+    if !may_act_on_seller(&session, sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     // Re-add plan with merged fields (add_plan is upsert by seller+name)
@@ -1081,7 +1091,7 @@ async fn plans_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if seller_scope(&session).is_some_and(|s| s != sid) {
+    if !may_act_on_seller(&session, sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     state.db.remove_plan(sid, &name);
@@ -1108,7 +1118,7 @@ async fn plans_active(
             return err(StatusCode::NOT_FOUND, "not_found", "plan not found").into_response();
         }
     };
-    if seller_scope(&session).is_some_and(|s| s != sid) {
+    if !may_act_on_seller(&session, sid) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your plan").into_response();
     }
     if f.active {
@@ -1387,7 +1397,7 @@ async fn invoices_get(
     };
     match state.db.get_invoice(&invoice_id) {
         Some((amount, asset, status, desc, plan_id, user_id, seller_id)) => {
-            if seller_scope(&session).is_some_and(|s| s != seller_id) {
+            if !may_act_on_seller(&session, seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1417,7 +1427,7 @@ async fn invoices_status(
     };
     // ownership check
     if let Some((_a, _as, _st, _d, _p, _u, sid)) = state.db.get_invoice(&invoice_id) {
-        if seller_scope(&session).is_some_and(|s| s != sid) {
+        if !may_act_on_seller(&session, sid) {
             return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
         }
     } else {
@@ -1607,7 +1617,7 @@ async fn codes_get(
     };
     match state.db.get_code(&code) {
         Some((id, seller_id, plan_id, value_days, max_uses, uses, expires_at)) => {
-            if seller_scope(&session).is_some_and(|s| s != seller_id) {
+            if !may_act_on_seller(&session, seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1634,7 +1644,7 @@ async fn codes_delete(
             return err(StatusCode::NOT_FOUND, "not_found", "code not found").into_response();
         }
     };
-    if seller_scope(&session).is_some_and(|s| s != seller_id) {
+    if !may_act_on_seller(&session, seller_id) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
     }
     // Real delete via the scoped helper (server db.rs addition): sellers delete
@@ -1731,7 +1741,7 @@ async fn codes_redemptions(
     };
     match state.db.get_code(&code) {
         Some((_id, seller_id, _p, _v, _m, _u, _e)) => {
-            if seller_scope(&session).is_some_and(|s| s != seller_id) {
+            if !may_act_on_seller(&session, seller_id) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your code").into_response();
             }
         }
@@ -1929,7 +1939,7 @@ async fn posts_get(
     let posts = state.db.list_posts(scope, 100000);
     match posts.into_iter().find(|p| p.0 == id) {
         Some(p) => {
-            if seller_scope(&session).is_some_and(|s| s != p.1) {
+            if !may_act_on_seller(&session, p.1) {
                 return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
             }
             (StatusCode::OK, Json(serde_json::json!({
@@ -1961,7 +1971,7 @@ async fn posts_update(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != p.1) {
+    if !may_act_on_seller(&session, p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     let new_content = f.content.or(f.text);
@@ -2008,7 +2018,7 @@ async fn posts_delete(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != p.1) {
+    if !may_act_on_seller(&session, p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -2045,7 +2055,7 @@ async fn posts_pin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != p.1) {
+    if !may_act_on_seller(&session, p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -2073,7 +2083,7 @@ async fn posts_unpin(
         Some(p) => p,
         None => return err(StatusCode::NOT_FOUND, "not_found", "post not found").into_response(),
     };
-    if seller_scope(&session).is_some_and(|s| s != p.1) {
+    if !may_act_on_seller(&session, p.1) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your post").into_response();
     }
     if p.3 != 0 {
@@ -3391,7 +3401,7 @@ async fn finance_refunds_create(
         }
     };
     let (inv_amount, inv_asset, inv_status, _desc, _plan, inv_user, inv_seller) = inv;
-    if seller_scope(&session).is_some_and(|s| s != inv_seller) {
+    if !may_act_on_seller(&session, inv_seller) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your invoice").into_response();
     }
     // Only settled money can be returned. `paid_ungranted` is still paid
