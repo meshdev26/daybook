@@ -40,6 +40,19 @@ verification remain open.
   the session loader refuses a pre-existing row. Owner, admin and buyer `user`
   accounts keep their existing scope. The console's create form now reports the
   refusal with a specific message instead of a generic failure.
+- Security: console writes by a session with no tenant binding are refused
+  instead of landing in the platform namespace. Plans, products, posts, codes,
+  promos, reviews and tickets are covered; the composer target gate is shared
+  with REST. Covered by `tenantless_console_session_cannot_write_in_the_global_namespace`.
+- Security: REST negative-equality gates now reject the buyer tier. Nineteen
+  gates use a positive tier-floor check, invoice status changes are allow-listed,
+  and global user and namespace writes refuse tenantless sessions. Covered by
+  `tenantless_rest_session_cannot_read_or_write_other_tenants`.
+- Security: MCP `delete_post` is scoped to the acting seller. This hardens the
+  invariant; the Sensitive owner gate already blocked non-owners. Covered by
+  `delete_post_is_tenant_scoped_for_sellers_and_owner`.
+- Security: the denied tenant sentinel no longer widens `list_channels` to the
+  platform namespace. Covered by `list_channels_denied_scope_returns_empty`.
 
 ## [0.4.2-alpha]
 
