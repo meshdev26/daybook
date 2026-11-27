@@ -23,9 +23,9 @@ Expected: exit code 0 each. Gate health only, NOT penetration-test evidence.
 
 ## 4. Isolation suite
 
-`cargo test --test tenant_isolation`; expect all 12 tests to pass:
+`cargo test --test tenant_isolation`; expect all 13 tests to pass:
 `rest_reads_expose_only_the_callers_rows`, `rest_single_item_and_admin_reads_fail_closed_for_sellers`, `rest_writes_ignore_forged_owner_fields_and_preserve_victim_rows`, `mcp_read_tools_are_scoped_per_seller_and_owner_sees_both`, `mcp_write_tools_ignore_bot_and_seller_spoofs`, `mcp_sensitive_and_identity_tools_refuse_both_sellers_before_validation`.
-`console_pages_and_posts_are_tenant_scoped`, `bot_resolution_follows_seller_and_channel_ownership`, `expire_check_must_not_touch_another_tenants_subscriptions`, `mutating_routes_require_session_and_never_mutate_another_tenant`, `tenantless_console_session_cannot_write_in_the_global_namespace`, `tenantless_rest_session_cannot_read_or_write_other_tenants`.
+`console_pages_and_posts_are_tenant_scoped`, `bot_resolution_follows_seller_and_channel_ownership`, `expire_check_must_not_touch_another_tenants_subscriptions`, `mutating_routes_require_session_and_never_mutate_another_tenant`, `tenantless_console_session_cannot_write_in_the_global_namespace`, `tenantless_rest_session_cannot_read_or_write_other_tenants`, `tenantless_console_session_cannot_read_other_tenants`.
 Expected: own markers present, foreign markers absent, forged ids leave `victim_snapshot` unchanged, B/primary bots get zero requests, tenantless sessions refused.
 
 ## 5. Bot regression
@@ -41,5 +41,5 @@ Expected: token accepted or rejected is reported; operator diagnostics only, nev
 ## 7. Sign-off
 
 Date each observation; keep issue #1 open. Publish, tag and push are human-only actions.
-Verbatim sentence that must remain (docs/SECURITY.md:46):
+Verbatim sentence that must remain (docs/SECURITY.md:47):
 "this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open."

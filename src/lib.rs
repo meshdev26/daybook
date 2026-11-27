@@ -4,6 +4,7 @@
 //! the modules as a lib keeps them fuzzable (`fuzz/`) and integration-testable
 //! without going through the process boundary.
 
+pub mod adapters;
 pub mod ai;
 pub mod api;
 pub mod auth;
