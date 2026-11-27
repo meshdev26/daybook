@@ -1680,7 +1680,12 @@ async fn codes_redeem(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let user_id = f.user_id.unwrap_or(session.account_id);
+    // Tier floor: a user-tier caller must not name a beneficiary in the body.
+    let user_id = if Role::from_role_str(&session.role) == Role::User {
+        session.account_id
+    } else {
+        f.user_id.unwrap_or(session.account_id)
+    };
     // Pre-flight seller-channel check (mirrors /redeem): redeem_code burns a
     // use unconditionally, so a code whose seller has nowhere to grant INTO
     // must be refused untouched, not consumed (P1#7).
