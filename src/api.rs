@@ -1817,7 +1817,9 @@ async fn posts_create(
     // principal (session), never a global 0, so seller rules apply too.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
-        session.seller_id.unwrap_or(0),
+        session
+            .seller_namespace()
+            .unwrap_or(crate::roles::TenantScope::DENIED_ID),
         Some(bot.id),
         &f.text,
     ) {
@@ -1831,7 +1833,9 @@ async fn posts_create(
         Ok(m) => m.id.0,
         Err(_) => 0,
     };
-    let seller_id = session.seller_id.unwrap_or(0);
+    let seller_id = session
+        .seller_namespace()
+        .unwrap_or(crate::roles::TenantScope::DENIED_ID);
     let _ = state
         .db
         .log_post(seller_id, &ch, msg_id, "text", Some(&f.text), "bot");
@@ -1885,7 +1889,9 @@ async fn posts_schedule(
     if !api_may_mutate_channel(&state, &session, &ch) {
         return err(StatusCode::FORBIDDEN, "forbidden", "not your channel").into_response();
     }
-    let seller_id = session.seller_id.unwrap_or(0);
+    let seller_id = session
+        .seller_namespace()
+        .unwrap_or(crate::roles::TenantScope::DENIED_ID);
     let id = state
         .db
         .create_scheduled_post(seller_id, &ch, &f.text, "text", &f.scheduled_at);
@@ -1962,7 +1968,9 @@ async fn posts_update(
         let bot = crate::web::effective_bot(&state, &session);
         if let Err(hold) = crate::handlers::moderation::gate_outbound(
             &state.db,
-            session.seller_id.unwrap_or(0),
+            session
+                .seller_namespace()
+                .unwrap_or(crate::roles::TenantScope::DENIED_ID),
             Some(bot.id),
             c,
         ) {
@@ -2097,9 +2105,11 @@ async fn broadcasts(
         .into_response();
     }
     let recipients = if Role::from_role_str(&session.role) == Role::Seller {
-        state
-            .db
-            .list_users_for_seller(session.seller_id.unwrap_or(0))
+        state.db.list_users_for_seller(
+            session
+                .seller_namespace()
+                .unwrap_or(crate::roles::TenantScope::DENIED_ID),
+        )
     } else {
         state.db.list_users()
     };
@@ -2110,7 +2120,9 @@ async fn broadcasts(
     // covers every recipient; seller scope comes from the session principal.
     if let Err(hold) = crate::handlers::moderation::gate_outbound(
         &state.db,
-        session.seller_id.unwrap_or(0),
+        session
+            .seller_namespace()
+            .unwrap_or(crate::roles::TenantScope::DENIED_ID),
         Some(bot.id),
         &f.text,
     ) {

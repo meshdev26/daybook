@@ -7609,6 +7609,11 @@ impl Db {
     /// List channels: `None` = every row (owner view); `Some(seller)` = the
     /// global namespace plus that seller's own rows, in insertion order.
     pub fn list_channels(&self, seller_scope: Option<i64>) -> Vec<ChannelRow> {
+        // The scoped predicate unions the platform namespace, so the denied
+        // sentinel would otherwise still return the global rows.
+        if seller_scope == Some(crate::roles::TenantScope::DENIED_ID) {
+            return Vec::new();
+        }
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let sql = match seller_scope {
             Some(_) => {

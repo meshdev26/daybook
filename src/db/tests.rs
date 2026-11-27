@@ -2888,6 +2888,23 @@ fn test_channels_add_list_set_default_default_channel() {
 }
 
 #[test]
+fn list_channels_denied_scope_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chan-denied.db");
+    let db = Db::new(path.to_str().unwrap()).unwrap();
+    db.add_channel("@global", 0).unwrap();
+    db.add_channel("@own", 5).unwrap();
+
+    assert_eq!(db.list_channels(None).len(), 2);
+    assert_eq!(db.list_channels(Some(5)).len(), 2);
+    assert!(
+        db.list_channels(Some(crate::roles::TenantScope::DENIED_ID))
+            .is_empty(),
+        "the denied sentinel must not widen to the global namespace"
+    );
+}
+
+#[test]
 fn test_channel_default_fallback_config() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("chanfb.db");
