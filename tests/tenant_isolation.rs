@@ -1809,3 +1809,64 @@ async fn tenantless_console_session_cannot_write_in_the_global_namespace() {
         "primary bot received traffic"
     );
 }
+
+/// The buyer tier can hold a REST bearer but no tenant authority. The old
+/// seller-only equality gates fell through for that tier and exposed another
+/// seller's rows; the scope gates must refuse it while the owner still reads.
+#[tokio::test]
+async fn tenantless_rest_session_cannot_read_or_write_other_tenants() {
+    let f = make_fixture().await;
+    let s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+    let invoice_before = f.db.get_invoice(&s.b_invoice);
+
+    f.db.create_web_account("tenantless-rest-buyer", "local-pw", "user", None)
+        .await
+        .unwrap();
+    let (id, _, _, _, _) =
+        f.db.get_web_account_by_username("tenantless-rest-buyer")
+            .unwrap();
+    let buyer = f.db.create_web_session(id, "user", None, 7);
+
+    let get_paths = [
+        format!("/api/v1/sellers/{B}"),
+        format!("/api/v1/plans/{}", s.b_plan),
+        format!("/api/v1/invoices/{}", s.b_invoice),
+        format!("/api/v1/codes/{}", s.b_code),
+    ];
+    for path in &get_paths {
+        let (status, body) = rest(&f.app, &buyer, "GET", path, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "buyer GET {path}: {body}");
+        assert!(
+            !body.contains(B_MARK),
+            "buyer GET {path} leaked B marker: {body}"
+        );
+
+        let (status, body) = rest(&f.app, &f.owner_session, "GET", path, None).await;
+        assert_eq!(status, StatusCode::OK, "owner control GET {path}: {body}");
+    }
+
+    let (status, body) = rest(
+        &f.app,
+        &buyer,
+        "POST",
+        &format!("/api/v1/invoices/{}/status", s.b_invoice),
+        Some(json!({"status": "expired"})),
+    )
+    .await;
+    assert!(
+        is_denied(status),
+        "buyer invoice status POST: {status} {body}"
+    );
+
+    assert_eq!(
+        victim_snapshot(&f.db),
+        before,
+        "a tenantless REST request changed B rows"
+    );
+    assert_eq!(
+        f.db.get_invoice(&s.b_invoice),
+        invoice_before,
+        "a tenantless REST request changed B's invoice"
+    );
+}
