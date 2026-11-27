@@ -59,8 +59,8 @@ verification remain open.
   `tenantless_console_session_cannot_read_other_tenants`.
 - Security: a buyer redeeming a code can no longer name a third-party
   beneficiary. The documented buyer redemption flow is unchanged.
-- Security: all REST ownership gates now refuse the denied sentinel before
-  comparing seller ids. A buyer could previously address `-1` as a seller id
+- Security: the converted REST ownership gates now refuse the denied sentinel
+  before comparing seller ids. A buyer could previously address `-1` as a seller id
   and create a phantom seller row. Covered by `denied_sentinel_cannot_be_used_as_a_seller_id`.
 - Test: local adversarial loopback suite with eight cases, including buyer
   invoice status forgery, foreign writes, seller MCP deletion and forged ids.

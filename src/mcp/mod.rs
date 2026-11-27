@@ -198,11 +198,9 @@ fn authenticate(web: &WebState, headers: &HeaderMap) -> Result<Principal, Box<Re
     )))
 }
 
-/// Rate-limit key: one bucket per principal — a seller is keyed by their
-/// seller id (a real Telegram user id, never colliding with the
-/// small-integer role keys), so exhausting one seller's bucket never
-/// throttles the owner or another seller. Principals without a seller id
-/// (the owner) keep the role-keyed bucket.
+/// Rate-limit key: a seller is keyed by its seller id and the owner by the
+/// role ordinal. A seller whose id equals that ordinal shares the owner bucket;
+/// this is a documented residual, not a boundary between principals.
 fn principal_key(principal: &Principal) -> i64 {
     principal.seller_id.unwrap_or(principal.role as i64)
 }

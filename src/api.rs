@@ -294,7 +294,7 @@ async fn auth_login(State(state): State<WebState>, Json(f): Json<LoginReq>) -> i
                         role,
                         seller_id,
                     })
-                    .unwrap(),
+                    .unwrap_or_default(),
                 ),
             )
                 .into_response()
@@ -434,7 +434,7 @@ async fn auth_mfa_verify(
                 role,
                 seller_id,
             })
-            .unwrap(),
+            .unwrap_or_default(),
         ),
     )
         .into_response()

@@ -142,6 +142,28 @@ proptest! {
 /// The scopeless-seller state is the defect `TenantScope` exists to close, so it
 /// gets a named assertion rather than riding on a proptest arm: `seller` + NULL
 /// must resolve to `Denied`, and `Denied` must never be spellable as the global
+/// The shared ownership gate must refuse the denied sentinel before comparing
+/// ids, or a caller can name `-1` as its own target and pass the equality test.
+#[test]
+fn ownership_gate_refuses_denied_sentinel() {
+    let session = |role: &str, sid: Option<i64>| crate::web::Session {
+        account_id: 1,
+        seller_id: sid,
+        role: role.to_string(),
+        selected_bot_id: None,
+        csrf_token: String::new(),
+    };
+
+    assert!(may_act_on_seller(&session("owner", None), -1));
+    assert!(may_act_on_seller(&session("admin", Some(7)), -1));
+    assert!(may_act_on_seller(&session("seller", Some(7)), 7));
+    assert!(!may_act_on_seller(&session("seller", Some(7)), 8));
+    assert!(!may_act_on_seller(&session("seller", None), 42));
+    assert!(!may_act_on_seller(&session("user", None), 42));
+    assert!(!may_act_on_seller(&session("user", None), -1));
+    assert!(!may_act_on_seller(&session("bogus", Some(3)), -1));
+}
+
 /// scope (`None`), which the `Db` layer reads as "every tenant's rows".
 #[test]
 fn no_scope_is_not_global() {
