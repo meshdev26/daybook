@@ -37,16 +37,30 @@ pub fn is_admin_role(role: &str) -> bool {
 
 /// True when a (role, seller binding) pair may carry tenant authority.
 ///
-/// The one state that may not is the seller tier with no binding: it has no
-/// tenant to act as, and treating it as "unscoped" is what used to widen it to
-/// the platform view. Every other tier is usable -- owner/admin are legitimately
-/// global, and `user` is a buyer account whose authority is limited elsewhere.
+/// The seller tier is a tenant grant, so it requires a *real* tenant id: a
+/// positive seller id. `None` is refused because it used to mean "unscoped,
+/// show every tenant" -- the fail-open state this gate exists to close.
+/// `Some(0)` is refused because `0` is [`TenantScope::PLATFORM_ID`], the
+/// operator namespace: a seller bound there would act as the platform owner.
+/// Negative ids are never issued to a seller (seller ids are positive Telegram
+/// user ids, and `-1` is [`TenantScope::DENIED_ID`]), so they are a malformed
+/// or fabricated binding and must fail closed too. This is checked at the gate
+/// rather than in `Role::tenant_scope`, which must still report its own
+/// `Denied` for the missing-binding sentinel.
+///
+/// Every other tier is usable -- owner/admin are legitimately global, and
+/// `user` (including an unknown role string, which parses to `User`) is a
+/// buyer account whose authority is limited elsewhere.
 ///
 /// This is the session-load gate (`api.rs::seller_scope` is the per-request
 /// view). Keeping it a pure function makes the policy testable without a DB and
 /// usable at both the mint and the load boundary.
 pub fn session_is_usable(role: &str, seller_id: Option<i64>) -> bool {
-    !(Role::from_role_str(role) == Role::Seller && seller_id.is_none())
+    match (Role::from_role_str(role), seller_id) {
+        (Role::Seller, Some(id)) => id > 0,
+        (Role::Seller, None) => false,
+        _ => true,
+    }
 }
 
 /// The tenant scope a request is allowed to act on, resolved once from the
@@ -308,5 +322,26 @@ mod tests {
         assert!(!is_admin_role("user"));
         assert!(!is_admin_role(""));
         assert!(!is_admin_role("bogus"));
+    }
+
+    #[test]
+    fn session_is_usable_requires_real_seller_binding() {
+        // Seller holds a tenant grant, so every non-positive binding is refused.
+        assert!(!session_is_usable("seller", None));
+        assert!(!session_is_usable("seller", Some(0)));
+        assert!(!session_is_usable("seller", Some(-1)));
+        assert!(!session_is_usable("seller", Some(-5)));
+        assert!(session_is_usable("seller", Some(42)));
+
+        // Owner/admin are legitimately global and buyer/unknown hold no grant:
+        // their usability must not depend on the binding value at all.
+        for role in ["owner", "admin", "user", "bogus"] {
+            for binding in [None, Some(0), Some(-1), Some(42)] {
+                assert!(
+                    session_is_usable(role, binding),
+                    "{role:?} with binding {binding:?} must stay usable"
+                );
+            }
+        }
     }
 }

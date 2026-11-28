@@ -127,6 +127,42 @@ mod tests {
         }
     }
 
+    /// Fixed cases for the canonicalization edge the proptest also samples:
+    /// unicode case/regional spellings, mixed whitespace (including a
+    /// non-breaking space that `trim` removes), and repeated `@` prefixes
+    /// must normalize identically, be idempotent, and refuse an all-prefix
+    /// target. Distinct from the proptest so a regression has a named case.
+    #[test]
+    fn channel_key_unicode_and_mixed_whitespace_is_canonical_and_fail_closed() {
+        for (input, expected) in [
+            ("\u{2003}@@MiXeD\u{00a0}Chan\u{2009}", "mixed\u{00a0}chan"),
+            ("\t@Upper\u{2028}", "upper"),
+            ("@\u{00c4}\u{00d6}\u{00dc}", "\u{00c4}\u{00d6}\u{00dc}"),
+            ("\u{00a0}@@\u{2003}", ""),
+            ("  @@  ", ""),
+            ("@\u{200b}@target", "\u{200b}@target"),
+        ] {
+            let key = channel_key(input);
+            assert_eq!(key, expected, "canonicalization of {input:?}");
+            assert_eq!(channel_key(&key), key, "second pass changed {input:?}");
+            assert!(!key.starts_with('@'), "leading @ survived: {key:?}");
+            if key.is_empty() {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Db::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+                assert!(!may_mutate_channel(&db, "seller", Some(42), 3, None, input));
+                assert!(!may_post_to_channel(
+                    &db,
+                    "seller",
+                    Some(42),
+                    3,
+                    None,
+                    input
+                ));
+                assert!(!may_mutate_channel(&db, "user", None, 4, None, input));
+            }
+        }
+    }
+
     #[test]
     fn channel_gate_matches_console_policy() {
         let dir = tempfile::tempdir().unwrap();

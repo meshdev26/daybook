@@ -783,6 +783,42 @@ async fn create_web_account_refuses_scopeless_seller() {
     assert!(db.get_web_account_by_username("legacy-ghost").is_some());
 }
 
+/// `0` is a real namespace (the operator's), not "no row". A seller bound to
+/// it would inherit the platform view, and negative ids are never issued, so
+/// neither binding may be minted. Refusal must leave no account row behind.
+#[tokio::test]
+async fn create_web_account_refuses_platform_namespace_seller() {
+    let path = "/tmp/opencode/test_create_platform_namespace_seller.db";
+    let _ = fs::remove_file(path);
+    let db = Db::new(path).unwrap();
+
+    for (username, seller_id) in [("bad-zero", 0i64), ("bad-negative", -1i64)] {
+        let err = db
+            .create_web_account(username, "pw", "seller", Some(seller_id))
+            .await
+            .expect_err("a seller bound to the platform namespace must be refused");
+        assert!(err.contains("seller binding"), "{err}");
+        assert!(
+            db.get_web_account_by_username(username).is_none(),
+            "the refused account must not be persisted"
+        );
+    }
+
+    // Real positive seller bindings and the non-seller tiers are unaffected.
+    db.create_web_account("bound-seller", "pw", "seller", Some(42))
+        .await
+        .expect("a real positive seller binding is legitimate");
+    db.create_web_account("boss", "pw", "owner", None)
+        .await
+        .expect("the owner is platform-level");
+    db.create_web_account("ops", "pw", "admin", Some(0))
+        .await
+        .expect("an admin may use the platform namespace");
+    db.create_web_account("shopper", "pw", "user", Some(0))
+        .await
+        .expect("a buyer holds no tenant grant");
+}
+
 #[tokio::test]
 async fn test_web_session_lifecycle() {
     let path = "/tmp/opencode/test_web_session_lifecycle.db";

@@ -1319,6 +1319,34 @@ async fn api_admin_web_accounts_crud() {
     let _ = db;
 }
 
+/// The owner-only REST create route passes role/seller_id through verbatim, so
+/// without the shared gate an owner could mint a seller in the platform
+/// namespace and hand out operator authority. That must fail (400) and persist
+/// no account row.
+#[tokio::test]
+async fn api_admin_web_accounts_rejects_platform_namespace_seller() {
+    let (state, _dir) = make_state().await;
+    let token = owner_token(&state);
+    let db = state.db.clone();
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/web-accounts")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::from(
+                    r#"{"username":"bad","password":"secret123","role":"seller","seller_id":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(db.get_web_account_by_username("bad").is_none());
+}
+
 // ---- Role gating ----
 #[tokio::test]
 async fn api_seller_cannot_access_admin() {

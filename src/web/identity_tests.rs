@@ -433,6 +433,142 @@ async fn login_throttle_keys_are_namespaced_against_identity_unlock() {
     );
 }
 
+/// MFA and recovery-code submissions share the `mfa:{pending token}` bucket
+/// (web and REST verify handlers). Flooding it must not lock `login:{username}`
+/// in the same map, and a login flood must not lock a fresh MFA challenge.
+/// Both directions are driven through public handlers; the map pattern is
+/// asserted with the helper copied from
+/// `login_throttle_keys_are_namespaced_identity_unlock`.
+fn mfa_pending_row(db: &crate::db::Db, account_id: i64, raw: &str) {
+    let expires = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    db.create_pending_mfa(
+        crate::web::auth_pages::sha256_hex(raw),
+        account_id,
+        "verify",
+        None::<&str>,
+        expires,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mfa_throttle_bucket_is_isolated_from_login_and_recovery() {
+    // Direction 1: five bad MFA/recovery codes trip only `mfa:`.
+    let (state, _dir) = make_state().await;
+    let attempts = state.login_attempts.clone();
+    let db = state.db.clone();
+    let (account_id, _, _, _, _) = db.get_web_account_by_username("owner").unwrap();
+    let app = router(state);
+    const RAW: &str = "mfa-throttle-victim-pending";
+    mfa_pending_row(&db, account_id, RAW);
+    for i in 0..5 {
+        let resp = app
+            .clone()
+            .oneshot(pending_post_req("/mfa/verify", "code=000000", RAW))
+            .await
+            .unwrap();
+        if i < 4 {
+            assert_eq!(resp.status(), StatusCode::OK, "mfa attempt {i}");
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "mfa attempt {i}"
+            );
+        }
+    }
+    let keys = attempts
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        keys.contains(&format!("mfa:{RAW}")),
+        "mfa bucket missing: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&format!("login:{RAW}")),
+        "mfa flood poisoned the login namespace: {keys:?}"
+    );
+    // The login victim is not locked: correct credentials still complete
+    // sign-in (owner enrollment redirect), never a 429.
+    let resp = app
+        .oneshot(post_req("/login", "username=owner&password=secret"))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "login victim locked"
+    );
+    assert!(
+        resp.status().is_redirection(),
+        "bad login outcome: {}",
+        resp.status()
+    );
+    assert_eq!(resp.headers().get("location").unwrap(), "/mfa/enroll");
+
+    // Direction 2: a login flood on `login:owner` leaves a fresh MFA/recovery
+    // challenge (same bucket the recovery-code path uses) untouched.
+    let (state2, _dir2) = make_state().await;
+    let attempts2 = state2.login_attempts.clone();
+    let db2 = state2.db.clone();
+    let (account2, _, _, _, _) = db2.get_web_account_by_username("owner").unwrap();
+    let app2 = router(state2);
+    for i in 0..5 {
+        let resp = app2
+            .clone()
+            .oneshot(post_req("/login", "username=owner&password=wrong"))
+            .await
+            .unwrap();
+        if i < 4 {
+            assert_eq!(resp.status(), StatusCode::OK, "login attempt {i}");
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "login attempt {i}"
+            );
+        }
+    }
+    const RAW2: &str = "mfa-after-login-flood";
+    mfa_pending_row(&db2, account2, RAW2);
+    let resp = app2
+        .oneshot(pending_post_req("/mfa/verify", "code=000000", RAW2))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "mfa victim locked"
+    );
+    let body = body_string(resp).await;
+    assert!(body.contains("Invalid code"), "{body}");
+    let keys2 = attempts2
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        keys2.contains(&crate::auth::login_throttle_key("owner")),
+        "login bucket missing: {keys2:?}"
+    );
+    assert!(
+        keys2.contains(&format!("mfa:{RAW2}")),
+        "mfa bucket missing: {keys2:?}"
+    );
+    assert!(
+        !keys2.contains("owner"),
+        "raw username bucket exists: {keys2:?}"
+    );
+    assert!(
+        !keys2.contains(RAW2),
+        "raw pending token bucket exists: {keys2:?}"
+    );
+}
+
 // ---- F5: wipe-and-repair ------------------------------------------
 
 #[tokio::test]

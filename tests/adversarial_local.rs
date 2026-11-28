@@ -238,6 +238,36 @@ async fn console(app: &Router, sess: &str, m: &str, p: &str, form: &str) -> (Sta
     send(app, req).await
 }
 
+/// Console GET/POST over the bearer transport. Mirrors `console()` but carries
+/// the same session token in `Authorization` instead of a `session=` cookie, so
+/// a scope-gate comparison changes only the transport.
+async fn bearer_console(
+    app: &Router,
+    sess: &str,
+    m: &str,
+    p: &str,
+    form: &str,
+) -> (StatusCode, String) {
+    let payload = if form.is_empty() {
+        String::new()
+    } else {
+        form.to_string()
+    };
+    let ct = if m == "POST" {
+        "application/x-www-form-urlencoded"
+    } else {
+        "application/json"
+    };
+    let req = Request::builder()
+        .method(m)
+        .uri(p)
+        .header("authorization", format!("Bearer {sess}"))
+        .header("content-type", ct)
+        .body(Body::from(payload))
+        .unwrap();
+    send(app, req).await
+}
+
 async fn mcp_call(app: &Router, tok: &str, tool: &str, args: Value) -> Value {
     let rpc = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}});
     let (code, text) = rest(app, tok, "POST", "/api/v1/mcp", rpc).await;
@@ -620,4 +650,129 @@ async fn sentinel_target_is_refused_for_bound_seller_too() {
         f.db.get_seller(-1).is_none(),
         "phantom seller -1 appeared after the own-seller control"
     );
+}
+
+/// A buyer has no seller scope: zero and ordinary negative ids must be refused
+/// like the `-1` sentinel, without opening a phantom namespace. Observed on
+/// the merged router: the seller routes gate on scope first and answer 403;
+/// `/api/v1/plans/0` looks the row up first and answers 404. Route and body
+/// shapes follow tenant_isolation.rs.
+#[tokio::test]
+async fn zero_and_non_sentinel_negative_seller_target_ids_are_refused() {
+    let f = make_fixture().await;
+    let _s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+
+    let cases = [
+        (
+            "GET",
+            "/api/v1/sellers/0",
+            Value::Null,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "GET",
+            "/api/v1/sellers/-5",
+            Value::Null,
+            StatusCode::FORBIDDEN,
+        ),
+        ("GET", "/api/v1/plans/0", Value::Null, StatusCode::NOT_FOUND),
+        (
+            "POST",
+            "/api/v1/sellers/0/ai-settings",
+            json!({"daily_token_budget": 999999999}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            "/api/v1/sellers/-5/ai-settings",
+            json!({"daily_token_budget": 999999999}),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (method, path, body, expected) in cases {
+        let (code, text) = rest(&f.app, &f.buyer_session, method, path, body).await;
+        assert_eq!(code, expected, "buyer {method} {path}: {code} {text}");
+    }
+    assert_eq!(victim_snapshot(&f.db), before, "tenant B rows changed");
+    for id in [0_i64, -5] {
+        assert!(f.db.get_seller(id).is_none(), "phantom seller {id} created");
+        assert!(
+            f.db.list_plans(Some(id)).is_empty(),
+            "phantom plans under {id}"
+        );
+    }
+}
+
+/// The two transports resolve the same session and must land on the same
+/// scope gate. A buyer is denied on every protected console page through both
+/// the cookie and the bearer header; seller A and the owner are allowed through
+/// both, so a matching denial cannot be an unrelated transport failure.
+#[tokio::test]
+async fn cookie_and_bearer_sessions_have_identical_scope_gates() {
+    let f = make_fixture().await;
+    let _s = seed(&f.db);
+    let pages = ["/dashboard", "/plans", "/subs", "/customers"];
+    for p in pages {
+        let (cookie_code, cookie_body) = console(&f.app, &f.buyer_session, "GET", p, "").await;
+        let (bearer_code, bearer_body) =
+            bearer_console(&f.app, &f.buyer_session, "GET", p, "").await;
+        assert_eq!(
+            cookie_code,
+            StatusCode::FORBIDDEN,
+            "buyer cookie {p}: {cookie_code} {cookie_body}"
+        );
+        assert_eq!(
+            bearer_code, cookie_code,
+            "buyer bearer {p}: {bearer_code} {bearer_body}"
+        );
+        assert!(
+            !cookie_body.contains(B_MARK) && !bearer_body.contains(B_MARK),
+            "buyer {p} leaked tenant B through a transport"
+        );
+    }
+    // Controls: a bound seller and an owner reach the same pages over both
+    // transports. The owner's /plans view spans both tenants (tenant_isolation.rs
+    // uses the same control), proving the buyer's denial is a scope gate.
+    for p in ["/dashboard", "/plans", "/subs"] {
+        let (cookie_code, cookie_body) = console(&f.app, &f.a_session, "GET", p, "").await;
+        let (bearer_code, bearer_body) = bearer_console(&f.app, &f.a_session, "GET", p, "").await;
+        assert_eq!(
+            cookie_code,
+            StatusCode::OK,
+            "seller A cookie {p}: {cookie_code} {cookie_body}"
+        );
+        assert_eq!(
+            bearer_code, cookie_code,
+            "seller A bearer {p}: {bearer_code} {bearer_body}"
+        );
+        assert!(
+            !cookie_body.contains(B_MARK) && !bearer_body.contains(B_MARK),
+            "seller A {p} leaked tenant B"
+        );
+    }
+    f.db.create_web_account("adv_owner", "local-pw", "owner", None)
+        .await
+        .unwrap();
+    let (owner_acc, ..) = f.db.get_web_account_by_username("adv_owner").unwrap();
+    let owner_session = f.db.create_web_session(owner_acc, "owner", None, 7);
+    for p in ["/dashboard", "/plans", "/subs"] {
+        let (cookie_code, cookie_body) = console(&f.app, &owner_session, "GET", p, "").await;
+        let (bearer_code, bearer_body) = bearer_console(&f.app, &owner_session, "GET", p, "").await;
+        assert_eq!(
+            cookie_code,
+            StatusCode::OK,
+            "owner cookie {p}: {cookie_code} {cookie_body}"
+        );
+        assert_eq!(
+            bearer_code, cookie_code,
+            "owner bearer {p}: {bearer_code} {bearer_body}"
+        );
+        if p == "/plans" {
+            assert!(
+                cookie_body.contains("adv beta plan") && bearer_body.contains("adv beta plan"),
+                "owner /plans lost the cross-tenant control: cookie={cookie_body} bearer={bearer_body}"
+            );
+        }
+    }
 }
