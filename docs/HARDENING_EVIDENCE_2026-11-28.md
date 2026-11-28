@@ -106,3 +106,18 @@ items are `implemented-but-verified-locally-red-green` and the combined tree is
 not claimed as fully verified. External gates remain open:
 independent pentest, scratch-deployment verification, owner security sign-off,
 one real seller in production for 30 days, and owner-executed tag/release.
+
+## 7. CI moderation gate
+
+A `moderation-gate` job was added to `.github/workflows/ci.yml` to run
+`cargo test --features moderation`, mirroring the existing gate job's checkout,
+toolchain, cache, and change filter. T1 plan:
+`docs/plans/2026-11-28-t1-ci-moderation-gate.md` (gitignored local record).
+
+The required red→green demonstration for this new gate did **not** complete:
+each feature-build run was cancelled by a harness restart. A temporary failing
+assertion was introduced in `src/db/tests.rs` for the red run and was reverted;
+`git diff` confirms no test file is part of this change. The CI job is
+therefore `implemented-but-unverified`, not verified. CI status must be read
+live from GitHub Actions after a human-executed push; this record does not
+claim a pass.

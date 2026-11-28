@@ -65,6 +65,22 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: make test
 
+  moderation-gate:
+    name: Gate (moderation feature)
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        if: needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@1.99.1
+      - name: Rust Cache
+        if: needs.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: Run moderation feature sweep
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --features moderation
+
   client-check:
     name: Client JS type check
     needs: changes
