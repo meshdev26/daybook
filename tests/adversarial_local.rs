@@ -495,3 +495,129 @@ async fn denied_sentinel_cannot_be_used_as_a_seller_id() {
         "phantom seller -1 was created"
     );
 }
+
+/// Read gates must refuse the denied sentinel as a target id, rather than
+/// falling through to a 404 from a missing seller row.
+#[tokio::test]
+async fn buyer_cannot_target_sentinel_in_seller_reads() {
+    let f = make_fixture().await;
+    assert!(
+        f.db.get_seller(-1).is_none(),
+        "phantom seller -1 exists before the requests"
+    );
+
+    // The router registers GET on the seller row and on its AI settings. It
+    // registers only POST on `.../channel`, so that path is exercised below
+    // with its registered method instead of a GET that would return 405.
+    for p in ["/api/v1/sellers/-1", "/api/v1/sellers/-1/ai-settings"] {
+        let (code, body) = rest(&f.app, &f.buyer_session, "GET", p, Value::Null).await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "buyer read {p}: {code} {body}");
+    }
+
+    // A negative numeric channel id skips proof-of-control for non-admins
+    // (src/api.rs), so without the ownership gate this write would succeed and
+    // `set_seller_channel(-1, ..)` would upsert a phantom sellers(-1) row.
+    let (code, body) = rest(
+        &f.app,
+        &f.buyer_session,
+        "POST",
+        "/api/v1/sellers/-1/channel",
+        json!({"channel": "-1001234567890"}),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "buyer bound a channel to seller -1: {code} {body}"
+    );
+    assert!(
+        f.db.get_seller(-1).is_none(),
+        "phantom seller -1 was created by a sentinel request"
+    );
+}
+
+/// These id-based handlers look the row up before they check ownership. `-1`
+/// names no plan or code, so the observed denial is NOT_FOUND (404), not the
+/// 403 an existing victim row would produce.
+#[tokio::test]
+async fn buyer_cannot_target_sentinel_in_plan_and_code_routes() {
+    let f = make_fixture().await;
+    let _s = seed(&f.db);
+    let before = victim_snapshot(&f.db);
+
+    let cases = [
+        ("POST", "/api/v1/plans/-1/active", json!({"active": false})),
+        (
+            "PATCH",
+            "/api/v1/plans/-1",
+            json!({"name":"sentinel-plan","price":"1","asset":"USDT","duration_days":3,"channel_id":A_CHANNEL}),
+        ),
+        ("DELETE", "/api/v1/codes/-1", Value::Null),
+    ];
+    for (method, path, body) in cases {
+        let (code, text) = rest(&f.app, &f.buyer_session, method, path, body).await;
+        assert_eq!(
+            code,
+            StatusCode::NOT_FOUND,
+            "buyer {method} {path}: {code} {text}"
+        );
+    }
+    assert_eq!(victim_snapshot(&f.db), before, "tenant B rows changed");
+    assert!(
+        f.db.list_plans(Some(-1)).is_empty(),
+        "phantom plan created under seller -1"
+    );
+    assert!(
+        f.db.list_codes(Some(-1), 100).is_empty(),
+        "phantom code created under seller -1"
+    );
+}
+
+/// A bound seller's scope is its own id, so equality with `-1` fails too.
+/// Operator tiers resolve to `None` scope and are the deliberate exception.
+#[tokio::test]
+async fn sentinel_target_is_refused_for_bound_seller_too() {
+    let f = make_fixture().await;
+    assert!(
+        f.db.get_seller(-1).is_none(),
+        "phantom seller -1 exists before the request"
+    );
+    let (code, body) = rest(
+        &f.app,
+        &f.a_session,
+        "POST",
+        "/api/v1/sellers/-1/ai-settings",
+        json!({"daily_token_budget": 999999999, "rpm_limit": 999999}),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "bound seller A wrote seller -1 ai settings: {code} {body}"
+    );
+    assert!(
+        f.db.get_seller(-1).is_none(),
+        "phantom seller -1 was created by seller A"
+    );
+
+    // Control: the same bound seller may write its own settings, so the
+    // refusal above is about the sentinel and not a broken endpoint.
+    let own = format!("/api/v1/sellers/{A}/ai-settings");
+    let (code, body) = rest(
+        &f.app,
+        &f.a_session,
+        "POST",
+        &own,
+        json!({"daily_token_budget": 1}),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "bound seller could not write own ai settings: {code} {body}"
+    );
+    assert!(
+        f.db.get_seller(-1).is_none(),
+        "phantom seller -1 appeared after the own-seller control"
+    );
+}

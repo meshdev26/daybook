@@ -33,41 +33,6 @@ verification remain open.
   attached to their own plans, owner/admin keep the global catalogue.
 - `to_chat_id` canonicalizes usernames to exactly one leading `@` and strips
   whitespace and control characters before any target reaches the Bot API.
-- A `seller` web account with no `seller_id` binding can no longer be minted or
-  used. That pair previously resolved to the platform/global view, so REST
-  handlers scoped by `seller_scope` widened to every tenant. `Role::tenant_scope`
-  now resolves it to `Denied`, `create_web_account` refuses it at creation, and
-  the session loader refuses a pre-existing row. Owner and admin keep their
-  global view; a buyer `user` session is now refused by tenant-scoped handlers.
-  The console's create form now reports the
-  refusal with a specific message instead of a generic failure.
-- Security: console writes by a session with no tenant binding are refused
-  instead of landing in the platform namespace. Plans, products, posts, codes,
-  promos, reviews and tickets are covered; the composer target gate is shared
-  with REST. Covered by `tenantless_console_session_cannot_write_in_the_global_namespace`.
-- Security: REST negative-equality gates now reject the buyer tier. Nineteen
-  gates use a positive tier-floor check, invoice status changes are allow-listed,
-  and global user and namespace writes refuse tenantless sessions. Covered by
-  `tenantless_rest_session_cannot_read_or_write_other_tenants`.
-- Security: MCP `delete_post` is scoped to the acting seller. This hardens the
-  invariant; the Sensitive owner gate already blocked non-owners. Covered by
-  `delete_post_is_tenant_scoped_for_sellers_and_owner`.
-- Security: the denied tenant sentinel no longer widens `list_channels` to the
-  platform namespace. Covered by `list_channels_denied_scope_returns_empty`.
-- Security: console read pages refuse a tenantless session instead of showing
-  every tenant's rows. Buyer nav entries are unchanged. Covered by
-  `tenantless_console_session_cannot_read_other_tenants`.
-- Security: a buyer redeeming a code can no longer name a third-party
-  beneficiary. The documented buyer redemption flow is unchanged.
-- Security: the converted REST ownership gates now refuse the denied sentinel
-  before comparing seller ids. A buyer could previously address `-1` as a seller id
-  and create a phantom seller row. Covered by `denied_sentinel_cannot_be_used_as_a_seller_id`.
-- Test: local adversarial loopback suite with eight cases, including buyer
-  invoice status forgery, foreign writes, seller MCP deletion and forged ids.
-  This is self-validation, not an independent penetration test.
-- Security: unknown-username floods can no longer evict a victim's active login
-  throttle bucket, and MCP rate keys no longer collide when a seller's id equals
-  the owner role ordinal.
 
 ## [0.4.2-alpha]
 
@@ -112,6 +77,41 @@ and the setup & management UX polish
 (`design-system/daybook/SETUP_UX_POLISH_SPEC.md`). Not yet tagged.
 
 ### Fixed
+- A `seller` web account with no `seller_id` binding can no longer be minted or
+  used. That pair previously resolved to the platform/global view, so REST
+  handlers scoped by `seller_scope` widened to every tenant. `Role::tenant_scope`
+  now resolves it to `Denied`, `create_web_account` refuses it at creation, and
+  the session loader refuses a pre-existing row. Owner and admin keep their
+  global view; a buyer `user` session is now refused by tenant-scoped handlers.
+  The console's create form now reports the
+  refusal with a specific message instead of a generic failure.
+- Security: console writes by a session with no tenant binding are refused
+  instead of landing in the platform namespace. Plans, products, posts, codes,
+  promos, reviews and tickets are covered; the composer target gate is shared
+  with REST. Covered by `tenantless_console_session_cannot_write_in_the_global_namespace`.
+- Security: REST negative-equality gates now reject the buyer tier. Nineteen
+  gates use a positive tier-floor check, invoice status changes are allow-listed,
+  and global user and namespace writes refuse tenantless sessions. Covered by
+  `tenantless_rest_session_cannot_read_or_write_other_tenants`.
+- Security: MCP `delete_post` is scoped to the acting seller. This hardens the
+  invariant; the Sensitive owner gate already blocked non-owners. Covered by
+  `delete_post_is_tenant_scoped_for_sellers_and_owner`.
+- Security: the denied tenant sentinel no longer widens `list_channels` to the
+  platform namespace. Covered by `list_channels_denied_scope_returns_empty`.
+- Security: console read pages refuse a tenantless session instead of showing
+  every tenant's rows. Buyer nav entries are unchanged. Covered by
+  `tenantless_console_session_cannot_read_other_tenants`.
+- Security: a buyer redeeming a code can no longer name a third-party
+  beneficiary. The documented buyer redemption flow is unchanged.
+- Security: the converted REST ownership gates now refuse the denied sentinel
+  before comparing seller ids. A buyer could previously address `-1` as a seller id
+  and create a phantom seller row. Covered by `denied_sentinel_cannot_be_used_as_a_seller_id`.
+- Test: local adversarial loopback suite with eight cases, including buyer
+  invoice status forgery, foreign writes, seller MCP deletion and forged ids.
+  This is self-validation, not an independent penetration test.
+- Security: unknown-username floods can no longer evict a victim's active login
+  throttle bucket, and MCP rate keys no longer collide when a seller's id equals
+  the owner role ordinal.
 - Security: `POST /api/v1/subscriptions/expire-check` is now seller-scoped — a seller token expires only that seller's active-but-expired subscriptions; owner/admin keep the global sweep used by the console and the periodic sweeper. Covered by a permanent case in the isolation suite.
 - Security: bot `/expirecheck` is seller-scoped the same way — a seller revokes and receives notices only for its own expired rows, using the caller's server-derived user id; owner/admin keep the global sweep. Covered by a regression test in `commands/tests.rs`.
 

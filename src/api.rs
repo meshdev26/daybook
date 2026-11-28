@@ -90,7 +90,7 @@ fn may_act_on_seller(session: &crate::web::Session, target: i64) -> bool {
     scope != crate::roles::TenantScope::DENIED_ID && scope == target
 }
 
-/// §2: every money approval, execution, void and resolution requires the
+/// Every money approval, execution, void and resolution requires the
 /// Owner role (not merely Admin+). Returns the spec's `owner_required` 403.
 fn owner_gate(session: &crate::web::Session) -> Result<(), (StatusCode, Json<ApiError>)> {
     if Role::from_role_str(&session.role) != Role::Owner {
@@ -103,7 +103,7 @@ fn owner_gate(session: &crate::web::Session) -> Result<(), (StatusCode, Json<Api
     Ok(())
 }
 
-/// §2 separation of duties: the human creator of a refund may never approve
+/// Separation of duties: the human creator of a refund may never approve
 /// or execute it. System-created refunds have no creator audit event and are
 /// exempt from this check (they still require an Owner approver).
 fn creator_gate(
@@ -1412,7 +1412,7 @@ async fn invoices_get(
 #[derive(Deserialize)]
 struct InvoiceStatusReq {
     status: String,
-    /// Required only for the operator-forced `failed` transition (§3.6).
+    /// Required only for the operator-forced `failed` transition, which is legal only before payment.
     reason: Option<String>,
 }
 async fn invoices_status(
@@ -1435,7 +1435,7 @@ async fn invoices_status(
     }
     // 'paid' and 'paid_ungranted' are verified/system states, never manual:
     // they may only be reached through the webhook, claim or recovery flow
-    // (§3.2/§3.6). Refuse both explicitly.
+    // (verified flows only). Refuse both explicitly.
     if f.status == "paid" || f.status == "paid_ungranted" {
         return err(
             StatusCode::BAD_REQUEST,
@@ -1445,10 +1445,10 @@ async fn invoices_status(
         .into_response();
     }
     if f.status == "failed" {
-        // §3.6 / D3.6: an operator-forced failure requires the exact Owner
+        // An operator-forced failure requires the exact Owner
         // role (not Admin/Seller), a non-empty reason, and an audit event.
         // 'failed' is legal only from a pre-payment state — never from a paid
-        // or paid_ungranted invoice (§3.1).
+        // or paid_ungranted invoice (both are paid states).
         if Role::from_role_str(&session.role) != Role::Owner {
             return err(StatusCode::FORBIDDEN, "owner_required", "owner required").into_response();
         }
@@ -2682,7 +2682,7 @@ struct FinanceRefundCreateReq {
     /// Defaults to the invoice's own amount/asset: a refund can never move
     /// money the invoice did not collect. Parsed as f64 (non-numeric is a
     /// 400); every role is clamped to the invoice amount and locked to its
-    /// asset (§1.2).
+    /// asset (all roles, without exception).
     amount: Option<String>,
     asset: Option<String>,
     reason: Option<String>,
@@ -2808,7 +2808,7 @@ async fn finance_payouts_create(
         )
         .into_response();
     };
-    // §3.5: a seller with a paid-but-ungranted invoice older than 72h whose
+    // A seller with a paid-but-ungranted invoice older than 72h whose
     // auto-refund has not executed carries an unresolved liability. New
     // payouts are blocked until that liability is resolved (the banner cannot
     // be dismissed by the seller). Internal operational target, not an SLA.
@@ -3026,7 +3026,7 @@ async fn finance_payouts_execute(
         };
         return err(StatusCode::CONFLICT, "invalid_state", msg).into_response();
     }
-    // §4.1: the guarded helper persists a fresh spend_id BEFORE the transfer
+    // The guarded helper persists a fresh spend_id BEFORE the transfer
     // and passes it to transfer_with_spend_id. No raw transfer() call may be
     // made on this path. A missing spend_id record is a hard error: no money
     // leaves the app unless its idempotency key is durable first.
@@ -3078,7 +3078,7 @@ async fn finance_payouts_execute(
         }
         GuardedTransferOutcome::Ambiguous { spend_id, error } => {
             // AMBIGUOUS: the transfer may or may not have been applied. The
-            // attempt keeps its spend_id and outcome for the §5 reconciliation
+            // attempt keeps its spend_id and outcome for reconciliation
             // flow; the row stays 'executing' (no fresh-key retry, no guessed
             // settlement).
             let meta = serde_json::json!({
@@ -3104,7 +3104,7 @@ async fn finance_payouts_execute(
         GuardedTransferOutcome::DefiniteRejected { spend_id, error } => {
             // DEFINITE rejection: the API refused the transfer, no money
             // moved. Revert the claim to 'approved'; a subsequent retry mints
-            // a NEW spend_id/attempt (§4.1 definite retry is fresh).
+            // a NEW spend_id/attempt (a definite retry is always fresh).
             state.db.finish_payout_execution(id, "approved");
             let meta = serde_json::json!({
                 "seller_id": seller_id, "amount": amount, "asset": asset,
@@ -3233,11 +3233,11 @@ async fn finance_payouts_process(
 
 /// Refund processing (manual mark-as-settled without a Crypto Pay transfer):
 /// approved -> executed, applying the SAME full/partial settlement decision as
-/// the transfer-backed execute and reconciliation paths (§1.3). The legacy
+/// the transfer-backed execute and reconciliation paths. The legacy
 /// `"processed"` status is forbidden: it bypassed the `is_full_refund` guard
 /// and expired the subscription / kicked the buyer even on a PARTIAL refund
 /// (security F1). This finalizes money, so it is Owner-only with creator separation
-/// just like `finance_refunds_execute` (§2) — an Admin must not be able to
+/// just like `finance_refunds_execute` — an Admin must not be able to
 /// bypass the two-person rule through this path.
 async fn finance_refunds_process(
     State(state): State<WebState>,
@@ -3363,7 +3363,7 @@ async fn finance_refunds_list(
 
 /// Refund creation: seller-scoped, always rooted in one of the caller's own
 /// paid invoices. Amount/asset default to the invoice's, so a refund can
-/// never move money the invoice did not collect. The §1.2 cap and asset lock
+/// never move money the invoice did not collect. The amount cap and asset lock
 /// apply to EVERY role (seller, admin and owner) — no unclamped approver
 /// shortcut. Creation goes through `create_refund_guarded` with the real
 /// actor and an idempotency key; the legacy id-0 audit wrapper is never used.
@@ -3415,7 +3415,7 @@ async fn finance_refunds_create(
         )
         .into_response();
     }
-    // §1.2: the asset lock applies to ALL roles, including admin/owner.
+    // The asset lock applies to ALL roles, including admin/owner.
     if f.asset
         .as_deref()
         .map(str::trim)
@@ -3448,7 +3448,7 @@ async fn finance_refunds_create(
                 )
                 .into_response();
             }
-            // §1.2: clamp for ALL roles — the cumulative cap in
+            // Clamp for ALL roles — the cumulative cap in
             // create_refund_guarded is the authoritative guard; this clamp
             // keeps the common single-refund case at the documented amount.
             if inv_amount_f.is_nan() || requested > inv_amount_f {
@@ -3534,7 +3534,7 @@ async fn finance_refunds_create(
         }
     };
     // An idempotent replay is the SAME money movement: never emit a second
-    // audit event (§1.2 step 5).
+    // audit event (one movement, one audit event).
     if creation.created_new {
         let meta = serde_json::json!({
             "invoice_id": f.invoice_id, "amount": amount, "asset": asset,
@@ -3557,7 +3557,7 @@ async fn finance_refunds_create(
         .into_response()
 }
 
-/// Refund approval: pending -> approved. Owner only (§2) — the creator of a
+/// Refund approval: pending -> approved. Owner only — the creator of a
 /// refund (seller, admin or owner) may never approve their own money row.
 async fn finance_refunds_approve(
     State(state): State<WebState>,
@@ -3618,7 +3618,7 @@ async fn finance_refunds_approve(
         .into_response()
 }
 
-/// §1.3: apply the money-success effects of a refund. A full refund flips the
+/// Apply the money-success effects of a refund. A full refund flips the
 /// invoice to `refunded` and revokes the subscription (+ channel kick); a
 /// partial refund leaves the invoice `paid` with no kick. Called only after a
 /// transfer receipts, or after the owner proves one landed in reconciliation.
@@ -3651,7 +3651,7 @@ async fn apply_refund_settlement(
             .unban_chat_member(cid, teloxide::types::UserId(user_id as u64))
             .await;
     }
-    // §3: the buyer hears "refund sent" only on this terminal outcome (never
+    // The buyer hears "refund sent" only on this terminal outcome (never
     // at refund creation or at the 24h "queued" alert). Best-effort DM through
     // the seller's bot; gate_outbound keeps held surfaces silent.
     let notice = format!("Your refund for invoice {inv} has been sent.");
@@ -3678,7 +3678,7 @@ async fn apply_refund_settlement(
 /// 'approved' for retry; an AMBIGUOUS failure (timeout / network, money
 /// state unknown) deliberately leaves the row 'executing' with an audit
 /// trail for the operator to reconcile on the Finance page before any retry.
-/// Owner only, with creator separation (§2).
+/// Owner only, with creator separation (two-person rule).
 async fn finance_refunds_execute(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -3791,7 +3791,7 @@ async fn finance_refunds_execute(
         };
         return err(StatusCode::CONFLICT, "invalid_state", msg).into_response();
     }
-    // §4.1: persist a fresh spend_id before dispatch; no raw transfer() call.
+    // Persist a fresh spend_id before dispatch; no raw transfer() call.
     let outcome =
         match execute_guarded_transfer(&state.db, "refund", id, refund_seller, None, |spend_id| {
             let cp = cp.clone();
@@ -3868,7 +3868,7 @@ async fn finance_refunds_execute(
         }
         GuardedTransferOutcome::DefiniteRejected { spend_id, error } => {
             // DEFINITE rejection: no money moved, revert to 'approved'. A
-            // retry mints a fresh spend_id/attempt (§4.1).
+            // retry mints a fresh spend_id/attempt (a definite retry is fresh).
             state.db.finish_refund_execution(id, "approved");
             let meta = serde_json::json!({
                 "invoice_id": invoice_id, "amount": amount, "asset": asset,
@@ -3897,13 +3897,13 @@ async fn finance_refunds_execute(
 
 #[derive(Deserialize)]
 struct ReconciliationResolveReq {
-    /// `executed`, `reverted_to_approved` or `void` (§5.3).
+    /// `executed`, `reverted_to_approved` or `void`.
     outcome: String,
     /// Human reason — required and persisted in the audit trail.
     reason: String,
 }
 
-/// §5.4 owner view of every executing/needs-reconciliation row with its
+/// Owner view of every executing/needs-reconciliation row with its
 /// spend_id and overdue flag. Read-only; no state is guessed or mutated.
 async fn finance_reconciliation_list(
     State(state): State<WebState>,
@@ -3935,7 +3935,7 @@ async fn finance_reconciliation_list(
         .into_response()
 }
 
-/// §5.3 owner resolution of one `needs_reconciliation` row. Exactly three
+/// Owner resolution of one `needs_reconciliation` row. Exactly three
 /// outcomes, each with a non-empty audited reason. The DB CAS makes
 /// resolution append-only: a second attempt is rejected (409).
 async fn finance_reconciliation_resolve(
