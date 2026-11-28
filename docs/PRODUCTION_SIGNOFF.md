@@ -20,7 +20,8 @@ that requires an external verifier or the owner.
 | Adversarial self-validation | 11 loopback tests passed | verified |
 | Moderation feature | full `--features moderation` sweep passed | verified |
 | Supply chain | `cargo audit` reported one pre-existing allowed warning (`rustix`); `cargo deny check licenses bans sources` passed | verified |
-| PR #4 CI | all checks passed on the current head, including the fmt/clippy/test/audit/deny gate | verified |
+| PR #4 CI on `85b0cef` | all checks passed, including the fmt/clippy/test/audit/deny gate (run `46117375989`) | verified |
+| PR #4 CI on `7b79fc0` | docs-only head; a fresh run (`46118653955`) was still pending at the last check | open |
 
 ## Open gates
 
