@@ -46,10 +46,10 @@
   seller sessions and the denied-sentinel id collision. The sentinel case was
   shown red (buyer got 200 and created `sellers(-1)`) before the shared
   ownership helper was fixed. This is not an independent penetration test.
-- Residual S3 findings from the adversarial review, not fixed here: the login
-  throttle map evicts old buckets after 1024 keys, so a flood of unknown
-  usernames can reset a victim's lockout; and the MCP rate bucket keys owner by
-  role ordinal 3, which collides with a real seller whose id is 3.
+- Two S3 findings from the adversarial review were closed: the login throttle
+  no longer evicts an active bucket to admit an unknown key, and MCP rate keys
+  put unbounded principals in a negative space so a seller whose id equals the
+  owner role ordinal keeps its own bucket. Both have regression tests.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)

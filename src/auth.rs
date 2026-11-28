@@ -96,18 +96,15 @@ pub fn login_throttle(
 ) -> bool {
     let mut map = map.lock().unwrap();
     let now = Instant::now();
-    if map.len() > 1024 {
-        map.retain(|_, at| now.duration_since(at.1) < Duration::from_secs(3600));
-    }
-    while map.len() > 1024 {
-        let Some(oldest) = map
-            .iter()
-            .min_by_key(|(_, at)| at.1)
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        map.remove(&oldest);
+    if !map.contains_key(key) && map.len() >= 1024 {
+        // An unknown username costs no bcrypt work, so a flood of them can fill
+        // this map. Evicting the oldest bucket would reset a victim's active
+        // lockout; drop only buckets whose window has lapsed and fail closed for
+        // new keys while every bucket is still live.
+        map.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(window_secs));
+        if map.len() >= 1024 {
+            return true;
+        }
     }
     let entry = map.entry(key.to_string()).or_insert((0, now));
     if now.duration_since(entry.1) >= Duration::from_secs(window_secs) {
@@ -228,5 +225,48 @@ pub fn cookie_path(state: &WebState) -> String {
         "/".to_string()
     } else {
         state.base_path.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn throttle_flood_does_not_reset_a_live_lockout() {
+        let map = Mutex::new(HashMap::new());
+        let victim = "login:victim";
+        for _ in 0..4 {
+            assert!(!login_throttle(&map, victim, 5, 900));
+        }
+        // Fill the map with distinct unknown keys; these cost no bcrypt work.
+        for i in 0..1024 {
+            login_throttle(&map, &format!("login:unknown-{i}"), 5, 900);
+        }
+        assert!(
+            login_throttle(&map, victim, 5, 900),
+            "the victim's lockout must survive a flood of other keys"
+        );
+        assert!(
+            login_throttle(&map, "login:newcomer", 5, 900),
+            "new keys must fail closed while every bucket is live"
+        );
+    }
+
+    #[test]
+    fn throttle_expired_buckets_make_room() {
+        let mut buckets = HashMap::new();
+        let expired = Instant::now() - Duration::from_secs(901);
+        for i in 0..1024 {
+            buckets.insert(format!("login:old-{i}"), (1, expired));
+        }
+        let map = Mutex::new(buckets);
+        assert!(
+            !login_throttle(&map, "login:fresh", 5, 900),
+            "expired buckets should be evicted to admit a new key"
+        );
     }
 }

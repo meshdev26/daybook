@@ -65,6 +65,9 @@ verification remain open.
 - Test: local adversarial loopback suite with eight cases, including buyer
   invoice status forgery, foreign writes, seller MCP deletion and forged ids.
   This is self-validation, not an independent penetration test.
+- Security: unknown-username floods can no longer evict a victim's active login
+  throttle bucket, and MCP rate keys no longer collide when a seller's id equals
+  the owner role ordinal.
 
 ## [0.4.2-alpha]
 

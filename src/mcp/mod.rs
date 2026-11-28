@@ -198,11 +198,14 @@ fn authenticate(web: &WebState, headers: &HeaderMap) -> Result<Principal, Box<Re
     )))
 }
 
-/// Rate-limit key: a seller is keyed by its seller id and the owner by the
-/// role ordinal. A seller whose id equals that ordinal shares the owner bucket;
-/// this is a documented residual, not a boundary between principals.
+/// Rate-limit key: seller ids are positive, so unbounded principals use a
+/// separate negative space. This keeps the owner bucket independent of a
+/// seller whose id happens to equal the owner's role ordinal.
 fn principal_key(principal: &Principal) -> i64 {
-    principal.seller_id.unwrap_or(principal.role as i64)
+    match principal.seller_id {
+        Some(sid) => sid,
+        None => -(principal.role as i64) - 1,
+    }
 }
 
 /// Fixed label for `mcp_tool_calls_total{tier}` — tier names are static
@@ -684,6 +687,24 @@ pub fn register_commands(reg: &mut CommandRegistry, state: WebState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn principal_keys_do_not_collide_with_owner_ordinal() {
+        let owner = Principal::OWNER;
+        let seller_with_ordinal_id = Principal {
+            role: roles::Role::Seller,
+            seller_id: Some(roles::Role::Owner as i64),
+        };
+        assert_ne!(
+            principal_key(&owner),
+            principal_key(&seller_with_ordinal_id)
+        );
+        assert!(principal_key(&owner) < 0);
+        assert_eq!(
+            principal_key(&seller_with_ordinal_id),
+            roles::Role::Owner as i64
+        );
+    }
     use crate::config::Config;
     use crate::db::Db;
     use axum::body::Body;
