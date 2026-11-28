@@ -94,7 +94,11 @@ pub fn login_throttle(
     max: u32,
     window_secs: u64,
 ) -> bool {
-    let mut map = map.lock().unwrap();
+    // A poisoned counter cannot be trusted to hold a live lockout, so deny the
+    // attempt rather than panic or continue with a possibly inconsistent map.
+    let Ok(mut map) = map.lock() else {
+        return true;
+    };
     let now = Instant::now();
     if !map.contains_key(key) && map.len() >= 1024 {
         // An unknown username costs no bcrypt work, so a flood of them can fill
@@ -118,7 +122,11 @@ pub fn login_ok(
     map: &std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
     key: &str,
 ) {
-    map.lock().unwrap().remove(key);
+    // Skip the removal on poison: deleting from a possibly inconsistent map
+    // could drop a live lockout, while leaving a bucket only adds friction.
+    if let Ok(mut map) = map.lock() {
+        map.remove(key);
+    }
 }
 
 pub fn secure_cookies() -> bool {
@@ -232,7 +240,7 @@ pub fn cookie_path(state: &WebState) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -268,5 +276,28 @@ mod tests {
             !login_throttle(&map, "login:fresh", 5, 900),
             "expired buckets should be evicted to admit a new key"
         );
+    }
+
+    fn poison(map: &Arc<Mutex<HashMap<String, (u32, Instant)>>>) {
+        let m = Arc::clone(map);
+        let _ = std::thread::spawn(move || {
+            let _guard = m.lock().unwrap();
+            panic!("deliberate poison for test");
+        })
+        .join();
+    }
+
+    #[test]
+    fn login_throttle_poisoned_lock_denies() {
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        poison(&map);
+        assert!(login_throttle(&map, "login:poisoned", 5, 900));
+    }
+
+    #[test]
+    fn login_ok_poisoned_lock_is_noop() {
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        poison(&map);
+        login_ok(&map, "login:poisoned");
     }
 }

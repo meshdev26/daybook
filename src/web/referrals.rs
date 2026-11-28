@@ -9,9 +9,9 @@ pub(super) async fn referrals_page(
         Some(s) => s,
         None => return Redirect::to(&state.url("/login")).into_response(),
     };
-    if session.tenant_scope().is_none() {
+    let Some(bonus_sid) = session.seller_namespace() else {
         return forbidden_page(&state, "Referrals", "Referrals").into_response();
-    }
+    };
     // Collect referrals across the visible seller scope.
     let mut all: Vec<(i64, i64, i64, i64, String, String, f64)> = Vec::new(); // (seller, id, referrer, referee, code, status, reward)
     if Role::from_role_str(&session.role) == Role::Seller {
@@ -58,7 +58,6 @@ pub(super) async fn referrals_page(
         rows_html
     );
     // Bonus balance display for the session user/seller.
-    let bonus_sid = session.seller_id.unwrap_or(0);
     let bonus_bal = state.db.bonus_balance(bonus_sid, session.account_id);
     let body = format!(
         r#"<h1>Referrals <span class="sub">referral program &amp; rewards</span></h1>

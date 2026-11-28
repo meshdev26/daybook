@@ -68,6 +68,7 @@ async fn retry_ungranted_grant(
     inv_id: &str,
     seller_id: i64,
     user_id: Option<i64>,
+    owner_id: i64,
 ) -> bool {
     if let Some(pid) = db.invoice_product(inv_id) {
         if db.product_grant_exists(inv_id) {
@@ -91,12 +92,12 @@ async fn retry_ungranted_grant(
         .map(|p| p.4)
         .unwrap_or(30)
         .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
+    let is_admin = seller_id == crate::roles::TenantScope::PLATFORM_ID
+        || crate::roles::role_of(db, seller_id, owner_id) >= crate::roles::Role::Admin;
     let ch = plan_info
         .as_ref()
         .and_then(|p| p.5.clone())
-        .or_else(|| db.seller_channel(seller_id))
-        .or_else(|| db.get_config("channel"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| crate::handlers::commands::channel_of(db, Some(seller_id), is_admin));
     if ch.is_empty() {
         return false;
     }
@@ -559,6 +560,7 @@ async fn run() {
             let crypto_bg = crypto.clone();
             let bm = bot_manager.clone();
             let this_id = bot_ctx.id;
+            let owner_id = bot_ctx.owner_id;
             tokio::spawn(async move {
                 use std::time::Duration;
                 loop {
@@ -586,6 +588,7 @@ async fn run() {
                             uid,
                             inv_seller,
                             this_id,
+                            owner_id,
                         )
                         .await;
                     }
@@ -937,7 +940,8 @@ async fn run() {
                     // audited; success returns the row to 'paid' and stops the
                     // job for that invoice. The 24h clock is never reset.
                     let user_id = db_bg.get_invoice(&inv_id).and_then(|i| i.5);
-                    let granted = retry_ungranted_grant(&db_bg, &inv_id, seller_id, user_id).await;
+                    let granted =
+                        retry_ungranted_grant(&db_bg, &inv_id, seller_id, user_id, owner_id).await;
                     if granted && db_bg.finalize_invoice_grant_retry(&inv_id) {
                         db_bg.log_action(
                             0,
@@ -1751,5 +1755,66 @@ fn open_in_browser(url: &str) {
     let result = std::process::Command::new("xdg-open").arg(url).spawn();
     if let Err(e) = result {
         tracing::warn!("could not open browser: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The replay path must not hand a seller's paid invoice to the operator's
+    /// global channel when the seller has no channel of its own.
+    #[tokio::test]
+    async fn retry_ungranted_grant_seller_no_channel_never_uses_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.db").to_string_lossy().into_owned();
+        let db = Db::new(&path).unwrap();
+        db.set_config("channel", "@operator");
+        db.upsert_seller(7, None, None);
+        db.add_plan(7, "no-channel-plan", "5", "USDT", 7, None);
+        db.save_invoice(
+            "inv-retry-no-channel",
+            7,
+            "5",
+            "USDT",
+            Some("no-channel-plan"),
+            "paid_ungranted",
+            None,
+            Some("no-channel-plan"),
+            Some(42),
+            None,
+        );
+
+        let telegram = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/CreateChatInviteLink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "invite_link": "https://t.me/+retry-invite",
+                    "creator": {"id": 42, "is_bot": true, "first_name": "Seller"},
+                    "creates_join_request": false,
+                    "is_primary": false,
+                    "is_revoked": false
+                }
+            })))
+            .mount(&telegram)
+            .await;
+
+        assert!(!retry_ungranted_grant(&db, "inv-retry-no-channel", 7, Some(42), 999).await);
+        assert!(
+            db.subscriptions_for_invoice("inv-retry-no-channel")
+                .is_empty()
+        );
+        let invites = telegram
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/CreateChatInviteLink"))
+            .count();
+        assert_eq!(invites, 0);
     }
 }

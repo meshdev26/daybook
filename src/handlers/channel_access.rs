@@ -10,7 +10,10 @@
 //! only a row they own or their configured default channel, and every other
 //! case fails closed.
 
-use crate::{db::Db, roles::Role};
+use crate::{
+    db::Db,
+    roles::{Role, TenantScope},
+};
 
 /// Normalize a channel target for comparison: trimmed, no leading `@`, ASCII
 /// lowercased. Stored names may be handles or numeric ids; the value sent to
@@ -50,16 +53,15 @@ pub fn may_mutate_channel(
     // Today's policy is role + seller-scope only; consulting them here would
     // narrow the owner/admin global tier and change existing behavior.
     let _ = (account_id, selected_bot_id);
-    if Role::from_role_str(session_role).has_level(Role::Admin) {
-        return true;
-    }
+    let sid = match Role::from_role_str(session_role).tenant_scope(session_seller_id) {
+        TenantScope::Global => return true,
+        TenantScope::Denied => return false,
+        TenantScope::Seller(sid) => sid,
+    };
     let key = channel_key(channel);
     if key.is_empty() {
         return false;
     }
-    let Some(sid) = session_seller_id else {
-        return false;
-    };
     if owns_channel_row(db, sid, channel) {
         return true;
     }
@@ -95,7 +97,10 @@ pub fn may_post_to_channel(
     // binding, a buyer or unknown-role principal would otherwise deliver a
     // message through the operator's bot and only fail afterwards when the row
     // is attributed. Operator tiers already passed `may_mutate_channel`.
-    if !Role::from_role_str(session_role).has_level(Role::Seller) || session_seller_id.is_none() {
+    if !matches!(
+        Role::from_role_str(session_role).tenant_scope(session_seller_id),
+        TenantScope::Seller(_)
+    ) {
         return false;
     }
     !key.is_empty() && owns_channel_row(db, 0, channel)
@@ -228,6 +233,34 @@ mod tests {
         ));
         assert!(!may_post_to_channel(
             &db, "unknown", None, 4, None, "@global"
+        ));
+    }
+
+    /// A buyer-tier session carrying another seller's binding is denied by the
+    /// typed scope on REST and console; channel gates must refuse it as well.
+    #[test]
+    fn channel_gate_refuses_user_binding_with_seller_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.upsert_seller(42, Some("seller42"), Some("@mine"));
+        db.add_channel("@mine", 42).unwrap();
+        db.add_channel("@global", 0).unwrap();
+        assert!(!may_mutate_channel(&db, "user", Some(42), 4, None, "@mine"));
+        assert!(!may_post_to_channel(
+            &db,
+            "user",
+            Some(42),
+            4,
+            None,
+            "@mine"
+        ));
+        assert!(!may_post_to_channel(
+            &db,
+            "user",
+            Some(42),
+            4,
+            None,
+            "@global"
         ));
     }
 }

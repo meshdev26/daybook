@@ -48,10 +48,33 @@ impl RateLimiter {
         }
     }
     pub fn check(&self, seller_id: i64) -> Result<(), u64> {
-        let mut map = self.buckets.lock().unwrap();
+        // Refuse on poison instead of panicking the AI/MCP request. A full
+        // bucket refills in one minute at every supported RPM setting.
+        const POISON_RETRY_SECS: u64 = 60;
+        let Ok(mut map) = self.buckets.lock() else {
+            return Err(POISON_RETRY_SECS);
+        };
         let b = map
             .entry(seller_id)
             .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_per_sec));
         b.try_consume(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn check_poisoned_lock_denies() {
+        let limiter = Arc::new(RateLimiter::new(20));
+        let l = Arc::clone(&limiter);
+        let _ = std::thread::spawn(move || {
+            let _guard = l.buckets.lock().unwrap();
+            panic!("deliberate poison for test");
+        })
+        .join();
+        assert_eq!(limiter.check(7), Err(60));
     }
 }

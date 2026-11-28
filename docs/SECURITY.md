@@ -26,7 +26,8 @@
   loader refuse that pair outright.
 - REST tenant gates now reject the buyer tier. Nineteen of the twenty-one negative
   equality gates were converted to a positive tier-floor check; `invoices_claim`
-  keeps its buyer self-claim carve-out (`src/api.rs:4797-4801`). An earlier draft
+  keeps its buyer self-claim carve-out (`src/api.rs:4804-4810`; the buyer
+  binding is at `src/api.rs:4814-4817`). An earlier draft
   claimed 41 gates and said `invoices_status` had no status allowlist. Both were
   wrong: the paid and paid_ungranted states were already refused, failed was
   owner-only, and the reachable forged value was `executed`, which analytics

@@ -2394,18 +2394,16 @@ async fn users_list(State(state): State<WebState>, headers: HeaderMap) -> impl I
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    if session.seller_namespace().is_none() {
+    let Some(seller_id) = session.seller_namespace() else {
         return err(
             StatusCode::FORBIDDEN,
             "not_a_seller",
             "seller profile required",
         )
         .into_response();
-    }
+    };
     let ids = if Role::from_role_str(&session.role) == Role::Seller {
-        state
-            .db
-            .list_users_for_seller(session.seller_id.unwrap_or(0))
+        state.db.list_users_for_seller(seller_id)
     } else {
         state.db.list_users()
     };
@@ -4989,15 +4987,7 @@ async fn invoices_claim(
         let ch = plan_info
             .as_ref()
             .and_then(|p| p.5.clone())
-            .or_else(|| state.db.seller_channel(sid))
-            .or_else(|| {
-                if admin {
-                    state.db.get_config("channel")
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::handlers::commands::channel_of(&state.db, Some(sid), admin));
         if ch.is_empty() {
             // Paid but ungrantable: release the claim so the background
             // granter retries once the seller configures a channel — never

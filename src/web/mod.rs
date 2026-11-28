@@ -838,16 +838,15 @@ fn may_mutate_channel(state: &WebState, session: &Session, chat_id: &str) -> boo
 /// mutations: owner/admin pass, a seller must own the row, and a `post_id`
 /// that does not exist is a denial for a seller (fail closed).
 fn may_mutate_post(state: &WebState, session: &Session, post_id: Option<i64>) -> bool {
-    if Role::from_role_str(&session.role).has_level(Role::Admin) {
-        return true;
-    }
+    let sid = match Role::from_role_str(&session.role).tenant_scope(session.seller_id) {
+        crate::roles::TenantScope::Global => return true,
+        crate::roles::TenantScope::Denied => return false,
+        crate::roles::TenantScope::Seller(sid) => sid,
+    };
     let Some(pid) = post_id else {
         return true;
     };
-    match (session.seller_id, state.db.get_post_seller(pid)) {
-        (Some(sid), Some(owner)) => owner == sid,
-        _ => false,
-    }
+    state.db.get_post_seller(pid) == Some(sid)
 }
 
 /// Composer target gate (`create_post`). The dashboard's channel dropdown

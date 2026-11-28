@@ -1062,6 +1062,31 @@ fn test_invoice_claim_finalize_and_exists() {
 }
 
 #[test]
+fn test_finalize_invoice_paid_never_overwrites_refunded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::new(dir.path().join("race.db").to_str().unwrap()).unwrap();
+    db.save_invoice(
+        "inv-refund-race",
+        1,
+        "10",
+        "USDT",
+        None,
+        "active",
+        None,
+        Some("P"),
+        Some(42),
+        None,
+    );
+    assert!(db.claim_invoice_for_grant("inv-refund-race")); // active -> granting
+    db.update_invoice_status("inv-refund-race", "refunded"); // refund settles mid-grant
+    db.finalize_invoice_paid("inv-refund-race"); // must be a no-op
+    assert_eq!(db.get_invoice("inv-refund-race").unwrap().2, "refunded");
+    assert_eq!(db.analytics_invoice_counts(1).1, 0); // no paid/revenue miscount
+    assert!(!db.claim_invoice_for_grant("inv-refund-race")); // no new grant possible
+    assert!(!db.subscription_exists_for_invoice("inv-refund-race"));
+}
+
+#[test]
 fn test_seller_has_channel() {
     let path = "/tmp/opencode/test_seller_has_channel.db";
     let _ = fs::remove_file(path);
