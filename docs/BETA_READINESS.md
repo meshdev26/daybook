@@ -6,8 +6,9 @@ below names entry criteria only.
 
 ## 1. Scope and current status
 
-- Version is `0.4.3-alpha` (`Cargo.toml:3`). No version bump was made here.
-- `README.md:5` calls the project alpha and self-reviewed (with AI assistance),
+- Version is `0.4.3-beta` (`Cargo.toml:3`), a local label only; no tag, push or
+  release was made here. The beta entry criteria below remain OPEN.
+- `README.md:5` calls the project beta by local label and self-reviewed (with AI assistance),
   not independently audited, and says not to use it with real customer money or
   live customer data before reading the code and testing seller isolation on
   one's own deployment. Issue #1 tracks that checklist (`README.md:7`).
@@ -32,7 +33,7 @@ below names entry criteria only.
 | Scratch-deployment verification / issue #1 | Human verifier on a throwaway instance; `make doctor` there | OPEN - issue #1 is OPEN | `docs/SECURITY.md:57`; `README.md:7`; `docs/RELEASING.md:38-40`; `Makefile:52-54` (`doctor` = read-only environment diagnostics); `gh issue view 1 --json state` |
 | Owner security sign-off on `docs/SECURITY.md` | Owner; recorded sign-off | OPEN - none recorded | `docs/PRODUCTION_SIGNOFF.md:32`, `:38-42` |
 | Defined pilot scope (e.g. non-money or limited sellers), with monitoring and rollback | Owner; bounded scope, observability, and a tested rollback path | OPEN - no pilot scope recorded; one real seller for 30 days is still an open gate | `docs/PRODUCTION_SIGNOFF.md:26-35`, `:33`; `docs/SECURITY.md:60`; `AGENT.md:95-97` (`RUST_LOG` observability); section 4 below and `docs/RELEASING.md:79-83` |
-| Version bump and owner-executed tag / release | Owner, human-approved and human-executed external publish | OPEN - version remains `0.4.3-alpha`; no tag or release was made here | `Cargo.toml:3`; `docs/RELEASING.md:43-53`, `:61-68`, `:85-89`; `docs/PRODUCTION_SIGNOFF.md:34` |
+| Version bump and owner-executed tag / release | Owner, human-approved and human-executed external publish | OPEN - local label is `0.4.3-beta`; no tag or release was made here | `Cargo.toml:3`; `docs/RELEASING.md:43-53`, `:61-68`, `:85-89`; `docs/PRODUCTION_SIGNOFF.md:34` |
 
 `docs/RELEASING.md:52-53` separately gates 1.0 on zero open P0/P1 data or money
 defects, security sign-off, and one real seller in production for 30 days; those
@@ -43,7 +44,7 @@ does not grant publishing authority.
 ## 3. Verified local and CI gates (not an audit)
 
 `docs/PRODUCTION_SIGNOFF.md:13-24` records these as verified on earlier heads:
-build, formatting, clippy, 804 library tests, 13 isolation tests, 11 loopback
+build, formatting, clippy, 810 library tests, 13 isolation tests, 13 loopback
 adversarial tests, the full `moderation` feature sweep, `cargo audit` with one
 allowed pre-existing `rustix` warning, `cargo deny check licenses bans sources`,
 and PR #4 CI run `46117375989` on `85b0cef`.
@@ -92,7 +93,8 @@ An agent cannot commission an independent penetration test
 money (`README.md:5`; `docs/SECURITY.md:60`), cannot sign off security
 (`docs/PRODUCTION_SIGNOFF.md:32`, `:38-42`), and cannot bump the version, push a
 tag, or publish a release without the owner (`docs/RELEASING.md:49-53`, `:67`,
-`:85-89`; `docs/PRODUCTION_SIGNOFF.md:34`). No version, tag, release, sign-off,
-or beta claim was made by this record.
+`:85-89`; `docs/PRODUCTION_SIGNOFF.md:34`). No tag, release, sign-off,
+or beta-readiness claim was made by this record; the local version label was
+changed separately.
 
 This record does not declare beta readiness; the named gates remain open.

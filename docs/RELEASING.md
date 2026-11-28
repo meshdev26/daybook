@@ -43,7 +43,7 @@ cargo deny check                # licenses
 ## Version bump
 
 Cargo tracks the milestone (`docs/ARCHITECTURE-V1.4.md` §5, Trust pack):
-milestone vN ships as `0.N.0` — v1.4 → `0.4.3-alpha`. `0.x` means pre-1.0; minors
+milestone vN ships as `0.N.0` — v1.4 → `0.4.3-beta` (local label). `0.x` means pre-1.0; minors
 may break.
 
 1. Edit `version` in `Cargo.toml`.

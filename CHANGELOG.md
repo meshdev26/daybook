@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning tracks the milestone: milestone vN ships as Cargo `0.N.0`
 (see [`docs/RELEASING.md`](docs/RELEASING.md)).
 
+## [0.4.3-beta]
+
+Local version label only -- not tagged, pushed, or released. Feature-complete by
+self-review with verified gates and an edge-case test suite; still not
+independently audited, with no penetration test, scratch-deployment verification,
+owner sign-off, or 30-day seller gate closed. No production or real-money use is
+authorized by this label.
+
 ## [0.4.3-alpha]
 
 Alpha pre-release of the v1.4 milestone. All seven product types are live by

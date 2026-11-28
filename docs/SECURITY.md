@@ -40,7 +40,7 @@
   surface decision. `codes_redeem` keeps the buyer redemption flow but ignores a
   caller-supplied beneficiary for the user tier. The buyer invoice self-claim
   and code redemption flows remain supported as documented in `docs/API.md`.
-- Local adversarial self-validation is in `tests/adversarial_local.rs`: eight
+- Local adversarial self-validation is in `tests/adversarial_local.rs`: thirteen
   loopback cases cover invoice status forgery, foreign review and ticket writes,
   seller MCP deletion, forged seller ids, tenantless console reads, legacy
   seller sessions and the denied-sentinel id collision. The sentinel case was
@@ -57,7 +57,7 @@
 - Automated self-validation of seller isolation on a fresh local database across REST, MCP, the web console and bot scoping; this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open.
 - The suite runs on loopback with mock Bot APIs, two forged-token seller principals and per-tenant markers. Seller-scoped REST `expire-check` (owner/admin retain the global sweep) is a permanent isolation case; bot `/expirecheck` has a matching regression test in `commands/tests.rs`.
 
-> **Status:** alpha, self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
+> **Status:** beta (local version label only), self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
 
 ## Payments
 - Always verify payment via Crypto Pay API before granting access.
