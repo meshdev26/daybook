@@ -15,9 +15,9 @@ that requires an external verifier or the owner.
 | Build | `cargo build` succeeded on this branch | verified |
 | Formatting | `cargo fmt --check` clean | verified |
 | Lint | `cargo clippy --all-targets -- -D warnings` clean | verified |
-| Unit tests | 804 library tests passed | verified |
+| Unit tests | 810 library tests passed | verified |
 | Tenant isolation | 13 integration tests passed | verified |
-| Adversarial self-validation | 11 loopback tests passed | verified |
+| Adversarial self-validation | 13 loopback tests passed | verified |
 | Moderation feature | full `--features moderation` sweep passed | verified |
 | Supply chain | `cargo audit` reported one pre-existing allowed warning (`rustix`); `cargo deny check licenses bans sources` passed | verified |
 | PR #4 CI gate on `85b0cef` | all checks passed, including the fmt/clippy/test/audit/deny gate (run `46117375989`) | verified |

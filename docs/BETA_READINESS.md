@@ -20,7 +20,7 @@ below names entry criteria only.
 - `docs/PRODUCTION_SIGNOFF.md:1-5` says that document is not a certification and
   that a claim is valid only when every gate is closed by the named authority;
   `:38-42` records that no owner sign-off exists.
-- Current work is on `security/local-adversarial`, seven commits ahead of
+- Current work is on `security/local-adversarial`, ten commits ahead of
   `master` and tracked against `origin/security/local-adversarial`; PR #4 to
   `master` is OPEN (`git status --short --branch`; `git log --oneline master..HEAD`;
   `gh pr view 4 --json state,headRefName,baseRefName`).
