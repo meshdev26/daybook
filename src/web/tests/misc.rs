@@ -773,3 +773,81 @@ async fn console_tables_render_actions_in_dedicated_cells() {
         );
     }
 }
+
+/// S3 hardening: a tenantless buyer must be refused by `create_post` before
+/// channel resolution or any Bot traffic, even against a global channel row.
+#[tokio::test]
+#[tracing::instrument(skip_all)]
+async fn create_post_refuses_tenantless_session_before_transport() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (mut state, _dir) = make_state().await;
+    // A global channel row the buyer's form will address.
+    state.db.add_channel("postscope", 0).unwrap();
+    // Wire the console bot to a mock so a stray transport hit is observable.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": { "message_id": 1, "date": 0, "chat": { "id": 42, "type": "private" } }
+        })))
+        .mount(&server)
+        .await;
+    let bot = teloxide::Bot::new("9:placeholder")
+        .set_api_url(server.uri().parse::<reqwest::Url>().unwrap());
+    let bot_id = state.db.create_bot("postscope", 0, None, "Mock bot");
+    let ctx = Arc::new(crate::bots::BotContext {
+        id: bot_id,
+        key: "postscope".to_string(),
+        bot,
+        owner_id: 0,
+        shared: Arc::new(state.cfg.clone()),
+        db: state.db.clone(),
+    });
+    let mut manager = crate::bots::BotManager::placeholder(
+        state.db.clone(),
+        Arc::new(state.cfg.clone()),
+        state.identity.clone(),
+    );
+    manager.bots = vec![ctx.clone()];
+    manager.primary = ctx;
+    state.bots = Arc::new(manager);
+
+    // A buyer session has no tenant namespace.
+    state
+        .db
+        .create_web_account("scopelessbuyer", "secret", "user", None)
+        .await
+        .unwrap();
+    let (acc_id, _u, _h, _r, _s) = state
+        .db
+        .get_web_account_by_username("scopelessbuyer")
+        .unwrap();
+    let token = state.db.create_web_session(acc_id, "user", None, 7);
+
+    let app = router(state.clone());
+    let resp = app
+        .oneshot(post_authed_req(
+            "/post",
+            "channel=postscope&text=scope-guard-probe",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(loc.contains("post_error=scope"), "{loc}");
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a tenantless post must never reach the Bot API"
+    );
+    assert!(
+        !state
+            .db
+            .list_posts(None, 100)
+            .iter()
+            .any(|p| p.5.as_deref() == Some("scope-guard-probe")),
+        "no post row may be written for a tenantless session"
+    );
+}

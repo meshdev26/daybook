@@ -14,9 +14,15 @@ use crate::{db::Db, roles::Role};
 
 /// Normalize a channel target for comparison: trimmed, no leading `@`, ASCII
 /// lowercased. Stored names may be handles or numeric ids; the value sent to
-/// Telegram is never rewritten.
+/// Telegram is never rewritten. A second pass must be a no-op, so stripping
+/// the prefix cannot stop while whitespace that trim() would remove is still
+/// hanging off the result.
 pub fn channel_key(channel: &str) -> String {
-    channel.trim().trim_start_matches('@').to_ascii_lowercase()
+    channel
+        .trim()
+        .trim_start_matches('@')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Exact stored form first, then the normalized key.

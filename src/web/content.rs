@@ -344,6 +344,12 @@ pub(super) async fn create_post(
     if ch.is_empty() || f.text.trim().is_empty() {
         return Redirect::to(&state.url("/dashboard")).into_response();
     }
+    // A tenantless session has no namespace to file the row in. Refuse before
+    // channel resolution and before any Telegram traffic: this check used to
+    // sit inside the Ok(sent) branch, after the message was already delivered.
+    let Some(seller_id) = session.seller_namespace() else {
+        return Redirect::to(&state.url("/dashboard?post_error=scope")).into_response();
+    };
     // Tenant gate on the resolved target (review H1): the send runs through
     // the bot bound to that channel, so a seller may only address the global
     // set the dropdown offers or a channel they own — never another seller's
@@ -380,13 +386,8 @@ pub(super) async fn create_post(
             }
             // Record the row with the sender it actually used -- the posts
             // page badge is a fact about the row, not the current binding.
-            //
-            // A sender with no tenant has no namespace to file this row in:
-            // the old `unwrap_or(0)` attributed it to the operator. The
-            // message has already been delivered, so report the scope failure.
-            let Some(seller_id) = session.seller_namespace() else {
-                return Redirect::to(&state.url("/dashboard?post_error=scope")).into_response();
-            };
+            // `seller_id` was bound before any transport (see above), so the
+            // row is always filed in a real tenant namespace.
             let message_id = i32::try_from(sent.message_id).unwrap_or(0);
             if let Err(e) = state.db.log_post(
                 seller_id,
