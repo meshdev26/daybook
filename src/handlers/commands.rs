@@ -461,7 +461,7 @@ pub async fn cmd_handler(
             send_menu(&bot, chat_id, role).await?;
         }
         Command::Channel => {
-            let ch = channel_of(&db, &cfg, Some(user_id), is_admin);
+            let ch = channel_of(&db, Some(user_id), is_admin);
             bot.send_message(chat_id, format!("Default target channel: {}", ch))
                 .await?;
         }
@@ -984,7 +984,7 @@ pub async fn cmd_handler(
                 .await?;
             }
             Ok((name, price, asset, days)) => {
-                let ch = channel_of(&db, &cfg, Some(user_id), is_admin);
+                let ch = channel_of(&db, Some(user_id), is_admin);
                 db.add_plan(user_id, name, price, asset, days, Some(&ch));
                 bot.send_message(chat_id, format!("Plan '{}' added.", name))
                     .await?;
@@ -2982,7 +2982,7 @@ pub async fn cmd_handler(
                 } else {
                     // Sellers grant only into their own channel; Admin/Owner
                     // may fall back to the global default.
-                    let ch = channel_of(&db, &cfg, Some(user_id), is_admin);
+                    let ch = channel_of(&db, Some(user_id), is_admin);
                     if ch.is_empty() {
                         bot.send_message(
                             chat_id,
@@ -3018,7 +3018,7 @@ pub async fn cmd_handler(
             if uid == 0 {
                 bot.send_message(chat_id, "Usage: /revoke user_id").await?;
             } else {
-                let ch = channel_of(&db, &cfg, Some(user_id), is_admin);
+                let ch = channel_of(&db, Some(user_id), is_admin);
                 // ban then unban (kick)
                 let cid = util::to_chat_id(&ch);
                 let _ = bot
@@ -4277,7 +4277,7 @@ fn channels_visible_to(
 /// OWN channel (`seller_channel`); the global default fallback is reserved
 /// for Admin/Owner, so a seller can never post/grant into a channel they do
 /// not control via the default config.
-fn channel_of(db: &Db, _cfg: &SharedConfig, seller_id: Option<i64>, is_admin: bool) -> String {
+pub fn channel_of(db: &Db, seller_id: Option<i64>, is_admin: bool) -> String {
     if let Some(sid) = seller_id
         && let Some(c) = db.seller_channel(sid)
     {
@@ -4298,15 +4298,15 @@ fn channel_of(db: &Db, _cfg: &SharedConfig, seller_id: Option<i64>, is_admin: bo
 /// is a ready-to-send one-line reply for the caller.
 fn resolve_target_channel(
     db: &Db,
-    cfg: &SharedConfig,
+    _cfg: &SharedConfig,
     user_id: i64,
     is_admin: bool,
     explicit: Option<String>,
 ) -> Result<String, String> {
     if is_admin {
-        return Ok(explicit.unwrap_or_else(|| channel_of(db, cfg, Some(user_id), true)));
+        return Ok(explicit.unwrap_or_else(|| channel_of(db, Some(user_id), true)));
     }
-    let own = channel_of(db, cfg, Some(user_id), false);
+    let own = channel_of(db, Some(user_id), false);
     if own.is_empty() {
         return Err("No channel set. Use /setchannel @channel first.".to_string());
     }

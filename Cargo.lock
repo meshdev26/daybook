@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "daybook"
-version = "0.4.3-alpha"
+version = "0.4.3-beta"
 dependencies = [
  "aes-gcm",
  "async-trait",

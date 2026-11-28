@@ -94,20 +94,21 @@ pub fn login_throttle(
     max: u32,
     window_secs: u64,
 ) -> bool {
-    let mut map = map.lock().unwrap();
+    // A poisoned counter cannot be trusted to hold a live lockout, so deny the
+    // attempt rather than panic or continue with a possibly inconsistent map.
+    let Ok(mut map) = map.lock() else {
+        return true;
+    };
     let now = Instant::now();
-    if map.len() > 1024 {
-        map.retain(|_, at| now.duration_since(at.1) < Duration::from_secs(3600));
-    }
-    while map.len() > 1024 {
-        let Some(oldest) = map
-            .iter()
-            .min_by_key(|(_, at)| at.1)
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        map.remove(&oldest);
+    if !map.contains_key(key) && map.len() >= 1024 {
+        // An unknown username costs no bcrypt work, so a flood of them can fill
+        // this map. Evicting the oldest bucket would reset a victim's active
+        // lockout; drop only buckets whose window has lapsed and fail closed for
+        // new keys while every bucket is still live.
+        map.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(window_secs));
+        if map.len() >= 1024 {
+            return true;
+        }
     }
     let entry = map.entry(key.to_string()).or_insert((0, now));
     if now.duration_since(entry.1) >= Duration::from_secs(window_secs) {
@@ -121,7 +122,11 @@ pub fn login_ok(
     map: &std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
     key: &str,
 ) {
-    map.lock().unwrap().remove(key);
+    // Skip the removal on poison: deleting from a possibly inconsistent map
+    // could drop a live lockout, while leaving a bucket only adds friction.
+    if let Ok(mut map) = map.lock() {
+        map.remove(key);
+    }
 }
 
 pub fn secure_cookies() -> bool {
@@ -228,5 +233,71 @@ pub fn cookie_path(state: &WebState) -> String {
         "/".to_string()
     } else {
         state.base_path.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn throttle_flood_does_not_reset_a_live_lockout() {
+        let map = Mutex::new(HashMap::new());
+        let victim = "login:victim";
+        for _ in 0..4 {
+            assert!(!login_throttle(&map, victim, 5, 900));
+        }
+        // Fill the map with distinct unknown keys; these cost no bcrypt work.
+        for i in 0..1024 {
+            login_throttle(&map, &format!("login:unknown-{i}"), 5, 900);
+        }
+        assert!(
+            login_throttle(&map, victim, 5, 900),
+            "the victim's lockout must survive a flood of other keys"
+        );
+        assert!(
+            login_throttle(&map, "login:newcomer", 5, 900),
+            "new keys must fail closed while every bucket is live"
+        );
+    }
+
+    #[test]
+    fn throttle_expired_buckets_make_room() {
+        let mut buckets = HashMap::new();
+        let expired = Instant::now() - Duration::from_secs(901);
+        for i in 0..1024 {
+            buckets.insert(format!("login:old-{i}"), (1, expired));
+        }
+        let map = Mutex::new(buckets);
+        assert!(
+            !login_throttle(&map, "login:fresh", 5, 900),
+            "expired buckets should be evicted to admit a new key"
+        );
+    }
+
+    fn poison(map: &Arc<Mutex<HashMap<String, (u32, Instant)>>>) {
+        let m = Arc::clone(map);
+        let _ = std::thread::spawn(move || {
+            let _guard = m.lock().unwrap();
+            panic!("deliberate poison for test");
+        })
+        .join();
+    }
+
+    #[test]
+    fn login_throttle_poisoned_lock_denies() {
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        poison(&map);
+        assert!(login_throttle(&map, "login:poisoned", 5, 900));
+    }
+
+    #[test]
+    fn login_ok_poisoned_lock_is_noop() {
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        poison(&map);
+        login_ok(&map, "login:poisoned");
     }
 }

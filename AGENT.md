@@ -47,7 +47,9 @@ cargo deny check
 - **Rust edition 2024**, stable toolchain.
 - No `unwrap()` in production paths except startup; use `?` or match.
 - All DB writes go through `Db` methods; no raw SQL in handlers.
-- Handlers must check `roles::role_of()` (Owner > Admin > Seller > User) before acting.
+- Authorize before acting: bot handlers use `roles::role_of()` (Owner > Admin >
+  Seller > User); REST and console handlers use the server-side session role and
+  the typed tenant scope in `roles.rs`. Never derive authority from a request field.
 - Scope all business data by `seller_id`.
 - Use `channel_of(db, cfg, Some(seller_id))` for per-seller channels.
 - Log via `tracing`; never log secrets.

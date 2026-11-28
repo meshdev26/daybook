@@ -2,7 +2,7 @@
 
 Daybook — the calm back-office ledger for your Telegram commerce.
 
-> **Alpha:** self-hosted, self-reviewed (with AI assistance), not independently audited. Do not use with real customer money or live customer data without first reading the code and testing seller isolation on your own deployment.
+> **Beta (local label only):** self-hosted, self-reviewed (with AI assistance), not independently audited. Do not use with real customer money or live customer data without first reading the code and testing seller isolation on your own deployment.
 >
 > Track the pre-real-money checklist in [issue #1](https://github.com/meshdev26/daybook/issues/1).
 

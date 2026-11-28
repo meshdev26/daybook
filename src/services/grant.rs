@@ -143,6 +143,7 @@ pub async fn grant_one<V: InvoiceVerifier + ?Sized>(
     uid: Option<i64>,
     inv_seller: i64,
     this_id: i64,
+    owner_id: i64,
 ) {
     // (a) Claim: only the winner verifies and grants.
     if !db.claim_invoice_for_grant(inv_id) {
@@ -268,12 +269,12 @@ pub async fn grant_one<V: InvoiceVerifier + ?Sized>(
         .unwrap_or(30)
         .clamp(1, crate::handlers::commands::MAX_PLAN_DAYS);
     let seller_id = inv_seller;
+    let is_admin = seller_id == crate::roles::TenantScope::PLATFORM_ID
+        || crate::roles::role_of(db, seller_id, owner_id) >= crate::roles::Role::Admin;
     let ch = plan_info
         .as_ref()
         .and_then(|p| p.5.clone())
-        .or_else(|| db.seller_channel(seller_id))
-        .or_else(|| db.get_config("channel"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| crate::handlers::commands::channel_of(db, Some(seller_id), is_admin));
     if ch.is_empty() {
         // Verified paid but nothing to grant into: non-terminal recovery with
         // a recoverable clock. Never age this to terminal `failed`.
@@ -526,6 +527,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
 
@@ -558,6 +560,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
         assert_eq!(db.get_invoice("inv-e2e").unwrap().2, "paid");
@@ -599,6 +602,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
 
@@ -661,6 +665,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
 
@@ -707,6 +712,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
 
@@ -751,6 +757,7 @@ mod tests {
             Some(42),
             7,
             9,
+            999,
         )
         .await;
 
@@ -799,6 +806,7 @@ mod tests {
                 Some(42),
                 7,
                 9,
+                999,
             )
             .await;
         }
@@ -854,6 +862,7 @@ mod tests {
                 Some(42),
                 7,
                 9,
+                999,
             )
             .await;
         }
@@ -916,6 +925,7 @@ mod tests {
                 if id == "inv-nouser" { None } else { Some(42) },
                 7,
                 9,
+                999,
             )
             .await;
         }
@@ -994,6 +1004,7 @@ mod tests {
             Some(42),
             99,
             9,
+            999,
         )
         .await;
 
@@ -1005,5 +1016,97 @@ mod tests {
         assert_eq!(hit_count(&telegram_a, "/SendMessage").await, 0);
         assert_eq!(hit_count(&telegram_b, "/CreateChatInviteLink").await, 1);
         assert_eq!(hit_count(&telegram_b, "/SendMessage").await, 1);
+    }
+
+    /// A seller-tier account with no channel of its own must never be granted
+    /// into the operator's global channel: fail closed to `paid_ungranted`.
+    #[tokio::test]
+    async fn seller_no_channel_never_grants_into_global_channel() {
+        let (_dir, db) = new_db();
+        db.set_config("channel", "@operator");
+        db.upsert_seller(7, None, None);
+        db.add_plan(7, "no-channel-plan", "5", "USDT", 7, None);
+        db.save_invoice(
+            "inv-no-channel",
+            7,
+            "5",
+            "USDT",
+            Some("no-channel-plan"),
+            "active",
+            None,
+            Some("no-channel-plan"),
+            Some(42),
+            None,
+        );
+        let telegram = MockServer::start().await;
+        let provider = MockServer::start().await;
+        mount_provider(&provider, "inv-no-channel", "paid").await;
+        mount_telegram(&telegram, true).await;
+
+        grant_one(
+            &db,
+            &bot_for(&telegram.uri()),
+            Some(&cp_for(&provider)),
+            "inv-no-channel",
+            Some("no-channel-plan"),
+            Some(42),
+            7,
+            9,
+            999,
+        )
+        .await;
+
+        assert_eq!(
+            db.get_invoice("inv-no-channel").unwrap().2,
+            "paid_ungranted"
+        );
+        assert!(db.subscriptions_for_invoice("inv-no-channel").is_empty());
+        assert_eq!(hit_count(&telegram, "/CreateChatInviteLink").await, 0);
+    }
+
+    /// Admin/Owner keep the global fallback; only the seller-tier fallback is
+    /// removed. The admin control proves the rule is a scope check, not a ban.
+    #[tokio::test]
+    async fn admin_seller_keeps_global_channel_fallback() {
+        let (_dir, db) = new_db();
+        db.set_config("channel", "@operator");
+        db.upsert_seller(7, None, None);
+        db.add_admin(7, None);
+        db.add_plan(7, "no-channel-plan", "5", "USDT", 7, None);
+        db.save_invoice(
+            "inv-admin",
+            7,
+            "5",
+            "USDT",
+            Some("no-channel-plan"),
+            "active",
+            None,
+            Some("no-channel-plan"),
+            Some(42),
+            None,
+        );
+        let telegram = MockServer::start().await;
+        let provider = MockServer::start().await;
+        mount_provider(&provider, "inv-admin", "paid").await;
+        mount_telegram(&telegram, true).await;
+
+        grant_one(
+            &db,
+            &bot_for(&telegram.uri()),
+            Some(&cp_for(&provider)),
+            "inv-admin",
+            Some("no-channel-plan"),
+            Some(42),
+            7,
+            9,
+            999,
+        )
+        .await;
+
+        assert_eq!(db.get_invoice("inv-admin").unwrap().2, "paid");
+        let subs = db.subscriptions_for_invoice("inv-admin");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].3, "@operator");
+        assert_eq!(hit_count(&telegram, "/CreateChatInviteLink").await, 1);
     }
 }

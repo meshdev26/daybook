@@ -2566,18 +2566,24 @@ impl Db {
     }
 
     /// Mark a claimed invoice as fully granted/paid. Best-effort: errors are
-    /// logged, not swallowed silently.
+    /// logged, not swallowed silently. Terminal `refunded`/`failed` rows are
+    /// skipped so a settled refund cannot be resurrected as paid.
     pub fn finalize_invoice_paid(&self, invoice_id: &str) {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().to_rfc3339();
-        if let Err(e) = conn.execute(
-            "UPDATE invoices SET status='paid', updated_at=?2 WHERE invoice_id=?1",
+        match conn.execute(
+            "UPDATE invoices SET status='paid', updated_at=?2 WHERE invoice_id=?1 AND status NOT IN ('refunded','failed')",
             params![invoice_id, now],
         ) {
-            tracing::warn!("failed to mark invoice {} as paid: {}", invoice_id, e);
+            Ok(0) => tracing::warn!(
+                "finalize skipped for invoice {}: terminal status (refunded or failed) or row absent",
+                invoice_id
+            ),
+            Err(e) => tracing::warn!("failed to mark invoice {} as paid: {}", invoice_id, e),
+            _ => {}
         }
     }
 
@@ -9029,7 +9035,10 @@ impl Db {
             stmt.query_map(params![s, b, st], mapper)
         } else if let (None, Some(b), _) = (seller_id, buyer_id, status) {
             // buyer-only: re-query simpler
-            let mut s2 = conn.prepare("SELECT id, seller_id, buyer_id, subject, status, updated_at FROM tickets WHERE buyer_id=?1 ORDER BY updated_at DESC").unwrap();
+            let mut s2 = match conn.prepare("SELECT id, seller_id, buyer_id, subject, status, updated_at FROM tickets WHERE buyer_id=?1 ORDER BY updated_at DESC") {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
             return s2
                 .query_map(params![b], mapper)
                 .ok()

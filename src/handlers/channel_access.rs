@@ -10,13 +10,22 @@
 //! only a row they own or their configured default channel, and every other
 //! case fails closed.
 
-use crate::{db::Db, roles::Role};
+use crate::{
+    db::Db,
+    roles::{Role, TenantScope},
+};
 
 /// Normalize a channel target for comparison: trimmed, no leading `@`, ASCII
 /// lowercased. Stored names may be handles or numeric ids; the value sent to
-/// Telegram is never rewritten.
+/// Telegram is never rewritten. A second pass must be a no-op, so stripping
+/// the prefix cannot stop while whitespace that trim() would remove is still
+/// hanging off the result.
 pub fn channel_key(channel: &str) -> String {
-    channel.trim().trim_start_matches('@').to_ascii_lowercase()
+    channel
+        .trim()
+        .trim_start_matches('@')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Exact stored form first, then the normalized key.
@@ -44,16 +53,15 @@ pub fn may_mutate_channel(
     // Today's policy is role + seller-scope only; consulting them here would
     // narrow the owner/admin global tier and change existing behavior.
     let _ = (account_id, selected_bot_id);
-    if Role::from_role_str(session_role).has_level(Role::Admin) {
-        return true;
-    }
+    let sid = match Role::from_role_str(session_role).tenant_scope(session_seller_id) {
+        TenantScope::Global => return true,
+        TenantScope::Denied => return false,
+        TenantScope::Seller(sid) => sid,
+    };
     let key = channel_key(channel);
     if key.is_empty() {
         return false;
     }
-    let Some(sid) = session_seller_id else {
-        return false;
-    };
     if owns_channel_row(db, sid, channel) {
         return true;
     }
@@ -89,7 +97,10 @@ pub fn may_post_to_channel(
     // binding, a buyer or unknown-role principal would otherwise deliver a
     // message through the operator's bot and only fail afterwards when the row
     // is attributed. Operator tiers already passed `may_mutate_channel`.
-    if !Role::from_role_str(session_role).has_level(Role::Seller) || session_seller_id.is_none() {
+    if !matches!(
+        Role::from_role_str(session_role).tenant_scope(session_seller_id),
+        TenantScope::Seller(_)
+    ) {
         return false;
     }
     !key.is_empty() && owns_channel_row(db, 0, channel)
@@ -118,6 +129,42 @@ mod tests {
                 s.trim().trim_start_matches('@').is_empty(),
                 "empty target mismatch: {:?} -> {:?}", s, k
             );
+        }
+    }
+
+    /// Fixed cases for the canonicalization edge the proptest also samples:
+    /// unicode case/regional spellings, mixed whitespace (including a
+    /// non-breaking space that `trim` removes), and repeated `@` prefixes
+    /// must normalize identically, be idempotent, and refuse an all-prefix
+    /// target. Distinct from the proptest so a regression has a named case.
+    #[test]
+    fn channel_key_unicode_and_mixed_whitespace_is_canonical_and_fail_closed() {
+        for (input, expected) in [
+            ("\u{2003}@@MiXeD\u{00a0}Chan\u{2009}", "mixed\u{00a0}chan"),
+            ("\t@Upper\u{2028}", "upper"),
+            ("@\u{00c4}\u{00d6}\u{00dc}", "\u{00c4}\u{00d6}\u{00dc}"),
+            ("\u{00a0}@@\u{2003}", ""),
+            ("  @@  ", ""),
+            ("@\u{200b}@target", "\u{200b}@target"),
+        ] {
+            let key = channel_key(input);
+            assert_eq!(key, expected, "canonicalization of {input:?}");
+            assert_eq!(channel_key(&key), key, "second pass changed {input:?}");
+            assert!(!key.starts_with('@'), "leading @ survived: {key:?}");
+            if key.is_empty() {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Db::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+                assert!(!may_mutate_channel(&db, "seller", Some(42), 3, None, input));
+                assert!(!may_post_to_channel(
+                    &db,
+                    "seller",
+                    Some(42),
+                    3,
+                    None,
+                    input
+                ));
+                assert!(!may_mutate_channel(&db, "user", None, 4, None, input));
+            }
         }
     }
 
@@ -186,6 +233,34 @@ mod tests {
         ));
         assert!(!may_post_to_channel(
             &db, "unknown", None, 4, None, "@global"
+        ));
+    }
+
+    /// A buyer-tier session carrying another seller's binding is denied by the
+    /// typed scope on REST and console; channel gates must refuse it as well.
+    #[test]
+    fn channel_gate_refuses_user_binding_with_seller_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+        db.upsert_seller(42, Some("seller42"), Some("@mine"));
+        db.add_channel("@mine", 42).unwrap();
+        db.add_channel("@global", 0).unwrap();
+        assert!(!may_mutate_channel(&db, "user", Some(42), 4, None, "@mine"));
+        assert!(!may_post_to_channel(
+            &db,
+            "user",
+            Some(42),
+            4,
+            None,
+            "@mine"
+        ));
+        assert!(!may_post_to_channel(
+            &db,
+            "user",
+            Some(42),
+            4,
+            None,
+            "@global"
         ));
     }
 }

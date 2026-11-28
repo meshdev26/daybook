@@ -26,7 +26,8 @@
   loader refuse that pair outright.
 - REST tenant gates now reject the buyer tier. Nineteen of the twenty-one negative
   equality gates were converted to a positive tier-floor check; `invoices_claim`
-  keeps its buyer self-claim carve-out (`src/api.rs:4797-4801`). An earlier draft
+  keeps its buyer self-claim carve-out (`src/api.rs:4804-4810`; the buyer
+  binding is at `src/api.rs:4814-4817`). An earlier draft
   claimed 41 gates and said `invoices_status` had no status allowlist. Both were
   wrong: the paid and paid_ungranted states were already refused, failed was
   owner-only, and the reachable forged value was `executed`, which analytics
@@ -40,6 +41,16 @@
   surface decision. `codes_redeem` keeps the buyer redemption flow but ignores a
   caller-supplied beneficiary for the user tier. The buyer invoice self-claim
   and code redemption flows remain supported as documented in `docs/API.md`.
+- Local adversarial self-validation is in `tests/adversarial_local.rs`: thirteen
+  loopback cases cover invoice status forgery, foreign review and ticket writes,
+  seller MCP deletion, forged seller ids, tenantless console reads, legacy
+  seller sessions and the denied-sentinel id collision. The sentinel case was
+  shown red (buyer got 200 and created `sellers(-1)`) before the shared
+  ownership helper was fixed. This is not an independent penetration test.
+- Two S3 findings from the adversarial review were closed: the login throttle
+  no longer evicts an active bucket to admit an unknown key, and MCP rate keys
+  put unbounded principals in a negative space so a seller whose id equals the
+  owner role ordinal keeps its own bucket. Both have regression tests.
 - Gap: independent multi-tenant penetration testing has not been run. Validate isolation on your own deployment before handling real customer money.
 
 ### Automated validation (self-check, not an audit)
@@ -47,7 +58,7 @@
 - Automated self-validation of seller isolation on a fresh local database across REST, MCP, the web console and bot scoping; this is not an independent multi-tenant penetration test or a third-party audit, and the scratch-deployment verification in issue #1 remains open.
 - The suite runs on loopback with mock Bot APIs, two forged-token seller principals and per-tenant markers. Seller-scoped REST `expire-check` (owner/admin retain the global sweep) is a permanent isolation case; bot `/expirecheck` has a matching regression test in `commands/tests.rs`.
 
-> **Status:** alpha, self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
+> **Status:** beta (local version label only), self-reviewed (with AI assistance), not independently audited; no real customer money. Gap checklist: https://github.com/meshdev26/daybook/issues/1.
 
 ## Payments
 - Always verify payment via Crypto Pay API before granting access.
